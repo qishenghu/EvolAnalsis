@@ -18,33 +18,17 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
-import json
-import os
 import uuid
 from collections import defaultdict
-from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
-from enum import Enum
 from pprint import pprint
-from typing import Dict, Optional, Type
 
 import numpy as np
 import ray
 import torch
-from codetiming import Timer
-from omegaconf import OmegaConf, open_dict
-from torch.utils.data import Dataset, Sampler
-from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
-
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.base import Worker
-from verl.single_controller.ray import (RayClassWithInitArgs, RayResourcePool,
-                                        RayWorkerGroup)
-from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (compute_data_metrics,
                                            compute_throughout_metrics,
@@ -55,19 +39,49 @@ from verl.trainer.ppo.ray_trainer import (AdvantageEstimator, RayPPOTrainer,
                                           compute_advantage,
                                           compute_response_mask)
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import reduce_metrics
-from verl.utils.seqlen_balancing import (get_seqlen_balanced_partitions,
-                                         log_seqlen_unbalance)
-from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.rollout.async_server import AsyncLLMServerManager
 
-from .ba_reward import compute_appworld_reward
-from .ba_src.beyondagent_execute import batch_experience_summarize
-from .parallel_env_manager import ParallelEnvManager
-from verl.utils.debug.vscode_breakpoint import vscode_conditional_breakpoint
 
+
+def parse_reward_from_dataproto(data: DataProto, return_dict=False) -> dict | torch.Tensor:
+    """
+    Compute reward for a batch of data.
+    Args:
+        data: DataProto object containing the input data.
+        return_dict: Whether to return a dictionary or just the reward tensor.
+
+    Returns:
+        Tensor of shape (bs, response_len) if return_dict is False,
+        or a dict with 'reward_tensor' and 'reward_extra_info'.
+    """
+    # Within DataFlow, world.execute() will pass a float score, which will be contained in the DataProto.non_tensor_batch('reward_scores')
+
+    # Initialize reward tensor
+    reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)  # (bs, reslen)
+    reward_extra_info = defaultdict(list)
+
+    # Batch-level processing
+    prompt_ids_batch = data.batch["prompts"]  # (bs, prompt_len)
+    prompt_lengths = prompt_ids_batch.shape[-1]
+
+    # Get attention masks for all items
+    attention_masks = data.batch["attention_mask"]  # (bs, total_len)
+    response_lengths = attention_masks[:, prompt_lengths:].sum(dim=1)  # (bs, )
+
+    # Get reward scores
+    reward_scores_list = [item["outcome"] for item in data.non_tensor_batch["reward_scores"]]
+    reward_scores = torch.tensor(reward_scores_list, device=reward_tensor.device, dtype=torch.float32)  # (bs, )
+
+    # Use advanced indexing to assign rewards
+    reward_tensor[torch.arange(len(data)), response_lengths - 1] = reward_scores
+
+    if return_dict:
+        return {
+            "reward_tensor": reward_tensor,
+            "reward_extra_info": reward_extra_info,
+        }
+    else:
+        return reward_tensor
 
 class BeyondAgentRayPPOTrainer(RayPPOTrainer):
     """
@@ -75,6 +89,7 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # TODO at jinli
         self.remote_batch_experience_summarize = ray.remote(batch_experience_summarize)
 
     def _validate(self):
@@ -197,8 +212,8 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
 
     def init_workers(self):
         super().init_workers()
-        self.reward_fn = compute_appworld_reward
-        self.val_reward_fn = compute_appworld_reward
+        self.reward_fn = parse_reward_from_dataproto
+        self.val_reward_fn = parse_reward_from_dataproto
         self.explorer_manager = ParallelEnvManager(
             config=self.config, 
             async_rollout_manager=self.async_rollout_manager
@@ -245,10 +260,10 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
-        last_val_metrics = None
+        last_val_metrics = Nonetrain_dataloader
 
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict in self.:
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
