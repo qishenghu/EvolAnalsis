@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import List
 
 from loguru import logger
@@ -14,6 +15,7 @@ class EMClient(HttpClient):
 
     def call_context_generator(self, trajectory: Trajectory, retrieve_top_k: int = 1, workspace_id: str = "default",
                                **kwargs) -> str:
+        start_time = time.time()
         self.url = self.base_url + "/context_generator"
         json_data = {
             "trajectory": trajectory.model_dump(),
@@ -27,6 +29,7 @@ class EMClient(HttpClient):
             return ""
 
         # TODO return raw experience instead of context @jinli
+        trajectory.metadata["context_time_cost"] = time.time() - start_time
         return response["context_msg"]["content"]
 
     async def async_call_context_generator(self, executor=None, **kwargs):
@@ -38,6 +41,8 @@ class EMClient(HttpClient):
         return await loop.run_in_executor(executor=executor, func=func)
 
     def call_summarizer(self, trajectories: List[Trajectory], workspace_id: str = "default", **kwargs):
+        start_time = time.time()
+
         self.url = self.base_url + "/summarizer"
         json_data = {
             "trajectories": [x.model_dump() for x in trajectories],
@@ -49,7 +54,7 @@ class EMClient(HttpClient):
             logger.warning("error call_context_generator")
             return ""
 
-        return response["experiences"]
+        return response["experiences"], time.time() - start_time
 
     async def async_call_summarizer(self, executor=None, **kwargs):
         loop = asyncio.get_event_loop()

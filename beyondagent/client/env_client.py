@@ -7,6 +7,7 @@ import requests
 class EnvClient:
     def __init__(self, base_url: str = "http://localhost:8000"):
         self.base_url = base_url.rstrip("/")
+        self.timeout = 300.0
 
     def _make_request(
         self,
@@ -27,7 +28,7 @@ class EnvClient:
             "params": params or {},
         }
         try:
-            response = requests.post(url, json=data)
+            response = requests.post(url, json=data, timeout=self.timeout)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:

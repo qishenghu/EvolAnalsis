@@ -531,6 +531,13 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
                             print("=" * 10 + "end fit rollout" + "=" * 10)
 
                             gen_batch_output = self.env_manager.to_dataproto(trajectories)
+                            context_time_cost = [x.metadata["context_time_cost"] for x in trajectories if "context_time_cost" in x.metadata]
+                            metrics.update({
+                              "context_cost_avg":   np.mean(context_time_cost),
+                              "context_cost_max":   np.max(context_time_cost),
+                              "context_cost_min":   np.min(context_time_cost),
+                            })
+
                             print(f"gen_batch_output.info batch.keys={gen_batch_output.batch.keys()}")
                             num_term_traj = sum([traj.is_terminated  for traj in trajectories])
                             num_not_none_traj = sum([len(traj.steps)>0  for traj in trajectories])
@@ -690,7 +697,10 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                     if summary_task is not None:
-                        experience_list = summary_task.result()
+                        experience_list, time_cost = summary_task.result()
+                        metrics.update({
+                            "experience_maker/summary": time_cost,
+                        })
                         print("wait for summary_task complete~")
                         if experience_list:
                             for i, experience in enumerate(experience_list):
