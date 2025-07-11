@@ -29,6 +29,7 @@ from beyondagent.module.agent_flow.base_agent_flow import BaseAgentFlow
 from beyondagent.module.task_manager import adapter
 from beyondagent.module.task_manager.adapter import OnflyRlDataset, to_rl_dataset
 from beyondagent.module.task_manager.data_mixture import MixtureStrategy, OriginalOnlyStrategy
+from beyondagent.module.task_manager.exploration_strategies import ExploreStrategy
 from beyondagent.module.task_manager.explorer import Explorer
 from beyondagent.module.task_manager.filters import TaskPostFilter
 from beyondagent.module.task_manager.prompts.prompt_explore import (
@@ -63,6 +64,7 @@ class TaskManager(object):
     def __init__(
         self,
         config: DictConfig,
+        exploration_strategy: ExploreStrategy,
         llm_client: LlmClient,
         old_retrival: TaskObjectiveRetrieval,
         mixture_strategy: MixtureStrategy,
@@ -71,6 +73,7 @@ class TaskManager(object):
         **kwargs: Unpack[TaskManagerProps],
     ):
         self._config = config
+        self._exploration_strategy=exploration_strategy
         self._llm_client = llm_client
         self._old_retrival = old_retrival
         self._mixture_strategy = mixture_strategy
@@ -91,6 +94,7 @@ class TaskManager(object):
         self._filters: list[TaskPostFilter] = []
         
         self._tasks: list[Task]=[]
+        self._exploration_strategy._inject_deps(self._old_retrival,self._llm_client)
     
     @property
     def seed_tasks(self):
@@ -186,48 +190,17 @@ class TaskManager(object):
         return res
 
     
-    def _exlore_and_summarize(self,task:Task,data_id:str,rollout_id:str):
-        trajectory=self._step_explore(task,data_id,rollout_id)
-        task_objectives=self._step_summarize(task,trajectory)
+    def _exlore_and_summarize(self,task:Task,data_id:str,rollout_id:str)->list[TaskObjective]:
+        trajectories=self._step_explore(task,data_id,rollout_id)
+        task_objectives=sum([self._step_summarize(task,trajectory) for trajectory in trajectories],[])
         return task_objectives
 
 
-    def _step_explore(self, task: Task, data_id: str, rollout_id: str):
+    def _step_explore(self, task: Task, data_id: str, rollout_id: str)->list[Trajectory]:
         """
         Step 1: explore the environment to find out possible actions and their results.
         """
-        # reset env every time
-        env_worker = Explorer(
-            env_type=task.env_type,
-            task_id=task.task_id,
-            instance_id=None,
-            env_service_url=self._env_service_url,
-        )
-        llm_chat_fn = self._get_llm_chat_fn(
-            sampling_params={
-                "temperature": self._exploration_llm_temperature,
-                "top_p": self._exploration_llm_top_p,
-                "top_k": self._exploration_llm_top_k,
-            }
-        )
-        agent_flow: BaseAgentFlow = AgentFlow(
-            enable_context_generator=False,
-            llm_chat_fn=llm_chat_fn,
-            tokenizer=self._tokenizer,
-            config=self._config,
-        )
-        agent_flow.max_steps = self._max_explore_step  # this is ugly
-
-        old_objectives = self._old_retrival.retrieve_objectives(task)
-
-        traj = env_worker.execute(
-            data_id=data_id,
-            rollout_id=rollout_id,
-            system_prompt=get_agent_interaction_system_prompt(task, old_objectives),
-            agent_flow=agent_flow,
-        )
-
-        return traj
+        return self._exploration_strategy.explore(task,data_id,rollout_id)
 
 
     def _step_summarize(
@@ -240,7 +213,7 @@ class TaskManager(object):
             task: Task
             trajectories: Trajectory.
         """
-        # 这个方法从现在看基本上是固定的
+        # 这个方法从现在看基本上是固定的，所以先不打算拆出去
         llm_fn = self._get_llm_chat_fn()
         old_objectives = self._old_retrival.retrieve_objectives(task)
         system_prompt, user_prompt = get_task_summarize_prompt(
