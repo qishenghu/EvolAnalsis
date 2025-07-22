@@ -29,32 +29,18 @@ from beyondagent.module.agent_flow.base_agent_flow import BaseAgentFlow
 from beyondagent.module.task_manager import adapter
 from beyondagent.module.task_manager.adapter import OnflyRlDataset, to_rl_dataset
 from beyondagent.module.task_manager.data_mixture import MixtureStrategy, OriginalOnlyStrategy
+from beyondagent.module.task_manager.strategies import TaskExploreStrategy
 from beyondagent.module.task_manager.explorer import Explorer
-from beyondagent.module.task_manager.filters import TaskPostFilter
-from beyondagent.module.task_manager.prompts.prompt_explore import (
-    get_agent_interaction_system_prompt,
-)
-from beyondagent.module.task_manager.prompts.prompt_summarize import (
-    get_task_summarize_prompt,
-    parse_tasks_from_response,
-)
+from beyondagent.module.task_manager.filters import NaiveTaskPostFilter, TaskPostFilter
+
 from beyondagent.module.task_manager.base import LlmClient, TaskObjectiveRetrieval
 from beyondagent.schema.task import Task, TaskObjective
 from beyondagent.schema.trajectory import Trajectory
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 class TaskManagerProps(TypedDict):
-    max_llm_retries: int
-    max_explore_step: int
     num_explore_threads: int
-    n: int
-    
-    exploration_llm_temperature: NotRequired[float]
-    exploration_llm_top_p: NotRequired[float]
-    exploration_llm_top_k: NotRequired[int]
-    
-    task_summary_history_length: NotRequired[int]
-
+    n: int # 重复探索的控制必须放在这里，task manager 要规划 task 执行顺序，避免在同时探索相同任务导致潜在的 query 重复
 
 # TODO: 能够替换的 exploration & extraction (summary) strategy
 
@@ -63,6 +49,7 @@ class TaskManager(object):
     def __init__(
         self,
         config: DictConfig,
+        exploration_strategy: TaskExploreStrategy,
         llm_client: LlmClient,
         old_retrival: TaskObjectiveRetrieval,
         mixture_strategy: MixtureStrategy,
@@ -71,26 +58,19 @@ class TaskManager(object):
         **kwargs: Unpack[TaskManagerProps],
     ):
         self._config = config
+        self._exploration_strategy=exploration_strategy
         self._llm_client = llm_client
         self._old_retrival = old_retrival
         self._mixture_strategy = mixture_strategy
         self._env_service_url = env_service_url
         self._tokenizer = tokenizer  # cc: 这玩意似乎不该在这
-        self._max_llm_retries = kwargs["max_llm_retries"] or 3
-        self._max_explore_step = kwargs["max_explore_step"] or 10
         self._num_exploration_threads = kwargs["num_explore_threads"] or 10
         self._n = kwargs["n"]
-        
-        self._exploration_llm_temperature = kwargs.get(
-            "exploration_llm_temperature", 1.0
-        )
-        self._exploration_llm_top_p = kwargs.get("exploration_llm_top_p", 1.0)
-        self._exploration_llm_top_k = kwargs.get("exploration_llm_top_k", 1)
-        self._task_summary_history_length = kwargs.get("task_summary_history_length", self._max_explore_step)
 
-        self._filters: list[TaskPostFilter] = []
+        self._filters: list[TaskPostFilter] = [NaiveTaskPostFilter()]
         
         self._tasks: list[Task]=[]
+        self._exploration_strategy._inject_deps(self._old_retrival,self._llm_client)
     
     @property
     def seed_tasks(self):
@@ -177,57 +157,29 @@ class TaskManager(object):
                 ]
                 task_objectives = sum([future.result() for future in futures], [])
                 res.extend(task_objectives)
-
-        # post filter
-        res = functools.reduce(lambda x, f: f.filter(x), self._filters, res)
+                # post filter
+                res = functools.reduce(lambda x, f: f.filter(x), self._filters, res)
+                self._old_retrival.reset()
+                for i in res:
+                    self._old_retrival.add_objective(i)
+                
         
         random.shuffle(res) # shuffle
 
         return res
 
     
-    def _exlore_and_summarize(self,task:Task,data_id:str,rollout_id:str):
-        trajectory=self._step_explore(task,data_id,rollout_id)
-        task_objectives=self._step_summarize(task,trajectory)
+    def _exlore_and_summarize(self,task:Task,data_id:str,rollout_id:str)->list[TaskObjective]:
+        trajectories=self._step_explore(task,data_id,rollout_id)
+        task_objectives=sum([self._step_summarize(task,trajectory) for trajectory in trajectories],[])
         return task_objectives
 
 
-    def _step_explore(self, task: Task, data_id: str, rollout_id: str):
+    def _step_explore(self, task: Task, data_id: str, rollout_id: str)->list[Trajectory]:
         """
         Step 1: explore the environment to find out possible actions and their results.
         """
-        # reset env every time
-        env_worker = Explorer(
-            env_type=task.env_type,
-            task_id=task.task_id,
-            instance_id=None,
-            env_service_url=self._env_service_url,
-        )
-        llm_chat_fn = self._get_llm_chat_fn(
-            sampling_params={
-                "temperature": self._exploration_llm_temperature,
-                "top_p": self._exploration_llm_top_p,
-                "top_k": self._exploration_llm_top_k,
-            }
-        )
-        agent_flow: BaseAgentFlow = AgentFlow(
-            enable_context_generator=False,
-            llm_chat_fn=llm_chat_fn,
-            tokenizer=self._tokenizer,
-            config=self._config,
-        )
-        agent_flow.max_steps = self._max_explore_step  # this is ugly
-
-        old_objectives = self._old_retrival.retrieve_objectives(task)
-
-        traj = env_worker.execute(
-            data_id=data_id,
-            rollout_id=rollout_id,
-            system_prompt=get_agent_interaction_system_prompt(task, old_objectives),
-            agent_flow=agent_flow,
-        )
-
-        return traj
+        return self._exploration_strategy.explore(task,data_id,rollout_id)
 
 
     def _step_summarize(
@@ -240,57 +192,8 @@ class TaskManager(object):
             task: Task
             trajectories: Trajectory.
         """
-        # 这个方法从现在看基本上是固定的
-        llm_fn = self._get_llm_chat_fn()
-        old_objectives = self._old_retrival.retrieve_objectives(task)
-        system_prompt, user_prompt = get_task_summarize_prompt(
-            [trajectory], old_objectives, len_history=self._task_summary_history_length
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        llm_output = llm_fn(messages=messages)["content"]
-        tasks = parse_tasks_from_response(task, llm_output)
-        return tasks
+        return self._exploration_strategy.summarize(task, trajectory)
 
-    def _get_llm_chat_fn(self, sampling_params: Optional[dict] = None) -> Callable:
-        def llm_chat(
-            messages: list[dict[str, str]],
-            custom_sampling_params: Optional[dict] = None,
-            request_id: Optional[str] = None,
-        ) -> dict:
-            """
-            input messages: [{"role": "system", "value": "..."}, {"role": "user", "value": "..."}]
-            output messages: [{"role": "assistant", "value": "..."}]
-            """
-            updated_sampling_params = {}
-            if sampling_params:
-                updated_sampling_params.update(sampling_params)
-            if custom_sampling_params:
-                updated_sampling_params.update(custom_sampling_params)
-
-            # output_messages = []
-            input_messages = copy.deepcopy(messages)
-            res = None
-            for i in range(self._max_llm_retries):
-                try:
-                    res = self._llm_client.chat(
-                        messages=input_messages, sampling_params=updated_sampling_params
-                    )
-                    break
-
-                except Exception as e:
-                    logger.exception(f"rollout_server.{i} error: {e.args}")
-                    time.sleep(i + 1)
-
-            assert res is not None, f"LLM client failed to chat"
-            return {
-                "role": "assistant",
-                "content": res,
-            }
-
-        return llm_chat
 
 
 class FullDataset(Dataset):
@@ -329,8 +232,9 @@ class FullDataset(Dataset):
     
     def save_to_file(self, filepath: str):
         """保存objectives到文件"""
+        objectives_without_origins=list(filter(lambda x:x.task.evaluator!="env",self._objectives))
         with open(filepath, "w") as f:
-            f.writelines([ob.json() + "\n" for ob in self._objectives])
+            f.writelines([ob.json() + "\n" for ob in objectives_without_origins])
         logger.info(f"Saved {len(self._objectives)} objectives to {filepath}")
     
     def load_from_file(self, filepath: str):

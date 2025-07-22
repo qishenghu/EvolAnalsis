@@ -101,7 +101,7 @@ You have already explored the following objectives:
 
 {objectives}
 
-Please avoid repeating the objectives in the current exploration.
+Please avoid repeating these objectives.
 
 # Now Start
 
