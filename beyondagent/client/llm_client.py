@@ -144,6 +144,8 @@ class DashScopeClient:
                 time.sleep(retry_delay * (2 ** attempt))  # 指数退避
         
         logger.error(f"All {max_retries} stream attempts failed")
+        
+        return
 
 
 # 使用示例
