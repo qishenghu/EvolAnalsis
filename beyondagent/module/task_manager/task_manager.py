@@ -20,6 +20,7 @@ from typing import (
 import hydra
 from loguru import logger
 from omegaconf import DictConfig
+import requests
 from torch.utils.data import IterableDataset,Dataset
 from tqdm import tqdm
 from beyondagent.client.env_client import EnvClient
@@ -96,8 +97,8 @@ class TaskManager(object):
             self._tasks.extend([Task(task_id=str(x),env_type=env_type,evaluator='env') for x in response])
             assert all([x.query is None for x in self._tasks]), "query of seed task must be empty"
             logger.info(f"loaded tasks from environment, #tasks={len(self._tasks)}")
-        except:
-            logger.error(f"failed to load tasks from environment")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"failed to load tasks from environment: {e}")
             return 0
         return len(response)
 
