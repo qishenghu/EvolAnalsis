@@ -1,4 +1,5 @@
 import json
+import random
 import time
 from typing import Optional, cast
 
@@ -9,6 +10,7 @@ from beyondagent.client.env_client import EnvClient
 from beyondagent.module.agent_flow.base_agent_flow import BaseAgentFlow
 from beyondagent.module.agent_flow.reward_calculator import RewardCalculator
 from beyondagent.module.task_manager.strategies.deduplication.embedding import StateRecorder
+from beyondagent.module.task_manager.strategies.deduplication.prompts import prompt_state_summary
 from beyondagent.schema.trajectory import Trajectory
 from beyondagent.utils.utils import convert_tool_to_user_message, clip_state_content_correctly
 
@@ -34,28 +36,53 @@ class ControlledAgentFlow(BaseAgentFlow):
     def execute(self, trajectory: Trajectory, env: EnvClient, instance_id: str, **kwargs) -> Trajectory:
         request_id: str = ""
         trajectory=trajectory.copy(deep=True) # clone the trajectory to avoid side effect
+        
+        rng=random.Random(trajectory.steps[0]['content']) # use system prompt as seed
         for act_step in range(self.max_steps):
-            # remove old system prompt
-            new_steps=[]
-            for i in trajectory.steps:
-                if i['role']=='system':
-                    if i['content'].find('In the past interactions at this place, you have output these action and observed these states already:')>=0:
-                        continue
-                new_steps.append(i)
-            trajectory.steps=new_steps
-            # add exploration instruction
-            records=self._state_recorder.get_state(trajectory)
-            if len(records)>0:
-                instruction="In the past interactions at this place, you have output these action and observed these states already:\n"
-                for id, record in enumerate(records):
-                    instruction+=f"## {id+1}.\n"
-                    instruction+=f"[action]\n{record[0][:self._max_record_len]}\n\n"
-                    instruction+=f"[state]\n{record[1][:self._max_record_len]}\n\n"
-                instruction+="## Continue your work."
-                instruction+="Please continue your work. You are not expected to repeat the action you have already observed." # TODO: better strategy
-                logger.debug(f"retrieve #records={len(records)}, #instruction={len(instruction)}")
+            # -------- 1. 清理旧 system prompt --------
+            new_steps = [
+                s for s in trajectory.steps
+                if not (s["role"] == "system" and
+                        "Now decide the single best next action" in s["content"])
+            ]
+            trajectory.steps = new_steps
+
+            # -------- 2. 生成 records --------
+            records = self._state_recorder.get_state(trajectory)
+            if len(records) != 0:
+                records_str = []
+                for idx, (action, state) in enumerate(records, start=1):
+                    records_str.append(f"## {idx}\n[action]\n{action[:self._max_record_len]}"
+                                    f"\n\n[state]\n{state[:self._max_record_len]}\n")
+                records_str = "\n".join(records_str)
+                records_str = self._compress_state_action(records_str)
+
+                # -------- 3. 组装强化版 prompt --------
+                instruction = f"""## Local Context
+You are currently **at the same location / state** as in the log below.
+
+### Interaction Log (collapsed)
+{records_str}
+
+## Decision Guidelines
+1. Prefer an **untried** action if it has a plausible chance of revealing new reward-relevant information.
+2. You may **repeat** a previous action only if
+a) it delivered high reward and you expect the reward to persist, **or**
+b) you need confirmation to reduce uncertainty.
+3. Avoid infinite loops: never repeat the same low-value action more than **2** times.
+4. Think step-by-step and output your reasoning before taking action (max 100 tokens).
+5. Return **exactly one** action.
+
+Now decide the single best next action.""".strip()
+
+                logger.debug(f"retrieve #records={len(records)}, prompt_len={len(instruction)}")
                 
-                trajectory.steps.append({"role":"user","content":instruction})
+                # -------- 4. 随机或固定策略把 prompt 写入对话 --------
+                if rng.random() <= 1.0:     # 这里仍然可调探索概率
+                    trajectory.steps.append({
+                        "role": "user",
+                        "content": instruction
+                    })
             
             assert len(trajectory.steps)>2
             assert trajectory.steps[0]['role'] == 'system'
@@ -71,7 +98,7 @@ class ControlledAgentFlow(BaseAgentFlow):
 
             # yunpeng 0623: to prevent add an imend token to an uncompleted seq, 
             # because the message-type output will be applied chat_template.
-            max_response_length = self.config.actor_rollout_ref.rollout.response_length
+            max_response_length = self.config.actor_rollout_ref.rollout.response_length # TODO qwen-plus max_length
             if current_token_len + max_response_length > self.max_model_len:
                 logger.warning(f"exceed max model, current_token_len={current_token_len}, max_response_length={max_response_length}, max_model_len={self.max_model_len}")
                 break
@@ -150,6 +177,17 @@ class ControlledAgentFlow(BaseAgentFlow):
             trajectory.steps = trajectory.steps[:-1]
 
         return trajectory
+    
+    
+    def _compress_state_action(self, records: str)-> str:
+        msg=[
+            {
+                'role': 'user',
+                'content': prompt_state_summary.get_prompt_compress_states(records)
+            }
+        ]
+        llm_output = self.llm_chat_fn(msg)
+        return prompt_state_summary.parse_compressed_results(llm_output['content'])
 
 
 def sanitize_env_state(state: dict):

@@ -101,6 +101,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
     """
     is_llm_reward = torch.tensor([batch.non_tensor_batch["extras"][i]["evaluator"]!='env' for i in range(len(batch.non_tensor_batch["extras"]))],dtype=torch.bool,device=batch.batch.device)
+    # 放在这里并不合适，但是我懒的管。这个 metric 其他人也不用现在
+    n=batch.batch["token_level_scores"].size(0)//is_llm_reward.size(0)
+    is_llm_reward=is_llm_reward.repeat_interleave(n)
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
@@ -178,10 +181,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             "critic/rewards-env/mean": torch.mean(sequence_reward[~is_llm_reward]).detach().item(),
             "critic/rewards-env/max": torch.max(sequence_reward[~is_llm_reward]).detach().item(),
             "critic/rewards-env/min": torch.min(sequence_reward[~is_llm_reward]).detach().item(),
-            # adv
-            "critic/advantages-env/mean": torch.mean(valid_adv[~is_llm_reward]).detach().item(),
-            "critic/advantages-env/max": torch.max(valid_adv[~is_llm_reward]).detach().item(),
-            "critic/advantages-env/min": torch.min(valid_adv[~is_llm_reward]).detach().item(),
         })
         metrics.update({
             # score
@@ -192,10 +191,6 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             "critic/rewards-syn/mean": torch.mean(sequence_reward[is_llm_reward]).detach().item(),
             "critic/rewards-syn/max": torch.max(sequence_reward[is_llm_reward]).detach().item(),
             "critic/rewards-syn/min": torch.min(sequence_reward[is_llm_reward]).detach().item(),
-            # adv
-            "critic/advantages-syn/mean": torch.mean(valid_adv[is_llm_reward]).detach().item(),
-            "critic/advantages-syn/max": torch.max(valid_adv[is_llm_reward]).detach().item(),
-            "critic/advantages-syn/min": torch.min(valid_adv[is_llm_reward]).detach().item(),
         })
     return metrics
 

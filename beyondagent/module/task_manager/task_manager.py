@@ -20,6 +20,7 @@ from typing import (
 import hydra
 from loguru import logger
 from omegaconf import DictConfig
+import requests
 from torch.utils.data import IterableDataset,Dataset
 from tqdm import tqdm
 from beyondagent.client.env_client import EnvClient
@@ -96,8 +97,8 @@ class TaskManager(object):
             self._tasks.extend([Task(task_id=str(x),env_type=env_type,evaluator='env') for x in response])
             assert all([x.query is None for x in self._tasks]), "query of seed task must be empty"
             logger.info(f"loaded tasks from environment, #tasks={len(self._tasks)}")
-        except:
-            logger.error(f"failed to load tasks from environment")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"failed to load tasks from environment: {e}")
             return 0
         return len(response)
 
@@ -150,7 +151,7 @@ class TaskManager(object):
         # 每次最多探索所有不同任务，或者最大线程个任务，防止同批次中生成相同任务
         parallel_num = min(self._num_exploration_threads, len(tasks))
         with ThreadPoolExecutor(max_workers=self._num_exploration_threads) as pool:
-            for i in tqdm(range(0, len(task_q), parallel_num), disable=not show_progress):
+            for i in tqdm(range(0, len(task_q), parallel_num),desc="generating tasks", disable=not show_progress):
                 futures = [
                     pool.submit(self._exlore_and_summarize, task, data_id, rollout_id)
                     for task, data_id, rollout_id in zip(
