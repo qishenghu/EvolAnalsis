@@ -29,6 +29,7 @@ class EnvWorker(object):
                                                     instance_id=self.instance_id)
         except Exception as e:
             logger.exception(f"encounter exception in env_worker.create_instance~ error={e.args}")
+            trajectory.metadata['error']='env'
             return trajectory
         
         
@@ -51,6 +52,7 @@ class EnvWorker(object):
                                                         **kwargs)
         except Exception as e:
             logger.exception(f"encounter exception in env_worker.agent_flow~ error={e.args}")
+            trajectory.metadata['error']='agent_flow'
 
         try:
             self.env.release_instance(self.instance_id)

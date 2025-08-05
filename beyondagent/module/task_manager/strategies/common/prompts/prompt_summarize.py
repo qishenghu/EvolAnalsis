@@ -223,14 +223,13 @@ def parse_tasks_from_response(task: Task, response: str) -> list[TaskObjective]:
             ):
                 continue
             task.query = t["query"]
-            tasks.append(
-                TaskObjective(
-                    task=task,
-                    confidence=t["confidence"],
-                    ground_truth=t["action_sequence"],
-                    reward=None,
-                )
+            x=TaskObjective(
+                task=task,
+                confidence=t["confidence"],
+                reward=None,
             )
+            x.ground_truth=t["action_sequence"]
+            tasks.append(x)
 
     except Exception as e:
         print(f"Error parsing tasks: {e}")

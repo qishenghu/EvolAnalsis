@@ -771,6 +771,10 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
                             del gen_baseline_batch, gen_baseline_output
 
                     batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                    
+                    # add `extras` back to batch, for sperate the original and synthetic data in metric calculation
+                    batch.non_tensor_batch['extras']=batch_extras
+                    
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
@@ -965,9 +969,6 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
                     }
                 )
                 # collect metrics
-                
-                # add `extras` back to batch, for sperate the original and synthetic data in metric calculation
-                batch.non_tensor_batch['extras']=batch_extras
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo

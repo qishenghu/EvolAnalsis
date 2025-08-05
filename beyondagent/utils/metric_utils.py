@@ -171,7 +171,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
     # if data consist of the original and synthetic data, calculate metrics separately.
-    if is_llm_reward.int().sum()!=batch.batch.size(0):
+    if is_llm_reward.int().sum()!=batch.batch.size(0) and is_llm_reward.int().sum()!=0:
         metrics.update({
             # score
             "critic/score-env/mean": torch.mean(sequence_score[~is_llm_reward]).detach().item(),

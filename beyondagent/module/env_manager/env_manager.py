@@ -1,7 +1,7 @@
 import copy
 import time
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Literal
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from typing import Dict, List, Literal, Tuple
 
 import numpy as np
 import torch
@@ -57,7 +57,7 @@ class ParallelEnvManager(object):
             # output_messages = []
             input_messages = copy.deepcopy(messages)
             weighted_addresses = self.async_rollout_manager.chat_scheduler.weighted_addresses
-            logger.info(f"weighted_addresses={weighted_addresses}")
+            # logger.info(f"weighted_addresses={weighted_addresses}")
             for i in range(self.max_llm_retries):
                 try:
                     self.async_rollout_manager.submit_chat_completions(messages=input_messages,
@@ -93,7 +93,7 @@ class ParallelEnvManager(object):
 
         llm_chat_fn = self.get_llm_chat_fn(sampling_params)
         agent_flow: BaseAgentFlow = AgentFlow(
-            reward_calculator=LlmAsJudgeRewardCalculator() if task.evaluator=='synthetic' else None, # TODO: better calculator injection
+            reward_calculator=LlmAsJudgeRewardCalculator("qwq-plus") if task.evaluator=='synthetic' else None, # TODO: better calculator injection
             llm_chat_fn=llm_chat_fn, 
             tokenizer=self.tokenizer, 
             config=self.config,
@@ -108,24 +108,73 @@ class ParallelEnvManager(object):
         return trajectory
 
     def rollout(self, tasks: List[Task], mode: Literal["sample", "validate"], epoch: str) -> List[Trajectory]:
+        """
+        使用线程池执行rollout任务，并自动重试失败的任务，直到所有任务成功。
+
+        Args:
+            tasks: 待处理的任务列表。
+            mode: 模式，'sample' 或 'validate'。
+            epoch: 当前的周期标识，用于日志和进度条。
+
+        Returns:
+            一个包含所有成功任务结果的Trajectory列表，并已排序。
+        """
+        rollout_n = 1 if mode == "validate" else self.rollout_n
         trajectory_list: List[Trajectory] = []
-        rollout_n = 1 if mode=="validate" else self.rollout_n
+        
+        # 1. 核心数据结构：使用一个字典来追踪所有“飞行中”的任务
+        #    键是 Future 对象，值是提交该任务所需的完整参数
+        future_to_params: Dict[Future, Tuple[Task, str, str, str, int]] = {}
+
         with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
-            futures = []
+            # 2. 初始提交：将所有任务第一次提交到线程池
             for data_id, task in enumerate(tasks):
                 for rollout_id in range(rollout_n):
                     thread_index = data_id * rollout_n + rollout_id
-                    future = executor.submit(self.rollout_env_worker, task=task, data_id=str(data_id),
-                                             rollout_id=str(rollout_id), mode=mode, thread_index=thread_index)
-                    futures.append(future)
+                    params = (task, str(data_id), str(rollout_id), mode, thread_index)
+                    future = executor.submit(self.rollout_env_worker, *params)
+                    future_to_params[future] = params
 
-            for future in tqdm(futures, desc=f"epoch{epoch}.collect_rollout"):
-                # do not fail silently
-                result = future.result()
-                trajectory_list.append(result)
+            total_rollouts = len(future_to_params)
+            pbar = tqdm(total=total_rollouts, desc=f"Epoch {epoch}: Collecting rollouts")
 
-            trajectory_list = sorted(trajectory_list, key=lambda x: (int(x.data_id), x.rollout_id))
-            return trajectory_list
+            # 3. 动态处理循环：只要还有任务在执行，就持续循环
+            while future_to_params:
+                # as_completed 会在任何一个 future 完成时立即返回它
+                for future in as_completed(future_to_params):
+                    # 获取与这个完成的 future 相关的原始参数
+                    params = future_to_params.pop(future) # 先从字典中移除
+
+                    try:
+                        # 4. 健壮的结果获取与错误处理
+                        result = future.result()
+
+                        # 处理“软失败”（worker内部捕获错误并返回特殊标记）
+                        if 'error' in result.metadata:
+                            error_msg = result.metadata['error']
+                            logger.warning(f"Task {params[1]}-{params[2]} failed with metadata error: {error_msg}. Retrying... \n Task: {params[0]}")
+                            # 将任务重新提交
+                            new_future = executor.submit(self.rollout_env_worker, *params) # type: ignore
+                            future_to_params[new_future] = params
+                            continue # 继续处理下一个完成的任务
+
+                        # 5. 成功处理
+                        trajectory_list.append(result)
+                        pbar.update(1) # 只有在真正成功时才更新进度条
+
+                    except Exception as e:
+                        # 处理“硬失败”（worker中未捕获的异常）
+                        logger.error(f"Task {params[1]}-{params[2]} raised an exception: {e}. Retrying... \n Task: {params[0]}")
+                        # 将任务重新提交
+                        new_future = executor.submit(self.rollout_env_worker, *params) # type: ignore
+                        future_to_params[new_future] = params
+
+            pbar.close()
+
+        # 6. 最终排序和返回
+        # 所有任务都已成功完成
+        trajectory_list = sorted(trajectory_list, key=lambda x: (int(x.data_id), int(x.rollout_id)))
+        return trajectory_list
 
     # TODO: define an extra class for trajectory-dataproto converting.
     def to_dataproto(self, trajectories: List[Trajectory]) -> DataProto:

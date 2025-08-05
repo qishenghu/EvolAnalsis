@@ -19,6 +19,8 @@ class AgentFlow(BaseAgentFlow):
         self._reward_calculator = reward_calculator
         if self._reward_calculator is not None:
             logger.info(f"reward_calculator={self._reward_calculator}")
+        else:
+            logger.info(f"reward_calculator=env")
         self._enable_context_generator=self.config.experience_maker.enable_context_generator
 
         self.instruction_template_ids = self.tokenizer.encode("<|im_start|>user\n")
@@ -83,7 +85,7 @@ class AgentFlow(BaseAgentFlow):
                 "request_id": request_id,
                 "time_cost": time_cost,
             }
-            logger.info(f"info_dict={json.dumps(info_dict)}")
+            # logger.info(f"info_dict={json.dumps(info_dict)}")
 
             request_id = new_request_id
             trajectory.steps.append(llm_output)

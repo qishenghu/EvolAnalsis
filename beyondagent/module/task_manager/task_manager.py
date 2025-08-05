@@ -122,7 +122,7 @@ class TaskManager(object):
     def get_or_load_full_dataset(self,filepath:Optional[str],*,config,tokenizer,processor)->"FullDataset":
         """Get the full dataset, or load from file.
         """
-        seed_tasks=[TaskObjective(task=task,ground_truth='[env]',confidence=1.0,reward=None) for task in self._tasks]
+        seed_tasks=[TaskObjective(task=task,confidence=1.0,reward=None) for task in self._tasks]
         dataset=FullDataset(self,seed_tasks,self._mixture_strategy,tokenizer=tokenizer,config=config,processor=processor)
         
         if filepath is not None and os.path.exists(filepath):
@@ -138,7 +138,7 @@ class TaskManager(object):
     def get_original_dataset(self,*,tokenizer,config,processor)->"FullDataset":
         """Get the original dataset.
         """
-        seed_tasks=[TaskObjective(task=task,ground_truth='[env]',confidence=1.0,reward=None) for task in self._tasks]
+        seed_tasks=[TaskObjective(task=task,confidence=1.0,reward=None) for task in self._tasks]
         dataset = FullDataset(self,seed_tasks,OriginalOnlyStrategy(),tokenizer=tokenizer,config=config,processor=processor)
         dataset.load_from_file('[unknown]')
         return dataset
