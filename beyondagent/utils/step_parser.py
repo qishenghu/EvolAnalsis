@@ -142,162 +142,114 @@ def parse_response_ids_to_steps(
     tokenizer,
     assistant_tpl: List[int] = None,
     user_tpl: List[int] = None,
-    mark_observation: bool = False,  # 是否给observation也打step_id
+    mark_observation: bool = False,
 ) -> StepParseResult:
-    """
-    改进版实现：
-    1. 按tokenid切分，保留start/end索引
-    2. 合并相邻same role，保证交替且第一个是assistant  
-    3. 组对成steps：每个assistant + 可选的后续user
-    4. 在原长度数组上**原位标记**step_ids，避免错位风险
-    """
-    
-    # 自动获取模板（通用于所有模型）
+    # 1) 自动提取模板
     if assistant_tpl is None:
         assistant_tpl = _extract_role_header_tokens(tokenizer, "assistant")
     if user_tpl is None:
         user_tpl = _extract_role_header_tokens(tokenizer, "user")
 
-    # Step 1: 按照tokenid切分，保留start/end索引
-    a_template_starts = _locate_template_positions(response_ids, assistant_tpl)
-    u_template_starts = _locate_template_positions(response_ids, user_tpl)
-    
-    # 计算body开始位置（处理空模板的情况）
-    if assistant_tpl:
-        a_body_starts = [pos + len(assistant_tpl) for pos in a_template_starts]
-    else:
-        # 没有assistant header：从0开始，表示response直接从assistant内容开始
-        a_body_starts = [0] if response_ids else []
-        
-    if user_tpl:
-        u_body_starts = [pos + len(user_tpl) for pos in u_template_starts]
-    else:
-        u_body_starts = []
+    # 2) 定位 header 与 body
+    a_hdr = _locate_template_positions(response_ids, assistant_tpl) if assistant_tpl else []
+    u_hdr = _locate_template_positions(response_ids, user_tpl) if user_tpl else []
 
-    # 创建所有切分点，保持原始位置信息
-    if assistant_tpl:
-        # 正常情况：有assistant header
-        markers: List[Tuple[int, str]] = (
-            [(pos, "assistant") for pos in a_body_starts] +
-            [(pos, "user") for pos in u_body_starts] +
-            [(len(response_ids), "end")]
-        )
-    else:
-        # 特殊情况：没有assistant header，从0开始，全靠user切分
-        markers: List[Tuple[int, str]] = (
-            [(0, "assistant")] +  # 从开头开始就是assistant
-            [(pos, "user") for pos in u_body_starts] +
-            [(len(response_ids), "end")]
-        )
-    markers.sort(key=lambda x: x[0])
+    a_body = [p + len(assistant_tpl) for p in a_hdr] if assistant_tpl else []
+    u_body = [p + len(user_tpl) for p in u_hdr] if user_tpl else []
 
-    # 构造segments，保留start/end索引
-    raw_segments = []
-    for i, (start, role) in enumerate(markers[:-1]):
-        end = markers[i + 1][0]
-        if start < end and role != "end":
-            segment_tokens = response_ids[start:end]
-            raw_segments.append({
-                "role": role, 
-                "start": start, 
-                "end": end,
-                "tokens": segment_tokens
-            })
+    # 若序列开头没有任何 header，则视为从 assistant 内容开始
+    if response_ids:
+        first_hdr = min(a_hdr[0] if a_hdr else len(response_ids),
+                        u_hdr[0] if u_hdr else len(response_ids))
+        if first_hdr > 0:
+            a_hdr = [0] + a_hdr         # 伪 header：用于结束边界
+            a_body = [0] + a_body       # 伪 body：用于开始边界
 
-    if not raw_segments:
-        return StepParseResult(
-            segments=[], 
-            steps=[], 
-            step_ids=[-1] * len(response_ids)
-        )
+    # 以“header 起点”作为切分的结束边界
+    cut_bounds = sorted(a_hdr + u_hdr + [len(response_ids)])
 
-    # Step 2: 合并相邻same role，更新start/end边界
-    merged_segments = []
-    for seg in raw_segments:
-        if (merged_segments and 
-            merged_segments[-1]["role"] == seg["role"] and
-            merged_segments[-1]["end"] == seg["start"]):
-            # 合并相邻同role：扩展end边界，合并tokens
-            merged_segments[-1]["end"] = seg["end"]
-            merged_segments[-1]["tokens"].extend(seg["tokens"])
+    def next_cut(pos: int) -> int:
+        for b in cut_bounds:
+            if b > pos:
+                return b
+        return len(response_ids)
+
+    # 3) 按 body→(下一 header 起点) 构造 segments（不会吞到下个 header 的 "user"/"assistant"）
+    segs = []
+    for s in a_body:
+        e = next_cut(s)
+        if s < e:
+            segs.append({"role": "assistant", "start": s, "end": e, "tokens": response_ids[s:e]})
+    for s in u_body:
+        e = next_cut(s)
+        if s < e:
+            segs.append({"role": "user", "start": s, "end": e, "tokens": response_ids[s:e]})
+    segs.sort(key=lambda x: x["start"])
+
+    if not segs:
+        return StepParseResult([], [], [-1] * len(response_ids))
+
+    # 4) 合并相邻同 role 段
+    merged = []
+    for seg in segs:
+        if merged and merged[-1]["role"] == seg["role"] and merged[-1]["end"] == seg["start"]:
+            merged[-1]["end"] = seg["end"]
+            merged[-1]["tokens"].extend(seg["tokens"])
         else:
-            merged_segments.append({
-                "role": seg["role"],
-                "start": seg["start"],
-                "end": seg["end"],
+            merged.append({
+                "role": seg["role"], "start": seg["start"], "end": seg["end"],
                 "tokens": seg["tokens"].copy()
             })
 
-    # 确保第一个是assistant
-    while merged_segments and merged_segments[0]["role"] != "assistant":
-        merged_segments.pop(0)
+    # 丢弃开头非 assistant 的段
+    while merged and merged[0]["role"] != "assistant":
+        merged.pop(0)
+    if not merged:
+        return StepParseResult([], [], [-1] * len(response_ids))
 
-    if not merged_segments:
-        return StepParseResult(
-            segments=[], 
-            steps=[], 
-            step_ids=[-1] * len(response_ids)
-        )
-
-    # Step 3: 组对成steps，保留位置信息（聚合到下一个assistant之前）
+    # 5) 组 step（assistant 段 + 中间若干 user 段汇成 observation）
     steps = []
     i = 0
-    while i < len(merged_segments):
-        seg = merged_segments[i]
-        if seg["role"] != "assistant":
+    while i < len(merged):
+        a = merged[i]
+        if a["role"] != "assistant":
             i += 1
             continue
-            
-        # action = 当前assistant段
-        action_start, action_end = seg["start"], seg["end"]
-        action_tokens = seg["tokens"]
+        action_start, action_end = a["start"], a["end"]
+        action_tokens = a["tokens"]
         action_text = tokenizer.decode(action_tokens, skip_special_tokens=True)
-        
-        # 从 i+1 开始，直到遇到下一个 assistant 为止，全部并成 observation
+
         j = i + 1
         obs_start = action_end
         obs_end = obs_start
         obs_tokens = []
-        
-        while j < len(merged_segments) and merged_segments[j]["role"] != "assistant":
-            obs_end = merged_segments[j]["end"]
-            obs_tokens.extend(merged_segments[j]["tokens"])
+        while j < len(merged) and merged[j]["role"] != "assistant":
+            obs_end = merged[j]["end"]
+            obs_tokens.extend(merged[j]["tokens"])
             j += 1
-            
         obs_text = tokenizer.decode(obs_tokens, skip_special_tokens=True) if obs_tokens else ""
-        
-        step = {
+
+        steps.append({
             "action_tokens": action_tokens,
             "observation_tokens": obs_tokens,
             "action_text": action_text,
             "observation_text": obs_text,
-            "action_start": action_start,
-            "action_end": action_end,
-            "obs_start": obs_start,
-            "obs_end": obs_end,
-        }
-        steps.append(step)
-        
-        i = j  # 跳到下一个 assistant（或结束）
+            "action_start": action_start, "action_end": action_end,
+            "obs_start": obs_start, "obs_end": obs_end,
+        })
+        i = j
 
-    # Step 4: 在原长度数组上**原位标记**step_ids
+    # 6) 原位打 step_ids
     step_ids = [-1] * len(response_ids)
-    
-    for step_k, step in enumerate(steps):
-        # 标记assistant动作区间
-        for pos in range(step["action_start"], step["action_end"]):
-            step_ids[pos] = step_k
-            
-        # 可选：标记observation区间
-        if mark_observation and step["obs_start"] < step["obs_end"]:
-            for pos in range(step["obs_start"], step["obs_end"]):
-                step_ids[pos] = step_k
+    for k, st in enumerate(steps):
+        for pos in range(st["action_start"], st["action_end"]):
+            step_ids[pos] = k
+        if mark_observation and st["obs_start"] < st["obs_end"]:
+            for pos in range(st["obs_start"], st["obs_end"]):
+                step_ids[pos] = k
 
-    return StepParseResult(
-        segments=merged_segments,
-        steps=steps,
-        step_ids=step_ids
-    )
+    return StepParseResult(merged, steps, step_ids)
+
 
 # 添加验证函数
 def verify_step_alignment(batch, tokenizer, global_step):
