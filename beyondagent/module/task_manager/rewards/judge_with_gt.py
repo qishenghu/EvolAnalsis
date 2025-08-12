@@ -70,7 +70,6 @@ class LlmAsJudgeRewardCalculatorWithGT(RewardCalculator):
     """
     def __init__(self, model_name='qwq-plus'):
         self._client=DashScopeClient(model_name=model_name)
-        self._gt="[No solution provided, please judge the task by yourself]"
     
     def pack_message(self, trajectory: Trajectory):
         """Pack trajectory into a message.
@@ -93,6 +92,7 @@ class LlmAsJudgeRewardCalculatorWithGT(RewardCalculator):
         return messages
     
     def set_gt(self,gt:Optional[str]):
+        assert gt is not None, "at least at present it cannot be none"
         self._gt=gt if gt is not None else "[No solution provided, please judge the task by yourself]"
     
     def calculate_reward(self, trajectory: Trajectory, env: EnvClient) -> float:
