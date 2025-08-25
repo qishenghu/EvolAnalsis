@@ -85,7 +85,7 @@ class LlmAsJudgeRewardCalculator(RewardCalculator):
     
     TODO: This is a temperary solution for synthetic data.
     """
-    def __init__(self,task:Task, model_name='qwq-plus'):
+    def __init__(self,task:Task, model_name='qwen3-235b-a22b-instruct-2507'):
         super().__init__(task)
         self._client=DashScopeClient(model_name=model_name)
     
