@@ -1200,6 +1200,15 @@ class BeyondAgentRayPPOTrainer(RayPPOTrainer):
                         # ============= End PRM GRPO =============
                         
                         
+                        
+                        # Apply decay factor of 0.5 to non_tensor_batch['extras'][i]['evaluator'] != 'env'
+                        assert 'extras' in batch.non_tensor_batch
+                        if 'extras' in batch.non_tensor_batch:
+                            for i in range(len(batch.non_tensor_batch['extras'])):
+                                assert 'evaluator' in batch.non_tensor_batch['extras'][i]
+                                evaluator = batch.non_tensor_batch['extras'][i]['evaluator']
+                                if evaluator != 'env':
+                                    batch.batch["advantages"][i] *= 0.5
 
                     # update critic
                     if self.use_critic:
