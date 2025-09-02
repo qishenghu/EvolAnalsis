@@ -73,34 +73,6 @@ def _steps_struct_to_text_list(steps: List[Dict[str, str]]) -> List[str]:
             out.append(act)
     return out
 
-# def parse_rollout_to_steps(rollout: str) -> List[Dict[str, str]]:
-#     """
-#     将包含 ... assistant\n<action text>\nuser\n<observation text> ... 的长串 rollout 拆成步骤列表。
-#     """
-    
-#     # Yunpeng.zyp: 2025.08.09
-#     # 危险，未区分大小写
-#     # parts = re.split(r'\n(assistant|user)\n', rollout, flags=re.I)
-#     # FIXME: 直接以assistant获取可能会被hack，需要改成从|imstart|\|imend|, 或直接从batch.non_tensor_batch["messages]里获取
-#     # FIXME: 后续这里的切分修改也应该和batch.step_ids的切分一致
-#     parts = re.split(r'\n(assistant|user)\n', rollout)
-
-#     if parts and parts[0].strip():
-#         parts = ['assistant', parts[0]] + parts[1:]
-
-#     steps: List[Dict[str, str]] = []
-#     i = 0
-#     while i < len(parts) - 1:
-#         role, text = parts[i].lower(), parts[i + 1]
-#         if role == 'assistant':
-#             action = text.strip()
-#             observation = ''
-#             if i + 2 < len(parts) - 1 and parts[i + 2].lower() == 'user':
-#                 observation = parts[i + 3].strip()
-#                 i += 2
-#             steps.append({"action": action, "observation": observation})
-#         i += 2
-#     return steps
 
 
 
