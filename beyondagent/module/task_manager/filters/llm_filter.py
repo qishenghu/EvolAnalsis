@@ -54,8 +54,10 @@ class LlmFilter(TaskPostFilter):
     
     def _filter_with_threadpool(self, tasks: Sequence[TaskObjective]) -> list[TaskObjective]:
         """使用线程池并行处理所有任务"""
+        from tqdm import tqdm
         res = []
         
+        progress=tqdm(total=len(tasks), desc="Filtering tasks")
         with ThreadPoolExecutor(max_workers=self._num_threads) as executor:
             # 提交所有任务
             future_to_task = {
@@ -66,6 +68,7 @@ class LlmFilter(TaskPostFilter):
             # 收集结果
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
+                progress.update(1)
                 try:
                     t=future.result()
                     if t is not None:
@@ -75,7 +78,7 @@ class LlmFilter(TaskPostFilter):
                     # 根据需求决定是否将失败的任务也包含在结果中
                     # 这里选择跳过失败的任务
                     continue
-        
+        progress.close()
         return res
     
     def _filter_with_batches(self, tasks: Sequence[TaskObjective]) -> list[TaskObjective]:
