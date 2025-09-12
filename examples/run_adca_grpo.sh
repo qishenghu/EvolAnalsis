@@ -87,7 +87,7 @@ python -m beyondagent.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     data.train_batch_size=32 \
     data.max_prompt_length=4096 \
-    data.max_response_length=20480 \
+    data.max_response_length=16300 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.return_raw_chat=True \
@@ -95,7 +95,7 @@ python -m beyondagent.main_ppo \
     actor_rollout_ref.rollout.enable_request_id=False \
     actor_rollout_ref.rollout.prompt_length=20480 \
     actor_rollout_ref.rollout.response_length=4096 \
-    actor_rollout_ref.rollout.max_model_len=25600 \
+    actor_rollout_ref.rollout.max_model_len=20480 \
     actor_rollout_ref.rollout.temperature=0.9 \
     actor_rollout_ref.model.path=/mnt/data_aisys_cpfs/xielipeng.xlp/models/Qwen2.5-14B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -132,10 +132,10 @@ python -m beyondagent.main_ppo \
     trainer.validation_data_dir="/mnt/data/taoshuchang.tsc/beyondagent/BeyondAgent/experiments/origindata_1node/exp_${suffix}_${current_time}/validation_log" \
     trainer.rollout_data_dir="/mnt/data/taoshuchang.tsc/beyondagent/BeyondAgent/experiments/origindata_1node/exp_${suffix}_${current_time}/rollout_log" \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=25600 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=25600 \
-    critic.ppo_max_token_len_per_gpu=25600 \
-    critic.forward_max_token_len_per_gpu=25600 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=20480 \
+    critic.ppo_max_token_len_per_gpu=20480 \
+    critic.forward_max_token_len_per_gpu=20480 \
     data.train_files=null \
     data.val_files=null \
     experience_maker.enable_summarizer=False \
