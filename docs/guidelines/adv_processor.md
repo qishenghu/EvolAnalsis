@@ -1,20 +1,19 @@
-### Advantage Processor (Self-Attributing)
+# Advantage Processor (Self-Attributing)
 
 The **Advantage Processor** is one of the fundamental components of the AgentEvolver framework, responsible for implementing the **`self-attributing`** mechanism. Traditional reinforcement learning methods face the **credit assignment problem** in long-horizon tasks: they cannot distinguish which actions in a trajectory are valuable versus unproductive, leading to inefficient learning. The Self-Attributing mechanism addresses this by leveraging LLM's causal reasoning capabilities to decompose learning signals into **process quality** (logical correctness of actions) and **outcome effectiveness** (final success), enabling precise step-wise credit assignment.
 
-#### **Core Implementation: ADCA-GRPO**
+### **Core Implementation: ADCA-GRPO**
 
 The primary implementation of the Advantage Processor is **ADCA-GRPO**. ADCA-GRPO uses a powerful LLM to perform causal analysis on trajectories, assigning an **attribution signal (GOOD/BAD)** to each step. This signal is then combined with the traditional outcome signal to produce a fine-grained advantage, leading to significantly improved sample efficiency. Experimental results demonstrate that ADCA-GRPO achieves approximately 10% performance improvement and 40% reduction in training steps compared to traditional GRPO methods.
 
 The modular design allows for future extensions with alternative credit assignment paradigms.
 
------
 
-### ADCA-GRPO: Implementation Workflow
+## ADCA-GRPO: Implementation Workflow 🧠
 
 The ADCA-GRPO advantage calculation is an end-to-end pipeline that transforms raw trajectory data into a fine-grained advantage signal. Think of it as teaching the agent to distinguish "good reasoning steps" from "bad ones" - similar to how a teacher evaluates both the problem-solving process and the final answer.
 
-#### **Stage 1: Semantic Evaluation - "Was this step done correctly?"**
+### **Stage 1: Semantic Evaluation - "Was this step done correctly?"**
 
 **Why we need this:** Traditional RL only knows if the final outcome was good or bad, but can't tell which intermediate steps were helpful. We need an LLM to act as a "step-by-step evaluator."
 
@@ -46,7 +45,7 @@ This function orchestrates the evaluation process:
 
 **Output:** `step_flags` - a list of lists containing boolean labels for each step in every trajectory.
 
-#### **Stage 2: Signal Fusion - "How do we balance process vs. outcome?"**
+### **Stage 2: Signal Fusion - "How do we balance process vs. outcome?"**
 
 **Why we need this:** Just like evaluating a student's work, we need to consider both the problem-solving steps (process) AND the final answer (outcome). The key insight is to normalize these signals independently to prevent one from overwhelming the other.
 
@@ -93,7 +92,7 @@ def _build_decouple(
 
 **Output:** `step_rewards` - fused, step-level reward values for each trajectory.
 
-#### **Stage 3: Advantage Computation - "How do we guide policy learning?"**
+### **Stage 3: Advantage Computation - "How do we guide policy learning?"**
 
 **Why we need this:** The step-level rewards must be converted to token-level advantages that the PPO/GRPO optimizer can use. This involves computing future reward expectations and mapping them to individual tokens.
 
@@ -111,18 +110,18 @@ Maps step-level advantages to token level using the `step_ids` tensor, which tra
 
 -----
 
-### Key Parameters & Configuration ⚙️
+## Key Parameters & Configuration ⚙️
 
 Here is a comprehensive list of parameters based on the source code and configuration structure.
 
-#### **1. Global & General Settings**
+### **1. Global & General Settings**
 
 | Parameter | Type | Description |
 | :--- | :--- | :--- |
 | `enable` | `bool` | **Master switch for the module**. If `true`, the attribution and advantage rewriting logic will be executed. |
 | `enable_adca_metric`| `bool` | Enables additional ADCA monitoring metrics. Recommended to turn on for debugging and analysis. |
 
-#### **2. LLM Attribution Service**
+### **2. LLM Attribution Service**
 
 These parameters control the behavior of calling the large language model for `GOOD`/`BAD` labeling.
 
@@ -135,7 +134,7 @@ These parameters control the behavior of calling the large language model for `G
 | `llm_evaluation_log_dir` | `str` | (Optional) The directory path to save LLM request/response logs. Highly recommended for debugging. |
 | `skip_type` | `str` | **Strategy for skipping LLM calls** to save costs. `"skip_small_adv"` (recommended) skips samples with near-zero advantage. `"skip_all_neg"` skips negative-reward samples. `"none"` disables skipping. |
 
-#### **3. ADCA-GRPO Core Algorithm (`adca_grpo` submodule)**
+### **3. ADCA-GRPO Core Algorithm (`adca_grpo` submodule)**
 
 These parameters directly influence the reward construction, fusion, and advantage computation.
 
@@ -153,9 +152,9 @@ These parameters directly influence the reward construction, fusion, and advanta
 
 -----
 
-### Quick Start & Recommended Configuration 🚀
+## Quick Start & Recommended Configuration 🚀
 
-#### **Step 1: Set Environment Variable**
+### **Step 1: Set Environment Variable**
 
 Before starting, ensure your API key is set in your terminal environment:
 
@@ -163,7 +162,7 @@ Before starting, ensure your API key is set in your terminal environment:
 export DASHSCOPE_API_KEY="sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-#### **Step 2: Recommended Configuration**
+### **Step 2: Recommended Configuration**
 
 Here is a more complete and ready-to-use baseline configuration. It uses the stable `decouple` scheme and includes detailed settings for cost optimization and monitoring.
 
