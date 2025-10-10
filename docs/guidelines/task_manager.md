@@ -11,12 +11,13 @@ In this section, we introduce Task Manager and explain how to efficiently collec
 
 ## Collect Your First Training Data
 
-To collect your training data, perform the following four steps:
+To collect your training data, perform the following five steps:
 
 1. Integrate your environment with Environment Service (as described in the previous section).  
 2. Profile the environment.  
 3. Configure the strategies to be applied, including their parameters.  
-4. Execute Task Manager and collect the training data.  
+4. Execute Task Manager and collect the training data.
+5. Check your data.
 
 ### 1. Adopt the Environment
 
@@ -110,9 +111,9 @@ task_manager:
   # env profiles used in exploration
   env_profile: cookbook/env_profiles/appworld.json
   # batch size of dynamic synthetic data
-  bs: ${data.train_batch_size}
+  bs: ${data.train_batch_size} # use the same batch size as train_batch_size
   # number of threads for exploration
-  num_explore_threads: ${thread_pool.max_workers}
+  num_explore_threads: 16
 
   # mixture strategy
   mixture:
@@ -135,7 +136,7 @@ task_manager:
   strategy_args:
     max_explore_step: 30
     max_llm_retries: 6
-    env_url: ${env_service.env_url}
+    env_url: ${env_service.env_url} # refer to env_service.env_url
     exploration_llm_temperature: 1.0
     exploration_llm_top_p: 1.0
     exploration_llm_top_k: 100
@@ -165,7 +166,7 @@ The synthesis progress will be displayed. When the process completes, the path t
 In most workflows, Task Manager is integrated with AgentEvolver. Launching AgentEvolver automatically starts the training and task synthesis pipeline.
 
 !!! info "Standalone vs Integrated"
-    Task Manager can be executed independently for lightweight data generation. It is recommended to tune strategies in standalone mode, and then use integrated mode in production, where additional features are available within AgentEvolver.
+    Task Manager can be run independently for rapid prototyping or small-scale data generation. It is recommended to tune strategies in standalone mode, and then use integrated mode in production, where additional features are available within AgentEvolver.
 
 ### 5. Check the Data
 
@@ -179,7 +180,7 @@ task_manager:
 ```
 
 !!! note "Dynamic vs Static"
-    `train_data_path` and `val_data_path` set, tasks will be explored once and saved to the specified path. If no path is set for integrated mode, Task Manager will generate un tasks dynamically during training. All synthetic tasks will be discarded after training.
+    `train_data_path` and `val_data_path` set, tasks will be explored once and saved to the specified path. If no path is set for integrated mode, Task Manager will generate tasks dynamically during training. All synthetic tasks will be discarded after training.
 
 Inspect the generated data to ensure it aligns with your training requirements.
 
@@ -403,7 +404,7 @@ task_manager:
   strategy_args:
     max_explore_step: 30
     max_llm_retries: 6
-    env_url: ${env_service.env_url}
+    env_url: ${env_service.env_url} # refer to env_service.env_url
     exploration_llm_temperature: 1.0
     exploration_llm_top_p: 1.0
     exploration_llm_top_k: 100
@@ -450,7 +451,7 @@ Typical reward components:
 * **Success check** – Whether the task is successfully completed.
 * **Efficiency check** – Whether the task is solved within reasonable steps.
 
-> While the built-in reward is general-purpose, it is recommended to design custom rewards aligned with the application domain.
+> Although the built-in synthetic reward provides a functional fallback, we strongly recommend implementing domain-specific reward functions to achieve optimal agent performance.
 
 Configuration example:
 
