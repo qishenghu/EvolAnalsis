@@ -81,7 +81,6 @@ class LlmAsJudgeRewardCalculatorWithGT(RewardCalculator):
         """
         messages=[]
         
-        # 添加轨迹消息（将所有对话转换为一个连贯的文本）
         trajectory_text = "The following is the dialogue trace of the task execution:\n\n"
         for i, msg in enumerate(trajectory.steps):
             role = msg.get("role", "unknown")

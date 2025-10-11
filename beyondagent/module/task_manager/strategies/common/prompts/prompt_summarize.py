@@ -115,7 +115,6 @@ def get_task_summarize_prompt(
     old_objectives: Sequence[TaskObjective],
     profile: EnvProfile | None,
 ) -> tuple[str, str]:
-    """获取任务摘要 prompt"""
     x = ""
     idx = 0
     for traj in trajectories:
@@ -163,20 +162,17 @@ Please identify the specific tasks the agent is attempting to complete in these 
 
 
 def parse_tasks_from_response(task: Task, response: str) -> list[TaskObjective]:
-    """从响应中解析任务列表"""
     task = task.copy()
 
     tasks: list[TaskObjective] = []
     try:
         import re
 
-        # 找到所有<task>标签中的内容
         task_matches = re.findall(r"<task>(.*?)</task>", response, re.DOTALL)
 
         for task_content in task_matches:
             t = json.loads(task_content)
 
-            # 检查必要字段
             if (
                 "query" not in t
                 or "confidence" not in t

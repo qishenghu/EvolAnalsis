@@ -110,7 +110,6 @@ def steps_to_msg(steps: list[dict[str, Any]]) -> str:
     Returns:
         str: A formatted string representing the entire trajectory.
     """
-    # 添加轨迹消息（将所有对话转换为一个连贯的文本）
     trajectory_text = ""
     assert steps[0]['role'] == 'assistant'
     for i, msg in enumerate(steps):
@@ -136,13 +135,12 @@ class LlmAsJudgeBinaryRewardCalculator(RewardCalculator):
     """
     RewardCalculator that uses LLM as judge.
     """
-    # 定义类变量，跨实例共享
-    _running_judge_mean_fast = 0.3  # 初始化为默认值
-    _running_judge_mean_slow = 0.3  # 初始化为默认值
+    _running_judge_mean_fast = 0.3
+    _running_judge_mean_slow = 0.3
 
     _alpha_fast=0.9
     _alpha_slow=0.95
-    _update_lock = threading.Lock()  # 锁也需要作为类变量共享
+    _update_lock = threading.Lock()
 
     def __init__(self, task: Task, model_name='qwen3-235b-a22b-instruct-2507', use_mean_constraint=True):
         """
@@ -212,7 +210,6 @@ class LlmAsJudgeBinaryRewardCalculator(RewardCalculator):
         assert len(trajectory.steps) >= 2 and trajectory.steps[1]['role'] == 'user', "trajectory must start with system message and then user message"
         task_query = trajectory.steps[1]['content']
         
-        # TODO 至少现在我们的合成任务 gt 一定不是空的
         assert self.task.ground_truth is not None, "ground truth must not be None for synthetic task"
         if self._use_mean_constraint:
             content=USER_PROMPT_WITH_MEAN_CONSTRAINT.format(

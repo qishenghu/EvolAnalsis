@@ -106,7 +106,7 @@ def steps_to_msg(steps: list[dict[str, Any]]) -> str:
     Returns:
         str: A single string that concatenates all the steps into a coherent message.
     """
-    # 添加轨迹消息（将所有对话转换为一个连贯的文本）
+    # format the trajectory
     trajectory_text = ""
     assert steps[0]['role'] == 'assistant'
     for i, msg in enumerate(steps):
@@ -132,13 +132,12 @@ class LlmAsJudgeBinaryRewardCalculatorWithGT(RewardCalculator):
     """
     RewardCalculator that uses LLM as judge.
     """
-    # 定义类变量，跨实例共享
-    _running_judge_mean_fast = 0.3  # 初始化为默认值
-    _running_judge_mean_slow = 0.3  # 初始化为默认值
+    _running_judge_mean_fast = 0.3
+    _running_judge_mean_slow = 0.3
 
     _alpha_fast=0.9
     _alpha_slow=0.95
-    _update_lock = threading.Lock()  # 锁也需要作为类变量共享
+    _update_lock = threading.Lock()
 
     def __init__(self, task: Task, model_name='qwen3-235b-a22b-instruct-2507', use_mean_constraint=True):
         super().__init__(task)
@@ -149,18 +148,12 @@ class LlmAsJudgeBinaryRewardCalculatorWithGT(RewardCalculator):
 
     @classmethod
     def update_running_mean(cls, new_score: float):
-        """
-        更新类变量 `_running_judge_mean`，用锁来保证线程安全。
-        """
         with cls._update_lock:
             cls._running_judge_mean_fast = cls._alpha_fast * cls._running_judge_mean_fast + (1-cls._alpha_fast) * new_score  # ⭐ Update the fast running mean
             cls._running_judge_mean_slow = cls._alpha_slow * cls._running_judge_mean_slow + (1-cls._alpha_slow) * new_score  # ⭐ Update the slow running mean
 
     @classmethod
     def get_running_mean(cls):
-        """
-        获取当前的 `_running_judge_mean`。
-        """
         with cls._update_lock:
             return cls._running_judge_mean_fast
 
@@ -184,7 +177,7 @@ class LlmAsJudgeBinaryRewardCalculatorWithGT(RewardCalculator):
         assert len(trajectory.steps) >= 2 and trajectory.steps[1]['role'] == 'user', "trajectory must start with system message and then user message"
         task_query = trajectory.steps[1]['content']
 
-        # TODO 至少现在我们的合成任务 gt 一定不是空的
+        # TODO the ground-truth must be provided, for now.
         assert self.task.ground_truth is not None, "ground truth must not be None for synthetic task"
         if self._use_mean_constraint:
             content=USER_PROMPT_WITH_MEAN_CONSTRAINT.format(

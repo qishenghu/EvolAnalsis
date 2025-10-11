@@ -8,58 +8,57 @@ from loguru import logger
 
 
 class MixtureStrategy(ABC):
-    """数据混合策略接口"""
+    """Data Mixture Strategy Interface"""
 
     @abstractmethod
     def mix_data(self,
                  synthetic_objectives: List[TaskObjective],
                  original_tasks: Sequence[TaskObjective]) -> List[TaskObjective]:
         """
-        混合合成数据和原始数据
+        Mixes synthetic data and original data.
 
         Args:
-            synthetic_objectives: 合成的任务目标列表
-            original_tasks: 原始任务列表
+            synthetic_objectives: A list of synthetic task objectives.
+            original_tasks: A sequence of original tasks.
 
         Returns:
-            混合后的任务目标列表
+            A list of mixed task objectives.
         """
         pass
 
 
 class UnifiedMixtureStrategy(MixtureStrategy):
     """
-    通用混合策略，可以覆盖所有常见的混合场景
+    A general-purpose mixture strategy that can cover all common mixing scenarios.
 
     Examples:
-        # 完全使用原始数据
+        # Use original data exclusively
         UnifiedMixtureStrategy(use_original=True, synthetic_ratio=0)
 
-        # 完全使用合成数据
+        # Use synthetic data exclusively
         UnifiedMixtureStrategy(use_original=False, synthetic_ratio=1.0)
 
-        # 使用所有原始数据 + 0.5倍数量的合成数据
+        # Use all original data + 0.5 times the quantity of synthetic data
         UnifiedMixtureStrategy(use_original=True, synthetic_ratio=0.5)
 
-        # 不使用原始数据，使用2倍原始数据数量的合成数据
+        # Do not use original data; use 2 times the quantity of synthetic data (relative to the original data's quantity)
         UnifiedMixtureStrategy(use_original=False, synthetic_ratio=2.0)
 
-        # 使用所有原始数据 + 1.5倍数量的合成数据
+        # Use all original data + 1.5 times the quantity of synthetic data
         UnifiedMixtureStrategy(use_original=True, synthetic_ratio=1.5)
     """
 
     def __init__(self, use_original: bool = True, synthetic_ratio: float = 0.0, shuffle: bool = True, seed: Optional[int] = None):
         """
         Args:
-            use_original: 是否使用原始数据
-                - True: 使用所有原始数据
-                - False: 不使用原始数据
-            synthetic_ratio: 合成数据的比例，相对于原始数据数量
-                - 0: 不使用合成数据
-                - 0-1: 使用 原始数据数量 * synthetic_ratio 个合成数据
-                - >1: 使用 原始数据数量 * synthetic_ratio 个合成数据（多倍数据）
-            shuffle: 是否在混合后打乱数据
-            seed: 随机种子，用于控制抽样和shuffle的随机性
+            use_original: Whether to use the original data.
+                - True: Use all original data.
+                - False: Do not use original data.
+            synthetic_ratio: The ratio of synthetic data, relative to the quantity of the original data.
+                - 0: Do not use synthetic data.
+                - 0-1: Use 'quantity of original data * synthetic_ratio' synthetic data points.
+            shuffle: Whether to shuffle the data after mixing.
+            seed: The random seed, used to control the randomness of sampling and shuffling.
         """
         self._use_original = use_original
         self._synthetic_ratio = synthetic_ratio
@@ -82,13 +81,13 @@ class UnifiedMixtureStrategy(MixtureStrategy):
         Returns:
             List[TaskObjective]: List of mixed task objectives.
         """
-        # 如果指定了种子，创建一个独立的随机状态
-        rng = random.Random(self._seed) if self._seed is not None else random  # ⭐ 创建随机数生成器，确保可重复性
+        # if seed is set, create a separate random state
+        rng = random.Random(self._seed) if self._seed is not None else random
 
         mixed_objectives = []
 
         if self._use_original:
-            mixed_objectives.extend(copy.deepcopy(original_tasks))  # ⭐ 将原始任务目标添加到混合列表中
+            mixed_objectives.extend(copy.deepcopy(original_tasks))
             logger.info(f"added {len(mixed_objectives)} original tasks")
         cnt_original_count = len(mixed_objectives)
 
@@ -100,7 +99,7 @@ class UnifiedMixtureStrategy(MixtureStrategy):
                     selected_synthetic = synthetic_objectives[:]
                     logger.warning(f"not enough synthetic data: need {target_synthetic_count}, have {len(synthetic_objectives)}, using all available")
                 else:
-                    selected_synthetic = rng.sample(synthetic_objectives, target_synthetic_count)  # ⭐ 从合成任务目标中随机选择指定数量的目标
+                    selected_synthetic = rng.sample(synthetic_objectives, target_synthetic_count)
 
                 mixed_objectives.extend(selected_synthetic)
                 logger.info(f"added {len(selected_synthetic)} synthetic tasks (ratio={self._synthetic_ratio})")
@@ -124,6 +123,6 @@ class UnifiedMixtureStrategy(MixtureStrategy):
         return f"UnifiedMixtureStrategy(use_original={self._use_original}, synthetic_ratio={self._synthetic_ratio}, shuffle={self._shuffle}, seed={self._seed})"  # ⭐ Generates the string representation
 
 class OriginalOnlyStrategy(UnifiedMixtureStrategy):
-    """只使用原始数据的策略（UnifiedMixtureStrategy的别名）"""
+    """A mixture strategy that only uses original data."""
     def __init__(self, shuffle: bool = True, seed: Optional[int] = None):
         super().__init__(use_original=True, synthetic_ratio=0.0, shuffle=shuffle, seed=seed)

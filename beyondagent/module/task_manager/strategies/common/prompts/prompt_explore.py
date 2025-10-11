@@ -121,7 +121,6 @@ User may asks questions like `[USER_QUESTION]`. You may explore related informat
 def get_agent_interaction_system_prompt(
     profile:EnvProfile | None
 ) -> str:
-    """获取环境交互系统提示"""
     if profile is not None:
         return AGENT_INTERACTION_SYSTEM_PROMPT.replace("[INSERT_ENVIRONMENT_DESCRIPTION_HERE]", profile.get_instruction())
     else:

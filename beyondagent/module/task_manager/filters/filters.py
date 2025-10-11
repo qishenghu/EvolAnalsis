@@ -19,19 +19,16 @@ class NaiveTaskPostFilter(TaskPostFilter):
         tasks = list(tasks)
         tasks.sort(key=lambda x: x.confidence or 0, reverse=True)  # ⭐ Sort tasks by confidence in descending order
 
-        # 简单去重：基于查询文本相似性
         unique_tasks = []
         seen_queries = set()
 
         for i, task in enumerate(tasks):
-            # 简化查询用于去重比较
             query = task.objective
             assert query is not None
             normalized_query = (
                 query.lower().strip()
             )  # FIXME: this only supports English
 
-            # 检查是否已存在相似查询
             is_duplicate = False
             for seen_query in seen_queries:
                 if self._check_similarity(normalized_query, seen_query):
@@ -58,7 +55,6 @@ class NaiveTaskPostFilter(TaskPostFilter):
         Returns:
             bool: True if the similarity is above the threshold, False otherwise.
         """
-        # 基于词汇重叠的简单相似性度量
         words1 = set(query1.split())
         words2 = set(query2.split())
 

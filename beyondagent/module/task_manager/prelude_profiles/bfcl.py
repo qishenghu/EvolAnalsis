@@ -4,7 +4,6 @@ from datetime import date
 
 from beyondagent.module.task_manager.env_profiles import EnvEntity, EnvEntityOpt, TaskPreference, EnvProfile
 
-# 假设 CRUD 操作
 def get_standard_file_ops():
     """
     Returns a list of standard file operations.
@@ -109,7 +108,6 @@ def get_support_ops():
         EnvEntityOpt("view_ticket", "View details of a support ticket.")
     ]  # ⭐ Defines the list of support ticket operations
 
-# 创建实体
 entities = [
     EnvEntity(
         name="FileSystem",
@@ -179,16 +177,13 @@ entities = [
     )
 ]
 
-# 定义用户和任务偏好
 task_pref = TaskPreference(num_entities=2, num_opts=3, relation_difficulty=3)
 
-# 创建用户配置文件
 env_profile = EnvProfile(
     name="Alice",
     background="A general user.",
     task=task_pref
 )
 
-# 注册实体
 env_profile.reg_entities(entities)
 

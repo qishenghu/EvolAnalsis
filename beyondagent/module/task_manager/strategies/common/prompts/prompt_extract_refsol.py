@@ -1,5 +1,4 @@
-# 这个 prompt 目前只用在 llm filter 中用于重新总结 ref solution
-
+# this prompt is used to summarize the agent's trajectory only
 import json
 from typing import Optional, Sequence, Tuple
 
@@ -54,7 +53,6 @@ def get_task_summarize_prompt(
     old_objectives: Sequence[TaskObjective],
     profile: EnvProfile | None,
 ) -> tuple[str, str]:
-    """获取任务摘要 prompt"""
     x = ""
     idx = 0
     for traj in trajectories:
@@ -91,19 +89,16 @@ Please identify the specific tasks the agent is attempting to complete in these 
 
 
 def parse_tasks_from_response(response: str) -> str|None:
-    """从响应中解析任务列表"""
 
     gts: list[str] = []
     try:
         import re
 
-        # 找到所有<task>标签中的内容
         task_matches = re.findall(r"<task>(.*?)</task>", response, re.DOTALL)
 
         for task_content in task_matches:
             t = json.loads(task_content)
 
-            # 检查必要字段
             if (
                 "confidence" not in t
                 or "action_sequence" not in t

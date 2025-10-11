@@ -13,7 +13,8 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.processing_utils import ProcessorMixin
 
 def convert_to_tasks(dataset:RLHFDataset,env_type:str, grader:str)->list[Task]:
-    """将来自环境的原本 RLHFDataset 转为供 TaskManager 使用的 Task 列表
+    """
+    Convert RLHFDataset to Task that used by TaskManager
     """
     res=[]
     for record in dataset:
@@ -39,11 +40,11 @@ def to_rl_dataset(
     for id,task_obj in enumerate(tasks):
         task = task_obj.task
 
-        # 构建 reward_model
-        # TODO 但现在的代码里似乎已经不用这个东西了
+        # build reward_model
+        # however, it seems that BA does not rely on this attr
         ground_truth = [task_obj.ground_truth] if task_obj.ground_truth else []
 
-        # 构建单条记录
+        # build record
         record = {
             "data_source": task.env_type,
             "prompt": [{"content": str(task.task_id), "role": "user"}], # `prompt` is never used. trainer will get trajectories from env. metrics code needs this to group results.
@@ -54,7 +55,7 @@ def to_rl_dataset(
                 "open_query": task.open_query,
                 "new_query": task.query,
                 "evaluator": task.evaluator,
-                "ground_truth": task_obj.ground_truth, # 用于提供给一些 grader 使用
+                "ground_truth": task_obj.ground_truth, # for some graders, such as LLM Judge w/ GT
             },
         }
 
@@ -64,7 +65,7 @@ def to_rl_dataset(
     with tempfile.NamedTemporaryFile(delete=False) as f:
         df.to_parquet(f.name)
 
-    # 转换为 Dataset
+    # convert to RLHFDataset
     return RLHFDataset([f.name], tokenizer, config, processor)
 
 

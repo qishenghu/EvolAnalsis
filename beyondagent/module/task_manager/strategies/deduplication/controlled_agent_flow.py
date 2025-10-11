@@ -21,7 +21,6 @@ class ControlledAgentFlow(BaseAgentFlow):
     def __init__(self,state_recorder:StateRecorder,reward_calculator:Optional[RewardCalculator]=None, max_record_len:int=200, **kwargs):
         super().__init__(**kwargs)
         self._state_recorder=state_recorder
-        # 优先传入的参数
         self._reward_calculator = reward_calculator
         self._max_record_len=max_record_len
         self._enable_context_generator=False
@@ -37,7 +36,7 @@ class ControlledAgentFlow(BaseAgentFlow):
         
         rng=random.Random(trajectory.steps[0]['content']) # use system prompt as seed
         for act_step in range(self.max_steps):
-            # -------- 1. 清理旧 system prompt --------
+            # 1. remove old system prompt
             new_steps = [
                 s for s in trajectory.steps
                 if not (s["role"] == "system" and
@@ -45,7 +44,7 @@ class ControlledAgentFlow(BaseAgentFlow):
             ]
             trajectory.steps = new_steps
 
-            # -------- 2. 生成 records --------
+            # 2. generate records
             records = self._state_recorder.get_state(trajectory)
             if len(records) != 0:
                 records_str = []
@@ -55,7 +54,7 @@ class ControlledAgentFlow(BaseAgentFlow):
                 records_str = "\n".join(records_str)
                 records_str = self._compress_state_action(records_str)
 
-                # -------- 3. 组装强化版 prompt --------
+                # 3. construct enhanced prompt
                 instruction = f"""## Local Context
 You are currently **at the same location / state** as in the log below.
 
@@ -75,8 +74,8 @@ Now decide the single best next action.""".strip()
 
                 logger.debug(f"retrieve #records={len(records)}, prompt_len={len(instruction)}")
                 
-                # -------- 4. 随机或固定策略把 prompt 写入对话 --------
-                if rng.random() <= 1.0:     # 这里仍然可调探索概率
+                # 4. add prompt to trajectory
+                if rng.random() <= 1.0:     # p
                     trajectory.steps.append({
                         "role": "user",
                         "content": instruction
@@ -157,7 +156,7 @@ Now decide the single best next action.""".strip()
 
                 trajectory.steps.append(sanitize_env_state(env_message))
                 # log state
-                # 使用未执行 action 的 trajectory 作为 key
+                # use the trajectory that has no last user message as key
                 self._state_recorder.add_state(old_trajectory, llm_output['content'], env_message['content'])
             trajectory.is_terminated = env_output["is_terminated"]
             

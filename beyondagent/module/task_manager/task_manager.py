@@ -44,7 +44,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset
 
 class TaskManagerProps(TypedDict):
     num_explore_threads: int
-    n: int # 重复探索的控制必须放在这里，task manager 要规划 task 执行顺序，避免在同时探索相同任务导致潜在的 query 重复
+    n: int # n must be placed here. The task manager needs to plan the task execution order to avoid potential duplicate queries resulting from simultaneously exploring the same task.
 
 class RewardProps(TypedDict):
     original_grader:str
@@ -89,7 +89,7 @@ class TaskManager(object):
         self._mixture_strategy = mixture_strategy
         self._reward_config=reward_config
         self._env_service_url = env_service_url
-        self._tokenizer = tokenizer  # cc: 这玩意似乎不该在这
+        self._tokenizer = tokenizer  # why is tokenizer here?
         self._num_exploration_threads = kwargs["num_explore_threads"] or 10
         self._n = kwargs["n"]
 
@@ -161,11 +161,11 @@ class TaskManager(object):
 
         Args:
             tasks: Iterable[Task]
-            bs: int. 该 batch size 决定一次读取的 task 数量。每次生成的 dataset 大小为 bs * self._n。
+            bs: int. This batch size determines the number of tasks read at one time. The size of the dataset generated each time is bs * self._n.
             tokenizer: transformers.tokenization_utils.PreTrainedTokenizer
             config: DictConfig. Only for RLHFDataset.
         """
-        # autoreloaddataset 没适配 mixture
+        # autoreloaddataset does not support mixture
         raise NotImplementedError("get_onthefly_dataset is not implemented")
         # return AutoReloadDataset(self,iter(self._tasks),bs,self._mix_original_tasks,tokenizer=tokenizer,config=config,processor=processor)
 
@@ -243,10 +243,10 @@ class TaskManager(object):
             except Exception as e:
                 logger.warning(f"Failed to load checkpoint: {e}, starting from scratch")
 
-        # 每个任务都 roll n 次
+        # we roll n times for each task
         task_q = list(copy.copy(tasks)) * self._n
 
-        # 每次最多探索所有不同任务，或者最大线程个任务，防止同批次中生成相同任务
+        # in each batch, we explore all different tasks or max_threads tasks, in order to avoid generating same task.
         parallel_num = min(self._num_exploration_threads, len(tasks))
         with ThreadPoolExecutor(max_workers=self._num_exploration_threads) as pool:
             batch_indices = list(range(0, len(task_q), parallel_num))
@@ -387,7 +387,7 @@ class FullDataset(Dataset):
         self._dataset = None
         self._synthetic_objectives = []
 
-        # 标记是否需要在下一轮迭代开始前刷新
+        # tag, used to mark whether the dataset needs to be refreshed
         self._refresh_after_epoch = False
 
     def _rebuild_dataset(self):

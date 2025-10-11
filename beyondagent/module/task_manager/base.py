@@ -15,7 +15,9 @@ class LlmRawClient(Protocol):
     ) -> dict: ...
 
 class TaskObjectiveRetrieval(abc.ABC):
-    """支持任务相关任务 objective 检索，用于避免重复探索"""
+    """
+    TaskObjectiveRetrieval
+    """
 
     @abc.abstractmethod
     def retrieve_objectives(self, task: Task) -> list[TaskObjective]: ...
@@ -31,7 +33,7 @@ class TaskObjectiveRetrieval(abc.ABC):
 class NaiveTaskObjectiveRetrieval(TaskObjectiveRetrieval):
 
     def __init__(self):
-        # 目前单次训练中只会有同一个 env_type 的 task，所以可以直接使用 task_id as key
+        # currently, a single training session will only contain tasks of the same env_type, so we can directly use task_id as the key
         self._mp: dict[str, list[TaskObjective]] = {}
 
     def retrieve_objectives(self, task: Task) -> list[TaskObjective]:

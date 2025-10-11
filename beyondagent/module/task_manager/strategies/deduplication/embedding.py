@@ -20,41 +20,30 @@ class EmbeddingClient:
         self._client = OpenAIEmbeddingClient(api_key=api_key, base_url=base_url, model_name=model)
         self.similarity_threshold = similarity_threshold
         
-        # 初始化ChromaDB
         self._chroma_client = chromadb.PersistentClient(
             path=chroma_db_path,
             settings=Settings(anonymized_telemetry=False)
         )
         
-        # 获取或创建集合
         self._collection = self._chroma_client.get_or_create_collection(
             name=collection_name,
-            metadata={"hnsw:space": "cosine"}  # 使用余弦相似度
+            metadata={"hnsw:space": "cosine"}
         )
         
-        # ID映射：ChromaDB使用string ID，我们需要维护int ID的映射
         self._id_mapping: dict[int, str] = {}
         self._reverse_id_mapping: dict[str, int] = {}
     
     def add(self, text: str, id: int):
         """
-        添加文本和对应的ID，生成并存储嵌入向量到ChromaDB
-        
-        Args:
-            text (str): 要添加的文本
-            id (int): 文本对应的ID
+        Add text and ID to ChromaDB
         """
-        # 获取文本的嵌入向量
         embedding = self._client.get_single_embedding(text)
         
-        # 生成ChromaDB使用的string ID
         chroma_id = f"doc_{id}_{uuid.uuid4().hex[:8]}"
         
-        # 更新ID映射
         self._id_mapping[id] = chroma_id
         self._reverse_id_mapping[chroma_id] = id
         
-        # 添加到ChromaDB
         self._collection.add(
             embeddings=[embedding],
             documents=[text],
@@ -64,36 +53,25 @@ class EmbeddingClient:
     
     def find_by_text(self, text: str) -> Optional[int]:
         """
-        根据文本查找相似的已存储文本，返回对应的ID
-        
-        Args:
-            text (str): 查询文本
-            
-        Returns:
-            Optional[int]: 如果找到相似度超过阈值的文本则返回其ID，否则返回None
+        Find a similar text in ChromaDB, return the corresponding ID
         """
-        # 检查集合是否为空
         if self._collection.count() == 0:
             return None
         
-        # 获取查询文本的嵌入向量
         query_embedding = self._client.get_single_embedding(text)
         
-        # 在ChromaDB中查询最相似的文档
         results = self._collection.query(
             query_embeddings=[query_embedding],
-            n_results=1,  # 只返回最相似的一个结果
+            n_results=1,  # only the top result
             include=["documents", "metadatas", "distances"]
         )
         
         if not results["ids"] or not results["ids"][0]:
             return None
         
-        # 获取距离（ChromaDB返回的是距离，需要转换为相似度）
         distance = results["distances"][0][0] # type: ignore
-        similarity = 1 - distance  # 余弦距离转换为余弦相似度
+        similarity = 1 - distance
         
-        # 检查相似度是否超过阈值
         if similarity >= self.similarity_threshold:
             chroma_id = results["ids"][0][0]
             return self._reverse_id_mapping.get(chroma_id)
@@ -102,14 +80,7 @@ class EmbeddingClient:
     
     def find_top_k_by_text(self, text: str, k: int = 5) -> list[tuple[int, float, str]]:
         """
-        根据文本查找最相似的k个文档
-        
-        Args:
-            text (str): 查询文本
-            k (int): 返回结果数量
-            
-        Returns:
-            list[tuple[int, float, str]]: (ID, 相似度, 文档内容) 的列表
+        Find the top k similar documents
         """
         if self._collection.count() == 0:
             return []
@@ -139,14 +110,7 @@ class EmbeddingClient:
     
     def _embedding(self, texts: Sequence[str], bs=10) -> list[list[float]]:
         """
-        批量获取文本的嵌入向量
-        
-        Args:
-            texts (Sequence[str]): 文本序列
-            bs (int): 批处理大小
-            
-        Returns:
-            list[list[float]]: 嵌入向量列表
+        Get the embedding of texts
         """
         res: list[list[float]] = []
         for i in range(0, len(texts), bs):
@@ -156,10 +120,7 @@ class EmbeddingClient:
     
     def get_all_stored_texts(self) -> dict[int, str]:
         """
-        获取所有已存储的文本
-        
-        Returns:
-            dict[int, str]: ID到文本的映射
+        Get all stored texts
         """
         all_data = self._collection.get(include=["documents", "metadatas"])
         result = {}
@@ -174,13 +135,7 @@ class EmbeddingClient:
     
     def remove(self, id: int) -> bool:
         """
-        删除指定ID的文本和嵌入向量
-        
-        Args:
-            id (int): 要删除的ID
-            
-        Returns:
-            bool: 删除成功返回True，ID不存在返回False
+        Remove the text and embedding vector of the specified ID
         """
         chroma_id = self._id_mapping.get(id)
         if chroma_id is None:
@@ -189,7 +144,6 @@ class EmbeddingClient:
         try:
             self._collection.delete(ids=[chroma_id])
             
-            # 清理ID映射
             del self._id_mapping[id]
             del self._reverse_id_mapping[chroma_id]
             
@@ -199,16 +153,13 @@ class EmbeddingClient:
     
     def clear(self):
         """清空所有存储的文本和嵌入向量"""
-        # 删除集合中的所有数据
         try:
             self._chroma_client.delete_collection(self._collection.name)
-            # 重新创建集合
             self._collection = self._chroma_client.get_or_create_collection(
                 name=self._collection.name,
                 metadata={"hnsw:space": "cosine"}
             )
             
-            # 清空ID映射
             self._id_mapping.clear()
             self._reverse_id_mapping.clear()
         except Exception as e:

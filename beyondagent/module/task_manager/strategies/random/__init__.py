@@ -35,7 +35,8 @@ class LlmRandomSamplingExploreStrategyProps(TypedDict):
 class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
     def __init__(self, * , tokenizer, config,**kwargs: Unpack[LlmRandomSamplingExploreStrategyProps]):
         self._tokenizer = tokenizer
-        self._config = config # 这东西仅仅用于给其他需要它的 class 使用
+        # this is used in other classes
+        self._config = config
         
         self._max_llm_retries = kwargs.get("max_llm_retries", 3)
         self._max_explore_step = kwargs.get("max_explore_step", 10)
@@ -49,8 +50,7 @@ class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
     def explore(self, task: Task, data_id: str, rollout_id: str) -> list[Trajectory]:
         env_worker = EnvWorker(
             task=task,
-            is_open_query=True, # agent does not respect the default instruction to solve the problems
-            config=self._config, # FIXME 既然一定需要这3个东西就不要设置成 = None
+            config=self._config, # FIXME must use these parameters, and their default values are incorrect
             thread_index=0,
             tokenizer=self._tokenizer
         )
@@ -71,9 +71,6 @@ class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
         agent_flow.max_model_len=102400 # TODO max len
         
         
-        if os.environ.get("DEBUG_ARG","").find("NO_QUERY")!=-1:
-            # 当 query 有值时，会覆盖掉 init message 中的原始 query
-            task.query="Start your exploration!"
         traj = env_worker.execute(
             data_id=data_id,
             rollout_id=rollout_id,
@@ -84,7 +81,7 @@ class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
                 'step':[0],
                 'token':[0],
             },
-            stop=[False], # 这俩玩意有没有什么办法能封装一下
+            stop=[False], # this method could be refactored
             system_prompt=get_agent_interaction_system_prompt(self.env_profile),
         )
 
@@ -100,7 +97,8 @@ class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
             }
         )
         old_objectives = self._old_retrival.retrieve_objectives(task)
-        # mask information
+        # mask information that may include the real query
+        # [0]: system prompt, [1]: may be user query or system prompt in user role, [2]: user query
         trajectory.steps[1]['content'] = '[MASKED]'
         trajectory.steps[2]['content'] = "[MASKED]"
         

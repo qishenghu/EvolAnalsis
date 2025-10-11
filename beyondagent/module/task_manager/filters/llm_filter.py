@@ -48,7 +48,6 @@ class LlmFilter(TaskPostFilter):
         self._tokenizer = tokenizer
         self._config = config
         
-        # 用于线程安全的锁（如果需要共享资源访问控制）
         self._lock = threading.Lock()  # ⭐ Initialize a lock for thread-safe operations
 
     def filter(self, tasks: Sequence[TaskObjective]) -> list[TaskObjective]:
@@ -64,10 +63,9 @@ class LlmFilter(TaskPostFilter):
         if not tasks:
             return []
         
-        # 方法1: 使用 ThreadPoolExecutor 并行处理
         return self._filter_with_threadpool(tasks)
         
-        # 方法2: 如果需要更细粒度的控制，可以使用下面的批处理方法
+        # Optional method 2: Process tasks in batches
         # return self._filter_with_batches(tasks)
 
     def _filter_with_threadpool(self, tasks: Sequence[TaskObjective]) -> list[TaskObjective]:
@@ -75,26 +73,25 @@ class LlmFilter(TaskPostFilter):
         from tqdm import tqdm
         res = []
         
-        progress=tqdm(total=len(tasks), desc="Filtering tasks")
+        progress = tqdm(total=len(tasks), desc="Filtering tasks")
         with ThreadPoolExecutor(max_workers=self._num_threads) as executor:
-            # 提交所有任务
+            # submit all tasks
             future_to_task = {
                 executor.submit(self._execute_strategy1, task): task 
                 for task in tasks
             }
             
-            # 收集结果
+            # collect results
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
                 progress.update(1)
                 try:
-                    t=future.result()
+                    t = future.result()
                     if t is not None:
                         res.append(t)
                 except Exception as e:
                     logger.exception(f"Error processing task {task}: {e}")
-                    # 根据需求决定是否将失败的任务也包含在结果中
-                    # 这里选择跳过失败的任务
+                    # ignore the failed tasks
                     continue
         progress.close()
         return res
@@ -136,7 +133,7 @@ class LlmFilter(TaskPostFilter):
         
         return res
 
-    def _execute_strategy1(self, task: TaskObjective) -> TaskObjective|None:
+    def _execute_strategy1(self, task: TaskObjective) -> TaskObjective | None:
         """
         Executes the first strategy for processing a task. This includes setting up a worker and an agent flow,
         executing the task, validating the result, and potentially rewriting the task's ground truth if the
@@ -171,16 +168,16 @@ class LlmFilter(TaskPostFilter):
                 task_train_exp_mode='woexp',
                 agent_flow=agent_flow,
                 tmux={
-                    'step':[0],
-                    'token':[0],
+                    'step': [0],
+                    'token': [0],
                 },
-                stop=[False], # 这俩玩意有没有什么办法能封装一下
-                system_prompt=make_solver_tip_prompt(task.objective,task.ground_truth)
+                stop=[False],  # parameter tmux and stop could be refactored
+                system_prompt=make_solver_tip_prompt(task.objective, task.ground_truth)
             )  # ⭐ Execute the task using the worker and agent flow
 
-            valid=self._validate(task,traj)
+            valid = self._validate(task, traj)
             if valid:
-                task=self._rewrite_new_gt(task,traj)
+                task = self._rewrite_new_gt(task, traj)
                 return task
             else:
                 return None
@@ -207,14 +204,16 @@ class LlmFilter(TaskPostFilter):
             logger.exception(f"Error in _validate for task {task}: {e}")
             return False
 
-    def _rewrite_new_gt(self,task:TaskObjective,trajectory:Trajectory)->TaskObjective:
-        """重写任务新的ground-truth"""
-        sys_prompt,user_prompt=get_task_summarize_prompt([trajectory],[task], None)
-        messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}]
-        llm_output=self._get_llm_chat_fn()(messages)["content"]
+    def _rewrite_new_gt(self, task: TaskObjective, trajectory: Trajectory) -> TaskObjective:
+        """
+        Rewrite ground-truth
+        """
+        sys_prompt, user_prompt = get_task_summarize_prompt([trajectory], [task], None)
+        messages = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_prompt}]
+        llm_output = self._get_llm_chat_fn()(messages)["content"]
         gt = parse_tasks_from_response(llm_output)
         if gt is not None:
-            task.ground_truth=gt
+            task.ground_truth = gt
         
         return task        
         
@@ -265,8 +264,8 @@ class LlmFilter(TaskPostFilter):
                     )  # ⭐ Attempt to get a response from the LLM
                     break
                 except Exception as e:
-                    logger.exception(f"llm_chat attempt {i+1} error: {e}")
-                    time.sleep(10*2**i)
+                    logger.exception(f"llm_chat attempt {i + 1} error: {e}")
+                    time.sleep(10 * 2**i)
 
             assert res is not None, f"LLM client failed to chat after 3 attempts"
             return {
@@ -283,25 +282,25 @@ from typing import List
 
 
 class TrajectoryEvaluator:
-    """Evaluate trajectory success using LLM / 使用LLM评估轨迹成功"""
+    """Evaluate trajectory success using LLM"""
     
-    def __init__(self, client:LlmClient):
+    def __init__(self, client: LlmClient):
         self.client = client
         self.prompts = EvaluationPrompts()
 
-    def evaluate_trajectory_success(self, task:TaskObjective, trajectory:Trajectory) -> bool:
-        """Evaluate if trajectory completed the task successfully / 评估轨迹是否成功完成任务"""
+    def evaluate_trajectory_success(self, task: TaskObjective, trajectory: Trajectory) -> bool:
+        """Evaluate if trajectory completed the task successfully"""
         try:
-            # Create trajectory summary / 创建轨迹摘要
+            # Create trajectory summary
             trajectory_summary = self._create_trajectory_summary(trajectory)
             
-            final_observation: str|None = None
+            final_observation: str | None = None
             for step in reversed(trajectory.steps):
-                if final_observation is None and step['role']!='assistant':
+                if final_observation is None and step['role'] != 'assistant':
                     final_observation = step['content']
                     break
                 
-            # Generate evaluation prompt / 生成评估提示
+            # Generate evaluation prompt
             assert task.objective is not None, "synthetic task must have objective"
             prompt = self.prompts.success_evaluation_prompt(
                 query=task.objective,
@@ -309,10 +308,10 @@ class TrajectoryEvaluator:
                 final_observation=final_observation or "[no observation]"
             )
             
-            # Get LLM evaluation / 获取LLM评估
-            response = self.client.chat(prompt,sampling_params={})
+            # Get LLM evaluation
+            response = self.client.chat(prompt, sampling_params={})
             
-            # Parse evaluation result / 解析评估结果
+            # Parse evaluation result
             success = self._parse_evaluation_response(response)
             
             logger.debug(f"Trajectory evaluation result: {success}")
@@ -335,8 +334,8 @@ class TrajectoryEvaluator:
         summary_blocks = []
         
         for i, step in enumerate(traj.steps):
-            block=f"(Step {i+1}) {step['role']}:\n"
-            block+=f"{step['content'][:200]}...\n"  # ⭐ Truncate the content to 200 characters and append an ellipsis
+            block = f"(Step {i + 1}) {step['role']}:\n"
+            block += f"{step['content'][:200]}...\n"  # ⭐ Truncate the content to 200 characters and append an ellipsis
             summary_blocks.append(block)
         
         return "\n".join(summary_blocks)
@@ -356,26 +355,26 @@ class TrajectoryEvaluator:
         
         response_lower = response.lower()
         
-        # Look for explicit success/failure indicators / 查找明确的成功/失败指标
+        # Look for explicit success/failure indicators
         if 'success: true' in response_lower or 'successful: true' in response_lower:
             return True
         elif 'success: false' in response_lower or 'successful: false' in response_lower:
             return False
         
-        # Look for keywords / 查找关键词
+        # Look for keywords
         success_keywords = ['success', 'completed', 'achieved', 'accomplished', 'solved']
         failure_keywords = ['failed', 'incomplete', 'unsuccessful', 'not completed', 'not achieved']
         
         success_count = sum(1 for keyword in success_keywords if keyword in response_lower)
         failure_count = sum(1 for keyword in failure_keywords if keyword in response_lower)
         
-        # Default to success if more success keywords found / 如果找到更多成功关键词则默认成功
+        # Default to success if more success keywords found
         return success_count > failure_count  # ⭐ Determine success based on the count of success and failure keywords
     
     
 
 class EvaluationPrompts:
-    """Prompt templates for trajectory evaluation / 轨迹评估的提示模板"""
+    """Prompt templates for trajectory evaluation"""
     
     def success_evaluation_prompt(self, query: str, trajectory_summary: str,
                                 final_observation: str) -> list:
@@ -430,7 +429,7 @@ class EvaluationPrompts:
 
 
 
-def make_solver_tip_prompt(query: str, gt:str):
+def make_solver_tip_prompt(query: str, gt: str):
     return f"""You are an AI assistant helping to complete tasks in an interactive environment.
 Feel free to use the tips to help you complete the task. The tips include a potential step-by-step solution to the task, but I do not ensure it is correct.
 

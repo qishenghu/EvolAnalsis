@@ -66,7 +66,6 @@ def steps_to_msg(steps: list[dict[str, Any]]) -> str:
     Returns:
         str: A formatted string representing the conversation trajectory.
     """
-    # 添加轨迹消息（将所有对话转换为一个连贯的文本）
     trajectory_text = ""
     assert steps[0]['role'] == 'assistant'  # ⭐ Ensures the first message is from the assistant
     for i, msg in enumerate(steps):
@@ -113,7 +112,6 @@ class LlmAsJudgeRewardCalculator(RewardCalculator):
         """
         messages=[]
         
-        # 添加轨迹消息（将所有对话转换为一个连贯的文本）
         assert len(trajectory.steps) >= 2 and trajectory.steps[1]['role'] == 'user', "trajectory must start with system message and then user message"
         query=trajectory.steps[1]['content']
         trajectory_text = f"Query: {query}\n"
