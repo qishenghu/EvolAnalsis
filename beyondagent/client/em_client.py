@@ -16,7 +16,9 @@ class EMClient(HttpClient):
                                **kwargs) -> str:
         start_time = time.time()
         self.url = self.base_url + "/context_generator"
+        print("################## ^^^^^^^^^^^^^^ breakpoint #############")
         breakpoint() 
+        raise NotImplementedError("not implemented")
         json_data = {
             "trajectory": trajectory.dict(),
             "retrieve_top_k": retrieve_top_k,
