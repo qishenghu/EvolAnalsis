@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import List
 from datetime import date
 
-from beyondagent.module.task_manager.user_profiles import EnvEntity, EnvEntityOpt, TaskPreference, UserProfile, get_crud_opts
+from beyondagent.module.task_manager.env_profiles import EnvEntity, EnvEntityOpt, TaskPreference, EnvProfile, get_crud_opts
 
 
 product_entity = EnvEntity(
@@ -38,11 +38,10 @@ product_entity = EnvEntity(
 
 user_pref = TaskPreference(num_entities=2, num_opts=2, relation_difficulty=3)
 
-user_profile = UserProfile(
+env_profile = EnvProfile(
     name="Generic Shopper",
     background="A user searching for a wide variety of consumer products across categories like electronics, clothing, home goods, and food.",
     task=user_pref
 )
 
-user_profile.reg_entity(product_entity)
-user_profile.save_to_json("user_profile.json")
+env_profile.reg_entity(product_entity)

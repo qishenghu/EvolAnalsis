@@ -58,9 +58,10 @@ env_service:
 task_manager:
   train_data_path: tasks_explored.train.json # tasks will be explored once if set. use it if you want to keep the same explorations.
   val_data_path: tasks_explored.val.json # tasks will be explored once if set. use it if you want to keep the same explorations.
-  llm_client: qwen3-235b-a22b-instruct-2507 # policy, or other llm name provided in DashScopeClient
+  llm_client: qwen-plus # policy, or other llm name provided in DashScopeClient
   # 0 - stop exploration
   n: 0
+  env_profile: cookbook/env_profiles/appworld.json # env profiles used in exploration. If you set n to 0, just ignore this.
   bs: ${data.train_batch_size} # this should be the same as train_batch_size
   num_explore_threads: ${thread_pool.max_workers}
 

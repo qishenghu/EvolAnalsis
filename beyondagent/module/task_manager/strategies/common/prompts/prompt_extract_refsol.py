@@ -3,7 +3,7 @@
 import json
 from typing import Optional, Sequence, Tuple
 
-from beyondagent.module.task_manager.user_profiles import UserProfile
+from beyondagent.module.task_manager.env_profiles import EnvProfile
 from beyondagent.schema.task import Task, TaskObjective
 from beyondagent.schema.trajectory import Trajectory
 from .prompt_summarize import _get_action_observation_pair
@@ -18,6 +18,7 @@ Your job is to analyze an agent's API interaction history and extract a solution
 # OBJECTIVES
 - Analyze the recorded API calls to identify the actual functional capabilities demonstrated.
 - Provide the sequence of technical steps that directly accomplishes the task.
+- The solution should be self-contained, i.e., it should include all necessary API calls and function definitions.
 
 # OUTPUT FORMAT
 For each identified task, output exactly one block in this format:
@@ -51,7 +52,7 @@ For each identified task, output exactly one block in this format:
 def get_task_summarize_prompt(
     trajectories: Sequence[Trajectory],
     old_objectives: Sequence[TaskObjective],
-    profile: UserProfile | None,
+    profile: EnvProfile | None,
 ) -> tuple[str, str]:
     """获取任务摘要 prompt"""
     x = ""

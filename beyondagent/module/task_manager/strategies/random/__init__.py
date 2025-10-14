@@ -49,7 +49,8 @@ class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
     def explore(self, task: Task, data_id: str, rollout_id: str) -> list[Trajectory]:
         env_worker = EnvWorker(
             task=task,
-            config=self._config, # FIXME 不是，你既然一定需要这3个东西就不要设置成 = None 啊 
+            is_open_query=True, # agent does not respect the default instruction to solve the problems
+            config=self._config, # FIXME 既然一定需要这3个东西就不要设置成 = None
             thread_index=0,
             tokenizer=self._tokenizer
         )
@@ -84,18 +85,27 @@ class LlmRandomSamplingExploreStrategy(TaskExploreStrategy):
                 'token':[0],
             },
             stop=[False], # 这俩玩意有没有什么办法能封装一下
-            system_prompt=get_agent_interaction_system_prompt(appworld.user_profile), # FIXME debug profile
+            system_prompt=get_agent_interaction_system_prompt(self.env_profile),
         )
 
         return [traj]
     
     def summarize(self, task: Task, trajectory: Trajectory) -> list[TaskObjective]:
-        llm_fn = self._get_llm_chat_fn(self.llm_client_summarize)
+        llm_fn = self._get_llm_chat_fn(
+            self.llm_client_summarize,
+            sampling_params={
+                "temperature": self._exploration_llm_temperature,
+                "top_p": self._exploration_llm_top_p,
+                "top_k": self._exploration_llm_top_k,
+            }
+        )
         old_objectives = self._old_retrival.retrieve_objectives(task)
         # mask information
+        trajectory.steps[1]['content'] = '[MASKED]'
         trajectory.steps[2]['content'] = "[MASKED]"
+        
         system_prompt, user_prompt = get_task_summarize_prompt(
-            [trajectory], old_objectives, appworld.user_profile # FIXME debug profile
+            [trajectory], old_objectives, self.env_profile
         )
         messages = [
             {"role": "system", "content": system_prompt},

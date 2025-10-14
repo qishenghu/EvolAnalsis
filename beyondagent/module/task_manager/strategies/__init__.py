@@ -3,7 +3,7 @@ import abc
 from loguru import logger
 
 from beyondagent.module.task_manager.base import LlmClient, TaskObjectiveRetrieval
-from beyondagent.module.task_manager.user_profiles import UserProfile
+from beyondagent.module.task_manager.env_profiles import EnvProfile
 from beyondagent.schema.task import Task, TaskObjective
 from beyondagent.schema.trajectory import Trajectory
 
@@ -13,12 +13,12 @@ class TaskExploreStrategy(abc.ABC):
     
     It provides nescessary contexts.
     """
-    def _inject_deps(self,old_retrival: TaskObjectiveRetrieval,llm_client_explore: LlmClient, llm_client_summarize: LlmClient, user_profile:UserProfile):
+    def _inject_deps(self,old_retrival: TaskObjectiveRetrieval,llm_client_explore: LlmClient, llm_client_summarize: LlmClient, env_profile:EnvProfile):
         self._old_retrival = old_retrival
         # TODO: where should I init the llm client
         self._llm_client_explore=llm_client_explore
         self._llm_client_summarize=llm_client_summarize
-        self._user_profile=user_profile
+        self._env_profile=env_profile
     
     @property
     def llm_client_explore(self):
@@ -39,10 +39,10 @@ class TaskExploreStrategy(abc.ABC):
         return self._old_retrival
     
     @property
-    def user_profile(self) -> UserProfile:
-        if not hasattr(self, "_user_profile"):
-            raise AttributeError("user_profile is not injected")
-        return self._user_profile
+    def env_profile(self) -> EnvProfile:
+        if not hasattr(self, "_env_profile"):
+            raise AttributeError("env_profile is not injected")
+        return self._env_profile
     
     @abc.abstractmethod
     def explore(

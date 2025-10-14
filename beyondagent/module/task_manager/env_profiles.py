@@ -11,12 +11,17 @@ class EnvEntityOpt:
 
 
 def get_crud_opts() -> List[EnvEntityOpt]:
-    """Return a standard set of CRUD operations."""
+    """
+    Returns a list of standard CRUD (Create, Read, Update, Delete) operations.
+
+    Returns:
+        List[EnvEntityOpt]: A list of CRUD operations, each with a name and description.
+    """
     return [
         EnvEntityOpt("create", "Create a new instance of this entity."),
         EnvEntityOpt("read", "Retrieve one or more attribute values of this entity."),
         EnvEntityOpt("update", "Modify one or more attribute values of this entity."),
-        EnvEntityOpt("delete", "Remove an instance of this entity.")
+        EnvEntityOpt("delete", "Remove an instance of this entity.")  # ⭐ Defines the delete operation
     ]
 
 
@@ -64,22 +69,39 @@ class TaskPreference:
                 "Requires reasoning and decision-making."
             )
         }
-        return mapping[int(self._relation_difficulty)]
+        return mapping[int(self._relation_difficulty)]  # ⭐ Maps the difficulty level to a descriptive string
 
 
-class UserProfile:
+class EnvProfile:
     """User profile and task environment description generator."""
     def __init__(self, name: str, background: str, task: TaskPreference):
         self._name = name
         self._background = background
         self._entities: List[EnvEntity] = []
         self._task_preference = task
+        
+        self._rubrics=[]
+    
+    def reg_rubric(self, rubric: str):
+        self._rubrics.append(rubric)
 
     def reg_entity(self, entity: EnvEntity):
-        self._entities.append(entity)
+        """
+        Registers a single environment entity.
+
+        Args:
+            entity (EnvEntity): The environment entity to be registered.
+        """
+        self._entities.append(entity)  # ⭐ Adds the given entity to the internal list
 
     def reg_entities(self, entities: List[EnvEntity]):
-        self._entities.extend(entities)
+        """
+        Registers multiple environment entities at once.
+
+        Args:
+            entities (List[EnvEntity]): A list of environment entities to be registered.
+        """
+        self._entities.extend(entities)  # ⭐ Extends the internal list with the provided entities
 
     def get_instruction(self) -> str:
         """
@@ -87,6 +109,9 @@ class UserProfile:
         This description contains NO role-setting for the LLM,
         so it can be seamlessly inserted into a larger prompt
         without causing conflicts.
+
+        Returns:
+            str: The generated environment description.
         """
         inst_parts = []
 
@@ -114,19 +139,35 @@ class UserProfile:
         inst_parts.append(f"- **Average number of operations involved**: {self._task_preference.num_opts}")
         inst_parts.append(f"- **Relation difficulty**: {self._task_preference.relation_difficulty}")
 
-        return "\n".join(inst_parts)
-    
+        return "\n".join(inst_parts)  # ⭐ Joins all parts to form the final instruction string
+
     def get_task_preference_instruction(self) -> str:
+        """
+        Generates an instruction string based on the user's task preferences.
+
+        Returns:
+            str: A formatted string describing the user's task preferences.
+        """
         inst_parts = []
         inst_parts.append(f"The task should involve the following characteristics:")
         inst_parts.append(f"- **Average number of entities involved**: {self._task_preference.num_entities}")
-        inst_parts.append(f"- **Average number of operations involved**: {self._task_preference.num_opts}")
+        inst_parts.append(f"- **Average number of operations involved**: {self._task_preference.num_opts}")  # ⭐ Adds the number of operations to the instruction
         inst_parts.append(f"- **Relation difficulty**: {self._task_preference.relation_difficulty}")
+        inst_parts.append("")
+        inst_parts.append(f"**Rubrics**:")
+        inst_parts.extend(self._rubrics)
+        inst_parts.append("You are required to follow these preferences strictly.")
+        inst_parts.append("")
 
-        return "\n".join(inst_parts)
-    
+        return "\n".join(inst_parts)  # ⭐ Joins the parts into a single string and returns it
+
     def to_json(self) -> str:
-        """Convert UserProfile to JSON string."""
+        """
+        Converts the UserProfile object into a JSON formatted string.
+
+        Returns:
+            str: A JSON string representation of the UserProfile.
+        """
         data = {
             "name": self._name,
             "background": self._background,
@@ -137,7 +178,7 @@ class UserProfile:
                     "attrs": entity.attrs,
                     "opts": [{"name": opt.name, "description": opt.description} for opt in entity.opts]
                 }
-                for entity in self._entities
+                for entity in self._entities  # ⭐ Iterates over each entity in the _entities list to build the 'entities' part of the JSON
             ],
             "task_preference": {
                 "num_entities": self._task_preference.num_entities,
@@ -145,17 +186,30 @@ class UserProfile:
                 "relation_difficulty": self._task_preference._relation_difficulty
             }
         }
-        return json.dumps(data, indent=2)
-    
+        return json.dumps(data, indent=2)  # ⭐ Converts the dictionary to a JSON string with an indentation of 2 spaces
+
     def save_to_json(self, file_path: str):
-        """Save UserProfile to a JSON file."""
+        """
+        Serialize the UserProfile instance into a JSON file.
+
+        Args:
+            file_path (str): The path where the JSON file will be saved.
+        """
         with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(self.to_json())
-    
+            f.write(self.to_json())  # ⭐ Write the JSON representation of the profile to the file
+
     @classmethod
-    def from_json(cls, json_str: str) -> 'UserProfile':
-        """Create UserProfile from JSON string."""
-        data = json.loads(json_str)
+    def from_json(cls, json_str: str) -> 'EnvProfile':
+        """
+        Deserialize a JSON string into a UserProfile object.
+
+        Args:
+            json_str (str): The JSON string representing a UserProfile.
+
+        Returns:
+            UserProfile: An instance of UserProfile reconstructed from the JSON string.
+        """
+        data = json.loads(json_str)  # ⭐ Parse the JSON string into a Python dictionary
         
         # Create task preference
         task_pref = TaskPreference(
@@ -165,7 +219,7 @@ class UserProfile:
         )
         
         # Create user profile
-        user_profile = cls(
+        env_profile = cls(
             name=data["name"],
             background=data["background"],
             task=task_pref
@@ -183,14 +237,22 @@ class UserProfile:
             )
             entities.append(entity)
         
-        user_profile.reg_entities(entities)
-        return user_profile
-    
+        env_profile.reg_entities(entities)  # ⭐ Register the entities with the user profile
+        return env_profile
+
     @classmethod
-    def load_from_json(cls, file_path: str) -> 'UserProfile':
-        """Load UserProfile from a JSON file."""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return cls.from_json(f.read())
+    def load_from_json(cls, file_path: str) -> 'EnvProfile':
+        """
+        Loads a UserProfile instance from a given JSON file.
+
+        Args:
+            file_path (str): The path to the JSON file containing the user profile data.
+
+        Returns:
+            UserProfile: An instance of UserProfile initialized with the data from the JSON file.
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:  # ⭐ Opens the file and prepares to read its contents
+            return cls.from_json(f.read())  # ⭐ Converts the JSON string into a UserProfile instance
 
 
 # ===== Example usage =====
@@ -217,7 +279,7 @@ if __name__ == "__main__":
 
     task_pref = TaskPreference(num_entities=2, num_opts=2, relation_difficulty=3)
 
-    user = UserProfile(
+    user = EnvProfile(
         name="Xiaoming",
         background="A music enthusiast who enjoys playing songs based on mood.",
         task=task_pref

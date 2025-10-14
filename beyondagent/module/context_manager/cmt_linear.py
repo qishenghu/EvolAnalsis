@@ -227,8 +227,9 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         # save basic
         assert len(self.full_context) == 0, "full_context should be empty when saving init input"
         for index, llm_msg in enumerate(init_input_arr):
-            if (index == len(init_input_arr) - 1) and add_nothink:
-                llm_msg['content'] += "\n/no_think"
+            if (index == len(init_input_arr) - 1):
+                if add_nothink:
+                    llm_msg['content'] += "\n/no_think"
             ext_msg = ExtendedMessage(
                 author="initialization",
                 role=llm_msg['role'],

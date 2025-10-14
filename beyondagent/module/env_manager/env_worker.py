@@ -18,21 +18,50 @@ class EnvWorker(object):
 
     def __init__(self, task: Task, instance_id: str = None, thread_index: int = None, tokenizer=None,
                  config: DictConfig = None):
-        self.config = config
-        self.env = EnvClient(base_url=config.env_service.env_url)
-        self.task = task
-        self.env_type: str = task.env_type
-        self.task_id: str = task.task_id
-        self.instance_id: str = instance_id if instance_id is not None else uuid.uuid4().hex
-        self.thread_index: int = thread_index
-        self.tokenizer = tokenizer
+        """
+        Initializes the EnvWorker with the provided task, configuration, and other optional parameters.
+
+        Args:
+            task (Task): The task object that contains the details of the task to be executed.
+            instance_id (str, optional): A unique identifier for the instance. If not provided, a new UUID will be generated.
+            thread_index (int, optional): The index of the thread if this worker is part of a multi-threaded setup.
+            tokenizer (optional): The tokenizer to be used for processing text.
+            config (DictConfig, optional): The configuration settings for the environment and other components.
+        """
+        self.config = config  # Store the provided configuration
+        self.env = EnvClient(base_url=config.env_service.env_url)  # Initialize the environment client
+        self.is_open_query = task.open_query # open query has no clear stop conditions, so we allow agent to decide when to stop.
+        self.task = task  # Store the task object
+        self.env_type: str = task.env_type  # Set the environment type based on the task
+        self.task_id: str = task.task_id  # Set the task ID
+        self.instance_id: str = instance_id if instance_id is not None else uuid.uuid4().hex  # Set or generate the instance ID
+        self.thread_index: int = thread_index  # Set the thread index
+        self.tokenizer = tokenizer  # Store the tokenizer
 
     def execute(self, data_id: str, rollout_id: str, add_exp: bool, task_train_exp_mode: str,agent_flow: BaseAgentFlow, tmux:dict,stop:list[bool], system_prompt: Optional[str] = None, **kwargs) -> Trajectory:    # add add_exp & task_train_exp_mode by ANNI
-        trajectory: Trajectory = Trajectory(data_id=data_id, rollout_id=rollout_id, steps=[], query="")
+        """
+        Executes the task in the environment, generates a trajectory, and returns it.
+
+        Args:
+            data_id (str): The unique identifier for the data.
+            rollout_id (str): The unique identifier for the rollout.
+            add_exp (bool): Flag indicating whether to add experience.
+            task_train_exp_mode (str): The mode for training experience.
+            agent_flow (BaseAgentFlow): The agent flow to execute the task.
+            tmux (dict): TMUX configuration.
+            stop (list[bool]): List of flags to indicate stopping conditions.
+            system_prompt (Optional[str]): Custom system prompt to be inserted.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Trajectory: The generated trajectory from the task execution.
+        """
+        trajectory: Trajectory = Trajectory(data_id=data_id, rollout_id=rollout_id, steps=[], query="")  # ⭐ Initialize the trajectory object
         try:
             init_response = self.env.create_instance(env_type=self.env_type,
                                                     task_id=self.task_id,
-                                                    instance_id=self.instance_id)
+                                                    instance_id=self.instance_id,
+                                                    params={'is_open_query': self.is_open_query})
 
             init_messages: list[dict] = init_response["state"]
             assert isinstance(init_messages, list) and len(init_messages)==2, "init_messages must be list and its length must be 2"
@@ -42,7 +71,7 @@ class EnvWorker(object):
                 init_messages[-1]["content"] = self.task.query
             else:
                 self.task.query = init_messages[-1]["content"]
-            
+
             # insert custom system prompt
             if system_prompt is not None:
                 # FIXME quick fix for test
@@ -83,7 +112,7 @@ class EnvWorker(object):
                 query=self.task.query,
                 add_exp=add_exp,
                 **kwargs
-            )
+            )  # ⭐ Execute the task and generate the trajectory
             self.env.release_instance(self.instance_id)
 
         except Exception as e:

@@ -1,6 +1,6 @@
 from typing import Optional, Sequence
 
-from beyondagent.module.task_manager.user_profiles import UserProfile
+from beyondagent.module.task_manager.env_profiles import EnvProfile
 from beyondagent.schema.task import Task, TaskObjective
 
 
@@ -119,7 +119,7 @@ User may asks questions like `[USER_QUESTION]`. You may explore related informat
 
 
 def get_agent_interaction_system_prompt(
-    profile:UserProfile | None
+    profile:EnvProfile | None
 ) -> str:
     """获取环境交互系统提示"""
     if profile is not None:
