@@ -130,7 +130,6 @@ python3 -m beyondagent.main_ppo \
     task_manager.n=0 \
     task_manager.train_data_path=/mnt/data/zouanni.zan/synthetic_data/tasks_explored.train.appworld0909_1.json \
     task_manager.mixture.synthetic_data_ratio=99999.0 \
-    task_manager.mixture.original_data_ratio=0.0 \
     task_manager.mixture.use_original_tasks=True \
     task_manager.grader.synthetic_grader=llm-binary-gt-no_constraint \
     task_manager.llm_client=qwen3-235b-a22b-instruct-2507 \

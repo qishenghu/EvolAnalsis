@@ -58,7 +58,6 @@ task_manager:
 
   mixture:
     use_original_tasks: True
-    original_data_ratio: 1.0
     synthetic_data_ratio: 0.0
     shuffle: True
 

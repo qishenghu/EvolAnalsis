@@ -55,12 +55,12 @@ def parse_args():
         help='Path to configuration file'
     )
     parser.add_argument('--with-appworld',
-        action='store_true',
+        action='store_true',  # Changed from store_true to action='store_true'
         default=False,
         help='Launch appworld'
     )
     parser.add_argument('--with-webshop',
-        action='store_true',
+        action='store_true',  # Changed from store_true to action='store_true'
         default=False,
         help='Launch webshop'
     )
@@ -75,17 +75,17 @@ def parse_args():
         help='Launch exp maker'
     )
     parser.add_argument('--with-logview',
-        action='store_true',
+        action='store_true',  # Changed from store_true to action='store_true'
         default=False,
         help='Launch logview'
     )
     parser.add_argument('--with-crafters',
-        action='store_true',
+        action='store_true',  # Changed from store_true to action='store_true'
         default=False,
         help='Launch Crafters Env Simulation'
     )
     parser.add_argument('--reboot',
-        action='store_true',
+        action='store_true',  # Changed from store_true to action='store_true'
         default=False,
         help='reboot flag'
     )
