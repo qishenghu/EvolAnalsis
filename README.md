@@ -24,17 +24,17 @@ improve their capabilities, aiming for efficient, cost-effective, and continuous
 
 ## 📰 News
 
-- **[2025-10]** 🎉🎉 AgentEvolver Technical Report is released now!
-- **[2025-10]** 🎉🎉 AgentEvolver v1 is released now!
+- **[2025-10]** 📄 The AgentEvolver Technical Report is now available, detailing the framework’s architecture, methodology, and key findings.
+- **[2025-10]** 🧩 AgentEvolver v1 has been released now!
 
 
-## 🧠 Why AgentEvolver
+## ✨ Why AgentEvolver
 
 <p align="center">
  <img src="docs/img/flowchart.png" alt="AgentEvolver Logo" width="80%">
 </p>
 
-🧠 **Self-Evolving Mechanisms** from Environment to Policy:
+🧠 Three **Self-Evolving Mechanisms** from Environment to Policy:
 
 - **Automatic Task Generation (Self-Questioning)** – Explore the environment and autonomously create diverse tasks, eliminating costly manual dataset construction.  
 - **Experience-guided Exploration (Self-Navigating)** – Summarize and reuse cross-task experience, guiding higher-quality rollouts and improving exploration efficiency.  
