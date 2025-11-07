@@ -11,12 +11,12 @@ At the core of the framework, the **Experience Manager** oversees all aspects of
 4. **Training Loss Management** – Aggregating and processing losses with respect to experience-based adjustments for stable learning.
 
 ## 🧩 Core Features
-The Self-Navigating framework enhances reinforcement learning by transforming how agents **create, reuse, and refine experiences**.
+The `Self-Navigating` framework enhances reinforcement learning by transforming how agents **create, reuse, and refine experiences**.
 It introduces structured mechanisms that make exploration **more efficient**, **context-aware**, and **self-evolving**.
 
 At its core are two classes:
 
-- **`ExperienceManager`** — handles experience scheduling, allocation, and pool updates.  
+- **`ExperienceManager`** — handles experience scheduling and allocation.  
 - **`ExperienceWorker`** — manages context injection during rollout and cleanup during training.
 
 
@@ -30,7 +30,7 @@ This module performs two levels of adaptive allocation:
 
 - **Task-Level Allocation**  
     - Determines whether each training task should **keep** or **discard** experience.
-    - Controlled by `train_sample_expmode`:  
+    - Controlled by `train_sample_mode`:  
         - `"allkeep"` → all tasks retain experience  
         - `"alldiscard"` → all tasks discard experience  
         - `"hybrid"` → keep ratio controlled by `train_sample_keepratio`
@@ -39,22 +39,25 @@ This module performs two levels of adaptive allocation:
 ```python
 # Class: ExperienceManager
 # Function: allocate_train_mode()
-expmode_to_ratio = {
+mode_to_ratio = {
     "allkeep": 1.0,
     "alldiscard": 0.0,
     "hybrid": self.train_sample_keepratio
 }
-keep_ratio = expmode_to_ratio.get(self.train_sample_expmode, self.train_sample_keepratio)
+keep_ratio = mode_to_ratio.get(
+    self.train_sample_mode, self.train_sample_keepratio
+)
+keep_count = int(len(tasks) * keep_ratio)
 exp_modes = ['keep'] * keep_count + ['discard'] * (len(tasks) - keep_count)
 ```
 
 - **Rollout-Level Allocation**
     - Determines the proportion of rollouts within one task that will **include experience**.
-    - Controlled by `val_rollout_expmode` and `train_rollout_expmode`:
+    - Controlled by `val_rollout_mode` and `train_rollout_mode`:
         - `"woexp"` → no rollout uses experience (pure exploration) 
         - `"all"` → all rollouts use experience (fully guided) 
-        - `"mixed"` → *partially guided*, rollout experience usage ratio determined by `rollout_expratio`
-    - The parameter `rollout_expratio` only takes effect when `val_rollout_expmode/train_rollout_expmode="mixed"`. For example, `rollout_expratio=0.3` means *30%* of rollouts will include experience, while the remaining *70%* proceed without it.
+        - `"mixed"` → *partially guided*, rollout experience usage ratio determined by `rollout_ratio`
+    - The parameter `rollout_ratio` only takes effect when `val_rollout_mode/val_rollout_mode="mixed"`. For example, `rollout_expratio=0.3` means *30%* of rollouts will include experience, while the remaining *70%* proceed without it.
 
 ```python
 # Class: ExperienceManager
@@ -71,11 +74,11 @@ add_exp_choices = {
 
 **✅Effect**:
 
-- `train_sample_expmode` controls how experience is used in training samples.
+- `train_sample_mode` controls how experience is used in training samples.
 
--  `val_rollout_expmode/train_rollout_expmode` defines the exploration regime (`woexp` / `mixed` / `all`).
+-  `val_rollout_mode/train_rollout_mode` defines the exploration regime (`woexp` / `mixed` / `all`).
 
-- `rollout_expratio` refines `mixed` mode by determining how many rollouts reuse experience.
+- `rollout_ratio` refines `mixed` mode by determining how many rollouts reuse experience.
 
 Together, they enable dynamic balancing between exploration and exploitation.
 
@@ -93,11 +96,12 @@ Convert raw trajectories into summarized experiences **asynchronously**, ensurin
 - Stores summarized results in the shared experience pool.
 
 ```python
-# Class: ExperienceManager
-# Function: update_experience_pool()
+# ba_ray_trainer.py
 summary_task = self.thread_pool.submit(
-    self.em_client.call_summarizer, trajectories=trajectories
-)
+    self.em_client.call_summarizer,
+    trajectories=trajectories,
+    workspace_id=reme_config.workspace_id
+    )
 ```
 
 
@@ -120,9 +124,14 @@ Make rollouts context-aware by injecting relevant past experiences into prompts.
 ```python
 # Class: ExperienceWorker
 # Function: manage_rollout_context()
-history_exp = self.em_client.call_context_generator(trajectory)
-formatted_exp = self.experience_template.format(history_exp)
-trajectory.steps[-1]["content"] = formatted_exp + trajectory.steps[-1]["content"]
+history_experience = self.em_client.call_context_generator(
+    trajectory=trajectory,
+    retrieve_top_k=reme_config.retrieve_top_k,
+    workspace_id=reme_config.workspace_id
+    )
+formatted_experience = self.experience_template.format(history_experience)
+new_content = formatted_experience + trajectory.steps[-1]["content"]
+trajectory.steps[-1]["content"] = new_content
 ```
 
 
@@ -203,109 +212,188 @@ pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=lo
 
 ## ⚙️ Key Parameters & Configuration
 
-### **1. Experience Maker (`experience_maker` submodule)**
+### Rollout Modes
 
-**`base_url`** (*str*)  
-: The endpoint of the **Experience Maker service**, responsible for summarization and retrieval.  
-Example: `"http://127.0.0.1:8001"`.
+**`train_rollout_mode`** (*str*)  
+: Controls how experiences are used during **training rollouts**.  
+Options:  
+- `"woexp"` → rollouts without any experience guidance (pure exploration)  
+- `"mixed"` → partially inject experiences based on `rollout_ratio`  
+- `"all"` → all rollouts include retrieved experiences  
+Default: `"woexp"`.
 
-**`workspace_id`** (*str*)  
-: Identifier for the current workspace. Each workspace maintains an isolated experience pool.  
-Default: `"default"`.
+**`val_rollout_mode`** (*str*)  
+: Controls how experiences are used during **validation/test rollouts**.  
+Same options as `train_rollout_mode`. Typically set to `"woexp"` for unbiased evaluation.  
+Default: `"woexp"`.
 
-**`enable_summarizer`** (*bool*)  
-: Whether to enable **asynchronous summarization** of raw trajectories into experience snippets.  
-`True` enables automatic knowledge distillation from rollouts.
-
-**`enable_context_generator`** (*bool*)  
-: Whether to enable **experience retrieval and context injection** during rollouts.  
-When `True`, the system fetches top-k relevant experiences and prepends them to rollout prompts.
-
-**`retrieve_top_k`** (*int*)  
-: The number of top relevant experiences retrieved per rollout when `enable_context_generator=True`.  
-Default: `3`.
-
-**`updated_freq`** (*int*)  
-: Frequency (in training steps) for updating the experience pool.  
-`0` disables periodic updates.
-
-**`val_summarizer_save`** (*bool*)  
-: Whether to save summarized experiences during validation.  
-Recommended to be `True` when analyzing model generalization or debugging experience evolution.
+**`rollout_ratio`** (*float*, range: [0.0, 1.0])  
+: When rollout mode is `"mixed"`, this ratio determines the proportion of rollouts that include experience.  
+Example: `0.3` means 30% experience-guided, 70% exploratory.  
+Default: `0.0`.
 
 ---
 
-### **2. Experience Manager (`exp_manager` submodule)**
+### **Training Sample Processing**
 
-**`val_rollout_expmode`** (*str*)  
-: Controls experience usage in **validation rollouts**.  
+**`train_sample_mode`** (*str*)  
+: Defines whether to keep or discard experience context in **training samples** after rollout.  
 Options:  
-- `"woexp"` → no experience (pure evaluation)  
-- `"mixed"` → partial experience injection (ratio defined by `rollout_expratio`)  
-- `"all"` → all rollouts use experience  
+- `"allkeep"` → all samples retain experience information  
+- `"alldiscard"` → strip experience from all samples (model learns from raw reasoning)  
+- `"hybrid"` → selective retention based on `train_sample_keepratio`  
+Default: `"alldiscard"`.
 
-**`train_rollout_expmode`** (*str*)  
-: Same as `val_rollout_expmode` but applies to **training rollouts**.  
-This parameter switches between unguided exploration (`woexp`) and experience-guided rollout (`mixed` or `all`).
-
-**`rollout_expratio`** (*float*)  
-: Ratio of rollouts that include experience when `train_rollout_expmode` or `val_rollout_expmode` is set to `"mixed"`.  
-Example: `0.3` means 30% of rollouts reuse experience; 70% remain exploratory.  
-Default: `0.0`.
-
-**`train_sample_expmode`** (*str*)  
-: Defines how **training samples** handle experience after rollout.  
-Options:  
-- `"allkeep"` → retain all experience information  
-- `"alldiscard"` → strip all experience context  
-- `"hybrid"` → partial retention (ratio by `train_sample_keepratio`)  
-
-**`train_sample_keepratio`** (*float*)  
-: When `train_sample_expmode="hybrid"`, controls the proportion of training samples that keep experience.  
+**`train_sample_keepratio`** (*float*, range: [0.0, 1.0])  
+: When `train_sample_mode="hybrid"`, controls the **task-level** proportion of samples that retain experience.  
 Default: `1.0`.
 
+---
+
+### **Experience Retrieval & Injection**
+
 **`experience_template`** (*str*)  
-: Template used to insert retrieved experiences into rollout messages.  
-The `{}` placeholder is replaced by formatted experience text.  
-Example:  `"\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"`
+: Template string for wrapping retrieved experiences before injecting into prompts.  
+The `{}` placeholder is replaced with formatted experience content.  
+Example: `"\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"`
 
-**`init_experience_before_training`** (*bool*)  
-: Whether to **initialize the experience pool** before training starts.  
-Useful when preloading prior knowledge for warm-start training.
+**`retrieve_top_k`** (*int*)  
+: Number of most relevant experiences to retrieve per query when `enable_context_generator=True`.  
+Default: `3`.
 
-**`init_experience_only`** (*bool*)  
-: If `True`, the system only initializes the experience pool without starting training.  
-Ideal for precomputing embeddings or testing summarization quality.
+---
+
+### **ReMe Service Configuration**
+
+**`base_url`** (*str*)  
+: HTTP endpoint of the **ReMe service** (Reflective Memory Engine).  
+Handles experience summarization, storage, and retrieval.  
+Example: `"http://127.0.0.1:8001"`.
+
+**`workspace_id`** (*str*)  
+: Unique identifier for the experience workspace. Different workspaces maintain isolated experience pools.  
+Default: `"default"`.
+
+**`enable_summarizer`** (*bool*)  
+: Whether to activate **automatic experience summarization** from rollout trajectories.  
+When `True`, raw reasoning traces are distilled into reusable experience snippets.  
+Default: `False`.
+
+**`enable_context_generator`** (*bool*)  
+: Whether to enable **experience retrieval and context injection** during rollouts.  
+Must be `True` for experience-guided rollouts to function.  
+Default: `False`.
+
+**`updated_freq`** (*int*)  
+: Frequency (in training steps) to refresh the experience pool.  
+Set to `0` to disable periodic updates.  
+Default: `0`.
+
+---
+
+### **Initialization & Utilities**
+
+**`init_exp_before_training`** (*bool*)  
+: Whether to **pre-populate the experience pool** before training begins.  
+Useful for warm-start scenarios with prior knowledge.  
+Default: `False`.
+
+**`init_exp_only`** (*bool*)  
+: If `True`, only initializes the experience pool without starting training.  
+Useful for pre-computing embeddings or validating summarization quality.  
+Default: `False`.
+
+**`summary_batch_size`** (*int*)  
+: Batch size for processing experience summarization requests.  
+Larger values improve throughput but require more memory.  
+Default: `8`.
 
 
 ## 🧭 Quick Start & Recommended Configuration
 
-### **Step 1: Set ReMe Service**
-[TODO]
+### Step 1: Set Up ReMe Service
 
-### **Step 2: Recommended Configuration**
+1. Ensure you have completed the [ReMe installation](https://github.com/agentscope-ai/ReMe?tab=readme-ov-file#%EF%B8%8F-installation);
 
-```yaml
-experience_maker:
-  base_url: "http://127.0.0.1:8001"         # Experience Maker service endpoint
-  workspace_id: "default"                   # Unique workspace identifier
-  enable_summarizer: False                  # Enable async summarization of trajectories
-  enable_context_generator: False           # Enable retrieval & context injection during rollout
-  retrieve_top_k: 3                         # Number of top relevant experiences retrieved per rollout
-  updated_freq: 0                           # Update frequency of experience pool (every k steps; 0 = disabled)
-  val_summarizer_save: False                # Save summarized experiences during validation
+2. Ensure you have modified the [environment configuration](https://github.com/agentscope-ai/ReMe?tab=readme-ov-file#environment-configuration);
 
-exp_manager:
-  val_rollout_expmode: "woexp"              # Validation rollout mode: ["woexp"=no exp, "mixed"=partial, "all"=full]
-  train_rollout_expmode: "mixed"            # Training rollout mode: ["woexp", "mixed", "all"]
-  rollout_expratio: 0.5                     # Ratio of rollouts using experience in "mixed" mode (e.g., 0.5 = 50%)
-  train_sample_expmode: "alldiscard"        # How to handle experience in training samples: ["allkeep", "alldiscard", "hybrid"]
-  train_sample_keepratio: 0.0               # Keep ratio for "hybrid" mode (0.0 = discard all)
-  experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"  # Experience insertion format
-  init_experience_before_training: True     # Initialize experience pool before training starts
-  init_experience_only: False               # Only initialize experience pool (no training)
+3. Start the ReMe service with the following command:
 
+```bash
+cd path_to_reme/ReMe
+
+reme \
+  config=default \
+  backend=http \
+  thread_pool_max_workers=256 \
+  http.host="127.0.0.1" \
+  http.port=8001 \
+  http.limit_concurrency=256 \
+  llm.default.model_name=qwen-max-2025-01-25 \
+  embedding_model.default.model_name=text-embedding-v4 \
+  vector_store.default.backend=local \
+  op.rerank_memory_op.params.enable_llm_rerank=false \
+  flow.summary_task_memory.flow_content="trajectory_preprocess_op >> (success_extraction_op|failure_extraction_op|comparative_extraction_op) >> memory_validation_op >> memory_deduplication_op >> update_vector_store_op"
 ```
 
 
-  [TODO: more details about experience pool initialization & experience pool example]
+### **Step 2: Recommended Configuration**
+Add the following configuration to your experiment settings:
+```yaml
+exp_manager:
+  val_rollout_mode: "woexp"    # rollout mode on dev/test set: ["mixed", "all", "woexp"]
+  train_rollout_mode: "mixed"  # rollout mode on train set: ["mixed", "all", "woexp"]
+  rollout_ratio: 0.5           # ratio of adding experience within group during rollout
+  train_sample_mode: "alldiscard"    # sample mode after train rollout: ["allkeep", "alldiscard", "hybrid"]
+  train_sample_keepratio: 0.0     # task-level ratio for keeping experience
+  experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"  # template for inserting experience
+  init_exp_before_training: True  # whether to init experience pool before training
+  init_exp_only: False  # whether to only init experience pool
+  summary_batch_size: 8  # batch size for experience summarization
+  reme:
+    base_url: "http://127.0.0.1:8001"  # base URL for ReMe service
+    workspace_id: "default"  # workspace ID for ReMe
+    enable_summarizer: True  # whether to enable experience summarizer
+    enable_context_generator: True  # whether to enable context generator
+    retrieve_top_k: 3  # number of top experiences to retrieve
+    updated_freq: 0   # experience pool update frequency (in steps, 0=disabled)
+```
+
+### **Step 3: Understanding Different Usage Modes**
+
+The experience pool system supports multiple usage modes to fit different experimental needs. Configure the parameters according to the table below:
+
+#### Mode Descriptions
+
+| Usage Mode | Description |
+|---|---|
+| **No Pool** | Training without any experience pool (baseline mode) |
+| **Init Only** | Initialize experience pool from trajectories only, without using it during training |
+| **Init + Train** | Initialize experience pool before training and use it throughout the training process |
+| **Init + Train + Update** | Initialize experience pool, use during training, and continuously update it with new experiences |
+| **Exist + Train** | Use an existing experience pool during training without initialization or updates |
+| **Exist + Train + Update** | Use an existing experience pool during training and continuously update it with new experiences |
+
+
+
+#### Configuration Matrix
+
+|  | No<br>Pool | Init<br>Only | Init +<br>Train | Init + Train<br>+ Update | Exist +<br>Train | Exist + Train<br>+ Update |
+|---|---|---|---|---|---|---|
+| `updated_freq` | 0 | 0 | 0 | k != 0 | 0 | k != 0 |
+| `init_exp_only` | False | True | False | False | False | False |
+| `init_exp_before_training` | False | True | True | True | False | False |
+| `enable_summarizer` | False | True | False | True | False | True |
+| `enable_context_generator` | False | False | True | True | True | True |
+| `workspace_id` | - | New ID | New ID | New ID | Exist ID | Exist ID |
+
+#### Configuration Notes
+
+- **`updated_freq`**: Set to a non-zero value (e.g., `100`) to enable periodic experience pool updates during training. `0` disables updates.
+
+- **`workspace_id`**: 
+  - Use a **new workspace ID** to create a fresh experience pool
+  - Specify an **existing workspace ID** to reuse a previously created pool
+  - When using `vector_store.default.backend=local`, the experience pool is saved at: `ReMe/local_vector_store/{workspace_id}.jsonl`
+
+- **Recommended starting point**: For most use cases, we recommend starting with **`Init + Train`** mode.
