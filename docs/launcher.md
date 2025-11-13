@@ -130,7 +130,7 @@ Use `--db` to enable post-mortem debugging and set tag-based conditional breakpo
 Then, inside your code, import the helper from `vsdb.py`:
 
 ```python
-from beyondagent import bp
+from agentevolver import bp
 
 def some_function():
    bp("tag")  # hits only if "tag" is in DEBUG_TAGS and RAY_DEBUG_POST_MORTEM is set
