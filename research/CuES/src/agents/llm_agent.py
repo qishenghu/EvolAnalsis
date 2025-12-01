@@ -41,30 +41,6 @@ class LLMAgent:
             logger.error(f"Failed to get next action: {e}")
             return None, None
     
-    # def get_next_action_with_reflection(self, observation: str, task_description: str,
-    #                                   query: str, history: List[str], 
-    #                                   previous_observations: List[str], ground_truth: str) -> Optional[str]:
-    #     """Get next action using reflection strategy"""
-    #     try:
-    #         prompt = self.prompts.reflection_action_prompt(
-    #             observation=observation,
-    #             task_description=task_description,
-    #             query=query,
-    #             action_history=history,
-    #             observation_history=previous_observations,
-    #             ground_truth=ground_truth
-    #         )
-            
-    #         response = self.client.chat_with_retry(prompt)
-    #         action = parse_action_from_response(response)
-            
-    #         logger.debug(f"Generated reflection action: {action}")
-    #         return action
-            
-    #     except Exception as e:
-    #         logger.error(f"Failed to get reflection action: {e}")
-    #         return None
-    
     def _extract_action(self, response: str) -> Optional[str]:
         """Extract action from LLM response"""
         if not response:
