@@ -1,0 +1,23 @@
+[project]
+name = "agentenv_aime"
+version = "0.0.1"
+description = "AIME Math Reasoning Environment"
+authors = [
+    {name = "EvolCL", email = ""}
+]
+dependencies = [
+    "tensordict==0.5.0",
+    "fastapi",
+    "uvicorn[standard]",
+    "datasets",
+]
+requires-python = ">=3.10,<3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project.scripts]
+aime = "agentenv_aime:launch"

@@ -535,11 +535,21 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 logger.warning("using test_normal as val dataset")
                 num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="test_normal")
             else:
-                for split in ['val','dev']:
+                # For AlfWorld, val and dev both return test set (200 tasks)
+                # So we only need to load once to avoid duplicates
+                if self.config.env_service.env_type == "alfworld":
+                    # Only load from 'val' split (which now returns test set)
                     try:
-                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split=split)
+                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="val")
                     except:
-                        logger.warning(f"failed to load val dataset from environment, split={split}. this may be *normal* if your dataset is split into train/dev")    
+                        logger.warning(f"failed to load val dataset from environment, split=val")
+                else:
+                    # For other environments, try both 'val' and 'dev'
+                    for split in ['val','dev']:
+                        try:
+                            num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split=split)
+                        except:
+                            logger.warning(f"failed to load val dataset from environment, split={split}. this may be *normal* if your dataset is split into train/dev")    
             
             assert num_loaded_val_tasks > 0, "failed to load val/dev dataset from environment"
         

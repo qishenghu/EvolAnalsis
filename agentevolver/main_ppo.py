@@ -156,10 +156,25 @@ def run_ppo(config) -> None:
     """
     if not ray.is_initialized():
         # this is for local ray cluster
+        # WandB configuration: use environment variables if set, otherwise use defaults
+        wandb_env_vars = {}
+        if os.environ.get("WANDB_API_KEY"):
+            wandb_env_vars["WANDB_API_KEY"] = os.environ.get("WANDB_API_KEY")
+        if os.environ.get("WANDB_BASE_URL"):
+            wandb_env_vars["WANDB_BASE_URL"] = os.environ.get("WANDB_BASE_URL")
+        # If WANDB_MODE is set, use it (e.g., "offline" for offline mode)
+        if os.environ.get("WANDB_MODE"):
+            wandb_env_vars["WANDB_MODE"] = os.environ.get("WANDB_MODE")
+        
         ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN",
-             "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true", "VLLM_USE_V1": "1", "WANDB_API_KEY": "local-e93291bd40698a593a1fcc5b99da6a71a753a383",
-             "WANDB_BASE_URL": "http://22.6.186.25:8080"}},
+            runtime_env={"env_vars": {
+                "TOKENIZERS_PARALLELISM": "true", 
+                "NCCL_DEBUG": "WARN", 
+                "VLLM_LOGGING_LEVEL": "WARN",
+                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true", 
+                "VLLM_USE_V1": "1",
+                **wandb_env_vars  # Add wandb env vars if set
+            }},
             num_cpus=config.ray_init.num_cpus,
         )  # ⭐ Initialize the Ray cluster with the specified runtime environment and number of CPUs
 

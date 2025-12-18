@@ -47,6 +47,17 @@ fi
 # ---- Step 7. Install FlashAttention packages ----
 echo
 echo "⚙️  Installing flash-attn libraries ..."
+# Fix cross-device link error by setting TMPDIR to same filesystem as cache
+# Use /data2 if available, otherwise use user's home directory
+if [[ -d "/data2" ]]; then
+    export TMPDIR="/data2/qisheng/tmp"
+    mkdir -p "$TMPDIR"
+    echo "Using TMPDIR=$TMPDIR (same filesystem as pip cache)"
+else
+    export TMPDIR="$HOME/tmp"
+    mkdir -p "$TMPDIR"
+    echo "Using TMPDIR=$TMPDIR"
+fi
 pip install --verbose flash-attn==2.7.4.post1 ring-flash-attn --no-build-isolation
 
 # ---- Step 8. Finish ----

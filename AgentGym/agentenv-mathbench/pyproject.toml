@@ -1,0 +1,21 @@
+[project]
+name = "agentenv_mathbench"
+version = "0.0.1"
+description = "MathBench single-choice reasoning environment"
+authors = [
+    {name = "EvolCL", email = ""}
+]
+dependencies = [
+    "fastapi",
+    "uvicorn",
+]
+requires-python = "~=3.9"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project.scripts]
+mathbench = "agentenv_mathbench:launch"

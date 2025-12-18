@@ -140,3 +140,7 @@ synthetic_data/*
 
 site
 launcher_record
+
+local_vector_store/
+
+AgentGym/agentenv-searchqa/retrieve_data/

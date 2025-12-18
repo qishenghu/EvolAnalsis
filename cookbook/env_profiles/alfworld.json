@@ -1,0 +1,11 @@
+{
+  "name": "alfworld_default",
+  "background": "A default environment profile for AlfWorld. This profile is not used when n=0 (no exploration).",
+  "task_preference": {
+    "num_entities": 1,
+    "num_opts": 1,
+    "relation_difficulty": 1
+  },
+  "entities": []
+}
+

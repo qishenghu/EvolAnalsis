@@ -69,6 +69,11 @@ def parse_args():
         default=False,
         help='Launch bfcl'
     )
+    parser.add_argument('--with-alfworld',
+        action='store_true',
+        default=False,
+        help='Launch AlfWorld'
+    )
     parser.add_argument('--with-reme',
         action='store_true',
         default=False,
@@ -101,6 +106,7 @@ def parse_args():
 def pty_launch(service_name: str, success_std_string="Starting server on"):
     service_path = os.environ.get(f'{service_name.upper()}_PATH')
     service_script = os.environ.get(f'{service_name.upper()}_SCRIPT')
+    print(f"full_argument_list: {service_script}")
     companion = LaunchCommandWhenAbsent(
         full_argument_list=[service_script],
         dir=service_path,
@@ -315,6 +321,12 @@ def main():
             raise FileNotFoundError(f"Configuration file not found: {exp_base}")
 
         env = os.environ.copy()
+        
+        # Set jieba cache directory to user-writable location to avoid permission errors
+        jieba_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jieba")
+        os.makedirs(jieba_cache_dir, exist_ok=True)
+        env["JIEBA_CACHE_DIR"] = jieba_cache_dir
+        
         if args.db:
             env["RAY_DEBUG_POST_MORTEM"] = "1"
             env["DEBUG_TAGS"] = args.db
@@ -326,6 +338,8 @@ def main():
     if args.with_reme:
         # test done
         pty_launch("reme", success_std_string="Uvicorn running on")
+        print("ReMe service started!!!!!!!!!!!!!!!!!!!!!!")
+        time.sleep(10)
 
     if args.with_appworld:
         # test done
@@ -341,6 +355,9 @@ def main():
 
     if args.with_bfcl:
         pty_launch("bfcl")
+
+    if args.with_alfworld:
+        pty_launch("alfworld")
 
     if args.with_logview:
 

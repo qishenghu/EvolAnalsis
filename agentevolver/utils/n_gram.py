@@ -22,6 +22,17 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
 
     def zipngram_chinese(text: str, ngram_size: int):
         import jieba
+        import os
+        
+        # Set jieba cache directory to user-writable location to avoid permission errors
+        jieba_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jieba")
+        os.makedirs(jieba_cache_dir, exist_ok=True)
+        jieba_cache_file = os.path.join(jieba_cache_dir, "jieba.cache")
+        
+        # Set cache file path before jieba initialization
+        if hasattr(jieba, 'dt'):
+            jieba.dt.cache_file = jieba_cache_file
+        
         text = preserve_chinese(text)
         seg_list = list(jieba.cut(text))
         # print(seg_list)

@@ -1,0 +1,22 @@
+[project]
+name = "agentenv_gpqa"
+version = "0.0.1"
+description = "GPQA-Diamond single-choice environment"
+authors = [
+    {name = "EvolCL", email = ""}
+]
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "datasets",
+]
+requires-python = ">=3.10,<3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project.scripts]
+gpqa = "agentenv_gpqa:launch"

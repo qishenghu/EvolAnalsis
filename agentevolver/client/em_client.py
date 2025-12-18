@@ -12,6 +12,12 @@ from agentevolver.utils.http_client import HttpClient
 class EMClient(HttpClient):
     base_url: str = Field(default="http://localhost:8001")
     timeout: int = Field(default=1200, description="request timeout, second")
+    
+    def __init__(self, **data):
+        # 设置默认重试次数为3，以应对 ReMe 服务的连接中断问题
+        if "retry_max_count" not in data:
+            data["retry_max_count"] = 3
+        super().__init__(**data)
 
     def call_context_generator(self, trajectory: Trajectory, retrieve_top_k: int = 1, workspace_id: str = "default",
                                **kwargs) -> str:
@@ -60,6 +66,26 @@ class EMClient(HttpClient):
         start_time = time.time()
 
         self.url = self.base_url + "/summary_task_memory"  # ⭐ Set the URL for the summarizer endpoint
+        
+        # 限制每次发送的轨迹数量，避免 payload 过大导致 ReMe 服务崩溃
+        # 如果轨迹太多，分批发送
+        max_trajectories_per_request = kwargs.get("max_trajectories_per_request", 50)
+        if len(trajectories) > max_trajectories_per_request:
+            logger.warning(f"Too many trajectories ({len(trajectories)}), splitting into batches of {max_trajectories_per_request}")
+            results = []
+            for i in range(0, len(trajectories), max_trajectories_per_request):
+                batch = trajectories[i:i + max_trajectories_per_request]
+                json_data = {
+                    "trajectories": [{"messages": x.steps, "score": x.reward.outcome} for x in batch],
+                    "workspace_id": workspace_id,
+                }
+                response = self.request(json_data=json_data, headers={"Content-Type": "application/json"})
+                if response is not None:
+                    results.append(response)
+                else:
+                    logger.warning(f"Batch {i//max_trajectories_per_request + 1} failed in call_summarizer")
+            return results, time.time() - start_time
+        
         json_data = {
             "trajectories": [{"messages": x.steps, "score": x.reward.outcome} for x in trajectories],
             "workspace_id": workspace_id,

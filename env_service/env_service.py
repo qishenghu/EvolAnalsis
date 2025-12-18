@@ -146,6 +146,11 @@ class EnvService:
         self.last_access_time = {}
         self.cleanup_interval = 300
         self.max_idle_time = 3600
+        # ⭐ For environments that support shared actors (like alfworld),
+        # maintain a pool of shared actors per env_type to avoid reloading
+        # mappings/games on every create_instance call.
+        self.shared_actors = {}  # {env_type: actor}
+        self.instance_env_types = {}  # {instance_id: env_type} - track env_type for each instance
 
     async def cleanup_inactive_instances(self):
         """
@@ -188,50 +193,79 @@ class EnvService:
         class RemoteEnv:
             """
             Remote environment class.
+            
+            For environments like alfworld that load large mappings/games at import time,
+            this class supports managing multiple env instances within a single actor to
+            avoid reloading on every create_instance call.
             """
 
-            def __init__(self, task_id, instance_id, params):
-                """Detailed init"""
-
+            def __init__(self):
+                """Initialize the remote env actor (without creating a specific env instance yet)."""
                 server_dir = os.path.abspath(
                     os.path.join(os.path.dirname(__file__), "..", ".."),
                 )
                 if server_dir not in sys.path:
                     sys.path.insert(0, server_dir)
+                
+                # Store env_type and module info for lazy initialization
+                self.env_type = env_type
+                self.env_module = None
+                self.envir_class = None
+                # Dictionary to store multiple env instances: {instance_id: env}
+                self.env_instances = {}
 
-                try:
-                    module = importlib.import_module(
-                        f"env_service.environments.{env_type}."
-                        f"{env_type}_env",
-                    )
-                    envir_class = getattr(
-                        module,
-                        f"{env_type.capitalize()}Env",
-                    )
-                    self.env = envir_class(task_id, instance_id, params)
-                except ImportError as e:
-                    print(f"Error importing {env_type}_env: {e}")
-                    raise
+            def _ensure_module_loaded(self):
+                """Lazy load the environment module (only once per actor)."""
+                if self.env_module is None:
+                    try:
+                        self.env_module = importlib.import_module(
+                            f"env_service.environments.{self.env_type}."
+                            f"{self.env_type}_env",
+                        )
+                        self.envir_class = getattr(
+                            self.env_module,
+                            f"{self.env_type.capitalize()}Env",
+                        )
+                    except ImportError as e:
+                        print(f"Error importing {self.env_type}_env: {e}")
+                        raise
 
-            def get_init_state(self, params):
+            def create_env_instance(self, task_id, instance_id, params):
+                """Create a new env instance within this actor."""
+                self._ensure_module_loaded()
+                env = self.envir_class(task_id, instance_id, params)
+                self.env_instances[instance_id] = env
+                return env
+
+            def get_init_state(self, instance_id, params):
                 """remote init state"""
-                return self.env.get_init_state(params)
+                if instance_id not in self.env_instances:
+                    raise ValueError(f"Env instance {instance_id} not found in this actor")
+                return self.env_instances[instance_id].get_init_state(params)
 
-            def step(self, action, params):
+            def step(self, instance_id, action, params):
                 """remote step"""
-                return self.env.step(action, params)
+                if instance_id not in self.env_instances:
+                    raise ValueError(f"Env instance {instance_id} not found in this actor")
+                return self.env_instances[instance_id].step(action, params)
 
-            def evaluate(self, messages, params):
+            def evaluate(self, instance_id, messages, params):
                 """remote eval"""
-                return self.env.evaluate(messages, params)
+                if instance_id not in self.env_instances:
+                    raise ValueError(f"Env instance {instance_id} not found in this actor")
+                return self.env_instances[instance_id].evaluate(messages, params)
 
-            def get_info(self, messages, params):
+            def get_info(self, instance_id, messages, params):
                 """remote get info"""
-                return self.env.get_info(messages, params)
+                if instance_id not in self.env_instances:
+                    raise ValueError(f"Env instance {instance_id} not found in this actor")
+                return self.env_instances[instance_id].get_info(messages, params)
 
-            def close(self):
+            def close(self, instance_id):
                 """remote close"""
-                return self.env.close()
+                if instance_id in self.env_instances:
+                    self.env_instances[instance_id].close()
+                    del self.env_instances[instance_id]
 
         self.remote_env[env_type] = RemoteEnv
         return RemoteEnv
@@ -282,10 +316,19 @@ class EnvService:
         try:
             if instance_id not in self.env_actors:
                 raise ValueError(f"Instance {instance_id} not found!")
-            return await self.env_actors[instance_id].get_info.remote(
-                messages,
-                params,
-            )
+            env_type = self.instance_env_types.get(instance_id)
+            # For shared actors (like alfworld), pass instance_id as first parameter
+            if env_type in ["alfworld"]:
+                return await self.env_actors[instance_id].get_info.remote(
+                    instance_id,
+                    messages,
+                    params,
+                )
+            else:
+                return await self.env_actors[instance_id].get_info.remote(
+                    messages,
+                    params,
+                )
         except Exception as e:
             print(f"Error in get_info: {str(e)}")
             raise
@@ -316,7 +359,7 @@ class EnvService:
         try:
             if instance_id is None:
                 instance_id = f"exp_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-
+            print(f"Creating env with instance_id: {instance_id}")
             env_remote_cls = self.get_remote_env_cls(env_type)
 
             print(
@@ -325,14 +368,35 @@ class EnvService:
                 f"instance_id: {instance_id}",
             )
 
-            if env_type == "webshop":
+            # ⭐ For environments that benefit from shared actors (like alfworld),
+            # reuse a single actor per env_type to avoid reloading mappings/games.
+            # For other environments (like webshop), create a new actor per instance.
+            if env_type in ["alfworld"]:
+                # Reuse shared actor for this env_type
+                if env_type not in self.shared_actors:
+                    self.shared_actors[env_type] = env_remote_cls.remote()
+                env_actor = self.shared_actors[env_type]
+                # Create env instance within the shared actor
+                await env_actor.create_env_instance.remote(task_id, instance_id, params)
+                init_state = await env_actor.get_init_state.remote(instance_id, params)
+            elif env_type == "webshop":
                 params["server"] = SIM_SERVER
                 env_actor = env_remote_cls.remote(task_id, instance_id, params)
+                self.env_actors[instance_id] = env_actor
+                init_state = await env_actor.get_init_state.remote(params)
             else:
+                # Default behavior: one actor per instance
                 env_actor = env_remote_cls.remote(task_id, instance_id, params)
+                self.env_actors[instance_id] = env_actor
+                init_state = await env_actor.get_init_state.remote(params)
 
-            self.env_actors[instance_id] = env_actor
-            init_state = await env_actor.get_init_state.remote(params)
+            # For shared actors, we still track instance_id -> actor mapping
+            # for step/evaluate/release operations
+            if env_type in ["alfworld"]:
+                self.env_actors[instance_id] = env_actor
+            
+            # Track env_type for each instance
+            self.instance_env_types[instance_id] = env_type
 
             self.update_access_time(instance_id)
 
@@ -372,10 +436,19 @@ class EnvService:
         try:
             if instance_id not in self.env_actors:
                 raise ValueError(f"Instance {instance_id} not found!")
-            data = await self.env_actors[instance_id].step.remote(
-                action,
-                params,
-            )
+            env_type = self.instance_env_types.get(instance_id)
+            # For shared actors (like alfworld), pass instance_id as first parameter
+            if env_type in ["alfworld"]:
+                data = await self.env_actors[instance_id].step.remote(
+                    instance_id,
+                    action,
+                    params,
+                )
+            else:
+                data = await self.env_actors[instance_id].step.remote(
+                    action,
+                    params,
+                )
             
             return data
 
@@ -408,10 +481,19 @@ class EnvService:
         try:
             if instance_id not in self.env_actors:
                 raise ValueError(f"Instance {instance_id} not found!")
-            return await self.env_actors[instance_id].evaluate.remote(
-                messages,
-                params,
-            )
+            env_type = self.instance_env_types.get(instance_id)
+            # For shared actors (like alfworld), pass instance_id as first parameter
+            if env_type in ["alfworld"]:
+                return await self.env_actors[instance_id].evaluate.remote(
+                    instance_id,
+                    messages,
+                    params,
+                )
+            else:
+                return await self.env_actors[instance_id].evaluate.remote(
+                    messages,
+                    params,
+                )
         except Exception as e:
             print(f"Error in evaluate: {str(e)}")
             raise
@@ -432,9 +514,19 @@ class EnvService:
         if instance_id not in self.env_actors:
             return False
         env_actor = self.env_actors[instance_id]
-        await env_actor.close.remote()
-        ray.kill(self.env_actors[instance_id])
+        env_type = self.instance_env_types.get(instance_id)
+        
+        # For shared actors (like alfworld), only close the specific instance,
+        # don't kill the entire actor
+        if env_type in ["alfworld"]:
+            await env_actor.close.remote(instance_id)
+            # Don't kill the shared actor, just remove the instance mapping
+        else:
+            await env_actor.close.remote()
+            ray.kill(self.env_actors[instance_id])
+        
         del self.env_actors[instance_id]
+        self.instance_env_types.pop(instance_id, None)
         self.last_access_time.pop(instance_id, None)
         return True
 
