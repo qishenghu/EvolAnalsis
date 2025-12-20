@@ -19,7 +19,7 @@ defaults:
 trainer:
   experiment_name: alfworld_qwen25-3b_grpo_expool
   project_name: alfworld_qwen25-3b
-  n_gpus_per_node: 2
+  n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 2
   save_freq: 1000
@@ -45,7 +45,7 @@ algorithm:
 # ============================================================================
 actor_rollout_ref:
   model:
-    path: Qwen/Qwen2.5-3B-Instruct
+    path: /data/code/exp/models/Qwen/Qwen2.5-3B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:

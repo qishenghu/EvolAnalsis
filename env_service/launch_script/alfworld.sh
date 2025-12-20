@@ -6,14 +6,14 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_SERVICE_DIR="$(dirname "$SCRIPT_DIR")"
 BEYONDAGENT_DIR="$(dirname "$(dirname "$ENV_SERVICE_DIR")")"
-AGENTGYM_ROOT="${AGENTGYM_ROOT:-$(cd "$BEYONDAGENT_DIR/AgentEvolver/AgentGym/agentenv-alfworld" && pwd)}"
+AGENTGYM_ROOT="${AGENTGYM_ROOT:-$(cd "$BEYONDAGENT_DIR/EvolAnalsis/AgentGym/agentenv-alfworld" && pwd)}"
 
 export AGENTGYM_ROOT
 export RAY_ENV_NAME=alfworld
 
 # Set ALFWORLD_DATA if not already set
 if [ -z "$ALFWORLD_DATA" ]; then
-    export ALFWORLD_DATA=~/.cache/alfworld
+    export ALFWORLD_DATA=/data/code/exp/alfworld
 fi
 
 echo "AGENTGYM_ROOT: $AGENTGYM_ROOT"

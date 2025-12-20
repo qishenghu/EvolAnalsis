@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 # 函数：kill占用指定端口的进程
 kill_port() {
@@ -29,10 +29,10 @@ kill_port() {
 }
 
 # 在启动主程序之前，先kill掉8081和8124端口的程序
-echo "Checking and killing processes on ports 8081 and 8124..."
-kill_port 8081
+# echo "Checking and killing processes on ports 8081 and 8124..."
+# kill_port 8081
 # kill_port 8124
 
 python launcher.py \
-  --conf config/alfworld_grpo.yaml \
-  --with-alfworld
+  --conf config/alfworld_grpo.yaml
+ # --with-alfworld
