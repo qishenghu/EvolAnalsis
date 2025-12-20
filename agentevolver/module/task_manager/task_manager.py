@@ -133,7 +133,7 @@ class TaskManager(object):
         assert all([x.query is None for x in self._tasks]), "query of seed task must be empty"
         logger.info(f"loaded tasks from dataset, #tasks={len(self._tasks)}")
 
-    def load_tasks_from_environment(self, env: EnvClient, *, env_type: str, split: str, params: Optional[dict] = None):
+    def load_tasks_from_environment(self, env: EnvClient, *, env_type: str, split: str, params: Optional[dict] = None, max_tasks: Optional[int] = None, shuffle: bool = True):
         """
         Loads tasks from a given environment and appends them to the internal task list.
 
@@ -148,6 +148,12 @@ class TaskManager(object):
         """
         try:
             response = env.get_env_profile(env_type, split, params)
+            if shuffle:
+                random.shuffle(response)
+            if max_tasks is not None and max_tasks > 0:
+                original_count = len(response)
+                response = response[:max_tasks]
+                logger.info(f"Limiting tasks from {original_count} to {len(response)} (max_tasks={max_tasks})")
             self._tasks.extend([Task(task_id=str(x),env_type=env_type,open_query=False,evaluator=self._reward_config["original_grader"]) for x in response])  # ⭐ Create Task objects from the response and add to the task list
             assert all([x.query is None for x in self._tasks]), "query of seed task must be empty"
             logger.info(f"loaded tasks from environment, #tasks={len(self._tasks)}")

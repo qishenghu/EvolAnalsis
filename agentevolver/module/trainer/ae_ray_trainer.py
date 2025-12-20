@@ -522,9 +522,12 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             assert isinstance(train_seed_dataset,RLHFDataset), "train_dataset must be RLHFDataset"
             self.train_task_manager.load_tasks_from_dataset(train_seed_dataset,env_type=self.config.env_service.env_type)
         else:
-            self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train")
-        # load val dataset
+            # self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train")
+            max_train_tasks = self.config.data.get("max_train_tasks", None)
+            shuffle = self.config.data.get("shuffle", True) # by default, shuffle the train tasks
+            self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train", max_tasks=max_train_tasks, shuffle=shuffle)
         
+        # load val dataset
         if self.config.data.val_files is not None:
             val_seed_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
             assert isinstance(val_seed_dataset,RLHFDataset), "train_dataset must be RLHFDataset"
@@ -533,14 +536,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             num_loaded_val_tasks = 0
             if 'val_on_test' in os.environ.get("DEBUG_ARG",'') or (self.config.data.val_type == 'test_normal' and self.config.env_service.env_type == "appworld"):
                 logger.warning("using test_normal as val dataset")
-                num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="test_normal")
+                num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="test_normal", shuffle=False)
             else:
                 # For AlfWorld, val and dev both return test set (200 tasks)
                 # So we only need to load once to avoid duplicates
                 if self.config.env_service.env_type == "alfworld":
                     # Only load from 'val' split (which now returns test set)
                     try:
-                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="val")
+                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="val", shuffle=False)
                     except:
                         logger.warning(f"failed to load val dataset from environment, split=val")
                 else:

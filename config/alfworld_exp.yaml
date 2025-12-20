@@ -114,6 +114,8 @@ data:
   val_files: null    # Load validation tasks from environment (200 test tasks)
   val_batch_size: 8
   val_type: "val"
+  max_train_tasks: 800
+  shuffle: true
 
 # ============================================================================
 # Environment Service Configuration - AlfWorld
