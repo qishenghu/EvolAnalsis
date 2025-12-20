@@ -1,0 +1,220 @@
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+# ============================================================================
+# AlfWorld GRPO Training Configuration
+# ============================================================================
+# This configuration is for training Qwen/Qwen2.5-3B-Instruct on AlfWorld
+# using GRPO with Experience Pool (ReMe), using only the 2420 training tasks
+# without generating synthetic tasks.
+# ============================================================================
+
+trainer:
+  experiment_name: alfworld_3b_grpo_exp
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 2
+  save_freq: 100
+  test_freq: 10
+  val_before_train: false
+  validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
+  rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
+  # Logger configuration: use wandb to sync training metrics
+  # Options: ["console"], ["wandb"], ["console", "wandb"], ["tensorboard"], etc.
+  logger: ["console", "wandb"]
+  # Optional: wandb proxy settings (if needed)
+  # wandb_proxy: "http://your-proxy:port"
+
+# ============================================================================
+# Algorithm Configuration
+# ============================================================================
+algorithm:
+  adv_estimator: grpo  # Use GRPO algorithm
+  use_kl_in_reward: false
+
+# ============================================================================
+# Model Configuration - Qwen/Qwen2.5-3B-Instruct
+# ============================================================================
+actor_rollout_ref:
+  model:
+    path: /data/code/exp/models/Qwen/Qwen2.5-3B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1e-6
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  rollout:
+    use_qwen3: false
+    enable_request_id: false
+    prompt_length: 20480
+    response_length: 4096
+    max_model_len: 25580
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: vllm
+    mode: async
+    gpu_memory_utilization: 0.6
+    n: 8
+    log_prob_max_token_len_per_gpu: 25580
+    val_kwargs:
+      n: 8
+    max_env_worker: 32
+    context_template: "linear"
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ""
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
+
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  train_batch_size: 8
+  max_prompt_length: 4000
+  max_response_length: 21580
+  filter_overlong_prompts: true
+  truncation: "error"
+  return_raw_chat: true
+  train_files: null  # Load tasks from environment (2420 training tasks)
+  val_files: null    # Load validation tasks from environment (200 test tasks)
+  val_batch_size: 8
+  val_type: "val"
+
+# ============================================================================
+# Environment Service Configuration - AlfWorld
+# ============================================================================
+env_service:
+  env_type: "alfworld"
+  env_url: "http://127.0.0.1:8081"
+
+# ============================================================================
+# Task Manager Configuration
+# ============================================================================
+# Configure to use only original tasks (2420 training tasks) without synthesis
+task_manager:
+  # Do not explore or generate synthetic tasks
+  n: 0  # 0 means no exploration/synthesis
+  # Use original tasks from environment
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0  # No synthetic tasks
+    shuffle: true
+  # Grader settings
+  grader:
+    original_grader: env  # Use environment's built-in evaluator
+    synthetic_grader: llm-binary-gt-no_constraint  # Not used since n=0
+  # Strategy settings (not used since n=0, but required)
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  # Other settings
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null  # Not used
+  val_data_path: null    # Not used
+  env_profile: cookbook/env_profiles/alfworld.json  # Placeholder (not used when n=0)
+
+# ============================================================================
+# Experience Pool (ReMe) Configuration
+# ============================================================================
+exp_manager:
+  # Rollout mode: "mixed" means use experience pool during rollout
+  train_rollout_mode: "mixed"
+  val_rollout_mode: "woexp"  # No experience for validation
+  # Ratio of adding experience within group during rollout
+  rollout_ratio: 0.5  # 50% of rollouts will use experience
+  # Sample mode after train rollout
+  train_sample_mode: "alldiscard"  # Discard all samples after rollout
+  train_sample_keepratio: 0.0
+  # Experience template for inserting experience
+  experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
+  # Initialize experience pool before training
+  init_exp_before_training: true
+  init_exp_only: false
+  # Batch size for experience summarization
+  summary_batch_size: 8
+  # ReMe (Experience Pool) service configuration
+  reme:
+    base_url: "http://127.0.0.1:8124"  # ReMe service URL
+    workspace_id: "alfworld_qwen25-3b_expool"  # Workspace ID for this experiment
+    enable_summarizer: true   # Enable experience summarization
+    enable_context_generator: true  # Enable experience retrieval
+    retrieve_top_k: 3  # Retrieve top 3 experiences
+    updated_freq: 0    # Update frequency (0 = disabled, update on demand)
+
+# ============================================================================
+# Attribution-Driven Credit Assignment (ADCA-GRPO) Configuration
+# ============================================================================
+# Optional: Enable ADCA-GRPO for better credit assignment
+attribution_driven_credit_assignment:
+  enable: false  # Set to true if you want to use ADCA-GRPO
+  evaluation_type: "api"
+  consistent_scale: 1.0
+  pos_unconsistent_scale: 0.2
+  neg_unconsistent_scale: -0.2
+  concurrent: 5
+  model: "qwen-plus"
+  api_max_retries: 200
+  llm_evaluation_log_dir: null
+  adca_grpo:
+    prm_scheme: "decouple"
+    do_batch_norm: true
+    equal_trajectory_weight: true
+    fix_base: 0.2
+    alpha_cosine_decay_enable: false
+    alpha: 0.1
+    alpha_min: 0.0
+    total_steps: 100
+    orm_distribution: last_step
+    enable_length_normalization: false
+    prm_steps: 100
+    skip_type: "none"
+    enable_adca_metric: false
+
+# ============================================================================
+# Thread Pool Configuration
+# ============================================================================
+thread_pool:
+  max_workers: 8
+
