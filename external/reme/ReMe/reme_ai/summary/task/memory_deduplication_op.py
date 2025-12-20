@@ -4,6 +4,7 @@ This module provides operations to remove duplicate or highly similar task
 memories by comparing embeddings and calculating similarity scores.
 """
 
+import asyncio
 from typing import List
 
 from flowllm.core.context import C
@@ -11,6 +12,7 @@ from flowllm.core.op import BaseAsyncOp
 from loguru import logger
 
 from reme_ai.schema.memory import BaseMemory
+from reme_ai.vector_store.update_vector_store_op import get_workspace_rw_lock
 
 
 @C.register_op()
@@ -82,34 +84,73 @@ class MemoryDeduplicationOp(BaseAsyncOp):
             logger.debug(f"Added unique task memory: {str(task_memory.when_to_use)[:50]}...")
 
         return unique_task_memories
+        
 
     async def _get_existing_task_memory_embeddings(self, workspace_id: str) -> List[List[float]]:
-        """Get embeddings of existing task memories"""
-        try:
-            if not hasattr(self, "vector_store") or not self.vector_store or not workspace_id:
-                return []
-
-            # Query existing task memory nodes
-            existing_nodes = await self.vector_store.async_search(
-                query="...",  # Empty query to get all
-                workspace_id=workspace_id,
-                top_k=self.op_params.get("max_existing_task_memories", 1000),
-            )
-
-            # Extract embeddings
-            existing_embeddings = []
-            for node in existing_nodes:
-                if hasattr(node, "embedding") and node.embedding:
-                    existing_embeddings.append(node.embedding)
-
-            logger.debug(
-                f"Retrieved {len(existing_embeddings)} existing task memory embeddings from workspace {workspace_id}",
-            )
-            return existing_embeddings
-
-        except Exception as e:
-            logger.warning(f"Failed to retrieve existing task memory embeddings: {e}")
+        """Get embeddings of existing task memories.
+        
+        Uses read lock to allow concurrent reads while preventing conflicts
+        with write operations. Includes retry mechanism for transient errors.
+        """
+        if not hasattr(self, "vector_store") or not self.vector_store or not workspace_id:
             return []
+
+        # Retry configuration
+        max_retries = 3
+        retry_delay = 0.5  # seconds
+        base_delay = 0.1  # base delay for exponential backoff
+        
+        # Get read lock for the workspace
+        rw_lock = await get_workspace_rw_lock(workspace_id)
+        read_lock = rw_lock.read_lock()
+        
+        for attempt in range(max_retries):
+            try:
+                async with read_lock:
+                    # Query existing task memory nodes
+                    existing_nodes = await self.vector_store.async_search(
+                        query="...",  # Empty query to get all
+                        workspace_id=workspace_id,
+                        top_k=self.op_params.get("max_existing_task_memories", 1000),
+                    )
+
+                    # Extract embeddings
+                    existing_embeddings = []
+                    for node in existing_nodes:
+                        if hasattr(node, "embedding") and node.embedding:
+                            existing_embeddings.append(node.embedding)
+
+                    logger.debug(
+                        f"Retrieved {len(existing_embeddings)} existing task memory embeddings from workspace {workspace_id}",
+                    )
+                    return existing_embeddings
+
+            except (OSError, IOError) as e:
+                # Check if it's the "Resource temporarily unavailable" error
+                # error_code = getattr(e, 'errno', None)
+                # if error_code == 11 or "Resource temporarily unavailable" in str(e):
+                    if attempt < max_retries - 1:
+                        # Exponential backoff with jitter
+                        delay = base_delay * (2 ** attempt) + retry_delay
+                        logger.warning(
+                            f"Resource temporarily unavailable when retrieving embeddings "
+                            f"(attempt {attempt + 1}/{max_retries}), retrying in {delay:.2f}s: {e}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        logger.warning(
+                            f"Failed to retrieve existing task memory embeddings after {max_retries} attempts: {e}"
+                        )
+                        return []
+            
+            except Exception as e:
+                # Other exceptions - log and return empty
+                logger.warning(f"Failed to retrieve existing task memory embeddings: {e}")
+                return []
+        
+        # Should not reach here, but return empty list as fallback
+        return []
 
     def _get_task_memory_embedding(self, task_memory: BaseMemory) -> List[float] | None:
         """Generate embedding for task memory"""

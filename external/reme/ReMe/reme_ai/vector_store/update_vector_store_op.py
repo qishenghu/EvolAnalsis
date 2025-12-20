@@ -11,7 +11,95 @@ from loguru import logger
 from reme_ai.schema.memory import BaseMemory
 
 
-_workspace_locks: Dict[str, asyncio.Lock] = {}
+class ReadWriteLock:
+    """A read-write lock implementation for asyncio.
+    
+    Allows multiple concurrent readers or a single exclusive writer.
+    Readers can proceed concurrently, but writers are exclusive.
+    """
+    
+    def __init__(self):
+        self._readers = 0
+        self._writer = False
+        self._lock = asyncio.Lock()
+        self._read_condition = asyncio.Condition(self._lock)
+        self._write_condition = asyncio.Condition(self._lock)
+    
+    async def acquire_read(self):
+        """Acquire a read lock. Multiple readers can hold this simultaneously."""
+        async with self._lock:
+            # Wait until no writer is active
+            while self._writer:
+                await self._read_condition.wait()
+            self._readers += 1
+    
+    async def release_read(self):
+        """Release a read lock."""
+        async with self._lock:
+            self._readers -= 1
+            if self._readers == 0:
+                # Notify waiting writers
+                self._write_condition.notify_all()
+    
+    async def acquire_write(self):
+        """Acquire a write lock. Exclusive - no readers or other writers allowed."""
+        async with self._lock:
+            # Wait until no readers and no writer
+            while self._readers > 0 or self._writer:
+                await self._write_condition.wait()
+            self._writer = True
+    
+    async def release_write(self):
+        """Release a write lock."""
+        async with self._lock:
+            self._writer = False
+            # Notify waiting readers and writers
+            self._read_condition.notify_all()
+            self._write_condition.notify_all()
+    
+    async def __aenter__(self):
+        """Async context manager entry for read lock."""
+        await self.acquire_read()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit for read lock."""
+        await self.release_read()
+    
+    class ReadLock:
+        """Context manager for read lock."""
+        def __init__(self, rw_lock: 'ReadWriteLock'):
+            self.rw_lock = rw_lock
+        
+        async def __aenter__(self):
+            await self.rw_lock.acquire_read()
+            return self
+        
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            await self.rw_lock.release_read()
+    
+    class WriteLock:
+        """Context manager for write lock."""
+        def __init__(self, rw_lock: 'ReadWriteLock'):
+            self.rw_lock = rw_lock
+        
+        async def __aenter__(self):
+            await self.rw_lock.acquire_write()
+            return self
+        
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            await self.rw_lock.release_write()
+    
+    def read_lock(self):
+        """Get a read lock context manager."""
+        return self.ReadLock(self)
+    
+    def write_lock(self):
+        """Get a write lock context manager."""
+        return self.WriteLock(self)
+
+
+_workspace_locks: Dict[str, ReadWriteLock] = {}
 _locks_lock: asyncio.Lock = None
 
 def _get_locks_lock() -> asyncio.Lock:
@@ -19,6 +107,24 @@ def _get_locks_lock() -> asyncio.Lock:
     if _locks_lock is None:
         _locks_lock = asyncio.Lock()
     return _locks_lock
+
+
+async def get_workspace_rw_lock(workspace_id: str) -> ReadWriteLock:
+    """Get or create a read-write lock for a workspace.
+    
+    This function is async-safe and can be called from multiple coroutines.
+    
+    Args:
+        workspace_id: The workspace ID to get the lock for.
+        
+    Returns:
+        The ReadWriteLock instance for the workspace.
+    """
+    locks_lock = _get_locks_lock()
+    async with locks_lock:
+        if workspace_id not in _workspace_locks:
+            _workspace_locks[workspace_id] = ReadWriteLock()
+        return _workspace_locks[workspace_id]
 
 
 
@@ -31,13 +137,14 @@ class UpdateVectorStoreOp(BaseAsyncOp):
     to delete and insert from the context response metadata.
     """
     
-    async def _get_workspace_lock(self, workspace_id: str) -> asyncio.Lock:
-        locks_lock = _get_locks_lock()
-        async with locks_lock:
-            if workspace_id not in _workspace_locks:
-                _workspace_locks[workspace_id] = asyncio.Lock()
-            return _workspace_locks[workspace_id]
-
+    async def _get_workspace_write_lock(self, workspace_id: str) -> ReadWriteLock.WriteLock:
+        """Get a write lock for the workspace.
+        
+        This method uses the read-write lock mechanism to ensure exclusive
+        access for write operations (insert/delete).
+        """
+        rw_lock = await get_workspace_rw_lock(workspace_id)
+        return rw_lock.write_lock()
 
     async def async_execute(self):
         """Execute the vector store update operation.
@@ -62,9 +169,9 @@ class UpdateVectorStoreOp(BaseAsyncOp):
         """
         workspace_id: str = self.context.workspace_id
 
-        workspace_lock = await self._get_workspace_lock(workspace_id)
+        write_lock = await self._get_workspace_write_lock(workspace_id)
 
-        async with workspace_lock:
+        async with write_lock:
             deleted_memory_ids: List[str] = self.context.response.metadata.get("deleted_memory_ids", [])
             if deleted_memory_ids:
                 await self.vector_store.async_delete(node_ids=deleted_memory_ids, workspace_id=workspace_id)
