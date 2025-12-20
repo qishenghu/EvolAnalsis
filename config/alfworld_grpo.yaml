@@ -17,14 +17,14 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_qwen25-3b_grpo_expool
-  project_name: alfworld_qwen25-3b
+  experiment_name: alfworld_3b_grpo_baseline
+  project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 2
-  save_freq: 1000
+  save_freq: 100
   test_freq: 10
-  val_before_train: true
+  val_before_train: false
   validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
   rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
   # Logger configuration: use wandb to sync training metrics
@@ -114,6 +114,8 @@ data:
   val_files: null    # Load validation tasks from environment (200 test tasks)
   val_batch_size: 8
   val_type: "val"
+  max_train_tasks: 800
+  shuffle: true
 
 # ============================================================================
 # Environment Service Configuration - AlfWorld
@@ -159,25 +161,25 @@ task_manager:
 # Experience Pool (ReMe) Configuration
 # ============================================================================
 exp_manager:
-  # Rollout mode: "mixed" means use experience pool during rollout
-  train_rollout_mode: "mixed"
+  # Rollout mode: "mixed" means use experience pool during rollout; "woexp" means no experience for rollout; "all" means use all experience for rollout;
+  train_rollout_mode: "woexp" # No experience for training when running GRPO baseline
   val_rollout_mode: "woexp"  # No experience for validation
   # Ratio of adding experience within group during rollout
-  rollout_ratio: 0.5  # 50% of rollouts will use experience
+  rollout_ratio: 0  # 0% of rollouts will use experience (not used when train_rollout_mode="woexp")
   # Sample mode after train rollout
   train_sample_mode: "alldiscard"  # Discard all samples after rollout
   train_sample_keepratio: 0.0
   # Experience template for inserting experience
   experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
   # Initialize experience pool before training
-  init_exp_before_training: true
+  init_exp_before_training: false
   init_exp_only: false
   # Batch size for experience summarization
   summary_batch_size: 8
   # ReMe (Experience Pool) service configuration
   reme:
     base_url: "http://127.0.0.1:8124"  # ReMe service URL
-    workspace_id: "alfworld_qwen25-3b_expool"  # Workspace ID for this experiment
+    workspace_id: "alfworld_3b_grpo_baseline"  # Workspace ID for this experiment
     enable_summarizer: true   # Enable experience summarization
     enable_context_generator: true  # Enable experience retrieval
     retrieve_top_k: 3  # Retrieve top 3 experiences
@@ -194,7 +196,7 @@ attribution_driven_credit_assignment:
   pos_unconsistent_scale: 0.2
   neg_unconsistent_scale: -0.2
   concurrent: 5
-  model: "qwen-max"
+  model: "qwen-plus"
   api_max_retries: 200
   llm_evaluation_log_dir: null
   adca_grpo:
