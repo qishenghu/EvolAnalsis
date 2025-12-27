@@ -1,9 +1,12 @@
 import random
 import re
+import numpy as np
+import torch
 from loguru import logger
 from dataclasses import dataclass, field
 from omegaconf import DictConfig
-from typing import List, Dict, Any, Optional, Literal, Tuple
+from typing import List, Dict, Any, Optional, Literal, Tuple, Set
+from collections import defaultdict
 from itertools import groupby
 from concurrent.futures import as_completed, Future
 from concurrent.futures.thread import ThreadPoolExecutor
@@ -52,6 +55,18 @@ class ExperienceManager(object):
 
         self.thread_pool = ThreadPoolExecutor(max_workers=self.config.thread_pool.max_workers)
         self.em_client = EMClient(base_url=self.reme_config.base_url)
+        
+        # ⭐ Experience Replay 相关属性
+        exp_replay_config = self.exp_manager_config.get("experience_replay", {})
+        self.difficulty2task_dict: Dict[int, List[str]] = defaultdict(list)  # 按难度分桶存储 task_id
+        self.task2trajectories: Dict[str, List[Trajectory]] = defaultdict(list)  # 按 task_id 存储 Trajectory 列表
+        self.skip_uid_set: Set[str] = set()  # 存储已经全部做对的 task_id，不再参与 replay
+        self.replay_start_ratio = exp_replay_config.get("replay_start_ratio", 0.35)
+        self.max_trajectories_per_task = exp_replay_config.get("max_trajectories_per_task", 10)
+        self.experience_lbound = exp_replay_config.get("experience_lbound", 0)
+        self.experience_rbound = exp_replay_config.get("experience_rbound", 8)
+        self.exp_select_mode = exp_replay_config.get("exp_select_mode", "argmin")
+        self.exp_ratio = exp_replay_config.get("exp_ratio", 0.5)
     
     def summarize_in_batch(self, trajectories: List[Trajectory]) -> None:
         trajectories_sorted = sorted(trajectories, key=lambda traj: traj.task_id)
@@ -211,7 +226,395 @@ class ExperienceManager(object):
         
         return exp_configs
 
+    # ==================== Experience Replay Methods ====================
+    
+    def update_difficulty2task_dict(self, trajectories: List[Trajectory]) -> None:
+        """
+        根据当前 step 的 rollout 结果更新 difficulty2task_dict。
+        
+        Difficulty 定义：在一个 training step 中，某个 task 的 n 次 rollout 中，reward=1 的次数。
+        
+        Args:
+            trajectories: 当前 step 的所有 on-policy trajectory 列表
+        """
+        # 按 task_id 分组统计
+        task_id_to_trajectories: Dict[str, List[Trajectory]] = defaultdict(list)
+        for traj in trajectories:
+            task_id = traj.task_id
+            task_id_to_trajectories[task_id].append(traj)
+        
+        # 计算每个 task 的 difficulty（reward=1 的数量）
+        for task_id, trajs in task_id_to_trajectories.items():
+            success_count = sum(1 for traj in trajs if traj.reward and traj.reward.outcome == 1.0)
+            new_difficulty = success_count
+            
+            # 检查 task_id 是否已经在某个难度的桶中
+            old_difficulty = None
+            for diff, task_list in self.difficulty2task_dict.items():
+                if task_id in task_list:
+                    old_difficulty = diff
+                    break
+            
+            # 如果 task_id 已经在旧桶中，且新 difficulty 不同，需要重新归类
+            if old_difficulty is not None and old_difficulty != new_difficulty:
+                # 从旧桶中移除
+                self.difficulty2task_dict[old_difficulty].remove(task_id)
+                logger.info(f"Moved task {task_id} from difficulty {old_difficulty} to difficulty {new_difficulty}")
+            
+            # 如果 task_id 不在新桶中，添加到新桶
+            if task_id not in self.difficulty2task_dict[new_difficulty]:
+                self.difficulty2task_dict[new_difficulty].append(task_id)
+                if old_difficulty is None:
+                    logger.debug(f"Added task {task_id} to difficulty {new_difficulty} bucket")
 
+    def save_trajectories_to_memory(self, trajectories: List[Trajectory]) -> None:
+        """
+        将轨迹及其 old_log_probs 保存到内存中的 task2trajectories。
+        如果某个 task 的轨迹数量超过 max_trajectories_per_task，则根据 exp_select_mode 替换。
+        
+        Args:
+            trajectories: 包含 old_log_probs 和 entropy 的轨迹列表
+        """
+        for traj in trajectories:
+            task_id = traj.task_id
+            if task_id not in self.task2trajectories:
+                self.task2trajectories[task_id] = []
+            
+            # 如果当前轨迹列表已满，根据 exp_select_mode 决定是否替换
+            if len(self.task2trajectories[task_id]) >= self.max_trajectories_per_task:
+                # 找到当前列表中 entropy 最高（或最低）的轨迹
+                current_entropies = [t.metadata.get("entropy", float('inf')) for t in self.task2trajectories[task_id]]
+                
+                if self.exp_select_mode == "argmin":  # 保留 entropy 最低的
+                    traj_entropy = traj.metadata.get("entropy", float('inf'))
+                    # 如果新轨迹的 entropy 更低，则替换掉当前最高的
+                    if traj_entropy < max(current_entropies):
+                        max_entropy_idx = current_entropies.index(max(current_entropies))
+                        self.task2trajectories[task_id][max_entropy_idx] = traj
+                        logger.debug(f"Replaced trajectory for task {task_id} with lower entropy.")
+                elif self.exp_select_mode == "argmax":  # 保留 entropy 最高的
+                    traj_entropy = traj.metadata.get("entropy", float('-inf'))
+                    # 如果新轨迹的 entropy 更高，则替换掉当前最低的
+                    if traj_entropy > min(current_entropies):
+                        min_entropy_idx = current_entropies.index(min(current_entropies))
+                        self.task2trajectories[task_id][min_entropy_idx] = traj
+                        logger.debug(f"Replaced trajectory for task {task_id} with higher entropy.")
+                else:  # 默认 FIFO
+                    self.task2trajectories[task_id].pop(0)  # 移除最旧的轨迹
+                    self.task2trajectories[task_id].append(traj)
+                    logger.debug(f"Replaced trajectory for task {task_id} using FIFO.")
+            else:
+                self.task2trajectories[task_id].append(traj)
+
+    def get_offpolicy_trajectories_from_memory(
+        self, 
+        task_id: str, 
+        num_trajectories: int = 1
+    ) -> List[Trajectory]:
+        """
+        从内存中的 task2trajectories 获取指定任务的 off-policy trajectory。
+        根据 exp_select_mode 选择轨迹。
+        
+        Args:
+            task_id: 任务 ID
+            num_trajectories: 获取的轨迹数量
+            
+        Returns:
+            List[Trajectory]: Off-policy trajectory 列表
+        """
+        import copy
+        available_trajectories = self.task2trajectories.get(task_id, [])
+        if not available_trajectories:
+            return []
+        
+        # 深拷贝以避免修改原始轨迹
+        available_trajectories = [copy.deepcopy(t) for t in available_trajectories]
+        
+        # 根据 exp_select_mode 选择轨迹
+        if self.exp_select_mode == "argmin":  # 选择 entropy 最低的
+            available_trajectories.sort(key=lambda t: t.metadata.get("entropy", float('inf')))
+        elif self.exp_select_mode == "argmax":  # 选择 entropy 最高的
+            available_trajectories.sort(key=lambda t: t.metadata.get("entropy", float('-inf')), reverse=True)
+        # 默认或 random 模式下，不排序，直接随机选择
+        
+        # 采样 num_trajectories 个轨迹
+        sampled_trajectories = available_trajectories[:min(num_trajectories, len(available_trajectories))]
+        
+        # 标记为 experience replay
+        for traj in sampled_trajectories:
+            traj.metadata["is_experience_replay"] = True
+            # ⭐ Prefix机制关键：将所有LLM消息（role="assistant"）的 author 设置为 "llm(do_not_train)"
+            if hasattr(traj, 'steps') and traj.steps:
+                for step in traj.steps:
+                    if isinstance(step, dict) and step.get("role") == "assistant":
+                        step["author"] = "llm(do_not_train)"
+        
+        return sampled_trajectories
+
+    def update_skip_uid_set_and_filter_trajectories(
+        self,
+        trajectories: List[Trajectory],
+        n_rollout: int,
+        entropys: Optional[torch.Tensor] = None,
+        response_mask: Optional[torch.Tensor] = None,
+    ) -> List[Trajectory]:
+        """
+        根据 rollout 结果更新 skip_uid_set，并筛选符合条件的轨迹（非全对非全错，且选择 entropy 最低的成功轨迹）。
+        
+        Args:
+            trajectories: 当前 step 的所有 on-policy trajectory 列表
+            n_rollout: 每个 task 的 rollout 数量
+            entropys: 当前 step 所有 on-policy 轨迹的 token 级 entropy (bs, response_len)
+            response_mask: 当前 step 所有 on-policy 轨迹的 response mask (bs, response_len)
+            
+        Returns:
+            List[Trajectory]: 筛选后符合条件的轨迹列表，用于保存到 task2trajectories
+        """
+        filtered_trajectories_to_save = []
+        
+        # 按 task_id 分组统计
+        task_id_to_trajectories: Dict[str, List[Trajectory]] = defaultdict(list)
+        task_id_to_entropy_list: Dict[str, List[Tuple[float, Trajectory]]] = defaultdict(list)
+        
+        for i, traj in enumerate(trajectories):
+            task_id = traj.task_id
+            task_id_to_trajectories[task_id].append(traj)
+            
+            # 计算轨迹的平均 entropy
+            if entropys is not None and response_mask is not None and i < entropys.shape[0]:
+                traj_entropys = entropys[i].cpu().numpy()
+                traj_response_mask = response_mask[i].cpu().numpy()
+                valid_entropys = traj_entropys[traj_response_mask.astype(bool)]
+                avg_entropy = float(np.mean(valid_entropys)) if len(valid_entropys) > 0 else 0.0
+            else:
+                avg_entropy = 0.0
+            
+            traj.metadata["entropy"] = avg_entropy  # 保存平均 entropy 到 metadata
+            task_id_to_entropy_list[task_id].append((avg_entropy, traj))
+        
+        for task_id, trajs in task_id_to_trajectories.items():
+            success_count = sum(1 for traj in trajs if traj.reward and traj.reward.outcome == 1.0)
+            
+            # 1. 更新 skip_uid_set
+            if success_count == n_rollout:  # 全部做对
+                if task_id not in self.skip_uid_set:
+                    self.skip_uid_set.add(task_id)
+                    # 从 difficulty2task_dict 中移除
+                    for diff, task_list in list(self.difficulty2task_dict.items()):
+                        if task_id in task_list:
+                            self.difficulty2task_dict[diff].remove(task_id)
+                            if not self.difficulty2task_dict[diff]:
+                                del self.difficulty2task_dict[diff]  # 如果桶为空则删除
+                    # 从 task2trajectories 中删除
+                    if task_id in self.task2trajectories:
+                        del self.task2trajectories[task_id]
+                    logger.info(f"Task {task_id} fully solved, added to skip_uid_set and removed from replay pool.")
+                continue  # 不再考虑加入经验池
+            elif task_id in self.skip_uid_set:  # 如果之前在 skip_uid_set 但现在没全对，则移除
+                self.skip_uid_set.remove(task_id)
+                logger.info(f"Task {task_id} no longer fully solved, removed from skip_uid_set.")
+            
+            # 2. 筛选加入 experience replay pool 的 tasks (非全对非全错)
+            if self.experience_lbound < success_count < self.experience_rbound:
+                # 选择 entropy 最低的成功轨迹
+                successful_trajs_with_entropy = [
+                    (e, t) for e, t in task_id_to_entropy_list[task_id] 
+                    if t.reward and t.reward.outcome == 1.0
+                ]
+                if successful_trajs_with_entropy:
+                    if self.exp_select_mode == "argmin":
+                        best_traj = min(successful_trajs_with_entropy, key=lambda x: x[0])[1]
+                    elif self.exp_select_mode == "argmax":
+                        best_traj = max(successful_trajs_with_entropy, key=lambda x: x[0])[1]
+                    else:  # 默认随机选择一个成功的
+                        best_traj = random.choice([t for e, t in successful_trajs_with_entropy])
+                    filtered_trajectories_to_save.append(best_traj)
+            else:
+                logger.debug(f"Task {task_id} (success_count={success_count}) not within bounds [{self.experience_lbound}, {self.experience_rbound}], skipping for experience pool.")
+        
+        return filtered_trajectories_to_save
+
+    def sample_tasks_from_replaypool(
+        self,
+        difficulty: Optional[int] = None,
+        num_tasks: int = 2,
+        strategy: str = "random"
+    ) -> List[str]:
+        """
+        从 replaytaskpool 中采样指定数量的 task_id。
+        
+        Args:
+            difficulty: 指定的难度值。如果为 None，则随机选择一个难度
+            num_tasks: 需要采样的 task 数量
+            strategy: 采样策略，"random" 或 "uniform"（按难度均匀采样）
+            
+        Returns:
+            List[str]: 采样得到的 task_id 列表
+        """
+        if not self.difficulty2task_dict:
+            return []
+        
+        if difficulty is None:
+            # 随机选择一个难度
+            available_difficulties = [d for d, tasks in self.difficulty2task_dict.items() if len(tasks) > 0]
+            if not available_difficulties:
+                return []
+            difficulty = random.choice(available_difficulties)
+        
+        # 从指定难度的 task 列表中采样
+        available_tasks = self.difficulty2task_dict.get(difficulty, [])
+        if len(available_tasks) == 0:
+            return []
+        
+        # 采样（允许重复）
+        sampled_tasks = random.choices(available_tasks, k=min(num_tasks, len(available_tasks)))
+        return sampled_tasks
+
+    def get_offpolicy_batch(
+        self, 
+        tasks: List[Task], 
+        num_trajectories_per_task: int = 1
+    ) -> List[Trajectory]:
+        """
+        为给定的任务列表从内存中获取 off-policy trajectory。
+        
+        Args:
+            tasks: 任务列表
+            num_trajectories_per_task: 每个任务获取的轨迹数量
+            
+        Returns:
+            List[Trajectory]: Off-policy trajectory 列表
+        """
+        offpolicy_trajectories = []
+        
+        for task in tasks:
+            try:
+                trajs = self.get_offpolicy_trajectories_from_memory(
+                    task_id=task.task_id,
+                    num_trajectories=num_trajectories_per_task
+                )
+                offpolicy_trajectories.extend(trajs)
+            except Exception as e:
+                logger.warning(f"Failed to get off-policy trajectory for task {task.task_id}: {e}")
+                continue
+        
+        return offpolicy_trajectories
+    
+    def get_valid_replay_task_ids(self) -> List[str]:
+        """
+        获取所有有可用轨迹的 replay task_ids（排除 skip_uid_set 中的）。
+        
+        Returns:
+            List[str]: 有效的 task_id 列表
+        """
+        valid_task_ids = []
+        for difficulty, task_ids in self.difficulty2task_dict.items():
+            for task_id in task_ids:
+                if task_id not in self.skip_uid_set:
+                    if task_id in self.task2trajectories and len(self.task2trajectories[task_id]) > 0:
+                        valid_task_ids.append(task_id)
+        return valid_task_ids
+
+    def save_experience_pool_to_disk(self, save_dir: str) -> None:
+        """
+        将 experience pool 保存到磁盘，用于断点续训。
+        
+        Args:
+            save_dir: 保存目录路径
+        """
+        import os
+        import json
+        import pickle
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 保存 difficulty2task_dict
+        difficulty2task_dict_path = os.path.join(save_dir, "difficulty2task_dict.json")
+        with open(difficulty2task_dict_path, "w") as f:
+            json.dump({str(k): v for k, v in self.difficulty2task_dict.items()}, f, indent=2)
+        
+        # 保存 skip_uid_set
+        skip_uid_set_path = os.path.join(save_dir, "skip_uid_set.json")
+        with open(skip_uid_set_path, "w") as f:
+            json.dump(list(self.skip_uid_set), f, indent=2)
+        
+        # 保存 task2trajectories (使用 pickle 以保存复杂对象)
+        task2trajectories_path = os.path.join(save_dir, "task2trajectories.pkl")
+        with open(task2trajectories_path, "wb") as f:
+            pickle.dump(self.task2trajectories, f)
+        
+        logger.info(f"Experience pool saved to {save_dir}")
+
+    def load_experience_pool_from_disk(self, load_dir: str) -> None:
+        """
+        从磁盘加载 experience pool，用于断点续训。
+        
+        Args:
+            load_dir: 加载目录路径
+        """
+        import os
+        import json
+        import pickle
+        
+        # 加载 difficulty2task_dict
+        difficulty2task_dict_path = os.path.join(load_dir, "difficulty2task_dict.json")
+        if os.path.exists(difficulty2task_dict_path):
+            with open(difficulty2task_dict_path, "r") as f:
+                loaded_dict = json.load(f)
+                self.difficulty2task_dict = defaultdict(list)
+                for k, v in loaded_dict.items():
+                    self.difficulty2task_dict[int(k)] = v
+            logger.info(f"Loaded difficulty2task_dict with {len(self.difficulty2task_dict)} difficulty buckets")
+        
+        # 加载 skip_uid_set
+        skip_uid_set_path = os.path.join(load_dir, "skip_uid_set.json")
+        if os.path.exists(skip_uid_set_path):
+            with open(skip_uid_set_path, "r") as f:
+                self.skip_uid_set = set(json.load(f))
+            logger.info(f"Loaded skip_uid_set with {len(self.skip_uid_set)} task_ids")
+        
+        # 加载 task2trajectories
+        task2trajectories_path = os.path.join(load_dir, "task2trajectories.pkl")
+        if os.path.exists(task2trajectories_path):
+            with open(task2trajectories_path, "rb") as f:
+                self.task2trajectories = pickle.load(f)
+            total_trajs = sum(len(trajs) for trajs in self.task2trajectories.values())
+            logger.info(f"Loaded task2trajectories with {len(self.task2trajectories)} tasks and {total_trajs} trajectories")
+
+    def update_difficulty2task_dict(self, trajectories: List[Trajectory]) -> None:
+        """
+        根据当前 rollout 的结果更新 difficulty2task_dict。
+        统计每个 task 的成功次数，并将 task 放入对应的 difficulty bucket。
+        
+        Args:
+            trajectories: 当前 step 的所有 on-policy trajectory 列表
+        """
+        # 按 task_id 分组统计成功次数
+        task_id_to_success_count: Dict[str, int] = defaultdict(int)
+        task_ids_seen: Set[str] = set()
+        
+        for traj in trajectories:
+            task_id = traj.task_id
+            task_ids_seen.add(task_id)
+            if traj.reward and traj.reward.outcome == 1.0:
+                task_id_to_success_count[task_id] += 1
+        
+        # 更新 difficulty2task_dict
+        for task_id in task_ids_seen:
+            success_count = task_id_to_success_count.get(task_id, 0)
+            
+            # 首先从旧的 difficulty bucket 中移除
+            for diff, task_list in list(self.difficulty2task_dict.items()):
+                if task_id in task_list:
+                    self.difficulty2task_dict[diff].remove(task_id)
+                    if not self.difficulty2task_dict[diff]:
+                        del self.difficulty2task_dict[diff]  # 如果桶为空则删除
+                    break
+            
+            # 如果不在 skip_uid_set 中，则加入新的 difficulty bucket
+            if task_id not in self.skip_uid_set:
+                self.difficulty2task_dict[success_count].append(task_id)
+                logger.debug(f"Task {task_id} moved to difficulty bucket {success_count}")
 
 
 class ExperienceWorker(object):

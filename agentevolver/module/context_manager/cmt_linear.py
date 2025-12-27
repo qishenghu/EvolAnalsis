@@ -589,6 +589,9 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         from verl.utils.model import compute_position_id_with_mask
         ext_steps = self.remove_last_non_llm_msg(copy.deepcopy(ext_steps))  # ⭐ Remove the last non-LLM message
 
+        # ⭐ 检查是否为 experience replay 数据
+        is_experience_replay = self.metadata.get("is_experience_replay", False)
+
         exp_worker = ExperienceWorker(self.config)
         for i, ext_msg in enumerate(ext_steps):
             experience, new_content = exp_worker.manage_training_context(ext_msg.content_for_future, self.metadata)
@@ -609,12 +612,28 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         split_prompt_reponse_index = -1
         for ext_msg in ext_steps:
             # find split index, this have to be done before input_ids += ext_msg.token_arr
-            if (split_prompt_reponse_index == -1) and (ext_msg.need_training):
+            # ⭐ Experience Replay: 对于 off-policy 数据，所有 LLM 消息都应该参与 loss 计算
+            # 使用 exp_mask 区分 on-policy 和 off-policy，而不是让 loss_mask=0
+            if (split_prompt_reponse_index == -1) and (ext_msg.need_training or (is_experience_replay and ext_msg.role == "assistant")):
                 split_prompt_reponse_index = len(input_ids)
-                assert ext_msg.author == 'llm', "The first message after initialization should be from LLM, not from env or user"
+                # 对于 experience replay，允许 author 为 "llm(do_not_train)"
+                if not is_experience_replay:
+                    assert ext_msg.author == 'llm', "The first message after initialization should be from LLM, not from env or user"
             input_ids += ext_msg.token_arr
             attention_mask += [1] * len(ext_msg.token_arr)
-            loss_mask += ext_msg.get_loss_mask(blackout_token_combo=self.blackout_token_combo)
+            # ⭐ Experience Replay: 对于 off-policy 数据，LLM 消息的 loss_mask 应该为 1（参与 loss 计算）
+            # 使用 exp_mask 来区分 on/off-policy，而不是用 loss_mask=0
+            if is_experience_replay and ext_msg.role == "assistant":
+                # Off-policy LLM 消息：loss_mask = 1（参与 off-policy loss 计算）
+                msg_loss_mask = [1] * len(ext_msg.token_arr)
+            else:
+                msg_loss_mask = ext_msg.get_loss_mask(blackout_token_combo=self.blackout_token_combo)
+            loss_mask += msg_loss_mask
+
+        # ⭐ 如果是 experience replay 数据且没有找到 split_prompt_reponse_index
+        # 说明没有 LLM 消息（异常情况），设置为第一个位置
+        if is_experience_replay and split_prompt_reponse_index == -1:
+            split_prompt_reponse_index = 0  # 所有内容都是 response（用于计算 loss）
 
         assert split_prompt_reponse_index != -1, "split_prompt_reponse_index should not be -1, at least one message should be in the context"
         position_ids = compute_position_id_with_mask(torch.tensor(attention_mask)).tolist()  # ⭐ Compute position IDs with mask

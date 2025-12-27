@@ -143,4 +143,7 @@ launcher_record
 
 local_vector_store/
 
+ExGRPO/
+
 AgentGym/agentenv-searchqa/retrieve_data/
+AgentGym/agentenv-searchqa/agentenv_searchqa/queries/

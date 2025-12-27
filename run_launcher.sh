@@ -33,6 +33,12 @@ kill_port() {
 # kill_port 8081
 # kill_port 8124
 
+# Run GRPO baseline (default)
 python launcher.py \
-  --conf config/alfworld_grpo.yaml
+  --conf config/alfworld_grpo_7b.yaml
+ # --with-alfworld
+
+# Run GRPO with Experience Replay
+# python launcher.py \
+#   --conf config/alfworld_grpo_7b_exp_replay.yaml
  # --with-alfworld

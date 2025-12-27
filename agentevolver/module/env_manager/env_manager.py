@@ -387,6 +387,90 @@ class ParallelEnvManager(object):
 
         return dataproto
 
+    def convert_offpolicy_to_cmt(
+        self,
+        offpolicy_trajectories: List[Trajectory],
+        config: DictConfig,
+        tokenizer
+    ) -> List:
+        """
+        将 off-policy Trajectory 转换为 Linear_CMT 对象，以便使用相同的 tokenize 流程。
+        
+        Args:
+            offpolicy_trajectories: Off-policy trajectory 列表
+            config: 配置对象
+            tokenizer: Tokenizer 实例
+            
+        Returns:
+            List[Linear_CMT]: 转换后的 Linear_CMT 对象列表
+        """
+        from agentevolver.module.context_manager.cmt_linear import Linear_CMT
+        from agentevolver.module.context_manager.cmt_base import ExtendedMessage
+        
+        cmt_array = []
+        
+        for traj_index, traj in enumerate(offpolicy_trajectories):
+            # 创建 Linear_CMT 对象
+            cmt = Linear_CMT(config, tokenizer)
+            
+            # 设置基本信息
+            # ⭐ 关键：data_id 必须是整数或可以转换为整数（因为 group_ids = torch.tensor([int(s.data_id) for s in samples])）
+            # 为 off-policy 数据分配独立的 data_id，避免与 on-policy 数据混合分组（GRPO 需要）
+            task_id = traj.task_id if hasattr(traj, 'task_id') else traj.metadata.get("task_id", "unknown")
+            
+            # 将 task_id 转换为整数（如果可能），否则使用 hash
+            try:
+                task_id_int = int(task_id)
+            except (ValueError, TypeError):
+                task_id_int = hash(task_id) % 100000  # 使用 hash 确保是整数
+            
+            # data_id 格式：使用大偏移量 + task_id + index，确保唯一且是整数
+            cmt.data_id = str(1000000 + task_id_int * 1000 + traj_index)
+            cmt.rollout_id = str(traj.metadata.get("rollout_id", traj_index))
+            cmt.task_id = task_id
+            cmt.query = traj.query if hasattr(traj, 'query') else traj.metadata.get("query", "")
+            cmt.reward = traj.reward
+            cmt.is_terminated = traj.is_terminated if hasattr(traj, 'is_terminated') else True
+            
+            # 将 messages 转换为 ExtendedMessage 并填充 full_context
+            # ⭐ Experience Replay: 对于 off-policy 数据，所有 LLM 消息的 author 保持为 "llm"
+            # 这样 loss_mask 不会为 0，LLM 消息会参与 off-policy loss 计算
+            # 使用 exp_mask=1 来区分 on-policy 和 off-policy，而不是用 loss_mask=0
+            steps = traj.steps if hasattr(traj, 'steps') else []
+            for msg in steps:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    author = msg.get("author", role)
+                    
+                    # ⭐ Experience Replay: LLM 消息保持 author="llm"，用于计算 off-policy loss
+                    # 使用 exp_mask 区分 on/off-policy，而不是让 loss_mask=0
+                    if role == "assistant":
+                        author = "llm"  # 保持为 "llm"，loss_mask=1，参与 off-policy loss 计算
+                    elif role == "user":
+                        author = "user"
+                    else:
+                        author = role
+                    
+                    ext_msg = ExtendedMessage(
+                        author=author,
+                        role=role,
+                        content=msg.get("content", ""),
+                        token_generator='auto',
+                        tokenizer=tokenizer,
+                    )
+                    cmt.full_context.append(ext_msg)
+            
+            # 标记为 experience replay
+            cmt.metadata["is_experience_replay"] = True
+            cmt.metadata["old_log_probs"] = traj.metadata.get("old_log_probs")
+            cmt.metadata["policy_version"] = traj.metadata.get("policy_version")
+            cmt.metadata["entropy"] = traj.metadata.get("entropy")
+            cmt.metadata["task_id"] = task_id
+            
+            cmt_array.append(cmt)
+        
+        return cmt_array
+
 
     def get_extra(self, cmt):
         """
@@ -396,12 +480,18 @@ class ParallelEnvManager(object):
             cmt (object): The comment object containing metadata.
 
         Returns:
-            dict: A dictionary with keys 'add_exp', 'task_train_expmode', and 'experience_list' corresponding to their respective values in the comment's metadata.
+            dict: A dictionary with keys 'add_exp', 'task_train_expmode', 'experience_list', 
+                  'is_experience_replay', and 'old_log_probs' corresponding to their respective 
+                  values in the comment's metadata.
         """
         extras = {
             "add_exp": cmt.metadata.get("add_exp", None),  # ⭐ Retrieves the 'add_exp' value from metadata
             "task_train_expmode": cmt.metadata.get("task_train_exp_mode", None),  # ⭐ Retrieves the 'task_train_exp_mode' value from metadata
-            "experience_list": cmt.metadata.get("experience_list", [])  # ⭐ Retrieves the 'experience' list from metadata
+            "experience_list": cmt.metadata.get("experience_list", []),  # ⭐ Retrieves the 'experience' list from metadata
+            "is_experience_replay": cmt.metadata.get("is_experience_replay", False),  # ⭐ Experience Replay: 标记是否为 off-policy 数据
+            "old_log_probs": cmt.metadata.get("old_log_probs"),  # ⭐ Experience Replay: 历史策略的 log_prob
+            "recorded_response_mask": cmt.metadata.get("response_mask"),  # ⭐ Multi-turn: 历史轨迹的 response_mask，用于对齐
+            "task_id": cmt.task_id,  # ⭐ 保存 task_id 用于后续处理
         }
         return extras
 
@@ -518,11 +608,24 @@ class ParallelEnvManager(object):
             reward_scores.append(sample.reward_scores)
             extras.append(sample.extras)
 
-            # Create experience mask: 1 if off_clip_high conditions met (add_exp=True, task_train_expmode="discard"), else 0
-            if sample.extras.get("add_exp", False) and sample.extras.get("task_train_expmode", None)=="discard":
+            # Create experience mask: 
+            # 1. Experience Replay (is_experience_replay=True): 只对 LLM 响应位置设置为 1（基于 loss_mask）
+            # 2. Experience-guided (add_exp=True, task_train_expmode="discard"): prompt 和 response 都标记为 1
+            # 3. 纯 On-policy: 全为 0
+            # ⭐ 优先级是 experience replay > experience-guided > on-policy
+            # ⭐ Multi-turn 关键：使用 loss_mask 来创建 exp_mask，确保只对 LLM 响应位置设置为 1
+            if sample.extras.get("is_experience_replay", False):
+                # Experience Replay: 只对 LLM 响应位置（loss_mask=1）设置 exp_mask=1
+                # 这样 Environment 响应不会被标记为 off-policy
+                prompt_exp_mask_list.append(torch.zeros(len(sample.prompt_loss_mask), dtype=torch.int))
+                # ⭐ 使用 response_loss_mask 而不是全 1，确保只标记 LLM 响应
+                response_exp_mask_list.append(torch.tensor(sample.response_loss_mask, dtype=torch.int))
+            elif sample.extras.get("add_exp", False) and sample.extras.get("task_train_expmode", None)=="discard":
+                # Experience-guided: prompt 和 response 都标记为 1
                 prompt_exp_mask_list.append(torch.ones(len(sample.prompt_loss_mask), dtype=torch.int))
                 response_exp_mask_list.append(torch.ones(len(sample.response_loss_mask), dtype=torch.int))
             else:
+                # On-policy without experience: 全为 0
                 prompt_exp_mask_list.append(torch.zeros(len(sample.prompt_loss_mask), dtype=torch.int))
                 response_exp_mask_list.append(torch.zeros(len(sample.response_loss_mask), dtype=torch.int))
 
@@ -585,6 +688,36 @@ class ParallelEnvManager(object):
 
         assert exp_mask.shape == loss_mask.shape, f"Shape mismatch: {exp_mask.shape} vs {loss_mask.shape}"
 
+        # ⭐ Experience Replay: 处理 recorded_old_log_probs
+        recorded_old_log_probs_list = []
+        for sample in samples:
+            old_log_probs = sample.extras.get("old_log_probs")
+            if old_log_probs is not None:
+                # 转换为 tensor 并对齐长度
+                if isinstance(old_log_probs, (list, np.ndarray)):
+                    old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32)
+                # 对齐到 response_length
+                response_length = len(sample.response_ids)
+                if len(old_log_probs) > response_length:
+                    old_log_probs = old_log_probs[:response_length]
+                elif len(old_log_probs) < response_length:
+                    old_log_probs = torch.cat([
+                        old_log_probs,
+                        torch.zeros(response_length - len(old_log_probs), dtype=torch.float32)
+                    ])
+                recorded_old_log_probs_list.append(old_log_probs)
+            else:
+                # 如果没有记录，创建零向量（后续会重新计算）
+                recorded_old_log_probs_list.append(
+                    torch.zeros(len(sample.response_ids), dtype=torch.float32)
+                )
+        
+        # Pad recorded_old_log_probs 到 max_response_length
+        recorded_old_log_probs = pad_sequence(recorded_old_log_probs_list, batch_first=True, padding_value=0.0)
+        recorded_old_log_probs = pad_sequence_to_length(
+            recorded_old_log_probs, max_response_length_this_batch, 0.0
+        )
+
         # Construct the batch using TensorDict
         batch = TensorDict(
             {
@@ -597,6 +730,7 @@ class ParallelEnvManager(object):
                 "exp_mask": exp_mask,        # add exp_mask by ANNI
                 "step_ids": step_ids_pad,
                 "group_ids": group_ids,   # ★ add groupid
+                "recorded_old_log_probs": recorded_old_log_probs,  # ⭐ Experience Replay: 历史策略的 old_log_probs
             },
             batch_size=len(samples),
         )

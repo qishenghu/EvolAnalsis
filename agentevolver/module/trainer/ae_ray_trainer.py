@@ -67,6 +67,7 @@ from agentevolver.utils.tracking import ValidationGenerationsLogger
 from agentevolver.module.adv_processor.adca_grpo_pipeline import apply_adca_grpo
 
 from agentevolver.module.exp_manager.exp_manager import ExperienceManager
+from agentevolver.module.exp_manager.experience_collate import ExperienceMixCollateFn
 
 
 def parse_reward_from_dataproto(data: DataProto, return_dict=False) -> dict | torch.Tensor:
@@ -787,6 +788,67 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         print("[validate_config] All configuration checks passed successfully!")
 
     ##################
+    # Experience Replay Methods
+    def _replace_recorded_old_log_probs(
+        self,
+        batch: DataProto,
+        current_old_log_prob: DataProto,
+        entropys: torch.Tensor,
+    ) -> DataProto:
+        """
+        替换 off-policy 数据的 old_log_prob 为 recorded_old_log_probs。
+        
+        这是 Experience Replay 的关键步骤：
+        - 对于 on-policy 数据：使用当前 policy 计算的 old_log_prob
+        - 对于 off-policy 数据：使用收集经验时保存的 recorded_old_log_probs
+        
+        Args:
+            batch: 当前 batch 数据，包含 exp_mask 和 recorded_old_log_probs
+            current_old_log_prob: 当前 policy 计算的 old_log_prob
+            entropys: 当前 policy 计算的 entropy
+            
+        Returns:
+            更新后的 batch
+        """
+        exp_mask = batch.batch["exp_mask"]  # [batch, seq_len]
+        response_mask = batch.batch["response_mask"]  # [batch, seq_len]
+        recorded_old_log_probs = batch.batch["recorded_old_log_probs"]  # [batch, response_len]
+        current_old_log_probs = current_old_log_prob.batch["old_log_probs"]  # [batch, response_len]
+        
+        # 获取 response 部分的 exp_mask
+        # exp_mask 是完整序列，我们需要提取 response 部分
+        # response_mask 标记了 response 部分的位置
+        prompt_length = batch.batch["prompts"].shape[-1]
+        response_exp_mask = exp_mask[:, prompt_length:]  # [batch, response_len]
+        
+        # 对齐长度
+        min_len = min(response_exp_mask.shape[-1], recorded_old_log_probs.shape[-1], current_old_log_probs.shape[-1])
+        response_exp_mask = response_exp_mask[:, :min_len]
+        recorded_old_log_probs = recorded_old_log_probs[:, :min_len]
+        
+        # 创建替换后的 old_log_probs
+        # off-policy (exp_mask=1): 使用 recorded_old_log_probs
+        # on-policy (exp_mask=0): 使用 current_old_log_probs
+        new_old_log_probs = torch.where(
+            response_exp_mask.bool(),
+            recorded_old_log_probs,
+            current_old_log_probs[:, :min_len]
+        )
+        
+        # 如果长度不够，用 current_old_log_probs 补齐
+        if min_len < current_old_log_probs.shape[-1]:
+            new_old_log_probs = torch.cat([
+                new_old_log_probs,
+                current_old_log_probs[:, min_len:]
+            ], dim=-1)
+        
+        # 更新 current_old_log_prob（后续会 union 到 batch）
+        current_old_log_prob.batch["old_log_probs"] = new_old_log_probs
+        
+        # 返回 batch（虽然 batch 本身没有改变，但 current_old_log_prob 已经更新）
+        return batch
+
+    ##################
     # ANNI
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
         """
@@ -1059,6 +1121,21 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        
+        # ⭐ Experience Replay: 加载 experience pool（如果有）
+        exp_replay_config = self.config.exp_manager.get("experience_replay", {})
+        if exp_replay_config.get("enable", False):
+            # 尝试从最新的 checkpoint 目录加载 experience pool
+            exp_pool_base_dir = os.path.join(self.config.trainer.default_local_dir, "experience_pool")
+            if os.path.exists(exp_pool_base_dir):
+                # 找到最新的 step 目录
+                step_dirs = [d for d in os.listdir(exp_pool_base_dir) if d.startswith("step_")]
+                if step_dirs:
+                    latest_step_dir = max(step_dirs, key=lambda x: int(x.split("_")[1]))
+                    exp_pool_load_dir = os.path.join(exp_pool_base_dir, latest_step_dir)
+                    self.exp_manager.load_experience_pool_from_disk(exp_pool_load_dir)
+                    logger.info(f"Loaded experience pool from {exp_pool_load_dir}")
+        
         # spread parameters to vllm
         self.async_rollout_manager.wake_up()
         self.async_rollout_manager.sleep()
@@ -1136,6 +1213,52 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         ground_truth=gen_batch.non_tensor_batch['extras'][i]['ground_truth']
                                     ) for i in range(len(gen_batch))
                             ]
+                            
+                            # ⭐ Experience Replay: 混合 on-policy 和 off-policy tasks
+                            exp_replay_config = self.config.exp_manager.get("experience_replay", {})
+                            enable_exp_replay = exp_replay_config.get("enable", False)
+                            experience_tasks = []
+                            offpolicy_cmt_array = []
+                            
+                            if enable_exp_replay:
+                                # 计算当前训练进度
+                                training_progress = self.global_steps / self.total_training_steps
+                                replay_start_ratio = exp_replay_config.get("replay_start_ratio", 0.35)
+                                
+                                if training_progress >= replay_start_ratio:
+                                    # 使用 ExperienceMixCollateFn 混合 tasks
+                                    experience_mix_collate = ExperienceMixCollateFn(
+                                        exp_manager=self.exp_manager,
+                                        train_task_manager=self.train_task_manager,
+                                        exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
+                                        replay_start_ratio=replay_start_ratio,
+                                        offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
+                                        n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                    )
+                                    
+                                    experience_tasks, on_policy_tasks = experience_mix_collate(
+                                        training_tasks=tasks,
+                                        training_progress=training_progress,
+                                        enable_replay=True,
+                                    )
+                                    
+                                    # 合并 tasks（experience_tasks 在前，on_policy_tasks 在后）
+                                    tasks = experience_tasks + on_policy_tasks
+                                    
+                                    # 为 experience tasks 获取 off-policy trajectories
+                                    if experience_tasks:
+                                        offpolicy_trajectories = self.exp_manager.get_offpolicy_batch(
+                                            tasks=experience_tasks,
+                                            num_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1)
+                                        )
+                                        if offpolicy_trajectories:
+                                            offpolicy_cmt_array = self.env_manager.convert_offpolicy_to_cmt(
+                                                offpolicy_trajectories=offpolicy_trajectories,
+                                                config=self.config,
+                                                tokenizer=self.tokenizer
+                                            )
+                                            logger.info(f"Got {len(offpolicy_cmt_array)} off-policy trajectories")
+                            
                             task_exp_configs = self.exp_manager.get_complete_exp_configs(tasks, mode="sample")
                             assert len(task_exp_configs)==len(tasks), "{len(task_exp_configs)=}, {len(gen_batch)=}"
 
@@ -1144,7 +1267,25 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             trajectories = self.env_manager.rollout(tasks, task_exp_configs, mode="sample", epoch=f"train.{epoch}.{i}")  # ⭐ Generate trajectories using the environment manager
                             assert len(trajectories)>0, "{len(trajectories)=}?"
                             print("=" * 10 + "end fit rollout" + "=" * 10)
-                            gen_batch_output = self.env_manager.to_dataproto(trajectories)
+                            
+                            # ⭐ Experience Replay: 更新 difficulty2task_dict 并合并轨迹
+                            if enable_exp_replay:
+                                # 更新 difficulty2task_dict（只用 on-policy 轨迹）
+                                self.exp_manager.update_difficulty2task_dict(trajectories)
+                                
+                                # 合并 on-policy 和 off-policy 轨迹
+                                if offpolicy_cmt_array:
+                                    all_trajectories = trajectories + offpolicy_cmt_array
+                                    logger.info(
+                                        f"Merged {len(trajectories)} on-policy + {len(offpolicy_cmt_array)} off-policy = "
+                                        f"{len(all_trajectories)} total trajectories"
+                                    )
+                                else:
+                                    all_trajectories = trajectories
+                            else:
+                                all_trajectories = trajectories
+                            
+                            gen_batch_output = self.env_manager.to_dataproto(all_trajectories)
                             
                             # update metrics about experience manager
                             exp_mask_ratio = gen_batch_output.batch["exp_mask"].float().mean()
@@ -1180,13 +1321,22 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)  # ⭐ Generate unique UIDs for each item in the batch
-
                     # in the new code, the rollout process generates new extras, which should be merged with the original extra.
                     # by now, they are stored separately.
                     # assert len(gen_batch_output.non_tensor_batch["extras"].keys()&batch_extras.keys())==0, "extra of extra should not overlap with existing extra...how funny..."
                     batch.non_tensor_batch['original_extras']=batch_extras  # ⭐ Store original extras before scaling
                     batch = union_gen_batch_via_task_id(tasks, batch, gen_batch_output)  # ⭐ Merge generated batch with the current batch
+                    
+                    # ⭐ GRPO 分组关键：uid 必须基于 data_id（group_ids）来设置，而不是随机 UUID
+                    # GRPO 使用 uid 来分组计算 advantage，同一 data_id 的轨迹应该在同一组
+                    # 从 group_ids 获取 data_id，转换为字符串作为 uid
+                    if "group_ids" in batch.batch:
+                        # group_ids 是 tensor，shape: (batch_size,)
+                        group_ids = batch.batch["group_ids"].cpu().numpy()
+                        batch.non_tensor_batch["uid"] = np.array([str(int(gid)) for gid in group_ids], dtype=object)
+                    else:
+                        # 如果没有 group_ids，使用随机 UUID（向后兼容）
+                        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)  # ⭐ Compute and add response mask to the batch
 
@@ -1223,8 +1373,66 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                         metrics.update(old_log_prob_metrics)
+                        
+                        # ⭐ Experience Replay: 替换 off-policy 数据的 old_log_prob
+                        if enable_exp_replay and "recorded_old_log_probs" in batch.batch:
+                            exp_is_correct = exp_replay_config.get("exp_is_correct", True)
+                            if exp_is_correct:
+                                batch = self._replace_recorded_old_log_probs(
+                                    batch=batch,
+                                    current_old_log_prob=old_log_prob,
+                                    entropys=entropys,
+                                )
+                                logger.info("Replaced off-policy old_log_probs with recorded ones")
+                        
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        
+                        # ⭐ Experience Replay: 保存成功轨迹到内存
+                        if enable_exp_replay:
+                            n_rollout = self.config.actor_rollout_ref.rollout.n
+                            # 只处理 on-policy 轨迹（前 len(trajectories) 个）
+                            num_on_policy = len(trajectories)
+                            on_policy_entropys = entropys[:num_on_policy] if entropys is not None else None
+                            on_policy_response_mask = response_masks[:num_on_policy]
+                            
+                            # 更新 skip_uid_set 并筛选轨迹
+                            filtered_trajectories = self.exp_manager.update_skip_uid_set_and_filter_trajectories(
+                                trajectories=trajectories,
+                                n_rollout=n_rollout,
+                                entropys=on_policy_entropys,
+                                response_mask=on_policy_response_mask,
+                            )
+                            
+                            # 将 old_log_probs 保存到轨迹 metadata
+                            # ⭐ Multi-turn 关键：保存完整的 response 部分的 old_log_probs（不过滤）
+                            # 这样在加载时可以正确对齐，避免位置错位
+                            old_log_probs_tensor = old_log_prob.batch["old_log_probs"]
+                            for idx, traj in enumerate(trajectories):
+                                if idx < old_log_probs_tensor.shape[0]:
+                                    traj_old_log_prob = old_log_probs_tensor[idx].cpu().numpy()
+                                    traj_response_mask = response_masks[idx].cpu().numpy()
+                                    # ⭐ 保存完整的 old_log_probs 和 response_mask
+                                    # 不过滤，保持位置对齐
+                                    traj.metadata["old_log_probs"] = traj_old_log_prob.tolist()
+                                    traj.metadata["response_mask"] = traj_response_mask.tolist()  # 保存 mask 用于后续对齐
+                                    traj.metadata["policy_version"] = self.global_steps
+                            
+                            # 保存筛选后的轨迹
+                            if filtered_trajectories:
+                                self.exp_manager.save_trajectories_to_memory(filtered_trajectories)
+                                logger.info(
+                                    f"Saved {len(filtered_trajectories)} trajectories to memory "
+                                    f"(skip_uid_set size: {len(self.exp_manager.skip_uid_set)})"
+                                )
+                            
+                            # 添加 experience replay 相关指标
+                            metrics.update({
+                                "exp_replay/skip_uid_set_size": len(self.exp_manager.skip_uid_set),
+                                "exp_replay/total_tasks_in_pool": len(self.exp_manager.get_valid_replay_task_ids()),
+                                "exp_replay/num_experience_tasks": len(experience_tasks),
+                                "exp_replay/num_offpolicy_trajectories": len(offpolicy_cmt_array),
+                            })
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
@@ -1389,6 +1597,16 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with _timer("save_checkpoint", timing_raw):
                             self._save_checkpoint()  # ⭐ Save the current state of the model as a checkpoint
+                            
+                            # ⭐ Experience Replay: 保存 experience pool 到磁盘
+                            if enable_exp_replay:
+                                exp_pool_save_dir = os.path.join(
+                                    self.config.trainer.default_local_dir,
+                                    "experience_pool",
+                                    f"step_{self.global_steps}"
+                                )
+                                self.exp_manager.save_experience_pool_to_disk(exp_pool_save_dir)
+                                logger.info(f"Saved experience pool to {exp_pool_save_dir}")
 
                 # training metrics
                 metrics.update(
