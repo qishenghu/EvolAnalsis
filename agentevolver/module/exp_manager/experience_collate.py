@@ -89,11 +89,16 @@ class ExperienceMixCollateFn:
             sampled_exp_task_ids = []
         
         # 将 experience task_ids 转换为 Task 对象
+        # ⭐ 注意：n_offpolicy_trajectories 会在 get_offpolicy_batch 中根据实际获取的数量设置
+        # 这里只做初始化（期望值），实际值可能更小
         experience_tasks = []
         for task_id in sampled_exp_task_ids:
             # 从 train_task_manager 获取 Task 对象
             task = self._get_task_by_id(task_id)
             if task is not None:
+                # 初始化 metadata（期望值，实际值在 get_offpolicy_batch 中更新）
+                task.metadata = task.metadata if hasattr(task, 'metadata') and task.metadata else {}
+                task.metadata["n_offpolicy_trajectories"] = self.offpolicy_trajectories_per_task  # 期望值
                 experience_tasks.append(task)
             else:
                 logger.warning(f"Failed to get Task object for task_id={task_id}, skipping")

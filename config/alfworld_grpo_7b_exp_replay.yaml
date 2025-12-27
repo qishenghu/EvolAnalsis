@@ -62,9 +62,18 @@ actor_rollout_ref:
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
     entropy_coeff: 0
-    off_cliprange_high: 0.6
+    off_cliprange_high: 0.6  # Used when off_policy_shaping_mode="higher_clip_bound"
     clip_ratio_high: 0.28
     loss_agg_mode: token-mean
+    # ⭐ Off-policy Policy Shaping Configuration
+    # Policy shaping modulates the gradient from experiential data to preserve entropy
+    # Two modes available:
+    #   1. "higher_clip_bound": AgentEvolver original - Use higher clip_upper_bound for off-policy data
+    #   2. "exgrpo_policy_shaping": ExGRPO paper - Replace CLIP term with f(w*(θ)) = w*(θ) / (w*(θ) + β)
+    #      where w*(θ) = exp(log_prob - old_log_prob) is the importance sampling ratio
+    #      This amplifies low-probability signals and dampens high-probability ones
+    off_policy_shaping_mode: "exgrpo_policy_shaping"  # "exgrpo_policy_shaping" or "higher_clip_bound"
+    off_policy_shaping_beta: 0.1  # β for ExGRPO policy shaping: f(x) = x/(x+β), default 0.1 as in ExGRPO paper
     fsdp_config:
       param_offload: false
       optimizer_offload: false
@@ -186,8 +195,8 @@ exp_manager:
   reme:
     base_url: "http://127.0.0.1:8124"  # ReMe service URL
     workspace_id: "alfworld_7b_grpo_exp_replay"  # Workspace ID for this experiment
-    enable_summarizer: true   # Enable experience summarization
-    enable_context_generator: true  # Enable experience retrieval
+    enable_summarizer: false   # Enable experience summarization
+    enable_context_generator: false  # Enable experience retrieval
     retrieve_top_k: 3  # Retrieve top 3 experiences
     updated_freq: 0    # Update frequency (0 = disabled, update on demand)
   
@@ -221,7 +230,7 @@ exp_manager:
     #   - experience_lbound=0: include tasks with at least 0 successes
     #   - experience_rbound=8: exclude tasks with 8 successes (fully solved, added to skip_uid_set)
     #   - This means: include tasks with 0-7 successes (non-fully-solved, non-fully-failed)
-    experience_lbound: 0  # Lower bound (inclusive)
+    experience_lbound: 2  # Lower bound (inclusive)
     experience_rbound: 8  # Upper bound (exclusive, typically equals n_rollout)
     
     # Trajectory selection mode for storing and replaying
@@ -231,6 +240,12 @@ exp_manager:
     #   - "random": Random selection
     #   - "fifo": First-In-First-Out (oldest trajectory)
     exp_select_mode: "argmin"  # Select lowest entropy trajectory
+    
+    # ⭐ ExGRPO 方式：是否使用当前 policy 计算 entropy 选择轨迹
+    # If true: 在选择时使用当前 policy 重新计算每个候选轨迹的 entropy（更准确，但计算开销更大）
+    # If false: 使用保存时的 entropy（更快，但可能不是当前 policy 下的最优选择）
+    # ⭐ Multi-turn 关键：只对 LLM 响应部分（loss_mask=1）计算 entropy
+    use_current_policy_entropy: true  # Use current policy to compute entropy for selection
     
     # Whether to use recorded_old_log_probs for off-policy data
     # If true: use recorded_old_log_probs (from historical policy) for importance sampling

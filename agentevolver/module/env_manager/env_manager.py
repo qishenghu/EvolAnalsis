@@ -292,21 +292,35 @@ class ParallelEnvManager(object):
             List[Trajectory]: A sorted list of Trajectory objects representing the results of the successfully completed tasks.
         """
         traj_cmt_array = []
-        rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
+        base_rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
         future_to_params: Dict[Future, Tuple[Task, TrajExpConfig, str, str, str, int, dict, list[bool]]] = {}
 
+        # ⭐ Experience Replay: 计算每个 task 的实际 on-policy rollout 数量
+        # 如果 task 有 n_offpolicy_trajectories，则减少相应的 on-policy rollout
+        task_rollout_counts = []
+        total_rollouts = 0
+        for task in tasks:
+            n_offpolicy = 0
+            if hasattr(task, 'metadata') and task.metadata:
+                n_offpolicy = task.metadata.get("n_offpolicy_trajectories", 0)
+            # on-policy rollout 数量 = base_rollout_n - n_offpolicy
+            task_rollout_n = max(1, base_rollout_n - n_offpolicy)  # 至少保留 1 次 on-policy rollout
+            task_rollout_counts.append(task_rollout_n)
+            total_rollouts += task_rollout_n
+        
         tmux = {
-            'step': [0 for _ in range(len(tasks) * rollout_n)],
-            'token': [0 for _ in range(len(tasks) * rollout_n)],
+            'step': [0 for _ in range(total_rollouts)],
+            'token': [0 for _ in range(total_rollouts)],
         }
-        stop = [False for _ in range(len(tasks) * rollout_n)]
+        stop = [False for _ in range(total_rollouts)]
 
+        thread_index = 0
         with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
             # 2. submit: submit all tasks to the thread pool
             for data_id, (task, task_exp_config) in enumerate(zip(tasks, task_exp_configs)):
-                for rollout_id in range(rollout_n):
-                    thread_index = data_id * rollout_n + rollout_id
-                    add_exp = task_exp_config.add_exp[rollout_id]
+                task_rollout_n = task_rollout_counts[data_id]
+                for rollout_id in range(task_rollout_n):
+                    add_exp = task_exp_config.add_exp[rollout_id] if rollout_id < len(task_exp_config.add_exp) else False
                     train_mode = task_exp_config.train_mode
                     traj_exp_config = TrajExpConfig(
                         add_exp=add_exp, train_mode=train_mode, task_id=task.task_id, data_id=data_id, rollout_id=rollout_id, mode=mode)
@@ -314,6 +328,7 @@ class ParallelEnvManager(object):
                     params = (task, traj_exp_config, str(data_id), str(rollout_id), mode, thread_index, tmux,stop)
                     future = executor.submit(self.rollout_env_worker, *params)
                     future_to_params[future] = params
+                    thread_index += 1
 
             total_rollouts = len(future_to_params)
             pbar = tqdm(total=total_rollouts, desc=f"Epoch {epoch}: Collecting rollouts")
@@ -391,7 +406,8 @@ class ParallelEnvManager(object):
         self,
         offpolicy_trajectories: List[Trajectory],
         config: DictConfig,
-        tokenizer
+        tokenizer,
+        task_id_to_data_id: Optional[Dict[str, int]] = None
     ) -> List:
         """
         将 off-policy Trajectory 转换为 Linear_CMT 对象，以便使用相同的 tokenize 流程。
@@ -400,6 +416,9 @@ class ParallelEnvManager(object):
             offpolicy_trajectories: Off-policy trajectory 列表
             config: 配置对象
             tokenizer: Tokenizer 实例
+            task_id_to_data_id: task_id 到 data_id 的映射。
+                ⭐ ExGRPO 设计：同一个 task 的所有 rollouts（on-policy 和 off-policy）应该共享同一个 data_id
+                这个映射确保 off-policy trajectory 使用与对应 on-policy trajectory 相同的 data_id
             
         Returns:
             List[Linear_CMT]: 转换后的 Linear_CMT 对象列表
@@ -414,18 +433,21 @@ class ParallelEnvManager(object):
             cmt = Linear_CMT(config, tokenizer)
             
             # 设置基本信息
-            # ⭐ 关键：data_id 必须是整数或可以转换为整数（因为 group_ids = torch.tensor([int(s.data_id) for s in samples])）
-            # 为 off-policy 数据分配独立的 data_id，避免与 on-policy 数据混合分组（GRPO 需要）
             task_id = traj.task_id if hasattr(traj, 'task_id') else traj.metadata.get("task_id", "unknown")
             
-            # 将 task_id 转换为整数（如果可能），否则使用 hash
-            try:
-                task_id_int = int(task_id)
-            except (ValueError, TypeError):
-                task_id_int = hash(task_id) % 100000  # 使用 hash 确保是整数
+            # ⭐ ExGRPO 设计：使用 task_id_to_data_id 映射获取 data_id
+            # 确保 off-policy trajectory 使用与对应 on-policy trajectory 相同的 data_id
+            # 这样 GRPO 计算 advantage 时，同一个 task 的所有 rollouts 会在同一个分组中
+            if task_id_to_data_id is not None and task_id in task_id_to_data_id:
+                data_id = task_id_to_data_id[task_id]
+            else:
+                # 回退：使用 task_id 作为 data_id
+                try:
+                    data_id = int(task_id)
+                except (ValueError, TypeError):
+                    data_id = hash(task_id) % 100000
             
-            # data_id 格式：使用大偏移量 + task_id + index，确保唯一且是整数
-            cmt.data_id = str(1000000 + task_id_int * 1000 + traj_index)
+            cmt.data_id = str(data_id)
             cmt.rollout_id = str(traj.metadata.get("rollout_id", traj_index))
             cmt.task_id = task_id
             cmt.query = traj.query if hasattr(traj, 'query') else traj.metadata.get("query", "")

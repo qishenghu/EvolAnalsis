@@ -149,8 +149,13 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     ##################
                     # ANNI 0814
                     from .het_core_algos import het_compute_token_on_off_policy_loss
-                    off_cliprange_high = self.config.off_cliprange_high
+                    off_cliprange_high = self.config.get("off_cliprange_high", 1.0)
                     exp_mask = data["exp_mask"][:, -response_length:]
+                    
+                    # ⭐ Off-policy policy shaping configuration
+                    off_policy_shaping_mode = self.config.get("off_policy_shaping_mode", "higher_clip_bound")
+                    off_policy_shaping_beta = self.config.get("off_policy_shaping_beta", 0.1)
+                    
                     ret_dict = het_compute_token_on_off_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -163,6 +168,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         off_cliprange_high=off_cliprange_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        off_policy_shaping_mode=off_policy_shaping_mode,
+                        off_policy_shaping_beta=off_policy_shaping_beta,
                     )  # ⭐ Compute on-policy and off-policy losses
                     pg_loss = ret_dict["pg_loss"]
                     pg_losses = ret_dict["pg_losses"]

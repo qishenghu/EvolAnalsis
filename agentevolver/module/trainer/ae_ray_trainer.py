@@ -23,7 +23,7 @@ from collections import defaultdict
 from concurrent.futures.thread import ThreadPoolExecutor
 from copy import deepcopy
 from pprint import pprint
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Dict
 import warnings
 
 from loguru import logger
@@ -848,6 +848,130 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         # 返回 batch（虽然 batch 本身没有改变，但 current_old_log_prob 已经更新）
         return batch
 
+    def _select_best_offpolicy_by_current_entropy(
+        self,
+        task_to_candidates: Dict[str, List],
+        tasks: List,
+        num_trajectories_per_task: int = 1,
+    ) -> List:
+        """
+        使用当前 policy 计算 entropy，选择每个 task 的最优 off-policy 轨迹。
+        
+        ⭐ ExGRPO 方式：在选择时使用当前 policy 重新计算 entropy，而不是使用保存时的 entropy。
+        ⭐ Multi-turn 关键：只对 LLM 响应部分（loss_mask=1）计算 entropy。
+        
+        Args:
+            task_to_candidates: task_id -> 候选轨迹列表的映射
+            tasks: experience task 列表
+            num_trajectories_per_task: 每个 task 选择的轨迹数量
+            
+        Returns:
+            List[Trajectory]: 选中的 off-policy 轨迹列表
+        """
+        if not task_to_candidates:
+            return []
+        
+        selected_trajectories = []
+        
+        for task in tasks:
+            task_id = task.task_id
+            candidates = task_to_candidates.get(task_id, [])
+            
+            if not candidates:
+                # 没有候选轨迹，设置 n_offpolicy_trajectories 为 0
+                if hasattr(task, 'metadata') and task.metadata:
+                    task.metadata["n_offpolicy_trajectories"] = 0
+                else:
+                    task.metadata = {"n_offpolicy_trajectories": 0}
+                continue
+            
+            if len(candidates) == 1:
+                # 只有一个候选，直接选择
+                selected_trajectories.append(candidates[0])
+                if hasattr(task, 'metadata') and task.metadata:
+                    task.metadata["n_offpolicy_trajectories"] = 1
+                else:
+                    task.metadata = {"n_offpolicy_trajectories": 1}
+                continue
+            
+            # 多个候选：将候选轨迹转换为 CMT，计算 entropy
+            try:
+                candidate_cmts = self.env_manager.convert_offpolicy_to_cmt(
+                    offpolicy_trajectories=candidates,
+                    config=self.config,
+                    tokenizer=self.tokenizer
+                )
+                
+                # 转换为 DataProto
+                candidate_batch = self.env_manager.to_dataproto(candidate_cmts)
+                
+                # 计算 entropy
+                log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
+                entropys = log_prob_result.batch["entropys"]  # [num_candidates, response_len]
+                
+                # ⭐ Multi-turn 关键：使用 loss_mask 计算 response 部分的平均 entropy
+                response_masks = candidate_batch.batch["response_mask"]  # [num_candidates, seq_len]
+                
+                # 计算每个候选的平均 entropy（只考虑 LLM 响应部分）
+                avg_entropys = []
+                for i in range(len(candidates)):
+                    if i < entropys.shape[0]:
+                        traj_entropy = entropys[i].cpu().numpy()
+                        traj_response_mask = response_masks[i].cpu().numpy()
+                        
+                        # 只计算 response_mask=1 的位置（LLM 响应）
+                        valid_entropys = traj_entropy[traj_response_mask.astype(bool)]
+                        avg_entropy = float(np.mean(valid_entropys)) if len(valid_entropys) > 0 else float('inf')
+                    else:
+                        avg_entropy = float('inf')
+                    avg_entropys.append(avg_entropy)
+                
+                # 根据 exp_select_mode 选择最优轨迹
+                exp_select_mode = self.exp_manager.exp_select_mode
+                if exp_select_mode == "argmin":
+                    # 选择 entropy 最低的 num_trajectories_per_task 个
+                    sorted_indices = np.argsort(avg_entropys)
+                elif exp_select_mode == "argmax":
+                    # 选择 entropy 最高的 num_trajectories_per_task 个
+                    sorted_indices = np.argsort(avg_entropys)[::-1]
+                else:
+                    # 随机选择
+                    sorted_indices = np.random.permutation(len(candidates))
+                
+                # 选择 num_trajectories_per_task 个轨迹
+                num_to_select = min(num_trajectories_per_task, len(candidates))
+                for idx in sorted_indices[:num_to_select]:
+                    selected_trajectories.append(candidates[idx])
+                
+                # 更新 task 的 n_offpolicy_trajectories
+                if hasattr(task, 'metadata') and task.metadata:
+                    task.metadata["n_offpolicy_trajectories"] = num_to_select
+                else:
+                    task.metadata = {"n_offpolicy_trajectories": num_to_select}
+                
+                logger.debug(
+                    f"Task {task_id}: selected {num_to_select} off-policy trajectories "
+                    f"(avg_entropys: {[f'{e:.4f}' for e in avg_entropys]})"
+                )
+                
+            except Exception as e:
+                logger.warning(f"Failed to compute entropy for task {task_id}: {e}")
+                # 回退到使用保存时的 entropy
+                if self.exp_manager.exp_select_mode == "argmin":
+                    candidates.sort(key=lambda t: t.metadata.get("entropy", float('inf')))
+                elif self.exp_manager.exp_select_mode == "argmax":
+                    candidates.sort(key=lambda t: t.metadata.get("entropy", float('-inf')), reverse=True)
+                
+                num_to_select = min(num_trajectories_per_task, len(candidates))
+                selected_trajectories.extend(candidates[:num_to_select])
+                
+                if hasattr(task, 'metadata') and task.metadata:
+                    task.metadata["n_offpolicy_trajectories"] = num_to_select
+                else:
+                    task.metadata = {"n_offpolicy_trajectories": num_to_select}
+        
+        return selected_trajectories
+
     ##################
     # ANNI
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
@@ -1247,15 +1371,44 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     
                                     # 为 experience tasks 获取 off-policy trajectories
                                     if experience_tasks:
-                                        offpolicy_trajectories = self.exp_manager.get_offpolicy_batch(
-                                            tasks=experience_tasks,
-                                            num_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1)
-                                        )
+                                        # ⭐ ExGRPO 方式：使用当前 policy 计算 entropy 选择最优轨迹
+                                        use_current_policy_entropy = exp_replay_config.get("use_current_policy_entropy", True)
+                                        num_trajectories_per_task = exp_replay_config.get("offpolicy_trajectories_per_task", 1)
+                                        
+                                        if use_current_policy_entropy:
+                                            # 获取所有候选轨迹
+                                            task_to_candidates = self.exp_manager.get_all_candidates_batch(
+                                                tasks=experience_tasks
+                                            )
+                                            # 使用当前 policy 计算 entropy 选择最优轨迹
+                                            offpolicy_trajectories = self._select_best_offpolicy_by_current_entropy(
+                                                task_to_candidates=task_to_candidates,
+                                                tasks=experience_tasks,
+                                                num_trajectories_per_task=num_trajectories_per_task,
+                                            )
+                                        else:
+                                            # 使用保存时的 entropy 选择轨迹
+                                            offpolicy_trajectories = self.exp_manager.get_offpolicy_batch(
+                                                tasks=experience_tasks,
+                                                num_trajectories_per_task=num_trajectories_per_task,
+                                                use_saved_entropy=True
+                                            )
+                                        
                                         if offpolicy_trajectories:
+                                            # ⭐ ExGRPO 设计：构建 task_id 到 data_id 的映射
+                                            # 确保 off-policy trajectory 使用与对应 on-policy trajectory 相同的 data_id
+                                            # tasks = experience_tasks + on_policy_tasks，experience_tasks 在前面
+                                            # experience_tasks[i] 的 data_id 是 i
+                                            task_id_to_data_id = {
+                                                task.task_id: idx
+                                                for idx, task in enumerate(tasks)
+                                            }
+                                            
                                             offpolicy_cmt_array = self.env_manager.convert_offpolicy_to_cmt(
                                                 offpolicy_trajectories=offpolicy_trajectories,
                                                 config=self.config,
-                                                tokenizer=self.tokenizer
+                                                tokenizer=self.tokenizer,
+                                                task_id_to_data_id=task_id_to_data_id
                                             )
                                             logger.info(f"Got {len(offpolicy_cmt_array)} off-policy trajectories")
                             

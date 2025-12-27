@@ -115,7 +115,7 @@
 [5] 计算 Reward 和 Advantage
     ├─ 计算 token_level_rewards
     ├─ 计算 advantages（GRPO/GAE）
-    └─ GRPO 基于 group_ids（data_id）分组，off-policy 使用独立分组
+    └─ GRPO 基于 group_ids（data_id）分组，同一 task 的 on/off-policy 共享 data_id
     ↓
 [6] 计算 Loss
     ├─ 使用 exp_mask 区分 on/off-policy
@@ -227,8 +227,9 @@
 - **Reward 计算**：根据环境反馈或 reward model 计算 `token_level_rewards`
 - **Advantage 计算**：
   - GRPO：基于 `group_ids`（data_id）分组计算 advantage
-  - Off-policy 数据使用独立的 `data_id`（整数格式，例如：`1000000 + task_id_int * 1000 + index`），确保单独分组
-- **关键点**：GRPO 的分组确保 off-policy 数据的 advantage 计算不会影响 on-policy 数据
+  - ⭐ **ExGRPO 设计**：同一 task 的 on-policy 和 off-policy 共享相同的 `data_id`
+  - 例如：experience_task_0 的 1 条 off-policy + 7 条 on-policy 都使用 `data_id=0`
+- **关键点**：同一 task 的 on/off-policy rollouts 一起计算 advantage，实现 distribution engineering
 
 **[6] 计算 Loss**：
 - **目的**：计算策略梯度损失，用于模型更新
@@ -237,8 +238,55 @@
   - 对于 on-policy 数据：`ratio = exp(log_prob_current - old_log_prob_current) = 1.0`
 - **Loss 计算**：
   - On-policy：标准 PPO loss，使用 `cliprange_low` 和 `cliprange_high`
-  - Off-policy：带重要性采样的 PPO loss，使用 `cliprange_low` 和 `off_cliprange_high`（通常更小，如 1.0）
+  - Off-policy：根据 `off_policy_shaping_mode` 选择不同的计算方式：
+    - **`"higher_clip_bound"`**（AgentEvolver 原始方式）：使用更高的 `off_cliprange_high` 进行 clipping
+    - **`"exgrpo_policy_shaping"`**（ExGRPO 论文方式）：使用 policy shaping 函数 `f(x) = x/(x+β)` 替代 CLIP 项
 - **关键点**：通过 `exp_mask` 区分 on/off-policy，应用不同的 loss 计算方式
+
+#### 6.8 Off-policy Policy Shaping 机制
+
+**背景**：Policy shaping 用于调节来自经验数据的梯度，以保持熵。有两种实现方式：
+
+**方式 1：Higher Clip Bound（AgentEvolver 原始方式）**
+
+- **原理**：对 off-policy 数据使用更高的 `clip_upper_bound`（`off_cliprange_high`）
+- **实现**：
+  ```python
+  off_pg_losses = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + off_cliprange_high)
+  ```
+- **优点**：简单直接，通过更大的 clip range 允许 off-policy 数据有更大的更新幅度
+- **配置**：`off_policy_shaping_mode: "higher_clip_bound"`，`off_cliprange_high: 0.6`
+
+**方式 2：ExGRPO Policy Shaping（ExGRPO 论文方式）**
+
+- **原理**：使用非线性变换 `f(x) = x/(x+β)` 替代 CLIP 项，放大低概率信号，抑制高概率信号
+- **实现**：
+  ```python
+  off_ratio = torch.exp(log_prob - old_log_prob)  # w*(θ) = π_new / π_old
+  off_ratio_shaped = off_ratio / (off_ratio + β)  # f(w*(θ)) = w*(θ) / (w*(θ) + β)
+  off_pg_losses = -advantages * off_ratio_shaped  # 替代 CLIP 项
+  ```
+- **优点**：
+  - 鼓励模型从经验的更新颖方面学习
+  - 放大低概率信号，抑制高概率信号，保持熵
+  - 不需要 clipping，更平滑的梯度
+- **配置**：`off_policy_shaping_mode: "exgrpo_policy_shaping"`，`off_policy_shaping_beta: 0.1`
+
+**Multi-turn 场景处理**：
+
+- 两种方式都使用 `exp_mask * response_mask` 来确保只对 off-policy 的 LLM 响应 tokens 计算 loss
+- 在 multi-turn 场景中，每轮 LLM 响应都参与 off-policy loss 计算
+- Environment 响应不参与 loss 计算（`response_mask=0`）
+
+**配置示例**：
+
+```yaml
+actor_rollout_ref:
+  actor:
+    off_policy_shaping_mode: "exgrpo_policy_shaping"  # 或 "higher_clip_bound"
+    off_policy_shaping_beta: 0.1  # 仅用于 exgrpo_policy_shaping
+    off_cliprange_high: 0.6  # 仅用于 higher_clip_bound
+```
 
 **[7] 反向传播更新模型**：
 - **目的**：根据计算的 loss 更新模型参数
@@ -741,21 +789,22 @@ def convert_offpolicy_to_cmt(
             raise ValueError(f"Unsupported context template: {config.actor_rollout_ref.rollout.context_template}")
         
         # 设置基本信息
-        # ⭐ 关键：data_id 必须是整数或可以转换为整数（因为 group_ids = torch.tensor([int(s.data_id) for s in samples])）
-        # 为 off-policy 数据分配独立的 data_id，避免与 on-policy 数据混合分组（GRPO 需要）
-        # 使用一个大的偏移量（例如 1000000）确保 off-policy data_id 不会与 on-policy data_id 冲突
-        # ⭐ 注意：Trajectory 对象没有直接的 task_id 属性，需要从 metadata 中获取
+        # ⭐ ExGRPO 设计：使用 task_id_to_data_id 映射
+        # 确保 off-policy trajectory 使用与对应 on-policy trajectory 相同的 data_id
+        # 这样 GRPO 计算 advantage 时，同一个 task 的所有 rollouts 会在同一个分组中
         task_id = traj.metadata.get("task_id", "unknown")
-        traj_index = len(cmt_array)  # 使用索引确保唯一性
-        # 将 task_id 转换为整数（如果可能），否则使用 hash
-        try:
-            task_id_int = int(task_id)
-        except (ValueError, TypeError):
-            task_id_int = hash(task_id) % 100000  # 使用 hash 确保是整数
         
-        # data_id 格式：使用大偏移量 + task_id + index，确保唯一且是整数
-        # 例如：1000000 + task_id_int * 1000 + traj_index
-        cmt.data_id = str(1000000 + task_id_int * 1000 + traj_index)
+        # 从 task_id_to_data_id 映射获取 data_id
+        if task_id_to_data_id is not None and task_id in task_id_to_data_id:
+            data_id = task_id_to_data_id[task_id]
+        else:
+            # 回退：使用 task_id 作为 data_id
+            try:
+                data_id = int(task_id)
+            except (ValueError, TypeError):
+                data_id = hash(task_id) % 100000
+        
+        cmt.data_id = str(data_id)
         cmt.rollout_id = traj.metadata.get("rollout_id", "0")
         cmt.task_id = task_id  # Linear_CMT 有 task_id 属性
         cmt.query = traj.query or traj.metadata.get("query", "")
@@ -845,10 +894,10 @@ def convert_offpolicy_to_cmt(
 2. **使用 `exp_mask` 区分**：不使用 `loss_mask=0` 来区分 off-policy，而是使用独立的 `exp_mask`
 3. **参考 ExGRPO**：ExGRPO 的 `mix_core_alg.py` 也是分别计算 `on_pg_loss` 和 `off_pg_loss`，然后合并
 - **关键设计**：
-  - `data_id` 使用整数格式（例如：`1000000 + task_id_int * 1000 + traj_index`），确保可以转换为整数
+  - ⭐ **ExGRPO 设计**：同一 task 的 on-policy 和 off-policy 使用相同的 `data_id`
   - **重要**：现有代码中 `group_ids = torch.tensor([int(s.data_id) for s in samples])` 要求 data_id 必须是整数或可以转换为整数
-  - 使用大偏移量（1000000）确保 off-policy data_id 不会与 on-policy data_id（通常是 0, 1, 2, ...）冲突
-  - 独立的 `data_id` 确保 GRPO 分组时 off-policy 数据不会与 on-policy 数据混合
+  - 使用 `task_id_to_data_id` 映射确保 off-policy trajectory 使用与 on-policy trajectory 相同的 data_id
+  - 同一 task 的所有 rollouts 在同一个 GRPO 分组中计算 advantage
   - 保持与 on-policy 轨迹相同的结构，便于后续统一处理
 
 #### Step 2: 修改 tokenize_steps 以支持 is_experience_replay
@@ -1734,22 +1783,23 @@ if self.config.exp_manager.experience_replay.get("enable", False):
   - 保存位置：`ExperienceManager.task2trajectories`（内存存储）
   - 保存内容：完整的 Trajectory 对象，包括 messages、reward、old_log_probs、policy_version、entropy 等
   - 作用：将成功经验保存到内存，供后续作为 off-policy 数据使用
-  - **⭐ Experience 优选逻辑（参考 ExGRPO）**：
+  - **⭐ Experience 存储与优选逻辑（参考 ExGRPO）**：
+    - **存储策略（ExGRPO 设计）**：存储所有 reward 为正的 trajectories，取用时再选最优的
     - **第一步：筛选高 reward 轨迹**：只保存 `reward == 1.0` 的成功轨迹，确保数据质量
     - **第二步：筛选符合条件的任务**：只保存"部分成功"的任务（`experience_lbound < success_count < experience_rbound`），排除全对和全错的任务
-    - **第三步：选择最优轨迹**：对于每个符合条件的任务，从所有成功轨迹中选择 **entropy 最低的轨迹**（模型最自信的成功经验）
-    - **第四步：保存到内存**：将筛选后的最优轨迹保存到 `task2trajectories`，每个 task 最多保存 `max_trajectories_per_task` 个
-    - **第五步：内存管理**：如果某个 task 的轨迹数量超过 `max_trajectories_per_task`，根据 `exp_select_mode` 替换：
+    - **第三步：保存所有成功轨迹**：将符合条件的任务的**所有成功轨迹**保存到 `task2trajectories`（不再只选一个最优的）
+    - **第四步：内存管理**：如果某个 task 的轨迹数量超过 `max_trajectories_per_task`，根据 `exp_select_mode` 替换：
       - `exp_select_mode="argmin"`：如果新轨迹的 entropy 更低，则替换掉当前 entropy 最高的轨迹
       - `exp_select_mode="argmax"`：如果新轨迹的 entropy 更高，则替换掉当前 entropy 最低的轨迹
       - 默认（FIFO）：删除最旧的轨迹
+    - **第五步：取用时优选**：在 `_select_best_offpolicy_by_current_entropy` 中，使用当前 policy 计算 entropy，选择最优的轨迹
   - **关键点**：
-    - **高 reward + 低 entropy = 最优 experience**：参考 ExGRPO 的设计，最优的 experience 是高 reward（reward=1）同时 entropy 最低的轨迹
-    - **Entropy 计算**：在 `update_skip_uid_set_and_filter_trajectories` 中，计算每个成功轨迹的平均 entropy（基于 `entropys` 和 `response_mask`）
-    - **保存的 old_log_prob**：是当前策略计算的，在后续训练中会作为历史策略的 old_log_prob 使用
+    - **存储时保存所有成功轨迹**：不在存储时筛选，而是保存所有 reward 为正的轨迹
+    - **取用时选择最优**：使用当前 policy 计算 entropy，选择 entropy 最低的轨迹
+    - **Entropy 计算**：在取用时使用 `compute_log_prob` 重新计算 entropy，确保使用当前 policy 的 entropy
+    - **保存的 old_log_prob**：是生成时策略计算的，在后续训练中会作为历史策略的 old_log_prob 使用
     - **需要确保 trajectories 和 batch 的顺序一致**：才能正确匹配 old_log_prob 和 entropy
     - **使用 `max_trajectories_per_task` 限制每个 task 的轨迹数量**：避免内存无限增长
-    - **Replay 时的选择**：在 `get_offpolicy_trajectories_from_memory` 中，也根据 `exp_select_mode` 选择 entropy 最低（或最高）的轨迹进行 replay
 
 ## 4. 配置项
 
@@ -1854,6 +1904,91 @@ exp_manager:
 2. **只有 LLM 响应需要计算 loss**：Environment 响应不参与 loss 计算
 3. **loss_mask 标记 LLM 响应**：在 multi-turn 中，`loss_mask` 只对 LLM 响应位置设置为 1
 
+#### 6.0.0.4 GRPO 分组：data_id 设计
+
+**⭐ ExGRPO 设计原则**：同一个 task 的所有 rollouts（on-policy 和 off-policy）应该共享同一个 `data_id`/`uid`。
+
+**背景**：GRPO 使用 `uid` 来分组计算 advantage，同一 `data_id` 的轨迹会在同一个分组中。引入 off-policy rollouts 的目的是为了干涉 rollout batch 做 rollouts 的 distribution engineering，所以属于同一个 task 的 on-policy 和 off-policy rollouts 应该一起计算 advantage。
+
+**实现方式**：
+
+```python
+# 在 ae_ray_trainer.py 中构建 task_id 到 data_id 的映射
+# tasks = experience_tasks + on_policy_tasks
+# experience_tasks[0] 的 data_id = 0, experience_tasks[1] 的 data_id = 1, ...
+task_id_to_data_id = {
+    task.task_id: idx
+    for idx, task in enumerate(tasks)
+}
+
+# 传递给 convert_offpolicy_to_cmt
+offpolicy_cmt_array = self.env_manager.convert_offpolicy_to_cmt(
+    offpolicy_trajectories=offpolicy_trajectories,
+    config=self.config,
+    tokenizer=self.tokenizer,
+    task_id_to_data_id=task_id_to_data_id  # ⭐ 确保使用相同的 data_id
+)
+```
+
+**示例**：假设 `batch_size=4`, `n_rollout=8`, `exp_ratio=0.5`, `offpolicy_trajectories_per_task=1`
+
+```
+tasks = [experience_task_0, experience_task_1, on_policy_task_0, on_policy_task_1]
+          ↓ data_id=0        ↓ data_id=1       ↓ data_id=2       ↓ data_id=3
+
+experience_task_0 的 rollouts:
+  - 1 条 off-policy trajectory (data_id=0)  ← 共享 data_id
+  - 7 条 on-policy trajectories (data_id=0) ← 共享 data_id
+  
+experience_task_1 的 rollouts:
+  - 1 条 off-policy trajectory (data_id=1)  ← 共享 data_id
+  - 7 条 on-policy trajectories (data_id=1) ← 共享 data_id
+```
+
+#### 6.0.0.5 ExGRPO 方式的 Entropy 计算（用于选择轨迹）
+
+**背景**：ExGRPO 在选择轨迹时，使用当前 policy 重新计算每个候选轨迹的 entropy，而不是使用保存时的 entropy。
+
+**配置项**：`use_current_policy_entropy`
+- `true`（推荐）：在选择时使用当前 policy 重新计算 entropy
+- `false`：使用保存时的 entropy（快速但可能不是当前 policy 下的最优选择）
+
+**实现方式**（`ae_ray_trainer.py:_select_best_offpolicy_by_current_entropy`）：
+
+```python
+# 1. 获取所有候选轨迹
+task_to_candidates = self.exp_manager.get_all_candidates_batch(tasks=experience_tasks)
+
+# 2. 将候选轨迹转换为 DataProto
+candidate_cmts = self.env_manager.convert_offpolicy_to_cmt(candidates, ...)
+candidate_batch = self.env_manager.to_dataproto(candidate_cmts)
+
+# 3. 使用当前 policy 计算 entropy
+log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
+entropys = log_prob_result.batch["entropys"]
+
+# 4. ⭐ Multi-turn 关键：只对 LLM 响应部分计算平均 entropy
+response_masks = candidate_batch.batch["response_mask"]
+for i in range(len(candidates)):
+    traj_entropy = entropys[i].cpu().numpy()
+    traj_response_mask = response_masks[i].cpu().numpy()
+    # 只计算 response_mask=1 的位置（LLM 响应）
+    valid_entropys = traj_entropy[traj_response_mask.astype(bool)]
+    avg_entropy = float(np.mean(valid_entropys))
+
+# 5. 根据 exp_select_mode 选择最优轨迹
+if exp_select_mode == "argmin":
+    sorted_indices = np.argsort(avg_entropys)  # 选择 entropy 最低的
+```
+
+**优点**：
+- 使用当前 policy 的 entropy，更符合当前策略
+- 随着 policy 更新，选择标准也会更新
+
+**Multi-turn 关键**：
+- 只对 LLM 响应部分（`response_mask=1`）计算 entropy
+- Environment 响应不参与 entropy 计算
+
 **关键实现细节**：
 
 #### 6.0.1 response_mask 的来源（het_actor.py:127-130）
@@ -1897,6 +2032,35 @@ traj.metadata["response_mask"] = traj_response_mask.tolist()  # 保存 mask 用�
 | response_mask | `attention_mask[:, -response_length:]` | `loss_mask[:, -response_length:]` |
 | exp_mask | 整个 response 部分为 1 | 只有 LLM 响应位置为 1 |
 | old_log_probs | 整个 response | 完整保存（不过滤） |
+| 混合粒度 | Sample-level（每条轨迹独立） | Task-level + Trajectory-level |
+| 轨迹数量控制 | 每个 sample = 1 条轨迹 | 每个 task 恒定 n_rollout 条（off + on） |
+
+#### 6.0.5 Experience Task 的轨迹数量控制
+
+**设计原则**：每个 task 的总轨迹数量恒定为 `n_rollout`，确保 GRPO 分组均衡。
+
+**实现方式**：
+- Experience task：`n_exp` 条 off-policy + `(n_rollout - n_exp)` 条 on-policy = `n_rollout` 条
+- On-policy task：`n_rollout` 条 on-policy = `n_rollout` 条
+
+```python
+# experience_collate.py: 初始化期望的 off-policy 数量
+task.metadata["n_offpolicy_trajectories"] = self.offpolicy_trajectories_per_task  # 期望值
+
+# exp_manager.py (get_offpolicy_batch): 根据实际获取的数量更新
+actual_count = len(trajs)
+task.metadata["n_offpolicy_trajectories"] = actual_count  # 实际值
+
+# env_manager.py (rollout): 根据实际数量调整 on-policy rollout 数量
+n_offpolicy = task.metadata.get("n_offpolicy_trajectories", 0)
+task_rollout_n = max(1, base_rollout_n - n_offpolicy)  # 至少 1 次 on-policy
+```
+
+**重要**：`n_offpolicy_trajectories` 以实际获取的数量为准，因为 experience pool 中可能没有足够的轨迹。
+
+**示例**（`n_rollout=8`, `offpolicy_trajectories_per_task=2`）：
+- Experience task：2 条 off-policy + 6 条 on-policy = 8 条总轨迹
+- On-policy task：8 条 on-policy = 8 条总轨迹
 
 ### 6.0.5 Difficulty2Task 机制
 
@@ -1950,7 +2114,9 @@ traj.metadata["response_mask"] = traj_response_mask.tolist()  # 保存 mask 用�
   - 可以随机选择难度，也可以指定特定难度（例如只选择 difficulty=3 的任务）
   - 允许重复采样（同一个 task 可能被采样多次）
 
-### 6.1 Experience 优选逻辑（参考 ExGRPO）
+### 6.1 Experience 存储与优选逻辑（参考 ExGRPO）
+
+⭐ **ExGRPO 设计原则**：存储所有 reward 为正的 trajectories，取用时再选最优的。
 
 **核心原则**：最优的 experience 是**高 reward（reward=1）同时 entropy 最低**的轨迹。
 
@@ -1972,7 +2138,9 @@ traj.metadata["response_mask"] = traj_response_mask.tolist()  # 保存 mask 用�
 - 在 replay 时，这些轨迹能够提供更稳定、更可靠的学习信号
 - 有助于模型更快地学习到正确的行为模式
 
-#### 6.1.2 Experience 优选流程
+#### 6.1.2 Experience 存储与优选流程
+
+**存储阶段**（在 `update_skip_uid_set_and_filter_trajectories` 中）：
 
 **步骤 1：筛选高 Reward 轨迹**
 - 只考虑 `reward == 1.0` 的成功轨迹
@@ -1983,32 +2151,42 @@ traj.metadata["response_mask"] = traj_response_mask.tolist()  # 保存 mask 用�
 - 排除全对的任务（`success_count == n_rollout`）：这些任务已经掌握，加入 `skip_uid_set`
 - 排除全错的任务（`success_count <= experience_lbound`）：这些任务太难，不适合 replay
 
-**步骤 3：计算 Entropy**
-- 对于每个成功轨迹，计算其平均 entropy：
+**步骤 3：保存所有成功轨迹**（⭐ ExGRPO 设计）
+- 将符合条件的任务的**所有成功轨迹**保存到 `task2trajectories`
+- 不在存储时筛选最优的，而是保存所有成功轨迹
+- 使用 `max_trajectories_per_task` 限制每个 task 的最大轨迹数
+
+**取用阶段**（在 `_select_best_offpolicy_by_current_entropy` 中）：
+
+**步骤 4：使用当前 Policy 计算 Entropy**（取用时）
+- 使用当前 policy 对候选轨迹计算 entropy：
   ```python
-  traj_entropys = entropys[i].cpu().numpy()  # (response_len,)
-  traj_response_mask = response_mask[i].cpu().numpy()  # (response_len,)
-  valid_entropys = traj_entropys[traj_response_mask.astype(bool)]
-  avg_entropy = np.mean(valid_entropys)  # 平均 entropy
-  traj.metadata["entropy"] = avg_entropy  # 保存到 metadata
+  # 在 _select_best_offpolicy_by_current_entropy 中
+  log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
+  entropys = log_prob_result.batch["entropys"]
+  
+  for i in range(len(candidates)):
+      traj_entropy = entropys[i].cpu().numpy()
+      traj_response_mask = response_masks[i].cpu().numpy()
+      valid_entropys = traj_entropy[traj_response_mask.astype(bool)]
+      avg_entropy = float(np.mean(valid_entropys))
+      avg_entropys.append(avg_entropy)
   ```
 
-**步骤 4：选择最优轨迹**
-- 对于每个符合条件的任务，从所有成功轨迹中选择 entropy 最低的轨迹：
+**步骤 5：选择最优轨迹**（取用时）
+- 根据当前 policy 的 entropy 选择最优轨迹：
   ```python
-  successful_trajs_with_entropy = [
-      (e, t) for e, t in task_id_to_entropy_list[task_id] 
-      if t.reward.outcome == 1.0
-  ]
   if exp_select_mode == "argmin":
-      best_traj = min(successful_trajs_with_entropy, key=lambda x: x[0])[1]  # 选择 entropy 最低的
+      sorted_indices = np.argsort(avg_entropys)  # 选择 entropy 最低的
   elif exp_select_mode == "argmax":
-      best_traj = max(successful_trajs_with_entropy, key=lambda x: x[0])[1]  # 选择 entropy 最高的
+      sorted_indices = np.argsort(avg_entropys)[::-1]  # 选择 entropy 最高的
+  best_traj = candidates[sorted_indices[0]]
   ```
 
-**步骤 5：保存到内存**
-- 将筛选后的最优轨迹保存到 `task2trajectories[task_id]`
-- 每个 task 最多保存 `max_trajectories_per_task` 个轨迹
+**关键区别（与之前设计相比）**：
+- **存储时**：保存所有成功轨迹（不再只保存一个最优的）
+- **取用时**：使用当前 policy 计算 entropy，选择最优的
+- **优势**：使用当前 policy 的 entropy 更能反映当前策略下哪个轨迹最优
 
 **步骤 6：内存管理**
 - 如果某个 task 的轨迹数量超过 `max_trajectories_per_task`，根据 `exp_select_mode` 替换：
@@ -2117,10 +2295,13 @@ elif self.exp_select_mode == "argmax":  # 选择 entropy 最高的
   - 或者：只获取 `reward >= min_reward_threshold` 的轨迹
 
 ### 6.7 GRPO 计算考虑
-- GRPO 基于 `group_ids`（通常是 `data_id`）进行分组计算 advantage
-- Off-policy 数据应该使用独立的 `data_id`，避免与 on-policy 数据混合分组
-- 在 `convert_offpolicy_to_cmt()` 中，为 off-policy trajectory 分配唯一的 `data_id`（整数格式，例如：`1000000 + task_id_int * 1000 + index`）
-- 这样 GRPO 会为 off-policy 数据单独计算 advantage，不会影响 on-policy 数据的 advantage 计算
+
+⭐ **ExGRPO 设计原则**：同一个 task 的所有 rollouts（on-policy 和 off-policy）应该共享同一个 `data_id`。
+
+- **关键设计**：
+  - GRPO 基于 `group_ids`（通常是 `data_id`）进行分组计算 advantage
+  - 同一 task 的 on-policy 和 off-policy 使用相同的 `data_id`，在同一组内计算 advantage
+  - 使用 `task_id_to_data_id` 映射确保 data_id 一致
 - **关键：总轨迹数必须等于 n_rollout**：
   - 对于 replay tasks：on-policy 数量 + off-policy 数量 = `n_rollout`
   - 对于 non-replay tasks：on-policy 数量 = `n_rollout`
@@ -2131,20 +2312,18 @@ elif self.exp_select_mode == "argmax":  # 选择 entropy 最高的
   - GRPO（Group Relative Policy Optimization）基于 `group_ids`（通常是 `data_id`）进行分组
   - 同一组内的轨迹共享相同的 advantage 计算（基于组内的 reward 分布）
   - 不同组之间的 advantage 计算是独立的
-- **为什么需要独立分组**：
-  - Off-policy 数据来自历史策略，其 reward 分布可能与当前 on-policy 数据不同
-  - 如果混合分组，off-policy 数据的 reward 会影响 on-policy 数据的 advantage 计算
-  - 这会导致 advantage 计算不准确，影响训练效果
+- **为什么共享 data_id（ExGRPO 设计）**：
+  - 引入 off-policy rollouts 的目的是为了干涉 rollout batch 做 rollouts 的 distribution engineering
+  - 属于同一个 task 的 on-policy 和 off-policy rollouts 应该一起计算 advantages
+  - Off-policy 轨迹通常是成功的轨迹，可以帮助提高该 task 的 reward 基准线
 - **实现方式**：
-  - 在 `convert_offpolicy_to_cmt()` 中，为每个 off-policy trajectory 分配唯一的 `data_id`
-  - 格式：使用整数格式（例如：`1000000 + task_id_int * 1000 + traj_index`），确保可以转换为整数
-  - **重要**：现有代码要求 `data_id` 必须是整数或可以转换为整数（`int(s.data_id)`）
-  - 使用大偏移量（1000000）确保 off-policy data_id 不会与 on-policy data_id 冲突
-  - 这样每个 off-policy trajectory 都是独立的一组，不会与其他数据混合
-- **优势**：
-  - On-policy 数据的 advantage 计算不受 off-policy 数据影响
-  - Off-policy 数据的 advantage 基于其自身的 reward 分布计算
-  - 两种数据的 advantage 计算都是准确的
+  - 在 `ae_ray_trainer.py` 中构建 `task_id_to_data_id` 映射
+  - 在 `convert_offpolicy_to_cmt()` 中使用该映射设置 off-policy trajectory 的 `data_id`
+  - 这样同一 task 的 on-policy 和 off-policy 轨迹在同一组中
+- **示例**：
+  - `tasks = [exp_task_0, exp_task_1, on_policy_task_0, on_policy_task_1]`
+  - `exp_task_0` 的 1 条 off-policy + 7 条 on-policy 都使用 `data_id=0`
+  - `exp_task_1` 的 1 条 off-policy + 7 条 on-policy 都使用 `data_id=1`
 
 ### 6.8 性能考虑
 - 内存管理：使用 `max_trajectories_per_task` 限制每个 task 的轨迹数量

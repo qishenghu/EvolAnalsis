@@ -54,6 +54,8 @@ def het_compute_token_on_off_policy_loss(
     off_cliprange_high=1.0,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    off_policy_shaping_mode: str = "higher_clip_bound",  # "higher_clip_bound" or "exgrpo_policy_shaping"
+    off_policy_shaping_beta: float = 0.1,  # β for ExGRPO policy shaping: f(x) = x/(x+β)
 ):
     """
     Computes the on-policy and off-policy losses for reinforcement learning using PPO.
@@ -98,10 +100,35 @@ def het_compute_token_on_off_policy_loss(
     on_pg_loss = verl_F.masked_mean(on_pg_losses, (1.0 - exp_mask) * response_mask)  # ⭐ Compute the on-policy loss
 
     # Off-policy calculations
-    off_cliprange_low = cliprange_low
-    off_pg_losses, off_pg_clipfrac, off_pg_clipfrac_lower = compute_pg_losses(off_cliprange_low, off_cliprange_high)
-    off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)  # ⭐ Compute the off-policy loss
-    off_pg_loss = torch.tensor(0.0) if off_pg_loss.isnan().item() else off_pg_loss
+    if off_policy_shaping_mode == "exgrpo_policy_shaping":
+        # ⭐ ExGRPO Policy Shaping: Replace CLIP term with f(w*(θ)) = w*(θ) / (w*(θ) + β)
+        # where w*(θ) = exp(log_prob - old_log_prob) is the importance sampling ratio
+        # This amplifies low-probability signals and dampens high-probability ones
+        negative_approx_kl_off = log_prob - old_log_prob
+        off_ratio = torch.exp(negative_approx_kl_off)  # w*(θ) = π_new / π_old
+        
+        # Apply policy shaping: f(x) = x / (x + β)
+        off_ratio_shaped = off_ratio / (off_ratio + off_policy_shaping_beta)
+        
+        # Replace CLIP term with shaped ratio: -advantages * f(w*(θ))
+        off_pg_losses = -advantages * off_ratio_shaped
+        
+        # No clipping for off-policy when using policy shaping
+        off_pg_clipfrac = torch.tensor(0.0)
+        off_pg_clipfrac_lower = torch.tensor(0.0)
+        
+        # Compute off-policy loss (only on LLM response tokens in multi-turn)
+        off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)
+        off_pg_loss = torch.tensor(0.0) if off_pg_loss.isnan().item() else off_pg_loss
+        
+    elif off_policy_shaping_mode == "higher_clip_bound":
+        # ⭐ AgentEvolver original: Use higher clip_upper_bound for off-policy data
+        off_cliprange_low = cliprange_low
+        off_pg_losses, off_pg_clipfrac, off_pg_clipfrac_lower = compute_pg_losses(off_cliprange_low, off_cliprange_high)
+        off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)  # ⭐ Compute the off-policy loss
+        off_pg_loss = torch.tensor(0.0) if off_pg_loss.isnan().item() else off_pg_loss
+    else:
+        raise ValueError(f"Invalid off_policy_shaping_mode: {off_policy_shaping_mode}. Must be 'exgrpo_policy_shaping' or 'higher_clip_bound'")
 
     # Combine on-policy and off-policy losses
     exp_mask = exp_mask.float()

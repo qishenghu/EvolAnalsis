@@ -309,7 +309,8 @@ class ExperienceManager(object):
     def get_offpolicy_trajectories_from_memory(
         self, 
         task_id: str, 
-        num_trajectories: int = 1
+        num_trajectories: int = 1,
+        use_saved_entropy: bool = True
     ) -> List[Trajectory]:
         """
         从内存中的 task2trajectories 获取指定任务的 off-policy trajectory。
@@ -318,6 +319,9 @@ class ExperienceManager(object):
         Args:
             task_id: 任务 ID
             num_trajectories: 获取的轨迹数量
+            use_saved_entropy: 是否使用保存时的 entropy 进行选择
+                - True: 使用保存时的 entropy（默认，快速但可能不是当前 policy 最优）
+                - False: 返回所有候选轨迹，由调用方使用当前 policy 计算 entropy 后选择
             
         Returns:
             List[Trajectory]: Off-policy trajectory 列表
@@ -330,26 +334,49 @@ class ExperienceManager(object):
         # 深拷贝以避免修改原始轨迹
         available_trajectories = [copy.deepcopy(t) for t in available_trajectories]
         
-        # 根据 exp_select_mode 选择轨迹
-        if self.exp_select_mode == "argmin":  # 选择 entropy 最低的
-            available_trajectories.sort(key=lambda t: t.metadata.get("entropy", float('inf')))
-        elif self.exp_select_mode == "argmax":  # 选择 entropy 最高的
-            available_trajectories.sort(key=lambda t: t.metadata.get("entropy", float('-inf')), reverse=True)
-        # 默认或 random 模式下，不排序，直接随机选择
-        
-        # 采样 num_trajectories 个轨迹
-        sampled_trajectories = available_trajectories[:min(num_trajectories, len(available_trajectories))]
+        if use_saved_entropy:
+            # 使用保存时的 entropy 进行选择
+            if self.exp_select_mode == "argmin":  # 选择 entropy 最低的
+                available_trajectories.sort(key=lambda t: t.metadata.get("entropy", float('inf')))
+            elif self.exp_select_mode == "argmax":  # 选择 entropy 最高的
+                available_trajectories.sort(key=lambda t: t.metadata.get("entropy", float('-inf')), reverse=True)
+            # 默认或 random 模式下，不排序，直接随机选择
+            
+            # 采样 num_trajectories 个轨迹
+            sampled_trajectories = available_trajectories[:min(num_trajectories, len(available_trajectories))]
+        else:
+            # 返回所有候选轨迹，由调用方使用当前 policy 计算 entropy 后选择
+            sampled_trajectories = available_trajectories
         
         # 标记为 experience replay
+        # ⭐ 注意：不再设置 author="llm(do_not_train)"
+        # Off-policy LLM 消息保持 author="llm"，参与 off-policy loss 计算
+        # 在 convert_offpolicy_to_cmt 中会强制设置 author="llm"
+        # 使用 exp_mask=1 来区分 on-policy 和 off-policy 数据
         for traj in sampled_trajectories:
             traj.metadata["is_experience_replay"] = True
-            # ⭐ Prefix机制关键：将所有LLM消息（role="assistant"）的 author 设置为 "llm(do_not_train)"
-            if hasattr(traj, 'steps') and traj.steps:
-                for step in traj.steps:
-                    if isinstance(step, dict) and step.get("role") == "assistant":
-                        step["author"] = "llm(do_not_train)"
         
         return sampled_trajectories
+    
+    def get_all_candidate_trajectories(
+        self,
+        task_id: str,
+    ) -> List[Trajectory]:
+        """
+        获取指定任务的所有候选 off-policy trajectories，不进行排序。
+        用于后续使用当前 policy 计算 entropy 后选择最优轨迹。
+        
+        Args:
+            task_id: 任务 ID
+            
+        Returns:
+            List[Trajectory]: 所有候选轨迹列表
+        """
+        return self.get_offpolicy_trajectories_from_memory(
+            task_id=task_id,
+            num_trajectories=999999,  # 获取所有
+            use_saved_entropy=False
+        )
 
     def update_skip_uid_set_and_filter_trajectories(
         self,
@@ -361,9 +388,11 @@ class ExperienceManager(object):
         """
         根据 rollout 结果更新 skip_uid_set，并筛选符合条件的轨迹（非全对非全错，且选择 entropy 最低的成功轨迹）。
         
+        只统计 on-policy 成功次数。判断"全部成功"时，使用实际的 on-policy rollout 数量（即该 task 的轨迹数）。
+        
         Args:
             trajectories: 当前 step 的所有 on-policy trajectory 列表
-            n_rollout: 每个 task 的 rollout 数量
+            n_rollout: 基准 rollout 数量（用于 experience_rbound 判断）
             entropys: 当前 step 所有 on-policy 轨迹的 token 级 entropy (bs, response_len)
             response_mask: 当前 step 所有 on-policy 轨迹的 response mask (bs, response_len)
             
@@ -394,9 +423,12 @@ class ExperienceManager(object):
         
         for task_id, trajs in task_id_to_trajectories.items():
             success_count = sum(1 for traj in trajs if traj.reward and traj.reward.outcome == 1.0)
+            # ⭐ 使用实际的 on-policy rollout 数量，而不是基准 n_rollout
+            # 对于 experience task，实际 rollout 数量 = n_rollout - n_offpolicy
+            actual_rollout_count = len(trajs)
             
             # 1. 更新 skip_uid_set
-            if success_count == n_rollout:  # 全部做对
+            if success_count == actual_rollout_count:  # 全部做对（基于实际 rollout 数量）
                 if task_id not in self.skip_uid_set:
                     self.skip_uid_set.add(task_id)
                     # 从 difficulty2task_dict 中移除
@@ -416,19 +448,16 @@ class ExperienceManager(object):
             
             # 2. 筛选加入 experience replay pool 的 tasks (非全对非全错)
             if self.experience_lbound < success_count < self.experience_rbound:
-                # 选择 entropy 最低的成功轨迹
-                successful_trajs_with_entropy = [
-                    (e, t) for e, t in task_id_to_entropy_list[task_id] 
+                # ⭐ ExGRPO 设计：存储所有 reward 为正的 trajectories，取用时再选最优的
+                # 不再在存储时只选择一个最优的
+                successful_trajs = [
+                    t for e, t in task_id_to_entropy_list[task_id] 
                     if t.reward and t.reward.outcome == 1.0
                 ]
-                if successful_trajs_with_entropy:
-                    if self.exp_select_mode == "argmin":
-                        best_traj = min(successful_trajs_with_entropy, key=lambda x: x[0])[1]
-                    elif self.exp_select_mode == "argmax":
-                        best_traj = max(successful_trajs_with_entropy, key=lambda x: x[0])[1]
-                    else:  # 默认随机选择一个成功的
-                        best_traj = random.choice([t for e, t in successful_trajs_with_entropy])
-                    filtered_trajectories_to_save.append(best_traj)
+                if successful_trajs:
+                    # 将所有成功的轨迹都加入待保存列表
+                    filtered_trajectories_to_save.extend(successful_trajs)
+                    logger.debug(f"Task {task_id}: adding {len(successful_trajs)} successful trajectories to experience pool")
             else:
                 logger.debug(f"Task {task_id} (success_count={success_count}) not within bounds [{self.experience_lbound}, {self.experience_rbound}], skipping for experience pool.")
         
@@ -473,14 +502,19 @@ class ExperienceManager(object):
     def get_offpolicy_batch(
         self, 
         tasks: List[Task], 
-        num_trajectories_per_task: int = 1
+        num_trajectories_per_task: int = 1,
+        use_saved_entropy: bool = True
     ) -> List[Trajectory]:
         """
         为给定的任务列表从内存中获取 off-policy trajectory。
+        同时更新每个 task 的 metadata["n_offpolicy_trajectories"] 为实际获取的数量。
         
         Args:
             tasks: 任务列表
-            num_trajectories_per_task: 每个任务获取的轨迹数量
+            num_trajectories_per_task: 每个任务期望获取的轨迹数量
+            use_saved_entropy: 是否使用保存时的 entropy 进行选择
+                - True: 使用保存时的 entropy（默认，快速但可能不是当前 policy 最优）
+                - False: 返回所有候选轨迹，由调用方使用当前 policy 计算 entropy 后选择
             
         Returns:
             List[Trajectory]: Off-policy trajectory 列表
@@ -491,14 +525,61 @@ class ExperienceManager(object):
             try:
                 trajs = self.get_offpolicy_trajectories_from_memory(
                     task_id=task.task_id,
-                    num_trajectories=num_trajectories_per_task
+                    num_trajectories=num_trajectories_per_task,
+                    use_saved_entropy=use_saved_entropy
                 )
                 offpolicy_trajectories.extend(trajs)
+                
+                # ⭐ 更新 task 的 n_offpolicy_trajectories 为实际获取的数量
+                # 这样 rollout 时可以根据实际数量调整 on-policy rollout 数量
+                actual_count = len(trajs)
+                if hasattr(task, 'metadata') and task.metadata:
+                    task.metadata["n_offpolicy_trajectories"] = actual_count
+                else:
+                    task.metadata = {"n_offpolicy_trajectories": actual_count}
+                    
+                if actual_count < num_trajectories_per_task:
+                    logger.debug(
+                        f"Task {task.task_id}: requested {num_trajectories_per_task} off-policy trajectories, "
+                        f"but only got {actual_count}"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to get off-policy trajectory for task {task.task_id}: {e}")
+                # 获取失败时，设置为 0
+                if hasattr(task, 'metadata') and task.metadata:
+                    task.metadata["n_offpolicy_trajectories"] = 0
+                else:
+                    task.metadata = {"n_offpolicy_trajectories": 0}
                 continue
         
         return offpolicy_trajectories
+    
+    def get_all_candidates_batch(
+        self, 
+        tasks: List[Task]
+    ) -> Dict[str, List[Trajectory]]:
+        """
+        为给定的任务列表获取所有候选 off-policy trajectories。
+        用于后续使用当前 policy 计算 entropy 后选择最优轨迹。
+        
+        Args:
+            tasks: 任务列表
+            
+        Returns:
+            Dict[str, List[Trajectory]]: task_id -> 候选轨迹列表的映射
+        """
+        task_to_candidates: Dict[str, List[Trajectory]] = {}
+        
+        for task in tasks:
+            try:
+                candidates = self.get_all_candidate_trajectories(task_id=task.task_id)
+                if candidates:
+                    task_to_candidates[task.task_id] = candidates
+            except Exception as e:
+                logger.warning(f"Failed to get candidate trajectories for task {task.task_id}: {e}")
+                continue
+        
+        return task_to_candidates
     
     def get_valid_replay_task_ids(self) -> List[str]:
         """
