@@ -919,17 +919,29 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 if not samples:
                     raise ValueError("No samples generated from candidate CMTs")
                 
-                # 直接转换为 DataProto（不经过 world_size 对齐）
+                # ⭐ 为了支持分布式计算，需要将样本数量对齐到 world_size
+                world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+                original_num_samples = len(samples)
+                remainder = original_num_samples % world_size
+                if remainder != 0:
+                    # 需要添加 padding 样本（复制已有样本）
+                    padding_needed = world_size - remainder
+                    for i in range(padding_needed):
+                        samples.append(samples[i % original_num_samples])
+                
+                # 转换为 DataProto
                 candidate_batch = self.env_manager.samples_to_dataproto(samples)
                 
                 # 计算 entropy
                 log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
-                entropys = log_prob_result.batch["entropys"]  # [num_candidates, response_len]
+                # ⭐ 只取原始样本的 entropy（去除 padding）
+                entropys = log_prob_result.batch["entropys"][:original_num_samples]  # [num_candidates, response_len]
                 
                 # ⭐ Multi-turn 关键：使用 loss_mask 计算 LLM 响应部分的平均 entropy
                 # 对于 multi-turn，loss_mask 只标记 LLM 响应位置（不包含 environment 响应）
                 response_length = candidate_batch.batch["responses"].shape[-1]
-                response_masks = candidate_batch.batch["loss_mask"][:, -response_length:]  # [num_candidates, response_len]
+                # ⭐ 只取原始样本的 response_mask（去除 padding）
+                response_masks = candidate_batch.batch["loss_mask"][:original_num_samples, -response_length:]  # [num_candidates, response_len]
                 
                 # 计算每个候选的平均 entropy（只考虑 LLM 响应部分）
                 avg_entropys = []
