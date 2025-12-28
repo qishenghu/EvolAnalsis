@@ -26,7 +26,7 @@ trainer:
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
-  total_epochs: 2
+  total_epochs: 1
   save_freq: 100
   test_freq: 10
   val_before_train: false
@@ -233,7 +233,7 @@ exp_manager:
     
     # ⭐ Training progress threshold: start replay when training_progress >= replay_start_ratio
     # When training_progress < replay_start_ratio, only accumulate experience (update difficulty2task_dict and save trajectories)
-    replay_start_ratio: 0.1  # Start replay at 10% of training (0.0-1.0)
+    replay_start_ratio: 0.05  # Start replay at 10% of training (0.0-1.0)
     
     # ⭐ Experience tasks ratio: proportion of experience tasks in each batch
     # For example, if batch_size=8, exp_ratio=0.5, then:
