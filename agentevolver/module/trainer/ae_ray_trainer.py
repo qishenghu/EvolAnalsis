@@ -905,6 +905,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 # 转换为 DataProto
                 candidate_batch = self.env_manager.to_dataproto(candidate_cmts)
                 
+                # ⭐ 计算 response_mask（to_dataproto 不会自动创建）
+                candidate_batch.batch["response_mask"] = compute_response_mask(candidate_batch)
+                
                 # 计算 entropy
                 log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
                 entropys = log_prob_result.batch["entropys"]  # [num_candidates, response_len]
