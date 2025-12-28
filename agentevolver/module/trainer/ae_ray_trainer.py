@@ -902,8 +902,25 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                     tokenizer=self.tokenizer
                 )
                 
-                # 转换为 DataProto
-                candidate_batch = self.env_manager.to_dataproto(candidate_cmts)
+                # ⭐ 检查转换后的 CMT 是否为空
+                if not candidate_cmts:
+                    raise ValueError("convert_offpolicy_to_cmt returned empty list")
+                
+                # 转换为 samples，跳过 world_size 对齐（因为只是用于 entropy 计算，不需要对齐）
+                samples = []
+                for cmt in candidate_cmts:
+                    extras = self.env_manager.get_extra(cmt)
+                    sample_arr = cmt.group_tokenize()
+                    for sample in sample_arr:
+                        sample.extras = extras
+                    samples.extend(sample_arr)
+                
+                # ⭐ 检查 samples 是否为空
+                if not samples:
+                    raise ValueError("No samples generated from candidate CMTs")
+                
+                # 直接转换为 DataProto（不经过 world_size 对齐）
+                candidate_batch = self.env_manager.samples_to_dataproto(samples)
                 
                 # 计算 entropy
                 log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
