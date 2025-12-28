@@ -73,12 +73,14 @@ class ExperienceMixCollateFn:
             # 阶段 1：只使用 training tasks，不进行 replay
             return [], training_tasks
         
+
         # 阶段 2：混合 experience tasks 和 on-policy tasks
         # 计算目标 experience task 数量
         target_exp_count = int(batch_size * self.exp_ratio)  # 例如：64 * 0.5 = 32
         
         # 从 replaytaskpool 采样 experience task_ids
         valid_exp_task_ids = self.exp_manager.get_valid_replay_task_ids()
+        print(f"valid_exp_task_ids: {valid_exp_task_ids}")
         
         # 采样 experience task_ids（最多 target_exp_count 个）
         n_exp = min(len(valid_exp_task_ids), target_exp_count)

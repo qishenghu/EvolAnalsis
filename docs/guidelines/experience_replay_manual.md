@@ -938,3 +938,67 @@ Experience Replay 与 GRPO 的完整流程包括：
 - **⭐ ExGRPO 存储策略**: 存储所有 reward 为正的轨迹，取用时使用当前 policy 计算 entropy 选择最优的
 - **LLM 消息保持 author="llm"**: 确保 `loss_mask=1`，参与 off-policy loss 计算
 
+---
+
+## 快速测试 Experience Replay 组件
+
+为了快速验证 experience replay 的各个组件是否正常工作，我们提供了测试脚本：
+
+### 快速检查（推荐）
+
+最简单的检查方式，只需要基本的 Python 和 torch：
+
+```bash
+cd /home/qisheng/agent/AgentEvolver
+python tests/quick_check_experience_replay.py
+```
+
+这个脚本会检查：
+1. 必要的导入是否可用
+2. Loss 计算函数（两种 policy shaping 方式）是否正常工作
+3. ExperienceManager 是否可以正确初始化
+4. GRPO 分组逻辑是否正确
+
+### 完整测试
+
+如果需要更详细的测试，可以使用完整的测试套件：
+
+```bash
+# 运行所有测试
+python tests/test_experience_replay_components.py --test all
+
+# 运行特定测试
+python tests/test_experience_replay_components.py --test loss_computation
+python tests/test_experience_replay_components.py --test trajectory_storage
+python tests/test_experience_replay_components.py --test grpo_grouping
+```
+
+可用的测试项：
+- `exp_manager`: ExperienceManager 基本功能
+- `trajectory_storage`: 轨迹存储和检索
+- `mix_collate`: ExperienceMixCollateFn
+- `offpolicy_retrieval`: Off-policy 轨迹获取
+- `loss_computation`: Loss 计算（两种 policy shaping 方式）
+- `grpo_grouping`: GRPO 分组机制
+- `skip_uid_set`: skip_uid_set 更新逻辑
+
+详细说明请参考 `tests/README_experience_replay_tests.md`。
+
+### 快速验证清单
+
+如果你想快速验证 experience replay 是否正常工作，可以按以下顺序运行：
+
+```bash
+# 1. 快速检查（最快）
+python tests/quick_check_experience_replay.py
+
+# 2. Loss 计算（最重要）
+python tests/test_experience_replay_components.py --test loss_computation
+
+# 3. 存储和检索
+python tests/test_experience_replay_components.py --test trajectory_storage
+
+# 4. GRPO 分组
+python tests/test_experience_replay_components.py --test grpo_grouping
+```
+

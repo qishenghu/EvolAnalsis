@@ -11,7 +11,7 @@ defaults:
 # ============================================================================
 # AlfWorld GRPO Training Configuration with Experience Replay
 # ============================================================================
-# This configuration is for training Qwen/Qwen2.5-7B-Instruct on AlfWorld
+# This configuration is for training Qwen/Qwen2.5-3B-Instruct on AlfWorld
 # using GRPO with Experience Replay mechanism.
 # 
 # Key settings:
@@ -22,7 +22,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_7b_grpo_exp_replay
+  experiment_name: alfworld_3b_grpo_exp_replay
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -46,11 +46,11 @@ algorithm:
   use_kl_in_reward: false
 
 # ============================================================================
-# Model Configuration - Qwen/Qwen2.5-7B-Instruct
+# Model Configuration - Qwen/Qwen2.5-3B-Instruct
 # ============================================================================
 actor_rollout_ref:
   model:
-    path: /data/code/exp/models/Qwen/Qwen2.5-7B-Instruct
+    path: /data/code/exp/models/Qwen/Qwen2.5-3B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:
@@ -211,7 +211,7 @@ exp_manager:
   # ReMe 服务配置（Experience Summarization 服务，已禁用）
   reme:
     base_url: "http://127.0.0.1:8124"  # ReMe 服务 URL（不需要启动）
-    workspace_id: "alfworld_7b_grpo_exp_replay"
+    workspace_id: "alfworld_3b_grpo_exp_replay"
     enable_summarizer: false        # ⭐ 禁用经验总结（不调用 LLM 总结经验）
     enable_context_generator: false # ⭐ 禁用经验检索（不从 ReMe 检索经验）
     retrieve_top_k: 3               # 检索数量（已禁用，不使用）
