@@ -1044,6 +1044,192 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
         print(f"Dumped generations to {filename}")
 
+    def _save_trajectories_for_analysis(
+        self,
+        trajectories: List[Trajectory],
+        tasks: List[Task],
+        entropys: torch.Tensor,
+        response_masks: torch.Tensor,
+        global_steps: int,
+        output_dir: str,
+    ):
+        """
+        保存 Trajectory 信息用于后续分析。
+        
+        保存的信息包括：
+        - messages: 从 trajectory.steps 中提取的消息列表
+        - reward: trajectory.reward.outcome 和完整的 reward 信息
+        - entropy: 从 entropys tensor 中提取的平均 entropy（只计算有效 token）
+        - step: 训练步数 (global_steps)
+        - task_id: 从 trajectory.metadata 或 tasks 中获取
+        - data_id, rollout_id: 用于匹配和标识
+        - is_terminated: 是否终止
+        - 其他 metadata 信息
+        
+        Args:
+            trajectories: Trajectory 对象列表
+            tasks: Task 对象列表，用于获取 task_id
+            entropys: Entropy tensor，shape (batch_size, response_len)
+            response_masks: Response mask tensor，shape (batch_size, response_len)
+            global_steps: 当前训练步数
+            output_dir: 输出目录路径
+        """
+        if not trajectories:
+            return
+        
+        # 创建 Trajectory 文件夹
+        trajectory_dir = os.path.join(output_dir, "Trajectory")
+        os.makedirs(trajectory_dir, exist_ok=True)
+        
+        # 创建 task_id 到 Task 的映射（用于获取 task_id）
+        task_id_map = {}
+        if tasks:
+            # 如果 tasks 列表长度与 trajectories 匹配，可以直接索引
+            # 否则需要通过 data_id 匹配
+            for task in tasks:
+                task_id_map[task.task_id] = task
+        
+        # 准备保存的数据
+        saved_data = []
+        
+        for idx, traj in enumerate(trajectories):
+            # 提取基本信息
+            data_id = traj.data_id
+            rollout_id = traj.rollout_id
+            
+            # 获取 task_id
+            task_id = None
+            if hasattr(traj, 'task_id'):
+                task_id = traj.task_id
+            elif traj.metadata and "task_id" in traj.metadata:
+                task_id = traj.metadata["task_id"]
+            elif tasks and idx < len(tasks):
+                task_id = tasks[idx].task_id
+            else:
+                # 尝试从 data_id 匹配
+                try:
+                    data_id_int = int(data_id)
+                    if data_id_int < len(tasks):
+                        task_id = tasks[data_id_int].task_id
+                except (ValueError, TypeError, IndexError):
+                    pass
+            
+            if task_id is None:
+                task_id = f"unknown_{data_id}_{rollout_id}"
+            
+            # 提取 messages（从 steps 中）
+            messages = []
+            if traj.steps:
+                for step in traj.steps:
+                    if isinstance(step, dict):
+                        # steps 已经是消息格式
+                        msg = {
+                            "role": step.get("role", "unknown"),
+                            "content": step.get("content", ""),
+                        }
+                        # 保留其他可能的字段
+                        if "tool_calls" in step:
+                            msg["tool_calls"] = step["tool_calls"]
+                        if "timestamp" in step:
+                            msg["timestamp"] = step["timestamp"]
+                        messages.append(msg)
+            
+            # 提取 reward 信息
+            reward_info = None
+            if traj.reward:
+                reward_info = {
+                    "outcome": traj.reward.outcome,
+                    "success_rate": traj.reward.success_rate,
+                    "madness": traj.reward.madness,
+                    "description": traj.reward.description,
+                }
+                if hasattr(traj.reward, 'metadata') and traj.reward.metadata:
+                    reward_info["metadata"] = traj.reward.metadata
+            
+            # 提取 entropy（从 entropys tensor 中）
+            entropy_info = None
+            if entropys is not None and idx < entropys.shape[0]:
+                traj_entropy = entropys[idx].cpu().numpy()  # (response_len,)
+                
+                # 获取对应的 response_mask
+                if response_masks is not None and idx < response_masks.shape[0]:
+                    traj_response_mask = response_masks[idx].cpu().numpy()  # (response_len,)
+                    
+                    # 只计算有效 token 的 entropy
+                    valid_entropys = traj_entropy[traj_response_mask.astype(bool)]
+                    
+                    if len(valid_entropys) > 0:
+                        entropy_info = {
+                            "mean": float(np.mean(valid_entropys)),
+                            "std": float(np.std(valid_entropys)),
+                            "min": float(np.min(valid_entropys)),
+                            "max": float(np.max(valid_entropys)),
+                            "num_valid_tokens": int(len(valid_entropys)),
+                            "total_tokens": int(len(traj_entropy)),
+                        }
+                    else:
+                        entropy_info = {
+                            "mean": None,
+                            "std": None,
+                            "min": None,
+                            "max": None,
+                            "num_valid_tokens": 0,
+                            "total_tokens": int(len(traj_entropy)),
+                        }
+                else:
+                    # 如果没有 mask，计算所有 token 的统计
+                    entropy_info = {
+                        "mean": float(np.mean(traj_entropy)),
+                        "std": float(np.std(traj_entropy)),
+                        "min": float(np.min(traj_entropy)),
+                        "max": float(np.max(traj_entropy)),
+                        "num_valid_tokens": int(len(traj_entropy)),
+                        "total_tokens": int(len(traj_entropy)),
+                    }
+            
+            # 构建保存的数据结构
+            traj_data = {
+                "data_id": data_id,
+                "rollout_id": rollout_id,
+                "task_id": task_id,
+                "step": global_steps,
+                "query": traj.query,
+                "messages": messages,
+                "reward": reward_info,
+                "entropy": entropy_info,
+                "is_terminated": traj.is_terminated,
+                "success": traj.success if hasattr(traj, 'success') else (traj.reward is not None and traj.reward.outcome > 0),
+            }
+            
+            # 添加 metadata（排除已经单独提取的字段）
+            if traj.metadata:
+                metadata_copy = {}
+                for k, v in traj.metadata.items():
+                    # 跳过已经单独提取的字段
+                    if k not in ["task_id", "old_log_probs", "response_mask"]:
+                        # 尝试序列化，如果失败则跳过
+                        try:
+                            json.dumps(v, ensure_ascii=False)
+                            metadata_copy[k] = v
+                        except (TypeError, ValueError):
+                            # 如果无法序列化，尝试转换为字符串
+                            try:
+                                metadata_copy[k] = str(v)
+                            except:
+                                pass
+                if metadata_copy:
+                    traj_data["metadata"] = metadata_copy
+            
+            saved_data.append(traj_data)
+        
+        # 保存为 JSONL 文件
+        filename = os.path.join(trajectory_dir, f"trajectories_step_{global_steps}.jsonl")
+        with open(filename, "w", encoding="utf-8") as f:
+            for data in saved_data:
+                f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        
+        logger.info(f"Saved {len(saved_data)} trajectories to {filename}")
+
 
     def _validate(self):
         """
@@ -1571,6 +1757,38 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
+                        
+                        # ⭐ 保存 Trajectory 信息用于后续分析
+                        # 在计算完 entropy 后保存，确保有完整的信息
+                        # 注意：只在 async_rollout_mode 时保存，因为 trajectories 和 tasks 只在此时定义
+                        if self.async_rollout_mode and trajectories:
+                            trajectory_save_dir = self.config.trainer.get("trajectory_save_dir", None)
+                            if trajectory_save_dir is None:
+                                # 如果没有指定，使用 default_local_dir
+                                trajectory_save_dir = self.config.trainer.get("default_local_dir", "checkpoints")
+                            
+                            if trajectory_save_dir:
+                                try:
+                                    # 只保存 on-policy trajectories（前 len(trajectories) 个）
+                                    # 因为 off-policy 的 entropy 可能不准确
+                                    num_on_policy = len(trajectories)
+                                    if num_on_policy > 0 and entropys is not None:
+                                        # 确保 entropys 和 trajectories 的长度匹配
+                                        if num_on_policy <= entropys.shape[0]:
+                                            on_policy_entropys = entropys[:num_on_policy]
+                                            on_policy_response_masks = response_masks[:num_on_policy] if response_masks is not None else None
+                                            
+                                            # tasks 在 async_rollout_mode 分支内定义，应该存在
+                                            self._save_trajectories_for_analysis(
+                                                trajectories=trajectories,
+                                                tasks=tasks,  # tasks 在 async_rollout_mode 分支内定义
+                                                entropys=on_policy_entropys,
+                                                response_masks=on_policy_response_masks,
+                                                global_steps=self.global_steps,
+                                                output_dir=trajectory_save_dir,
+                                            )
+                                except Exception as e:
+                                    logger.warning(f"Failed to save trajectories for analysis: {e}")
                         
                         # ⭐ Experience Replay: 保存成功轨迹到内存
                         if enable_exp_replay:
