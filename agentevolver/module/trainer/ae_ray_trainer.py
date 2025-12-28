@@ -1234,7 +1234,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
         from agentevolver.utils.tracking import Tracking
 
-        logger = Tracking(
+        tracker = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
@@ -1276,7 +1276,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             val_metrics = self._validate()  # ⭐ Perform initial validation and get the validation metrics
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
+            tracker.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
 
@@ -1778,7 +1778,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)  # ⭐ Log the collected metrics
+                tracker.log(data=metrics, step=self.global_steps)  # ⭐ Log the collected metrics
 
                 progress_bar.update(1)
                 self.global_steps += 1
