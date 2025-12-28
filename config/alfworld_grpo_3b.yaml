@@ -22,14 +22,14 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_exp_replay
+  experiment_name: alfworld_3b_grpo
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 1
   save_freq: 100
   test_freq: 10
-  val_before_train: false
+  val_before_train: true
   validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
   rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
   # Logger configuration: use wandb to sync training metrics
@@ -92,7 +92,7 @@ actor_rollout_ref:
     n: 8  # ⭐ Rollout: 8 rollouts per task
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
-      n: 1
+      n: 8
     max_env_worker: 32
     context_template: "linear"
     context_template_train_sp_action: false
@@ -211,7 +211,7 @@ exp_manager:
   # ReMe 服务配置（Experience Summarization 服务，已禁用）
   reme:
     base_url: "http://127.0.0.1:8124"  # ReMe 服务 URL（不需要启动）
-    workspace_id: "alfworld_3b_grpo_exp_replay"
+    workspace_id: "alfworld_3b_grpo"
     enable_summarizer: false        # ⭐ 禁用经验总结（不调用 LLM 总结经验）
     enable_context_generator: false # ⭐ 禁用经验检索（不从 ReMe 检索经验）
     retrieve_top_k: 3               # 检索数量（已禁用，不使用）
@@ -229,17 +229,17 @@ exp_manager:
   # ============================================================================
   experience_replay:
     # ⭐ 主开关：启用 Experience Replay 机制
-    enable: true
+    enable: false
     
     # ⭐ Training progress threshold: start replay when training_progress >= replay_start_ratio
     # When training_progress < replay_start_ratio, only accumulate experience (update difficulty2task_dict and save trajectories)
-    replay_start_ratio: 0.03  # Start replay at 10% of training (0.0-1.0)
+    replay_start_ratio: 1.0  # Start replay at 10% of training (0.0-1.0)
     
     # ⭐ Experience tasks ratio: proportion of experience tasks in each batch
     # For example, if batch_size=8, exp_ratio=0.5, then:
     #   - 4 experience tasks (from replaytaskpool, with off-policy trajectories)
     #   - 4 on-policy tasks (from original training tasks)
-    exp_ratio: 0.5  # 50% experience tasks, 50% on-policy tasks (0.0-1.0)
+    exp_ratio: 0.0  # 50% experience tasks, 50% on-policy tasks (0.0-1.0)
     
     # Number of off-policy trajectories per experience task
     # For example, if n_rollout=8, offpolicy_trajectories_per_task=1, then:
