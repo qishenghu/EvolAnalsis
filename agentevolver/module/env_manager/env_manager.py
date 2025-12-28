@@ -2,6 +2,7 @@ import copy
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Dict, List, Literal, Tuple
+from typing import Optional, Union
 
 import numpy as np
 import torch
