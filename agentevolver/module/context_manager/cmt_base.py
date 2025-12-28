@@ -183,7 +183,7 @@ class ExtendedMessage:
             bool: True if the message needs training, False otherwise.
         """
         NEED_TRAIN_AUTHORS = ["llm"]
-        NON_TRAIN_AUTHORS = ["env", "initialization", "user", "memory", "llm(do_not_train)"]
+        NON_TRAIN_AUTHORS = ["env", "initialization", "user", "memory", "llm(do_not_train)", "system"]
         assert (self.author in NEED_TRAIN_AUTHORS) or (self.author in NON_TRAIN_AUTHORS) or (self.author.endswith('(discard)')), f"author {self.author} is not identified"
         return (self.author in NEED_TRAIN_AUTHORS)  # ⭐ Determines if the message needs training based on the author
 
