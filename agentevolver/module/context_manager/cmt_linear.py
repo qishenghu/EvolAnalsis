@@ -618,7 +618,7 @@ class Linear_CMT(Trajectory, ContextManagerBase):
                 split_prompt_reponse_index = len(input_ids)
                 # 对于 experience replay，允许 author 为 "llm(do_not_train)"
                 if not is_experience_replay:
-                assert ext_msg.author == 'llm', "The first message after initialization should be from LLM, not from env or user"
+                    assert ext_msg.author == 'llm', "The first message after initialization should be from LLM, not from env or user"
             input_ids += ext_msg.token_arr
             attention_mask += [1] * len(ext_msg.token_arr)
             # ⭐ Experience Replay: 对于 off-policy 数据，LLM 消息的 loss_mask 应该为 1（参与 loss 计算）
