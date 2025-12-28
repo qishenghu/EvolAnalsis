@@ -905,15 +905,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 # 转换为 DataProto
                 candidate_batch = self.env_manager.to_dataproto(candidate_cmts)
                 
-                # ⭐ 计算 response_mask（to_dataproto 不会自动创建）
-                candidate_batch.batch["response_mask"] = compute_response_mask(candidate_batch)
-                
                 # 计算 entropy
                 log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
                 entropys = log_prob_result.batch["entropys"]  # [num_candidates, response_len]
                 
-                # ⭐ Multi-turn 关键：使用 loss_mask 计算 response 部分的平均 entropy
-                response_masks = candidate_batch.batch["response_mask"]  # [num_candidates, seq_len]
+                # ⭐ Multi-turn 关键：使用 loss_mask 计算 LLM 响应部分的平均 entropy
+                # 对于 multi-turn，loss_mask 只标记 LLM 响应位置（不包含 environment 响应）
+                response_length = candidate_batch.batch["responses"].shape[-1]
+                response_masks = candidate_batch.batch["loss_mask"][:, -response_length:]  # [num_candidates, response_len]
                 
                 # 计算每个候选的平均 entropy（只考虑 LLM 响应部分）
                 avg_entropys = []
