@@ -2025,6 +2025,37 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                        
+                        # ============================================================================
+                        # 🔍 DEBUG: Detailed reward tensor analysis to diagnose negative rewards
+                        # ============================================================================
+                        _tlr = batch.batch["token_level_rewards"]
+                        _tlr_sums = _tlr.sum(dim=-1)
+                        _nonzero_counts = (_tlr != 0).sum(dim=-1)
+                        
+                        logger.info(
+                            f"📊 REWARD TENSOR DEBUG:\n"
+                            f"  Shape: {_tlr.shape}\n"
+                            f"  Sum stats: min={_tlr_sums.min().item():.4f}, max={_tlr_sums.max().item():.4f}, mean={_tlr_sums.mean().item():.4f}\n"
+                            f"  Non-zero counts: min={_nonzero_counts.min().item()}, max={_nonzero_counts.max().item()}, mean={_nonzero_counts.float().mean().item():.2f}"
+                        )
+                        
+                        # Check for samples with multiple non-zero positions (should be 0 or 1)
+                        _multi_nonzero_mask = _nonzero_counts > 1
+                        if _multi_nonzero_mask.any():
+                            logger.warning(
+                                f"⚠️ MULTIPLE NON-ZERO REWARD POSITIONS DETECTED!\n"
+                                f"  {_multi_nonzero_mask.sum().item()} samples have >1 non-zero reward positions\n"
+                                f"  This could cause sum to be unexpectedly large!"
+                            )
+                            # Print details for first few problematic samples
+                            for idx in torch.where(_multi_nonzero_mask)[0][:5]:
+                                _positions = (_tlr[idx] != 0).nonzero(as_tuple=True)[0]
+                                _values = _tlr[idx, _positions]
+                                logger.warning(
+                                    f"    Sample {idx.item()}: {_nonzero_counts[idx].item()} non-zero positions at {_positions.tolist()}, "
+                                    f"values={_values.tolist()}, sum={_tlr_sums[idx].item():.4f}"
+                                )
 
                         # ============================================================================
                         # ⭐ DAPO Dynamic Sampling: Filter samples with all-correct or all-incorrect outcomes
