@@ -574,6 +574,7 @@ def dapo_overlong_reward_shaping(
     is_truncated: torch.Tensor,
     truncation_penalty: float = -0.5,
     soft_penalty_mode: str = "additive",
+    response_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     DAPO Overlong Reward Shaping: Apply soft penalty to truncated samples.
@@ -598,6 +599,10 @@ def dapo_overlong_reward_shaping(
             - "multiplicative": reward = reward * (1 + penalty)  [penalty < 0]
             - "replace_if_positive": If truncated and reward > 0, set reward = penalty
             - "cap": Cap positive rewards at penalty value
+        response_mask (Tensor, optional): Response mask indicating valid response tokens.
+            Shape: (batch_size, seq_len). If provided, when the original reward tensor is all-zeros
+            (e.g., reward==0 for a trajectory), we will place the shaped penalty at the last valid
+            response token instead of the last index (which may be padding).
 
     Returns:
         torch.Tensor: Modified rewards with overlong penalty applied
@@ -647,8 +652,25 @@ def dapo_overlong_reward_shaping(
                 modified_rewards[i] = 0  # Clear all positions
                 modified_rewards[i, reward_pos] = new_traj_reward
             else:
-                # No reward was assigned (all zeros), assign penalty to last position
-                modified_rewards[i, -1] = truncation_penalty if soft_penalty_mode == "additive" else 0
+                # No reward was assigned (all zeros, e.g. reward==0). Place shaped reward at the last
+                # valid response token if response_mask is available; otherwise fall back to last index.
+                if response_mask is not None:
+                    # last valid token index in the response
+                    last_valid = response_mask[i].nonzero(as_tuple=True)[0]
+                    if len(last_valid) > 0:
+                        reward_pos = last_valid[-1]
+                        modified_rewards[i] = 0
+                        modified_rewards[i, reward_pos] = new_traj_reward
+                    else:
+                        # Degenerate: no valid response tokens. Fall back to last index,
+                        # but still place the correctly *shaped* trajectory reward.
+                        modified_rewards[i] = 0
+                        modified_rewards[i, -1] = new_traj_reward
+                else:
+                    # No response_mask provided. Fall back to last index,
+                    # but still place the correctly *shaped* trajectory reward.
+                    modified_rewards[i] = 0
+                    modified_rewards[i, -1] = new_traj_reward
     else:
         # 1D case: simple element-wise penalty application
         if soft_penalty_mode == "additive":

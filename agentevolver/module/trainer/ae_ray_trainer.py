@@ -1972,6 +1972,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 is_truncated=is_truncated,
                                 truncation_penalty=truncation_penalty,
                                 soft_penalty_mode=soft_penalty_mode,
+                                response_mask=response_mask,
                             )
                             batch.batch["token_level_scores"] = reward_tensor
                             
