@@ -2,6 +2,50 @@
 algorithm:
   adv_estimator: grpo
   use_kl_in_reward: false
+  
+  # ============================================================================
+  # DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) Configuration
+  # ============================================================================
+  # DAPO is an improvement over GRPO that addresses entropy collapse, reward noise,
+  # and training instability through four key mechanisms:
+  # 1. Clip-Higher: Decoupled asymmetric clipping for better exploration
+  # 2. Dynamic Sampling: Filter samples with all-correct or all-incorrect outcomes
+  # 3. Token-Level Policy Gradient: Already supported via loss_agg_mode: token-mean
+  # 4. Overlong Reward Shaping: Soft penalty for truncated samples
+  # ============================================================================
+  dapo:
+    # Main switch: enable DAPO algorithm improvements
+    enable: false
+    
+    # ============================================================================
+    # Dynamic Sampling Configuration
+    # ============================================================================
+    # Filters out prompts where either all rollouts are correct (acc=1.0) or
+    # all are incorrect (acc=0.0), as they don't contribute useful gradients.
+    dynamic_sampling:
+      enable: false
+      # Filter mode options:
+      #   - "strict": Remove if all same (acc=0 or acc=1) - DAPO default
+      #   - "remove_all_correct": Only remove if all correct (acc=1)
+      #   - "remove_all_incorrect": Only remove if all incorrect (acc=0)
+      #   - "none": No filtering
+      filter_mode: "strict"
+    
+    # ============================================================================
+    # Overlong Reward Shaping Configuration
+    # ============================================================================
+    # Applies soft penalty to truncated samples instead of treating them as
+    # complete failures, preserving learning signal from partial completions.
+    overlong_reward_shaping:
+      enable: false
+      # Penalty value for truncated samples (negative value recommended)
+      truncation_penalty: -0.5
+      # How to apply the penalty:
+      #   - "additive": reward = reward + penalty
+      #   - "multiplicative": reward = reward * (1 + penalty)
+      #   - "replace_if_positive": If truncated and reward > 0, set reward = penalty
+      #   - "cap": Cap positive rewards at penalty value
+      soft_penalty_mode: "additive"
 
 data:
   train_batch_size: 32         
@@ -73,6 +117,16 @@ actor_rollout_ref:
     
     loss_agg_mode: token-mean
     clip_ratio_high: 0.28
+    
+    # ============================================================================
+    # DAPO Clip-Higher Configuration (Decoupled Asymmetric Clipping)
+    # ============================================================================
+    # When use_dapo=true, enables DAPO's Clip-Higher mechanism:
+    # - For positive advantages (A > 0): Use clip_ratio_high to limit probability increase
+    # - For negative advantages (A < 0): Remove upper clipping to allow more exploration
+    # This helps prevent entropy collapse by encouraging exploration of low-probability tokens.
+    # ============================================================================
+    use_dapo: false  # Enable DAPO's Clip-Higher mechanism (set to true to use DAPO)
   ref:
     log_prob_micro_batch_size_per_gpu: 1
     fsdp_config:

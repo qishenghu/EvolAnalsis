@@ -9,22 +9,27 @@ defaults:
   - _self_
 
 # ============================================================================
-# AlfWorld GRPO Training Configuration
+# AlfWorld GRPO Training Configuration with Experience Replay
 # ============================================================================
 # This configuration is for training Qwen/Qwen2.5-7B-Instruct on AlfWorld
-# using GRPO with Experience Pool (ReMe), using only the 2420 training tasks
-# without generating synthetic tasks.
+# using GRPO with Experience Replay mechanism.
+# 
+# Key settings:
+# - batch_size: 8
+# - rollout: 8 (n_rollout)
+# - replay_start_ratio: 0.1 (start replay at 10% of training)
+# - exp_ratio: 0.5 (50% experience tasks, 50% on-policy tasks)
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_7b_grpo_baseline
+  experiment_name: alfworld_7b_grpo
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
-  total_epochs: 2
+  total_epochs: 1
   save_freq: 100
   test_freq: 10
-  val_before_train: false
+  val_before_train: true
   validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
   rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
   # Logger configuration: use wandb to sync training metrics
@@ -39,6 +44,30 @@ trainer:
 algorithm:
   adv_estimator: grpo  # Use GRPO algorithm
   use_kl_in_reward: false
+  
+  # ============================================================================
+  # DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) Configuration
+  # ============================================================================
+  # DAPO is an improvement over GRPO that addresses entropy collapse, reward noise,
+  # and training instability through four key mechanisms:
+  # 1. Clip-Higher: Decoupled asymmetric clipping (configured in actor.use_dapo)
+  # 2. Dynamic Sampling: Filter samples with all-correct or all-incorrect outcomes
+  # 3. Token-Level Policy Gradient: Already supported via loss_agg_mode: token-mean
+  # 4. Overlong Reward Shaping: Soft penalty for truncated samples
+  # ============================================================================
+  dapo:
+    enable: false  # Main switch: enable DAPO algorithm improvements
+    
+    # Dynamic Sampling: Filters out prompts where all rollouts have same outcome
+    dynamic_sampling:
+      enable: false
+      filter_mode: "strict"  # "strict", "remove_all_correct", "remove_all_incorrect", "none"
+    
+    # Overlong Reward Shaping: Soft penalty for truncated samples
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: "additive"  # "additive", "multiplicative", "replace_if_positive", "cap"
 
 # ============================================================================
 # Model Configuration - Qwen/Qwen2.5-7B-Instruct
@@ -57,9 +86,21 @@ actor_rollout_ref:
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
     entropy_coeff: 0
-    off_cliprange_high: 0.6
+    off_cliprange_high: 0.6  # Used when off_policy_shaping_mode="higher_clip_bound"
     clip_ratio_high: 0.28
     loss_agg_mode: token-mean
+    # ⭐ Off-policy Policy Shaping Configuration
+    # Policy shaping modulates the gradient from experiential data to preserve entropy
+    # Two modes available:
+    #   1. "higher_clip_bound": AgentEvolver original - Use higher clip_upper_bound for off-policy data
+    #   2. "exgrpo_policy_shaping": ExGRPO paper - Replace CLIP term with f(w*(θ)) = w*(θ) / (w*(θ) + β)
+    #      where w*(θ) = exp(log_prob - old_log_prob) is the importance sampling ratio
+    #      This amplifies low-probability signals and dampens high-probability ones
+    off_policy_shaping_mode: "exgrpo_policy_shaping"  # "exgrpo_policy_shaping" or "higher_clip_bound"
+    off_policy_shaping_beta: 0.1  # β for ExGRPO policy shaping: f(x) = x/(x+β), default 0.1 as in ExGRPO paper
+    # ⭐ DAPO Clip-Higher: Enable decoupled asymmetric clipping
+    # When true, uses DAPO's asymmetric clipping that removes upper bound for negative advantages
+    use_dapo: false  # Set to true to enable DAPO's Clip-Higher mechanism
     fsdp_config:
       param_offload: false
       optimizer_offload: false
@@ -75,10 +116,10 @@ actor_rollout_ref:
     name: vllm
     mode: async
     gpu_memory_utilization: 0.6
-    n: 8
+    n: 8  # ⭐ Rollout: 8 rollouts per task
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
-      n: 8
+      n: 1
     max_env_worker: 32
     context_template: "linear"
     context_template_train_sp_action: false
@@ -104,7 +145,7 @@ critic:
 # Data Configuration
 # ============================================================================
 data:
-  train_batch_size: 8
+  train_batch_size: 8  # ⭐ Batch size: 8
   max_prompt_length: 4000
   max_response_length: 21580
   filter_overlong_prompts: true
@@ -158,32 +199,113 @@ task_manager:
   env_profile: cookbook/env_profiles/alfworld.json  # Placeholder (not used when n=0)
 
 # ============================================================================
-# Experience Pool (ReMe) Configuration
+# Experience Manager Configuration
+# ============================================================================
+# ⭐ 本配置只使用 Experience Replay 机制，不使用：
+#    - Experience-guided rollout（经验引导的 rollout）
+#    - Experience summarize（经验总结到 ReMe 服务）
 # ============================================================================
 exp_manager:
-  # Rollout mode: "mixed" means use experience pool during rollout; "woexp" means no experience for rollout; "all" means use all experience for rollout;
-  train_rollout_mode: "woexp" # No experience for training when running GRPO baseline
-  val_rollout_mode: "woexp"  # No experience for validation
-  # Ratio of adding experience within group during rollout
-  rollout_ratio: 0  # 0% of rollouts will use experience (not used when train_rollout_mode="woexp")
-  # Sample mode after train rollout
-  train_sample_mode: "alldiscard"  # Discard all samples after rollout
+  # ============================================================================
+  # Experience-Guided Rollout Configuration (DISABLED)
+  # ============================================================================
+  # "woexp" = Without Experience: 不在 rollout 时注入经验到 prompt
+  # 其他选项: "mixed"（部分使用经验）, "all"（全部使用经验）
+  train_rollout_mode: "woexp"  # ⭐ 禁用 experience-guided rollout
+  val_rollout_mode: "woexp"    # ⭐ 禁用 experience-guided validation
+  rollout_ratio: 0             # ⭐ 0% 的 rollouts 使用经验（配合 woexp 使用）
+  
+  # Sample mode: 控制 rollout 后样本的处理方式
+  # "alldiscard": 丢弃所有样本（不影响 Experience Replay，因为 Experience Replay 有独立的保存逻辑）
+  # "allkeep": 保留所有样本
+  # "hybrid": 混合模式（保留 train_sample_keepratio 比例）
+  train_sample_mode: "alldiscard"
   train_sample_keepratio: 0.0
-  # Experience template for inserting experience
+  
+  # Experience template: 用于 experience-guided rollout 时注入经验的模板（已禁用，不使用）
   experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
-  # Initialize experience pool before training
-  init_exp_before_training: false
-  init_exp_only: false
-  # Batch size for experience summarization
+  
+  # ============================================================================
+  # Experience Summarization Configuration (DISABLED)
+  # ============================================================================
+  # 不在训练前初始化经验池（不需要预先准备经验）
+  init_exp_before_training: false  # ⭐ 禁用训练前经验初始化
+  init_exp_only: false             # ⭐ 不只做经验初始化
+  
+  # 经验总结批量大小（不使用，但需要保留以兼容代码）
   summary_batch_size: 8
-  # ReMe (Experience Pool) service configuration
+  
+  # ReMe 服务配置（Experience Summarization 服务，已禁用）
   reme:
-    base_url: "http://127.0.0.1:8124"  # ReMe service URL
-    workspace_id: "alfworld_7b_grpo_baseline"  # Workspace ID for this experiment
-    enable_summarizer: true   # Enable experience summarization
-    enable_context_generator: true  # Enable experience retrieval
-    retrieve_top_k: 3  # Retrieve top 3 experiences
-    updated_freq: 0    # Update frequency (0 = disabled, update on demand)
+    base_url: "http://127.0.0.1:8124"  # ReMe 服务 URL（不需要启动）
+    workspace_id: "alfworld_7b_grpo"
+    enable_summarizer: false        # ⭐ 禁用经验总结（不调用 LLM 总结经验）
+    enable_context_generator: false # ⭐ 禁用经验检索（不从 ReMe 检索经验）
+    retrieve_top_k: 3               # 检索数量（已禁用，不使用）
+    updated_freq: 0                 # 更新频率（0 = 禁用）
+  
+  # ============================================================================
+  # Experience Replay Configuration (ENABLED)
+  # ============================================================================
+  # ⭐ Experience Replay 机制说明：
+  #    - 在训练过程中保存成功的 on-policy 轨迹到内存（task2trajectories）
+  #    - 根据 exp_ratio 混合 experience tasks 和 on-policy tasks
+  #    - 对于 experience tasks，从内存中获取 off-policy 轨迹加入训练
+  #    - 使用 exp_mask 区分 on-policy 和 off-policy 轨迹
+  #    - 同一 task 的所有轨迹（on + off）共享 uid，在 GRPO 中一起计算 advantage
+  # ============================================================================
+  experience_replay:
+    # ⭐ 主开关：启用 Experience Replay 机制
+    enable: false
+    
+    # ⭐ Training progress threshold: start replay when training_progress >= replay_start_ratio
+    # When training_progress < replay_start_ratio, only accumulate experience (update difficulty2task_dict and save trajectories)
+    replay_start_ratio: 1.0  # Start replay at 10% of training (0.0-1.0)
+    
+    # ⭐ Experience tasks ratio: proportion of experience tasks in each batch
+    # For example, if batch_size=8, exp_ratio=0.5, then:
+    #   - 4 experience tasks (from replaytaskpool, with off-policy trajectories)
+    #   - 4 on-policy tasks (from original training tasks)
+    exp_ratio: 0.0  # 50% experience tasks, 50% on-policy tasks (0.0-1.0)
+    
+    # Number of off-policy trajectories per experience task
+    # For example, if n_rollout=8, offpolicy_trajectories_per_task=1, then:
+    #   - 1 off-policy trajectory (from memory)
+    #   - 7 on-policy trajectories (from rollout)
+    #   - Total: 8 trajectories per experience task
+    offpolicy_trajectories_per_task: 1
+    
+    # Success count bounds for tasks to be included in experience replay pool
+    # Only tasks with success_count in [experience_lbound, experience_rbound) will be saved
+    # For example, if n_rollout=8:
+    #   - experience_lbound=0: include tasks with at least 0 successes
+    #   - experience_rbound=8: exclude tasks with 8 successes (fully solved, added to skip_uid_set)
+    #   - This means: include tasks with 0-7 successes (non-fully-solved, non-fully-failed)
+    experience_lbound: 2  # Lower bound (inclusive)
+    experience_rbound: 8  # Upper bound (exclusive, typically equals n_rollout)
+    
+    # Trajectory selection mode for storing and replaying
+    # Options:
+    #   - "argmin": Select trajectory with lowest entropy (default, recommended)
+    #   - "argmax": Select trajectory with highest entropy
+    #   - "random": Random selection
+    #   - "fifo": First-In-First-Out (oldest trajectory)
+    exp_select_mode: "argmin"  # Select lowest entropy trajectory
+    
+    # ⭐ ExGRPO 方式：是否使用当前 policy 计算 entropy 选择轨迹
+    # If true: 在选择时使用当前 policy 重新计算每个候选轨迹的 entropy（更准确，但计算开销更大）
+    # If false: 使用保存时的 entropy（更快，但可能不是当前 policy 下的最优选择）
+    # ⭐ Multi-turn 关键：只对 LLM 响应部分（loss_mask=1）计算 entropy
+    use_current_policy_entropy: true  # Use current policy to compute entropy for selection
+    
+    # Whether to use recorded_old_log_probs for off-policy data
+    # If true: use recorded_old_log_probs (from historical policy) for importance sampling
+    # If false: use current policy's old_log_prob (same as on-policy)
+    exp_is_correct: true  # Use recorded_old_log_probs for correct importance sampling
+    
+    # Maximum number of trajectories to store per task (memory management)
+    # When exceeded, use replacement strategy based on exp_select_mode
+    max_trajectories_per_task: 5  # Store up to 5 trajectories per task
 
 # ============================================================================
 # Attribution-Driven Credit Assignment (ADCA-GRPO) Configuration

@@ -1886,12 +1886,126 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
+                        # ============================================================================
+                        # ⭐ DAPO Overlong Reward Shaping: Apply soft penalty to truncated samples
+                        # ============================================================================
+                        dapo_config = self.config.algorithm.get("dapo", {})
+                        use_dapo = dapo_config.get("enable", False)
+                        
+                        if use_dapo and dapo_config.get("overlong_reward_shaping", {}).get("enable", False):
+                            from agentevolver.module.exp_manager.het_core_algos import dapo_overlong_reward_shaping
+                            
+                            overlong_config = dapo_config.get("overlong_reward_shaping", {})
+                            truncation_penalty = overlong_config.get("truncation_penalty", -0.5)
+                            soft_penalty_mode = overlong_config.get("soft_penalty_mode", "additive")
+                            
+                            # ============================================================================
+                            # Multi-turn aware truncation detection
+                            # ============================================================================
+                            # In multi-turn scenarios, we need to check:
+                            # 1. Response length hitting max_response_length
+                            # 2. Trajectory is_terminated flag (if available)
+                            # 3. For multi-turn: max_steps reached without completion
+                            # ============================================================================
+                            
+                            responses = batch.batch["responses"]
+                            attention_mask = batch.batch["attention_mask"]
+                            response_length = responses.size(1)
+                            response_mask = attention_mask[:, -response_length:]
+                            
+                            # Method 1: Check if response reached max length
+                            max_response_length = self.config.data.max_response_length
+                            actual_response_lengths = response_mask.sum(dim=-1)
+                            is_truncated_by_length = (actual_response_lengths >= max_response_length - 1)
+                            
+                            # Method 2: Check trajectory is_terminated flag (for multi-turn)
+                            # If trajectory is not terminated, it was likely truncated
+                            is_truncated_by_termination = torch.zeros_like(is_truncated_by_length)
+                            if self.async_rollout_mode and trajectories:
+                                # Only check on-policy trajectories
+                                num_on_policy = len(trajectories)
+                                for idx, traj in enumerate(trajectories):
+                                    if idx < len(is_truncated_by_termination):
+                                        # Not terminated means truncated in multi-turn
+                                        if not getattr(traj, 'is_terminated', True):
+                                            is_truncated_by_termination[idx] = True
+                            
+                            # Combine both methods: truncated if either condition is met
+                            is_truncated = is_truncated_by_length | is_truncated_by_termination.to(is_truncated_by_length.device)
+                            
+                            # Apply overlong reward shaping
+                            original_reward_tensor = reward_tensor.clone()
+                            reward_tensor = dapo_overlong_reward_shaping(
+                                rewards=reward_tensor,
+                                is_truncated=is_truncated,
+                                truncation_penalty=truncation_penalty,
+                                soft_penalty_mode=soft_penalty_mode,
+                            )
+                            batch.batch["token_level_scores"] = reward_tensor
+                            
+                            # Log metrics with multi-turn aware information
+                            num_truncated = is_truncated.sum().item()
+                            num_truncated_by_length = is_truncated_by_length.sum().item()
+                            num_truncated_by_termination = is_truncated_by_termination.sum().item()
+                            metrics.update({
+                                "dapo/num_truncated_samples": num_truncated,
+                                "dapo/truncation_ratio": num_truncated / len(is_truncated),
+                                "dapo/num_truncated_by_length": num_truncated_by_length,
+                                "dapo/num_truncated_by_termination": num_truncated_by_termination,
+                            })
+                            if num_truncated > 0:
+                                reward_diff = (original_reward_tensor.sum(dim=-1) - reward_tensor.sum(dim=-1))[is_truncated].mean().item()
+                                metrics.update({
+                                    "dapo/avg_truncation_penalty_applied": reward_diff,
+                                })
+
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)  # ⭐ Apply KL divergence penalty
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # ============================================================================
+                        # ⭐ DAPO Dynamic Sampling: Filter samples with all-correct or all-incorrect outcomes
+                        # ============================================================================
+                        if use_dapo and dapo_config.get("dynamic_sampling", {}).get("enable", False):
+                            from agentevolver.module.exp_manager.het_core_algos import dapo_filter_samples
+                            
+                            dynamic_sampling_config = dapo_config.get("dynamic_sampling", {})
+                            filter_mode = dynamic_sampling_config.get("filter_mode", "strict")
+                            
+                            # Get group IDs for filtering
+                            if "uid" in batch.non_tensor_batch:
+                                group_ids = batch.non_tensor_batch["uid"]
+                            elif "group_ids" in batch.batch:
+                                group_ids = batch.batch["group_ids"].cpu().numpy()
+                            else:
+                                group_ids = np.array([str(i) for i in range(len(batch))])
+                            
+                            # Get rewards for filtering
+                            filter_rewards = batch.batch["token_level_rewards"].sum(dim=-1)
+                            
+                            # Apply dynamic sampling filter
+                            keep_mask = dapo_filter_samples(
+                                rewards=filter_rewards,
+                                group_ids=group_ids,
+                                n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                filter_mode=filter_mode,
+                            )
+                            
+                            num_filtered = (~keep_mask).sum().item()
+                            if num_filtered > 0:
+                                logger.info(f"DAPO Dynamic Sampling: Filtered {num_filtered} samples with {filter_mode} mode")
+                                
+                                # Instead of removing samples (which would break GRPO grouping),
+                                # we zero out the advantages for filtered samples after advantage computation
+                                batch.batch["dapo_keep_mask"] = keep_mask.float()
+                                
+                            metrics.update({
+                                "dapo/num_filtered_samples": num_filtered,
+                                "dapo/filter_ratio": num_filtered / len(keep_mask),
+                            })
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
@@ -1913,6 +2027,19 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
+                        
+                        # ============================================================================
+                        # ⭐ DAPO Dynamic Sampling: Zero out advantages for filtered samples
+                        # ============================================================================
+                        if "dapo_keep_mask" in batch.batch:
+                            dapo_keep_mask = batch.batch["dapo_keep_mask"]
+                            # Expand mask to match advantage shape (batch_size, seq_len)
+                            if dapo_keep_mask.dim() == 1:
+                                dapo_keep_mask = dapo_keep_mask.unsqueeze(-1)
+                            # Zero out advantages for filtered samples
+                            batch.batch["advantages"] = batch.batch["advantages"] * dapo_keep_mask
+                            logger.info(f"DAPO: Applied keep_mask to zero out {(dapo_keep_mask == 0).sum().item()} sample advantages")
+                        
                         # shuchang
                         # ==================== Begin ADCA GRPO  ====================
                         attribution_cfg = self._get_attribution_config()

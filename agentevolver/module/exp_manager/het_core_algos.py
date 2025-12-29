@@ -316,6 +316,336 @@ def bam_compute_token_on_off_policy_loss_v2(
 
     return ret_dict
 
+def dapo_compute_policy_loss(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    exp_mask=None,
+    cliprange_low=0.2,
+    cliprange_high=0.28,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+    # Off-policy (Experience Replay) settings
+    off_policy_shaping_mode: str = "exgrpo_policy_shaping",
+    off_policy_shaping_beta: float = 0.1,
+):
+    """
+    Computes the policy loss using DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization).
+    
+    DAPO introduces asymmetric clipping (Clip-Higher) to encourage exploration:
+    - For positive advantages (A > 0): Use clip_high to limit probability increase
+    - For negative advantages (A < 0): Remove upper clipping to allow low-probability tokens to decrease further
+    
+    This decoupled clipping mechanism helps prevent entropy collapse by allowing the model
+    to explore low-probability tokens while still constraining high-probability updates.
+    
+    ⭐ Experience-Replay Compatible:
+    - On-policy data: Uses DAPO's Clip-Higher mechanism
+    - Off-policy data: Uses ExGRPO policy shaping (f(x) = x/(x+β)) to handle importance sampling
+
+    Args:
+        old_log_prob (Tensor): Log probabilities of the actions under the old policy.
+            Shape: (batch_size, response_length)
+        log_prob (Tensor): Log probabilities of the actions under the new policy.
+            Shape: (batch_size, response_length)
+        advantages (Tensor): Advantage values for the actions.
+            Shape: (batch_size, response_length) or (batch_size,)
+        response_mask (Tensor): Mask indicating which tokens are part of the response.
+            Shape: (batch_size, response_length)
+        exp_mask (Tensor, optional): Mask indicating off-policy data (1) vs on-policy data (0).
+            Shape: (batch_size, response_length). Defaults to None (all on-policy).
+        cliprange_low (float): Lower bound for clipping range. Default: 0.2 (DAPO default: ε_low)
+        cliprange_high (float): Upper bound for clipping range. Default: 0.28 (DAPO default: ε_high)
+        clip_ratio_c (float): Maximum ratio for extreme clipping. Default: 3.0
+        loss_agg_mode (str): Mode for aggregating the loss. Defaults to "token-mean".
+        off_policy_shaping_mode (str): How to handle off-policy data from Experience Replay.
+            - "exgrpo_policy_shaping": Use f(x) = x/(x+β) shaping (default, recommended)
+            - "dapo_clip_higher": Apply DAPO Clip-Higher to off-policy data too
+        off_policy_shaping_beta (float): β for ExGRPO policy shaping. Default: 0.1
+
+    Returns:
+        dict: A dictionary containing:
+            - pg_loss: Aggregated policy gradient loss
+            - pg_losses: Per-token policy gradient losses
+            - pg_clipfrac: Fraction of tokens that were clipped (upper bound)
+            - pg_clipfrac_lower: Fraction of tokens clipped at lower bound
+            - ppo_kl: Approximate KL divergence between old and new policies
+            - entropy_bonus_tokens: Count of tokens where clipping was relaxed (A < 0)
+            - on_pg_loss, off_pg_loss: Separate losses for on/off-policy data
+    """
+    # Compute importance sampling ratio
+    negative_approx_kl = log_prob - old_log_prob
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    ratio = torch.exp(negative_approx_kl)  # π_new / π_old
+
+    # Handle exp_mask: default to all on-policy if not provided
+    if exp_mask is None:
+        exp_mask = torch.zeros_like(response_mask)
+    exp_mask = exp_mask.float()
+
+    # ============================================================================
+    # ON-POLICY: DAPO Clip-Higher (Decoupled asymmetric clipping)
+    # ============================================================================
+    # For A > 0 (encouraging actions): clip ratio to [1-ε_low, 1+ε_high]
+    # For A < 0 (discouraging actions): clip ratio to [1-ε_low, ∞) - remove upper bound
+    #   This allows low-probability tokens to be further reduced without constraint
+    # ============================================================================
+    
+    # Standard PPO loss without clipping
+    on_pg_losses1 = -advantages * ratio
+    
+    # Clipped PPO loss for positive advantages (A > 0)
+    # Use standard clip: [1 - ε_low, 1 + ε_high]
+    ratio_clipped_pos = torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    on_pg_losses_clipped_pos = -advantages * ratio_clipped_pos
+    
+    # Clipped PPO loss for negative advantages (A < 0)
+    # DAPO: Remove upper clip bound - only clip lower bound
+    # This is equivalent to: clip ratio to [1 - ε_low, +∞)
+    # In practice, we use a very large upper bound (clip_ratio_c)
+    ratio_clipped_neg = torch.clamp(ratio, 1 - cliprange_low, clip_ratio_c)
+    on_pg_losses_clipped_neg = -advantages * ratio_clipped_neg
+    
+    # Select clipped loss based on advantage sign
+    on_pg_losses_clipped = torch.where(advantages >= 0, on_pg_losses_clipped_pos, on_pg_losses_clipped_neg)
+    
+    # PPO-style max: take the more conservative (larger) loss
+    on_pg_losses = torch.maximum(on_pg_losses1, on_pg_losses_clipped)
+    
+    # Additional safety clipping for extreme ratios (prevents gradient explosion)
+    on_pg_losses_extreme = -advantages * clip_ratio_c
+    on_pg_losses = torch.where(
+        advantages < 0,
+        torch.min(on_pg_losses, on_pg_losses_extreme),
+        on_pg_losses
+    )
+    
+    # Compute on-policy loss (only where exp_mask == 0)
+    on_policy_mask = (1.0 - exp_mask) * response_mask
+    on_pg_loss = verl_F.masked_mean(on_pg_losses, on_policy_mask)
+    
+    # ============================================================================
+    # OFF-POLICY: Experience Replay handling
+    # ============================================================================
+    # Off-policy data from Experience Replay needs special handling due to
+    # distribution shift. We use ExGRPO's policy shaping by default.
+    # ============================================================================
+    
+    if off_policy_shaping_mode == "exgrpo_policy_shaping":
+        # ⭐ ExGRPO Policy Shaping: Replace CLIP term with f(w*(θ)) = w*(θ) / (w*(θ) + β)
+        # This amplifies low-probability signals and dampens high-probability ones
+        off_ratio = ratio  # Same ratio, but with different shaping
+        off_ratio_shaped = off_ratio / (off_ratio + off_policy_shaping_beta)
+        off_pg_losses = -advantages * off_ratio_shaped
+        off_pg_clipfrac = torch.tensor(0.0)
+    elif off_policy_shaping_mode == "dapo_clip_higher":
+        # Apply DAPO Clip-Higher to off-policy data too (same as on-policy)
+        off_pg_losses = on_pg_losses
+        off_pg_clipfrac = torch.tensor(0.0)
+    else:
+        raise ValueError(f"Invalid off_policy_shaping_mode: {off_policy_shaping_mode}")
+    
+    # Compute off-policy loss (only where exp_mask == 1)
+    off_policy_mask = exp_mask * response_mask
+    off_pg_loss = verl_F.masked_mean(off_pg_losses, off_policy_mask)
+    off_pg_loss = torch.tensor(0.0) if off_pg_loss.isnan().item() else off_pg_loss
+    
+    # ============================================================================
+    # Combine on-policy and off-policy losses
+    # ============================================================================
+    pg_losses = off_pg_losses * exp_mask + on_pg_losses * (1.0 - exp_mask)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    # Compute clipping statistics (only for on-policy data)
+    # Upper bound clipping: when clipped loss > unclipped loss (for A > 0)
+    clipfrac_upper = verl_F.masked_mean(
+        (torch.gt(on_pg_losses_clipped_pos, on_pg_losses1) & (advantages >= 0)).float(), 
+        on_policy_mask
+    )
+    clipfrac_upper = torch.tensor(0.0) if clipfrac_upper.isnan().item() else clipfrac_upper
+    
+    # Lower bound clipping: when extreme clipping was applied (for A < 0)
+    clipfrac_lower = verl_F.masked_mean(
+        (torch.gt(on_pg_losses, on_pg_losses_extreme) & (advantages < 0)).float(), 
+        on_policy_mask
+    )
+    clipfrac_lower = torch.tensor(0.0) if clipfrac_lower.isnan().item() else clipfrac_lower
+    
+    # Count tokens where DAPO relaxed clipping (A < 0, allowing more freedom)
+    entropy_bonus_tokens = verl_F.masked_mean((advantages < 0).float(), response_mask)
+
+    return {
+        "pg_loss": pg_loss,
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac_upper,
+        "pg_clipfrac_lower": clipfrac_lower,
+        "ppo_kl": ppo_kl,
+        "entropy_bonus_tokens": entropy_bonus_tokens,
+        # Separate on/off-policy losses for monitoring
+        "on_pg_loss": on_pg_loss,
+        "off_pg_loss": off_pg_loss,
+        "on_pg_losses": on_pg_losses,
+        "off_pg_losses": off_pg_losses,
+        "on_pg_clipfrac": clipfrac_upper,
+        "on_pg_clipfrac_lower": clipfrac_lower,
+    }
+
+
+def dapo_filter_samples(
+    rewards: torch.Tensor,
+    group_ids: np.ndarray,
+    n_rollout: int,
+    filter_mode: str = "strict",
+) -> torch.Tensor:
+    """
+    DAPO Dynamic Sampling: Filter samples where all rollouts have same outcome.
+    
+    This implements DAPO's Dynamic Sampling mechanism which filters out prompts
+    where either:
+    - All rollouts are correct (accuracy = 1.0) - too easy
+    - All rollouts are incorrect (accuracy = 0.0) - too hard or no learning signal
+    
+    These prompts don't contribute useful gradients for learning because the
+    advantage normalization within the group will result in zero variance.
+
+    Args:
+        rewards (Tensor): Reward tensor, shape (batch_size,) or (batch_size, seq_len)
+            For outcome rewards, this is typically the final reward per trajectory.
+        group_ids (np.ndarray): Group IDs (uid) for GRPO grouping, shape (batch_size,)
+            Samples with the same group_id belong to the same prompt/task.
+        n_rollout (int): Expected number of rollouts per prompt.
+        filter_mode (str): Filtering mode:
+            - "strict": Remove if all same (acc=0 or acc=1)
+            - "remove_all_correct": Only remove if all correct (acc=1)
+            - "remove_all_incorrect": Only remove if all incorrect (acc=0)
+            - "none": No filtering
+
+    Returns:
+        torch.Tensor: Boolean mask indicating which samples to KEEP (True = keep, False = filter out)
+            Shape: (batch_size,)
+    """
+    if filter_mode == "none":
+        return torch.ones(len(rewards), dtype=torch.bool, device=rewards.device)
+    
+    # Get scalar rewards if needed
+    if rewards.dim() > 1:
+        rewards = rewards.sum(dim=-1)
+    
+    # Convert rewards to binary success/failure
+    # Assume reward > 0 means success
+    successes = (rewards > 0).float()
+    
+    # Group by group_id and compute success rate
+    group_to_indices = defaultdict(list)
+    for i, gid in enumerate(group_ids):
+        group_to_indices[gid].append(i)
+    
+    keep_mask = torch.ones(len(rewards), dtype=torch.bool, device=rewards.device)
+    
+    for gid, indices in group_to_indices.items():
+        if len(indices) == 0:
+            continue
+        
+        group_successes = successes[indices]
+        success_rate = group_successes.mean().item()
+        
+        should_filter = False
+        
+        if filter_mode == "strict":
+            # Filter if all same (acc=0 or acc=1)
+            should_filter = (success_rate == 0.0) or (success_rate == 1.0)
+        elif filter_mode == "remove_all_correct":
+            # Only remove if all correct
+            should_filter = (success_rate == 1.0)
+        elif filter_mode == "remove_all_incorrect":
+            # Only remove if all incorrect
+            should_filter = (success_rate == 0.0)
+        
+        if should_filter:
+            for idx in indices:
+                keep_mask[idx] = False
+    
+    return keep_mask
+
+
+def dapo_overlong_reward_shaping(
+    rewards: torch.Tensor,
+    is_truncated: torch.Tensor,
+    truncation_penalty: float = -0.5,
+    soft_penalty_mode: str = "additive",
+) -> torch.Tensor:
+    """
+    DAPO Overlong Reward Shaping: Apply soft penalty to truncated samples.
+    
+    Instead of treating truncated samples as complete failures (reward=0),
+    DAPO applies a soft penalty that:
+    1. Preserves some learning signal from partially correct trajectories
+    2. Discourages overly long responses that get truncated
+    3. Reduces reward noise from arbitrary truncation points
+
+    Args:
+        rewards (Tensor): Original reward tensor, shape (batch_size,) or (batch_size, seq_len)
+        is_truncated (Tensor): Boolean tensor indicating which samples were truncated
+            Shape: (batch_size,)
+        truncation_penalty (float): Penalty for truncated samples. Default: -0.5
+            - For "additive": Added to the reward
+            - For "multiplicative": Multiplies the reward
+            - For "replace_if_positive": Replaces positive rewards with this value
+        soft_penalty_mode (str): How to apply the penalty:
+            - "additive": reward = reward + penalty
+            - "multiplicative": reward = reward * (1 + penalty)  [penalty < 0]
+            - "replace_if_positive": If truncated and reward > 0, set reward = penalty
+            - "cap": Cap positive rewards at penalty value
+
+    Returns:
+        torch.Tensor: Modified rewards with overlong penalty applied
+            Same shape as input rewards
+    """
+    modified_rewards = rewards.clone()
+    
+    # Handle both 1D and 2D reward tensors
+    if rewards.dim() > 1:
+        # For sequence-level rewards, apply penalty to the last token
+        # or sum and redistribute
+        is_truncated_expanded = is_truncated.unsqueeze(-1).expand_as(rewards)
+    else:
+        is_truncated_expanded = is_truncated
+    
+    if soft_penalty_mode == "additive":
+        # Simply add penalty to truncated samples
+        modified_rewards = torch.where(
+            is_truncated_expanded,
+            rewards + truncation_penalty,
+            rewards
+        )
+    elif soft_penalty_mode == "multiplicative":
+        # Multiply by (1 + penalty) - penalty should be negative
+        modified_rewards = torch.where(
+            is_truncated_expanded,
+            rewards * (1 + truncation_penalty),
+            rewards
+        )
+    elif soft_penalty_mode == "replace_if_positive":
+        # Replace positive rewards with penalty value if truncated
+        modified_rewards = torch.where(
+            is_truncated_expanded & (rewards > 0),
+            torch.full_like(rewards, truncation_penalty),
+            rewards
+        )
+    elif soft_penalty_mode == "cap":
+        # Cap positive rewards at a lower value if truncated
+        modified_rewards = torch.where(
+            is_truncated_expanded & (rewards > truncation_penalty),
+            torch.full_like(rewards, truncation_penalty),
+            rewards
+        )
+    else:
+        raise ValueError(f"Invalid soft_penalty_mode: {soft_penalty_mode}")
+    
+    return modified_rewards
+
+
 def bam_compute_token_on_off_policy_loss_v3(
     old_log_prob,
     log_prob,

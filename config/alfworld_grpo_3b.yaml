@@ -44,6 +44,30 @@ trainer:
 algorithm:
   adv_estimator: grpo  # Use GRPO algorithm
   use_kl_in_reward: false
+  
+  # ============================================================================
+  # DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) Configuration
+  # ============================================================================
+  # DAPO is an improvement over GRPO that addresses entropy collapse, reward noise,
+  # and training instability through four key mechanisms:
+  # 1. Clip-Higher: Decoupled asymmetric clipping (configured in actor.use_dapo)
+  # 2. Dynamic Sampling: Filter samples with all-correct or all-incorrect outcomes
+  # 3. Token-Level Policy Gradient: Already supported via loss_agg_mode: token-mean
+  # 4. Overlong Reward Shaping: Soft penalty for truncated samples
+  # ============================================================================
+  dapo:
+    enable: false  # Main switch: enable DAPO algorithm improvements
+    
+    # Dynamic Sampling: Filters out prompts where all rollouts have same outcome
+    dynamic_sampling:
+      enable: false
+      filter_mode: "strict"  # "strict", "remove_all_correct", "remove_all_incorrect", "none"
+    
+    # Overlong Reward Shaping: Soft penalty for truncated samples
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: "additive"  # "additive", "multiplicative", "replace_if_positive", "cap"
 
 # ============================================================================
 # Model Configuration - Qwen/Qwen2.5-3B-Instruct
@@ -74,6 +98,9 @@ actor_rollout_ref:
     #      This amplifies low-probability signals and dampens high-probability ones
     off_policy_shaping_mode: "exgrpo_policy_shaping"  # "exgrpo_policy_shaping" or "higher_clip_bound"
     off_policy_shaping_beta: 0.1  # β for ExGRPO policy shaping: f(x) = x/(x+β), default 0.1 as in ExGRPO paper
+    # ⭐ DAPO Clip-Higher: Enable decoupled asymmetric clipping
+    # When true, uses DAPO's asymmetric clipping that removes upper bound for negative advantages
+    use_dapo: false  # Set to true to enable DAPO's Clip-Higher mechanism
     fsdp_config:
       param_offload: false
       optimizer_offload: false
@@ -92,7 +119,7 @@ actor_rollout_ref:
     n: 8  # ⭐ Rollout: 8 rollouts per task
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
-      n: 8
+      n: 1
     max_env_worker: 32
     context_template: "linear"
     context_template_train_sp_action: false
