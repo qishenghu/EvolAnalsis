@@ -1882,7 +1882,39 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)  # ⭐ Get the reward tensor and extra info from the async call
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # ============================================================================
+                        # 🔍 DEBUG: Check ORIGINAL reward tensor BEFORE overlong_reward_shaping
+                        # ============================================================================
+                        _orig_reward_sums = reward_tensor.sum(dim=-1)
+                        if _orig_reward_sums.min().item() < -10:  # Threshold for abnormal values
+                            logger.warning(
+                                f"🚨 ABNORMAL REWARD DETECTED BEFORE overlong_reward_shaping!\n"
+                                f"  reward_sums: min={_orig_reward_sums.min().item():.2f}, max={_orig_reward_sums.max().item():.2f}, mean={_orig_reward_sums.mean().item():.2f}\n"
+                                f"  reward_tensor shape: {reward_tensor.shape}\n"
+                                f"  Non-zero positions per sample (first 5):"
+                            )
+                            for i in range(min(5, reward_tensor.shape[0])):
+                                non_zero_count = (reward_tensor[i] != 0).sum().item()
+                                logger.warning(f"    Sample {i}: non-zero positions={non_zero_count}, sum={_orig_reward_sums[i].item():.2f}")
+
                         print(f"{list(reward_extra_infos_dict.keys())=}")
+                        # Extra debug: if reward manager provides overlong-related fields, summarize them.
+                        if reward_extra_infos_dict:
+                            try:
+                                if "overlong_reward" in reward_extra_infos_dict:
+                                    _ov = torch.tensor(reward_extra_infos_dict["overlong_reward"], dtype=torch.float32)
+                                    metrics.update({
+                                        "reward/overlong_reward/mean": _ov.mean().item(),
+                                        "reward/overlong_reward/max": _ov.max().item(),
+                                        "reward/overlong_reward/min": _ov.min().item(),
+                                    })
+                                if "overlong" in reward_extra_infos_dict:
+                                    _ovb = torch.tensor(reward_extra_infos_dict["overlong"], dtype=torch.float32)
+                                    metrics.update({
+                                        "reward/overlong/ratio": _ovb.mean().item(),
+                                    })
+                            except Exception as _e:
+                                logger.warning(f"Failed to summarize overlong reward extra info: {_e}")
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
@@ -1943,6 +1975,30 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             )
                             batch.batch["token_level_scores"] = reward_tensor
                             
+                            # ============================================================================
+                            # 🔍 DEBUG: Check reward tensor values after overlong_reward_shaping
+                            # ============================================================================
+                            reward_sums = reward_tensor.sum(dim=-1)
+                            original_reward_sums = original_reward_tensor.sum(dim=-1)
+                            
+                            # Check for abnormally negative rewards
+                            if reward_sums.min().item() < -10:  # Threshold for abnormal values
+                                logger.warning(
+                                    f"🚨 ABNORMAL REWARD DETECTED after overlong_reward_shaping!\n"
+                                    f"  reward_sums: min={reward_sums.min().item():.2f}, max={reward_sums.max().item():.2f}, mean={reward_sums.mean().item():.2f}\n"
+                                    f"  original_reward_sums: min={original_reward_sums.min().item():.2f}, max={original_reward_sums.max().item():.2f}, mean={original_reward_sums.mean().item():.2f}\n"
+                                    f"  is_truncated count: {is_truncated.sum().item()}/{len(is_truncated)}\n"
+                                    f"  truncation_penalty: {truncation_penalty}, soft_penalty_mode: {soft_penalty_mode}"
+                                )
+                                # Check non-zero count per sample
+                                for i in range(min(5, reward_tensor.shape[0])):
+                                    non_zero_count = (reward_tensor[i] != 0).sum().item()
+                                    if non_zero_count > 1:
+                                        logger.warning(
+                                            f"  Sample {i}: non-zero positions={non_zero_count}, sum={reward_sums[i].item():.2f}, "
+                                            f"is_truncated={is_truncated[i].item()}"
+                                        )
+                            
                             # Log metrics with multi-turn aware information
                             num_truncated = is_truncated.sum().item()
                             num_truncated_by_length = is_truncated_by_length.sum().item()
@@ -1952,6 +2008,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 "dapo/truncation_ratio": num_truncated / len(is_truncated),
                                 "dapo/num_truncated_by_length": num_truncated_by_length,
                                 "dapo/num_truncated_by_termination": num_truncated_by_termination,
+                                # 🔍 DEBUG: Add reward statistics
+                                "dapo/reward_sum_min": reward_sums.min().item(),
+                                "dapo/reward_sum_max": reward_sums.max().item(),
+                                "dapo/reward_sum_mean": reward_sums.mean().item(),
                             })
                             if num_truncated > 0:
                                 reward_diff = (original_reward_tensor.sum(dim=-1) - reward_tensor.sum(dim=-1))[is_truncated].mean().item()

@@ -105,8 +105,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     # it is not a good idea to calculate n this way
     n=batch.batch["token_level_scores"].size(0)//is_llm_reward.size(0)
     is_llm_reward=is_llm_reward.repeat_interleave(n)
-    sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    token_level_scores = batch.batch["token_level_scores"]
+    token_level_rewards = batch.batch["token_level_rewards"]
+    sequence_score = token_level_scores.sum(-1)
+    # NOTE:
+    # - token_level_rewards is typically sparse (reward placed on the last valid response token)
+    # - but can also be dense (per-token shaping / penalties)
+    # We log both sum-over-tokens and last-token reward for debugging.
+    sequence_reward = token_level_rewards.sum(-1)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
@@ -121,6 +127,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     response_info = _compute_response_info(batch)
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
+
+    # Reward at the last valid response token (common "sequence-level reward" convention)
+    # Clamp for numerical safety when response_length==0 (shouldn't happen in practice).
+    last_resp_idx = torch.clamp(response_length.long() - 1, min=0)
+    batch_idx = torch.arange(token_level_rewards.size(0), device=token_level_rewards.device)
+    last_token_reward = token_level_rewards[batch_idx, last_resp_idx]
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -140,6 +152,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "critic/rewards/mean": torch.mean(sequence_reward).detach().item(),
         "critic/rewards/max": torch.max(sequence_reward).detach().item(),
         "critic/rewards/min": torch.min(sequence_reward).detach().item(),
+        # reward (debug variants)
+        "critic/rewards_sum/mean": torch.mean(sequence_reward).detach().item(),
+        "critic/rewards_sum/max": torch.max(sequence_reward).detach().item(),
+        "critic/rewards_sum/min": torch.min(sequence_reward).detach().item(),
+        "critic/rewards_last/mean": torch.mean(last_token_reward).detach().item(),
+        "critic/rewards_last/max": torch.max(last_token_reward).detach().item(),
+        "critic/rewards_last/min": torch.min(last_token_reward).detach().item(),
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
@@ -182,6 +201,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             "critic/rewards-env/mean": torch.mean(sequence_reward[~is_llm_reward]).detach().item(),
             "critic/rewards-env/max": torch.max(sequence_reward[~is_llm_reward]).detach().item(),
             "critic/rewards-env/min": torch.min(sequence_reward[~is_llm_reward]).detach().item(),
+            "critic/rewards_sum-env/mean": torch.mean(sequence_reward[~is_llm_reward]).detach().item(),
+            "critic/rewards_sum-env/max": torch.max(sequence_reward[~is_llm_reward]).detach().item(),
+            "critic/rewards_sum-env/min": torch.min(sequence_reward[~is_llm_reward]).detach().item(),
+            "critic/rewards_last-env/mean": torch.mean(last_token_reward[~is_llm_reward]).detach().item(),
+            "critic/rewards_last-env/max": torch.max(last_token_reward[~is_llm_reward]).detach().item(),
+            "critic/rewards_last-env/min": torch.min(last_token_reward[~is_llm_reward]).detach().item(),
         })
         metrics.update({
             # score
@@ -192,6 +217,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             "critic/rewards-syn/mean": torch.mean(sequence_reward[is_llm_reward]).detach().item(),
             "critic/rewards-syn/max": torch.max(sequence_reward[is_llm_reward]).detach().item(),
             "critic/rewards-syn/min": torch.min(sequence_reward[is_llm_reward]).detach().item(),
+            "critic/rewards_sum-syn/mean": torch.mean(sequence_reward[is_llm_reward]).detach().item(),
+            "critic/rewards_sum-syn/max": torch.max(sequence_reward[is_llm_reward]).detach().item(),
+            "critic/rewards_sum-syn/min": torch.min(sequence_reward[is_llm_reward]).detach().item(),
+            "critic/rewards_last-syn/mean": torch.mean(last_token_reward[is_llm_reward]).detach().item(),
+            "critic/rewards_last-syn/max": torch.max(last_token_reward[is_llm_reward]).detach().item(),
+            "critic/rewards_last-syn/min": torch.min(last_token_reward[is_llm_reward]).detach().item(),
         })
     return metrics
 

@@ -586,6 +586,7 @@ def dapo_overlong_reward_shaping(
 
     Args:
         rewards (Tensor): Original reward tensor, shape (batch_size,) or (batch_size, seq_len)
+            For 2D tensors, reward is typically placed at the last valid token position.
         is_truncated (Tensor): Boolean tensor indicating which samples were truncated
             Shape: (batch_size,)
         truncation_penalty (float): Penalty for truncated samples. Default: -0.5
@@ -606,42 +607,76 @@ def dapo_overlong_reward_shaping(
     
     # Handle both 1D and 2D reward tensors
     if rewards.dim() > 1:
-        # For sequence-level rewards, apply penalty to the last token
-        # or sum and redistribute
-        is_truncated_expanded = is_truncated.unsqueeze(-1).expand_as(rewards)
+        # For 2D reward tensors (batch_size, seq_len), the reward is typically placed
+        # at the last valid token position. We should only apply penalty to the 
+        # trajectory-level reward, not to every token.
+        # 
+        # ⭐ FIX: Sum rewards to get trajectory-level reward, apply penalty, then 
+        # find the last non-zero position and apply the penalty there.
+        # 
+        # Alternative simpler approach: Apply penalty only to the last token position
+        # where reward was originally placed.
+        
+        # Find positions where reward is non-zero (typically last valid token)
+        reward_positions = (rewards != 0)
+        
+        for i in range(rewards.shape[0]):
+            if not is_truncated[i]:
+                continue
+                
+            # Get trajectory-level reward
+            traj_reward = rewards[i].sum()
+            
+            # Apply penalty based on mode
+            if soft_penalty_mode == "additive":
+                new_traj_reward = traj_reward + truncation_penalty
+            elif soft_penalty_mode == "multiplicative":
+                new_traj_reward = traj_reward * (1 + truncation_penalty)
+            elif soft_penalty_mode == "replace_if_positive":
+                new_traj_reward = truncation_penalty if traj_reward > 0 else traj_reward
+            elif soft_penalty_mode == "cap":
+                new_traj_reward = min(traj_reward.item(), truncation_penalty) if traj_reward > truncation_penalty else traj_reward
+            else:
+                raise ValueError(f"Invalid soft_penalty_mode: {soft_penalty_mode}")
+            
+            # Find the position where reward was placed (last non-zero or last position)
+            non_zero_positions = reward_positions[i].nonzero(as_tuple=True)[0]
+            if len(non_zero_positions) > 0:
+                # Reward was placed at a specific position
+                reward_pos = non_zero_positions[-1]
+                modified_rewards[i] = 0  # Clear all positions
+                modified_rewards[i, reward_pos] = new_traj_reward
+            else:
+                # No reward was assigned (all zeros), assign penalty to last position
+                modified_rewards[i, -1] = truncation_penalty if soft_penalty_mode == "additive" else 0
     else:
-        is_truncated_expanded = is_truncated
-    
-    if soft_penalty_mode == "additive":
-        # Simply add penalty to truncated samples
-        modified_rewards = torch.where(
-            is_truncated_expanded,
-            rewards + truncation_penalty,
-            rewards
-        )
-    elif soft_penalty_mode == "multiplicative":
-        # Multiply by (1 + penalty) - penalty should be negative
-        modified_rewards = torch.where(
-            is_truncated_expanded,
-            rewards * (1 + truncation_penalty),
-            rewards
-        )
-    elif soft_penalty_mode == "replace_if_positive":
-        # Replace positive rewards with penalty value if truncated
-        modified_rewards = torch.where(
-            is_truncated_expanded & (rewards > 0),
-            torch.full_like(rewards, truncation_penalty),
-            rewards
-        )
-    elif soft_penalty_mode == "cap":
-        # Cap positive rewards at a lower value if truncated
-        modified_rewards = torch.where(
-            is_truncated_expanded & (rewards > truncation_penalty),
-            torch.full_like(rewards, truncation_penalty),
-            rewards
-        )
-    else:
-        raise ValueError(f"Invalid soft_penalty_mode: {soft_penalty_mode}")
+        # 1D case: simple element-wise penalty application
+        if soft_penalty_mode == "additive":
+            modified_rewards = torch.where(
+                is_truncated,
+                rewards + truncation_penalty,
+                rewards
+            )
+        elif soft_penalty_mode == "multiplicative":
+            modified_rewards = torch.where(
+                is_truncated,
+                rewards * (1 + truncation_penalty),
+                rewards
+            )
+        elif soft_penalty_mode == "replace_if_positive":
+            modified_rewards = torch.where(
+                is_truncated & (rewards > 0),
+                torch.full_like(rewards, truncation_penalty),
+                rewards
+            )
+        elif soft_penalty_mode == "cap":
+            modified_rewards = torch.where(
+                is_truncated & (rewards > truncation_penalty),
+                torch.full_like(rewards, truncation_penalty),
+                rewards
+            )
+        else:
+            raise ValueError(f"Invalid soft_penalty_mode: {soft_penalty_mode}")
     
     return modified_rewards
 
