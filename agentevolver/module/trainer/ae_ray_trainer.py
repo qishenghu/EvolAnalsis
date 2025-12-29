@@ -2009,10 +2009,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 "dapo/truncation_ratio": num_truncated / len(is_truncated),
                                 "dapo/num_truncated_by_length": num_truncated_by_length,
                                 "dapo/num_truncated_by_termination": num_truncated_by_termination,
-                                # 🔍 DEBUG: Add reward statistics
+                                # 🔍 DEBUG: Add reward statistics (after DAPO overlong penalty)
                                 "dapo/reward_sum_min": reward_sums.min().item(),
                                 "dapo/reward_sum_max": reward_sums.max().item(),
                                 "dapo/reward_sum_mean": reward_sums.mean().item(),
+                                # ⭐ Record original environment reward (before DAPO overlong penalty)
+                                "env_reward/original_reward_min": original_reward_sums.min().item(),
+                                "env_reward/original_reward_max": original_reward_sums.max().item(),
+                                "env_reward/original_reward_mean": original_reward_sums.mean().item(),
+                                "env_reward/original_reward_std": original_reward_sums.std().item(),
                             })
                             if num_truncated > 0:
                                 reward_diff = (original_reward_tensor.sum(dim=-1) - reward_tensor.sum(dim=-1))[is_truncated].mean().item()
