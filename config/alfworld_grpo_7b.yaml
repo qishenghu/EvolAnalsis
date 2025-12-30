@@ -28,8 +28,8 @@ trainer:
   nnodes: 1
   total_epochs: 1
   save_freq: 100
-  test_freq: 10
-  val_before_train: true
+  test_freq: 50
+  val_before_train: false
   validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
   rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
   # Logger configuration: use wandb to sync training metrics

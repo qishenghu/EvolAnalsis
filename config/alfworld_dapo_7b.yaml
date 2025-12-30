@@ -1,0 +1,266 @@
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+# ============================================================================
+# AlfWorld DAPO Training Configuration (Pure DAPO, No Experience Replay)
+# ============================================================================
+# This configuration enables DAPO (Decoupled Clip and Dynamic sAmpling Policy 
+# Optimization) improvements on top of GRPO for training Qwen/Qwen2.5-7B-Instruct.
+# 
+# ⭐ DAPO Key Features (ALL ENABLED):
+#   1. Clip-Higher: Decoupled asymmetric clipping to prevent entropy collapse
+#   2. Dynamic Sampling: Filter samples with all-correct or all-incorrect outcomes
+#   3. Token-Level Policy Gradient: via loss_agg_mode: token-mean
+#   4. Overlong Reward Shaping: Soft penalty for truncated samples
+#
+# ⭐ Experience Replay & Experience Guide: DISABLED
+#   - No off-policy data from experience pool
+#   - No experience injection into prompts
+#   - Pure on-policy DAPO training
+# ============================================================================
+
+trainer:
+  experiment_name: alfworld_7b_dapo
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  save_freq: 100
+  test_freq: 25
+  val_before_train: false
+  validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
+  rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
+  logger: ["console", "wandb"]
+
+# ============================================================================
+# Algorithm Configuration - DAPO ENABLED
+# ============================================================================
+algorithm:
+  adv_estimator: grpo  # DAPO builds on top of GRPO
+  use_kl_in_reward: false
+  
+  # ============================================================================
+  # ⭐ DAPO Configuration - ALL FEATURES ENABLED
+  # ============================================================================
+  dapo:
+    enable: true  # Main switch: enable DAPO algorithm improvements
+    
+    # ⭐ Dynamic Sampling: Filter prompts where all rollouts have same outcome
+    # This removes samples that don't contribute useful gradients
+    dynamic_sampling:
+      enable: true
+      # "strict": Remove if all same (acc=0 or acc=1) - recommended for DAPO
+      # "remove_all_correct": Only remove if all correct (acc=1)
+      # "remove_all_incorrect": Only remove if all incorrect (acc=0)
+      # "none": No filtering
+      filter_mode: "strict"
+    
+    # ⭐ Overlong Reward Shaping: Soft penalty for truncated samples
+    # Preserves learning signal from partial completions
+    overlong_reward_shaping:
+      enable: true
+      truncation_penalty: -0.5  # Soft penalty instead of treating as failure
+      # "additive": reward = reward + penalty
+      # "multiplicative": reward = reward * (1 + penalty)
+      # "replace_if_positive": If truncated and reward > 0, set reward = penalty
+      # "cap": Cap positive rewards at penalty value
+      soft_penalty_mode: "additive"
+
+# ============================================================================
+# Model Configuration - Qwen/Qwen2.5-7B-Instruct
+# ============================================================================
+actor_rollout_ref:
+  model:
+    path: /data/code/exp/models/Qwen/Qwen2.5-7B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1e-6
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    use_kl_loss: false  # ⭐ DAPO removes KL divergence regularization (as per DAPO paper)
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    
+    # ============================================================================
+    # ⭐ DAPO Clip-Higher Configuration (Decoupled Asymmetric Clipping)
+    # ============================================================================
+    # When use_dapo=true, enables DAPO's Clip-Higher mechanism:
+    # - For positive advantages (A > 0): Use clip_ratio_high to limit probability increase
+    # - For negative advantages (A < 0): Remove upper clipping to allow more exploration
+    # This helps prevent entropy collapse by encouraging exploration of low-probability tokens.
+    # ============================================================================
+    use_dapo: true  # ⭐ ENABLE DAPO's Clip-Higher mechanism
+    
+    # ε_low: Lower bound for clipping (used for both A > 0 and A < 0)
+    clip_ratio_low: 0.2
+    # ε_high: Upper bound for clipping (only used when A > 0)
+    # When A < 0, upper bound is removed (set to clip_ratio_c)
+    clip_ratio_high: 0.28
+    # Maximum ratio for extreme clipping (used as upper bound when A < 0)
+    clip_ratio_c: 3.0
+    
+    # ⭐ Token-Level Policy Gradient (DAPO's 3rd improvement)
+    loss_agg_mode: token-mean
+    
+    # Off-policy settings (not used since Experience Replay is disabled)
+    # But kept for compatibility
+    off_cliprange_high: 0.6
+    off_policy_shaping_mode: "exgrpo_policy_shaping"
+    off_policy_shaping_beta: 0.1
+    
+    fsdp_config:
+      param_offload: false
+      optimizer_offload: false
+  rollout:
+    use_qwen3: false
+    enable_request_id: false
+    prompt_length: 20480
+    response_length: 4096
+    max_model_len: 25580
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: vllm
+    mode: async
+    gpu_memory_utilization: 0.6
+    n: 8  # ⭐ Rollout: 8 rollouts per task (for GRPO grouping)
+    log_prob_max_token_len_per_gpu: 25580
+    val_kwargs:
+      n: 1
+    max_env_worker: 32
+    context_template: "linear"
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ""
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
+
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  train_batch_size: 8  # ⭐ Batch size: 8
+  max_prompt_length: 4000
+  max_response_length: 21580
+  filter_overlong_prompts: true
+  truncation: "error"
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  val_type: "val"
+  max_train_tasks: 800
+  shuffle: true
+
+# ============================================================================
+# Environment Service Configuration - AlfWorld
+# ============================================================================
+env_service:
+  env_type: "alfworld"
+  env_url: "http://127.0.0.1:8081"
+
+# ============================================================================
+# Task Manager Configuration
+# ============================================================================
+task_manager:
+  n: 0  # No exploration/synthesis
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/alfworld.json
+
+# ============================================================================
+# Experience Manager Configuration - ALL DISABLED
+# ============================================================================
+# ⭐ Pure DAPO training without any experience mechanisms:
+#    - Experience Replay: DISABLED
+#    - Experience-guided rollout: DISABLED
+#    - Experience summarization: DISABLED
+# ============================================================================
+exp_manager:
+  # ⭐ Experience-Guided Rollout: DISABLED
+  train_rollout_mode: "woexp"  # Without Experience
+  val_rollout_mode: "woexp"
+  rollout_ratio: 0
+  
+  train_sample_mode: "alldiscard"
+  train_sample_keepratio: 0.0
+  experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
+  
+  # ⭐ Experience Summarization: DISABLED
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  
+  reme:
+    base_url: "http://127.0.0.1:8124"
+    workspace_id: "alfworld_7b_dapo"
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  
+  # ⭐ Experience Replay: DISABLED
+  experience_replay:
+    enable: false  # ⭐ DISABLED - Pure on-policy DAPO training
+    replay_start_ratio: 1.0
+    exp_ratio: 0.0
+    offpolicy_trajectories_per_task: 1
+    experience_lbound: 2
+    experience_rbound: 8
+    exp_select_mode: "argmin"
+    use_current_policy_entropy: true
+    exp_is_correct: true
+    max_trajectories_per_task: 5
+
+# ============================================================================
+# Attribution-Driven Credit Assignment - DISABLED
+# ============================================================================
+attribution_driven_credit_assignment:
+  enable: false
+
+# ============================================================================
+# Thread Pool Configuration
+# ============================================================================
+thread_pool:
+  max_workers: 8
