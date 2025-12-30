@@ -23,7 +23,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo
+  experiment_name: alfworld_3b_grpo_bz16
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -156,7 +156,7 @@ data:
   val_files: null    # Load validation tasks from environment (200 test tasks)
   val_batch_size: 16  # Increased to match train_batch_size
   val_type: "val"
-  max_train_tasks: 800
+  max_train_tasks: 1600
   shuffle: true
 
 # ============================================================================

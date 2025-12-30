@@ -35,7 +35,7 @@ kill_port() {
 
 # Run GRPO baseline (default)
 python launcher.py \
-  --conf config/alfworld_dapo_3b.yaml
+  --conf config/alfworld_grpo_3b.yaml
  # --with-alfworld
 
 # Run GRPO with Experience Replay
