@@ -15,10 +15,11 @@ defaults:
 # using GRPO with Experience Replay mechanism.
 # 
 # Key settings:
-# - batch_size: 8
+# - batch_size: 16 (increased from 8, with memory optimizations)
 # - rollout: 8 (n_rollout)
 # - replay_start_ratio: 0.1 (start replay at 10% of training)
 # - exp_ratio: 0.5 (50% experience tasks, 50% on-policy tasks)
+# - Memory optimizations: param_offload, optimizer_offload, lower gpu_memory_utilization
 # ============================================================================
 
 trainer:
@@ -81,7 +82,7 @@ actor_rollout_ref:
     optim:
       lr: 1e-6
     ppo_micro_batch_size_per_gpu: 1
-    ppo_mini_batch_size: 8
+    ppo_mini_batch_size: 16  # Increased to match train_batch_size
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
@@ -102,8 +103,8 @@ actor_rollout_ref:
     # When true, uses DAPO's asymmetric clipping that removes upper bound for negative advantages
     use_dapo: false  # Set to true to enable DAPO's Clip-Higher mechanism
     fsdp_config:
-      param_offload: false
-      optimizer_offload: false
+      param_offload: true   # ⭐ Enable to save GPU memory (offload model params to CPU)
+      optimizer_offload: true  # ⭐ Enable to save GPU memory (offload optimizer states to CPU)
   rollout:
     use_qwen3: false
     enable_request_id: false
@@ -115,7 +116,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.5  # ⭐ Reduced from 0.6 to 0.5 to free up memory for training
     n: 8  # ⭐ Rollout: 8 rollouts per task
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
@@ -145,7 +146,7 @@ critic:
 # Data Configuration
 # ============================================================================
 data:
-  train_batch_size: 8  # ⭐ Batch size: 8
+  train_batch_size: 16  # ⭐ Batch size: 16 (increased from 8, with memory optimizations)
   max_prompt_length: 4000
   max_response_length: 21580
   filter_overlong_prompts: true
@@ -153,7 +154,7 @@ data:
   return_raw_chat: true
   train_files: null  # Load tasks from environment (2420 training tasks)
   val_files: null    # Load validation tasks from environment (200 test tasks)
-  val_batch_size: 8
+  val_batch_size: 16  # Increased to match train_batch_size
   val_type: "val"
   max_train_tasks: 800
   shuffle: true
@@ -233,7 +234,7 @@ exp_manager:
   init_exp_only: false             # ⭐ 不只做经验初始化
   
   # 经验总结批量大小（不使用，但需要保留以兼容代码）
-  summary_batch_size: 8
+  summary_batch_size: 16  # Updated to match train_batch_size
   
   # ReMe 服务配置（Experience Summarization 服务，已禁用）
   reme:
