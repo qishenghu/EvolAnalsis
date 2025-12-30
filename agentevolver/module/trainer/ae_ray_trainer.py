@@ -526,7 +526,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             # self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train")
             max_train_tasks = self.config.data.get("max_train_tasks", None)
             shuffle = self.config.data.get("shuffle", True) # by default, shuffle the train tasks
-            self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train", max_tasks=max_train_tasks, shuffle=shuffle)
+            seed = self.config.data.get("seed", 2026)
+            self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train", max_tasks=max_train_tasks, shuffle=shuffle, seed=seed)
         
         # load val dataset
         if self.config.data.val_files is not None:

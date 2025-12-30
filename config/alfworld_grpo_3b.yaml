@@ -158,6 +158,7 @@ data:
   val_type: "val"
   max_train_tasks: 1600
   shuffle: true
+  seed: 2026
 
 # ============================================================================
 # Environment Service Configuration - AlfWorld
