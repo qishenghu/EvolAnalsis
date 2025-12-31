@@ -147,3 +147,6 @@ ExGRPO/
 
 AgentGym/agentenv-searchqa/retrieve_data/
 AgentGym/agentenv-searchqa/agentenv_searchqa/queries/
+
+alfworld_3b_grpo_bz16/
+*.ipynb

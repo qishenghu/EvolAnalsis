@@ -138,8 +138,8 @@ class AlfworldEnv(BaseEnv):
             )
         
         self.current_game_index = game_index
-        self.current_observation = reset_result["observation"]
         self.current_available_actions = reset_result.get("available_actions", [])
+        self.current_observation = reset_result["observation"] + "\nAVAILABLE ACTIONS: " + ", ".join(self.current_available_actions)
         self.is_done = False
         self.current_reward = 0.0
         
@@ -199,25 +199,27 @@ class AlfworldEnv(BaseEnv):
         # Parse "Action:" from LLM output if present
         # LLM may output: "Thought: ... Action: go to kitchen" or "Action: go to kitchen"
         # We need to extract just the action part
-        parsed_action = self._parse_action_from_llm_output(action_str)
+        parsed_action_raw = self._parse_action_from_llm_output(action_str)
+        parsed_action = parsed_action_raw.strip() if isinstance(parsed_action_raw, str) else None
         
-        # If parsing failed (returned None), return error state
-        if parsed_action is None:
-            # Return error state with "Invalid action." message
-            # Only return user message (consistent with other environments)
-            state_messages = [
-                {
-                    "role": "user",
-                    "content": "Invalid action."
-                }
-            ]
+        # If parsing failed or action not in available actions:
+        # Strategy A: do NOT terminate; return an error observation so the agent can correct itself.
+        if parsed_action is None or parsed_action not in self.current_available_actions:
+            available_actions = self.current_available_actions or []
+            invalid_obs = "Invalid action."
+            if available_actions:
+                invalid_obs += "\nAVAILABLE ACTIONS: " + ", ".join(available_actions)
+            state_messages = [{"role": "user", "content": invalid_obs}]
             
             return {
                 "state": state_messages,
-                "reward": self.current_reward,  # Use current reward (no change)
-                "is_terminated": self.is_done,  # Use current termination status
+                # Keep a neutral step reward; the final score is evaluated by `evaluate()`.
+                # Avoid leaking/keeping stale self.current_reward in this invalid-action response.
+                "reward": 0.0,
+                "is_terminated": False,
                 "info": {
-                    "available_actions": self.current_available_actions,
+                    "available_actions": available_actions,
+                    "invalid_action": True,
                 },
                 "instance_id": self.instance_id,
             }
@@ -237,8 +239,8 @@ class AlfworldEnv(BaseEnv):
             raise RuntimeError(f"Step failed: {step_result['error']}")
         
         # Update state
-        self.current_observation = step_result["observation"]
         self.current_available_actions = step_result.get("available_actions", [])
+        self.current_observation = step_result["observation"] + "\nAVAILABLE ACTIONS: " + ", ".join(self.current_available_actions)
         self.is_done = step_result["done"]
         self.current_reward = step_result.get("reward", 0.0)
         

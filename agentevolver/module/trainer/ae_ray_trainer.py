@@ -1053,6 +1053,11 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         response_masks: torch.Tensor,
         global_steps: int,
         output_dir: str,
+        batch_task_ids: Optional[np.ndarray] = None,
+        batch_rollout_ids: Optional[np.ndarray] = None,
+        batch_messages: Optional[np.ndarray] = None,
+        batch_group_ids: Optional[torch.Tensor] = None,
+        batch_reward_scores: Optional[np.ndarray] = None,
     ):
         """
         保存 Trajectory 信息用于后续分析。
@@ -1092,11 +1097,187 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         
         # 准备保存的数据
         saved_data = []
+
+        # ---------------------------------------------------------------------
+        # Debug printing (sampled): print some rollouts' dialogues during training
+        # to help online inspection without opening JSONL files.
+        # ---------------------------------------------------------------------
+        print_prob = 0.1
+        max_print_per_call = 3
+        max_msg_chars = 1024  # truncate each message to avoid spamming logs
+
+        def _truncate_text(s: str, n: int) -> str:
+            if s is None:
+                return ""
+            s = str(s)
+            return s if len(s) <= n else s[:n] + "\n…(truncated)…"
+
+        def _format_messages(msgs: list) -> str:
+            lines = []
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role", "unknown")
+                content = _truncate_text(m.get("content", ""), max_msg_chars)
+                lines.append(f"[{role}]: {content}")
+            return "\n".join(lines)
+
+        printed_cnt = 0
         
-        for idx, traj in enumerate(trajectories):
-            # 提取基本信息
-            data_id = traj.data_id
-            rollout_id = traj.rollout_id
+        # ---------------------------------------------------------------------
+        # IMPORTANT (multi-gpu / balance_batch):
+        # - `trainer.balance_batch=True` will reorder samples inside `batch`.
+        # - `trajectories` keeps the original rollout order.
+        # If we index-align `entropys[idx]` with `trajectories[idx]`, we may mix
+        # stats from one rollout with messages from another.
+        #
+        # Fix: if batch-level identifiers are provided, align by (group_id, rollout_id)
+        # where group_id == int(data_id) used in env_manager.samples_to_dataproto().
+        # ---------------------------------------------------------------------
+
+        traj_map: dict[tuple[int, str], Trajectory] = {}
+        for t in trajectories:
+            try:
+                gid = int(t.data_id)
+            except Exception:
+                continue
+            traj_map[(gid, str(t.rollout_id))] = t
+
+        use_batch_alignment = (
+            batch_rollout_ids is not None
+            and batch_messages is not None
+            and batch_group_ids is not None
+            and entropys is not None
+        )
+
+        if use_batch_alignment:
+            # Iterate in batch order (aligned with entropys/response_masks) and only
+            # keep entries that correspond to on-policy trajectories we just rolled out.
+            # NOTE: batch_group_ids is a tensor on device; bring to cpu once.
+            batch_gids = batch_group_ids.detach().cpu().tolist()
+            for bidx in range(min(len(batch_gids), entropys.shape[0])):
+                gid = int(batch_gids[bidx])
+                rollout_id = str(batch_rollout_ids[bidx])
+                traj = traj_map.get((gid, rollout_id))
+                if traj is None:
+                    continue
+
+                data_id = traj.data_id
+
+                # 获取 task_id（优先使用 batch_task_ids，其次 fallback 到 traj/tasks）
+                task_id = None
+                if batch_task_ids is not None and bidx < len(batch_task_ids):
+                    task_id = str(batch_task_ids[bidx])
+                elif hasattr(traj, "task_id"):
+                    task_id = traj.task_id
+                elif traj.metadata and "task_id" in traj.metadata:
+                    task_id = traj.metadata["task_id"]
+                elif tasks and bidx < len(tasks):
+                    task_id = tasks[bidx].task_id
+                if task_id is None:
+                    task_id = f"unknown_{data_id}_{rollout_id}"
+
+                # messages: from batch (aligned) if possible
+                messages = []
+                bm = batch_messages[bidx]
+                if isinstance(bm, dict) and "messages" in bm:
+                    messages = bm["messages"]
+                elif isinstance(bm, list):
+                    messages = bm
+
+                # reward: prefer batch reward_scores if provided (aligned)
+                reward_info = None
+                if batch_reward_scores is not None and bidx < len(batch_reward_scores):
+                    rs = batch_reward_scores[bidx]
+                    if isinstance(rs, dict):
+                        reward_info = rs
+                elif traj.reward:
+                    reward_info = {
+                        "outcome": traj.reward.outcome,
+                        "success_rate": traj.reward.success_rate,
+                        "madness": traj.reward.madness,
+                        "description": traj.reward.description,
+                    }
+                    if hasattr(traj.reward, "metadata") and traj.reward.metadata:
+                        reward_info["metadata"] = traj.reward.metadata
+
+                # entropy stats
+                entropy_info = None
+                traj_entropy = entropys[bidx].detach().cpu().numpy()
+                if response_masks is not None and bidx < response_masks.shape[0]:
+                    traj_response_mask = response_masks[bidx].detach().cpu().numpy()
+                    valid_entropys = traj_entropy[traj_response_mask.astype(bool)]
+                    entropy_info = {
+                        "mean": float(np.mean(valid_entropys)) if len(valid_entropys) > 0 else None,
+                        "std": float(np.std(valid_entropys)) if len(valid_entropys) > 0 else None,
+                        "min": float(np.min(valid_entropys)) if len(valid_entropys) > 0 else None,
+                        "max": float(np.max(valid_entropys)) if len(valid_entropys) > 0 else None,
+                        "num_valid_tokens": int(len(valid_entropys)),
+                        "total_tokens": int(len(traj_entropy)),
+                    }
+                else:
+                    entropy_info = {
+                        "mean": float(np.mean(traj_entropy)),
+                        "std": float(np.std(traj_entropy)),
+                        "min": float(np.min(traj_entropy)),
+                        "max": float(np.max(traj_entropy)),
+                        "num_valid_tokens": int(len(traj_entropy)),
+                        "total_tokens": int(len(traj_entropy)),
+                    }
+
+                traj_data = {
+                    "data_id": data_id,
+                    "rollout_id": rollout_id,
+                    "task_id": task_id,
+                    "step": global_steps,
+                    "query": traj.query,
+                    "messages": messages,
+                    "reward": reward_info,
+                    "entropy": entropy_info,
+                    "is_terminated": traj.is_terminated,
+                    "success": traj.success if hasattr(traj, "success") else (traj.reward is not None and traj.reward.outcome > 0),
+                }
+
+                # metadata (same behavior as before)
+                if traj.metadata:
+                    metadata_copy = {}
+                    for k, v in traj.metadata.items():
+                        if k not in ["task_id", "old_log_probs", "response_mask"]:
+                            try:
+                                json.dumps(v, ensure_ascii=False)
+                                metadata_copy[k] = v
+                            except (TypeError, ValueError):
+                                try:
+                                    metadata_copy[k] = str(v)
+                                except Exception:
+                                    pass
+                    if metadata_copy:
+                        traj_data["metadata"] = metadata_copy
+
+                saved_data.append(traj_data)
+
+                # sampled printing
+                if printed_cnt < max_print_per_call and random.random() < print_prob:
+                    try:
+                        logger.info(
+                            "\n"
+                            f"========== [Trajectory Sample] step={global_steps} ==========\n"
+                            f"task_id={task_id} data_id={data_id} rollout_id={rollout_id} "
+                            f"success={traj_data.get('success')} terminated={traj_data.get('is_terminated')}\n"
+                            f"entropy_valid/total={entropy_info.get('num_valid_tokens') if entropy_info else None}/"
+                            f"{entropy_info.get('total_tokens') if entropy_info else None}\n"
+                            f"{_format_messages(messages)}\n"
+                            f"========== [End Trajectory Sample] =========="
+                        )
+                        printed_cnt += 1
+                    except Exception as _e:
+                        logger.warning(f"Failed to print sampled trajectory: {_e}")
+        else:
+            # Fallback to original (index-based) behavior
+            for idx, traj in enumerate(trajectories):
+                # 提取基本信息
+                data_id = traj.data_id
+                rollout_id = traj.rollout_id
             
             # 获取 task_id
             task_id = None
@@ -1221,7 +1402,25 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 if metadata_copy:
                     traj_data["metadata"] = metadata_copy
             
-            saved_data.append(traj_data)
+                saved_data.append(traj_data)
+
+                # sampled printing (fallback)
+                if printed_cnt < max_print_per_call and random.random() < print_prob:
+                    try:
+                        entropy_info = traj_data.get("entropy") or {}
+                        logger.info(
+                            "\n"
+                            f"========== [Trajectory Sample] step={global_steps} ==========\n"
+                            f"task_id={traj_data.get('task_id')} data_id={traj_data.get('data_id')} "
+                            f"rollout_id={traj_data.get('rollout_id')} "
+                            f"success={traj_data.get('success')} terminated={traj_data.get('is_terminated')}\n"
+                            f"entropy_valid/total={entropy_info.get('num_valid_tokens')}/{entropy_info.get('total_tokens')}\n"
+                            f"{_format_messages(traj_data.get('messages', []))}\n"
+                            f"========== [End Trajectory Sample] =========="
+                        )
+                        printed_cnt += 1
+                    except Exception as _e:
+                        logger.warning(f"Failed to print sampled trajectory: {_e}")
         
         # 保存为 JSONL 文件
         filename = os.path.join(trajectory_dir, f"trajectories_step_{global_steps}.jsonl")
@@ -1783,8 +1982,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             self._save_trajectories_for_analysis(
                                                 trajectories=trajectories,
                                                 tasks=tasks,  # tasks 在 async_rollout_mode 分支内定义
-                                                entropys=on_policy_entropys,
-                                                response_masks=on_policy_response_masks,
+                                                # IMPORTANT: pass full batch-aligned tensors/ids to avoid
+                                                # mismatching when trainer.balance_batch=True reorders batch.
+                                                entropys=entropys,
+                                                response_masks=response_masks,
+                                                batch_task_ids=batch.non_tensor_batch.get("task_ids", None),
+                                                batch_rollout_ids=batch.non_tensor_batch.get("rollout_ids", None),
+                                                batch_messages=batch.non_tensor_batch.get("messages", None),
+                                                batch_group_ids=batch.batch.get("group_ids", None),
+                                                batch_reward_scores=batch.non_tensor_batch.get("reward_scores", None),
                                                 global_steps=self.global_steps,
                                                 output_dir=trajectory_save_dir,
                                             )

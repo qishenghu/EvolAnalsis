@@ -25,12 +25,22 @@ class BabyAIEnvClient(BaseEnvClient):
     )
 
     def __init__(
-        self, env_server_base: str, data_len: int, *args, timeout: int = 300, **kwargs
+        self, 
+        env_server_base: str, 
+        data_len: int, 
+        is_eval: bool = True,
+        test_data_start_index: int = -1,
+        *args, 
+        timeout: int = 300, 
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.env_server_base = env_server_base
         self.timeout = timeout
         self.data_len = data_len
+        self.is_eval = is_eval
+        self.test_data_start_index = test_data_start_index
+        assert self.test_data_start_index >= 0, "test_data_start_index must be >= 0"
 
         ok = requests.post(f"{self.env_server_base}/create", timeout=self.timeout)
         if ok.status_code != 200:
@@ -88,7 +98,8 @@ class BabyAIEnvClient(BaseEnvClient):
         )
 
     def reset(self, data_idx: int = 0) -> dict[str, Any]:
-        response = self._post("reset", {"data_idx": data_idx})
+        actual_data_idx = self.test_data_start_index + data_idx
+        response = self._post("reset", {"data_idx": actual_data_idx})
         self.info = {
             "observation": response["observation"],
             "reward": response["reward"],
