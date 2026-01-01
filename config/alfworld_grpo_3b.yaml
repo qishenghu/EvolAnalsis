@@ -15,7 +15,7 @@ defaults:
 # using GRPO with Experience Replay mechanism.
 # 
 # Key settings:
-# - batch_size: 16 (increased from 8, with memory optimizations)
+# - batch_size: 8 (increased from 8, with memory optimizations)
 # - rollout: 8 (n_rollout)
 # - replay_start_ratio: 0.1 (start replay at 10% of training)
 # - exp_ratio: 0.5 (50% experience tasks, 50% on-policy tasks)
@@ -23,13 +23,13 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_bz16_stricter
+  experiment_name: alfworld_3b_grpo_bz8_stricter
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 1
   save_freq: 100
-  test_freq: 100
+  test_freq: 50
   val_before_train: false
   validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
   rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
@@ -82,7 +82,7 @@ actor_rollout_ref:
     optim:
       lr: 1e-6
     ppo_micro_batch_size_per_gpu: 1
-    ppo_mini_batch_size: 16  # Increased to match train_batch_size
+    ppo_mini_batch_size: 8  # Increased to match train_batch_size
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
@@ -146,7 +146,7 @@ critic:
 # Data Configuration
 # ============================================================================
 data:
-  train_batch_size: 16  # ⭐ Batch size: 16 (increased from 8, with memory optimizations)
+  train_batch_size: 8  # ⭐ Batch size: 8 (increased from 8, with memory optimizations)
   max_prompt_length: 4000
   max_response_length: 21580
   filter_overlong_prompts: true
@@ -154,9 +154,9 @@ data:
   return_raw_chat: true
   train_files: null  # Load tasks from environment (2420 training tasks)
   val_files: null    # Load validation tasks from environment (200 test tasks)
-  val_batch_size: 16  # Increased to match train_batch_size
+  val_batch_size: 8  # Increased to match train_batch_size
   val_type: "val"
-  max_train_tasks: 1600
+  max_train_tasks: 800
   shuffle: true
   seed: 2026
 
@@ -235,7 +235,7 @@ exp_manager:
   init_exp_only: false             # ⭐ 不只做经验初始化
   
   # 经验总结批量大小（不使用，但需要保留以兼容代码）
-  summary_batch_size: 16  # Updated to match train_batch_size
+  summary_batch_size: 8  # Updated to match train_batch_size
   
   # ReMe 服务配置（Experience Summarization 服务，已禁用）
   reme:
