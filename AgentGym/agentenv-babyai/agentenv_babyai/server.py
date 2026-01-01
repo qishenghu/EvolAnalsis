@@ -53,3 +53,8 @@ def render_endpoint(body: CloseRequestBody):
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/env", response_model=str)
+def return_env_name():
+    return 'babyai'
