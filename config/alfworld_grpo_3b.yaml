@@ -23,13 +23,13 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_bz16
+  experiment_name: alfworld_3b_grpo_bz16_stricter
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 1
   save_freq: 100
-  test_freq: 50
+  test_freq: 100
   val_before_train: false
   validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
   rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
@@ -109,7 +109,7 @@ actor_rollout_ref:
     use_qwen3: false
     enable_request_id: false
     prompt_length: 20480
-    response_length: 4096
+    response_length: 2048
     max_model_len: 25580
     temperature: 0.9
     log_prob_micro_batch_size_per_gpu: 1
