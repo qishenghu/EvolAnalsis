@@ -18,6 +18,8 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export OPENAI_API_KEY=""
 export OPENAI_API_BASE="https://api.openai.com/v1"
+export NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=1
 
 # 设置 PYTHONPATH 指向项目根目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
