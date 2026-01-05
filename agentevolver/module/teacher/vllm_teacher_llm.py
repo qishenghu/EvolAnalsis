@@ -38,6 +38,7 @@ class VLLMTeacherLLM(BaseTeacherLLM):
         gpu_memory_utilization: float = 0.85,
         collect_log_prob: bool = True,  # 开源模型默认采集 log_prob
         trust_remote_code: bool = True,
+        max_num_seqs: Optional[int] = None,  # vLLM 并发序列数
     ):
         """
         初始化 vLLM Teacher LLM。
@@ -52,6 +53,7 @@ class VLLMTeacherLLM(BaseTeacherLLM):
             gpu_memory_utilization: GPU 内存使用率
             collect_log_prob: 是否采集 log probabilities
             trust_remote_code: 是否信任远程代码
+            max_num_seqs: vLLM 最大并发序列数（None 使用 vLLM 默认值，通常 256-1024）
         """
         self._model_path = model_path
         self._model_name = model_path.split('/')[-1]  # 使用路径最后一部分作为名称
@@ -61,6 +63,7 @@ class VLLMTeacherLLM(BaseTeacherLLM):
         self.tensor_parallel_size = tensor_parallel_size
         self.gpu_memory_utilization = gpu_memory_utilization
         self.trust_remote_code = trust_remote_code
+        self.max_num_seqs = max_num_seqs
         
         # 延迟导入 vLLM
         try:
@@ -81,18 +84,22 @@ class VLLMTeacherLLM(BaseTeacherLLM):
         
         # 初始化 vLLM 引擎
         logger.info(f"[VLLMTeacherLLM] Loading model from {model_path}...")
-        self.llm = LLM(
-            model=model_path,
-            tensor_parallel_size=tensor_parallel_size,
-            gpu_memory_utilization=gpu_memory_utilization,
-            trust_remote_code=trust_remote_code,
-        )
+        llm_kwargs = {
+            "model": model_path,
+            "tensor_parallel_size": tensor_parallel_size,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "trust_remote_code": trust_remote_code,
+        }
+        if max_num_seqs is not None:
+            llm_kwargs["max_num_seqs"] = max_num_seqs
+        self.llm = LLM(**llm_kwargs)
         
         # 保存 SamplingParams 类引用
         self._SamplingParams = SamplingParams
         
         logger.info(f"[VLLMTeacherLLM] Initialized with model={model_path}, "
-                   f"tp={tensor_parallel_size}, collect_log_prob={collect_log_prob}")
+                   f"tp={tensor_parallel_size}, gpu_mem={gpu_memory_utilization}, "
+                   f"max_num_seqs={max_num_seqs}, collect_log_prob={collect_log_prob}")
     
     def __call__(
         self, 
@@ -240,6 +247,7 @@ def create_teacher_llm(config: Dict[str, Any]) -> BaseTeacherLLM:
             gpu_memory_utilization=config.get("gpu_memory_utilization", 0.85),
             collect_log_prob=config.get("collect_log_prob", True),
             trust_remote_code=config.get("trust_remote_code", True),
+            max_num_seqs=config.get("max_num_seqs", None),
         )
     else:
         raise ValueError(f"Unsupported teacher LLM type: {llm_type}. "

@@ -36,6 +36,18 @@ Usage:
         --task_file data/alfworld/task_ids.txt \
         --output data/teacher_trajectories/alfworld_gpt4.jsonl \
         --collect_log_prob false
+    
+    # 大规模采集（2000 tasks × 10 rollouts，使用并行加速）
+    python scripts/collect_teacher_trajectories.py \
+        --env alfworld \
+        --env_url http://localhost:8081 \
+        --backend vllm \
+        --model_path /data/models/Qwen2.5-72B-Instruct \
+        --task_file data/alfworld/task_ids.txt \
+        --output data/teacher_trajectories/alfworld_qwen72b.jsonl \
+        --n_per_task 10 \
+        --max_workers 16 \
+        --save_every 100
 """
 
 import argparse
@@ -45,6 +57,7 @@ import sys
 import copy
 import time
 import uuid
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Callable
@@ -134,10 +147,14 @@ def parse_args():
         "--gpu_memory_utilization", type=float, default=0.85,
         help="[vLLM] GPU memory utilization ratio"
     )
+    parser.add_argument(
+        "--max_num_seqs", type=int, default=None,
+        help="[vLLM] Maximum number of sequences processed in parallel (default: vLLM default, typically 256-1024)"
+    )
     
     # ===== 通用生成参数 =====
     parser.add_argument(
-        "--temperature", type=float, default=0.0,
+        "--temperature", type=float, default=0.6,
         help="Sampling temperature"
     )
     parser.add_argument(
@@ -172,8 +189,8 @@ def parse_args():
         help="Maximum steps per trajectory"
     )
     parser.add_argument(
-        "--max_workers", type=int, default=4,
-        help="Maximum parallel workers for trajectory collection"
+        "--max_workers", type=int, default=8,
+        help="Maximum parallel workers for trajectory collection (recommended: 8-16 for 2000 tasks)"
     )
     
     # ===== 输出配置 =====
@@ -626,6 +643,8 @@ def main():
             "max_tokens": args.max_tokens,
             "collect_log_prob": collect_log_prob,
         }
+        if args.max_num_seqs is not None:
+            llm_config["max_num_seqs"] = args.max_num_seqs
     
     teacher_llm = create_teacher_llm(llm_config)
     logger.info(f"Teacher LLM: {teacher_llm.model_name}")
@@ -643,30 +662,31 @@ def main():
         except:
             tokenizer = AutoTokenizer.from_pretrained("gpt2")
     
-    # 8. 创建 Rollout 执行器
-    executor = TeacherRolloutExecutor(
-        teacher_llm=teacher_llm,
-        tokenizer=tokenizer,
-        config=config,
-        env_url=args.env_url,
-        collect_log_prob=collect_log_prob,
-    )
-    
-    # 9. 开始采集
-    all_trajectories = []
-    successful_count = 0
-    failed_count = 0
-    
-    try:
-        from tqdm import tqdm
-        task_iter = tqdm(task_ids, desc="Collecting")
-    except ImportError:
-        task_iter = task_ids
+    # 8. 创建 Rollout 执行器（每个线程需要独立的执行器实例）
+    # 注意：对于 vLLM 后端，多个线程共享同一个 LLM 实例是安全的（vLLM 内部处理并发）
+    # 对于 OpenAI 后端，多个线程并发调用也是安全的
     
     output_file = args.output
     os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
     
-    for i, task_id in enumerate(task_iter):
+    # 线程安全的计数器和锁
+    successful_count = [0]  # 使用列表以便在闭包中修改
+    failed_count = [0]
+    write_lock = threading.Lock()
+    collected_trajectories = []  # 线程安全的列表（append 操作是原子的）
+    checkpoint_counter = [0]  # 用于定期保存
+    
+    def process_single_rollout(task_id: str, rollout_idx: int, thread_index: int) -> Optional[Dict[str, Any]]:
+        """处理单个 (task, rollout) 组合"""
+        # 为每个线程创建独立的执行器实例（避免状态冲突）
+        executor = TeacherRolloutExecutor(
+            teacher_llm=teacher_llm,  # LLM 实例是线程安全的
+            tokenizer=tokenizer,
+            config=config,
+            env_url=args.env_url,
+            collect_log_prob=collect_log_prob,
+        )
+        
         task = Task(
             task_id=task_id,
             env_type=args.env,
@@ -674,73 +694,123 @@ def main():
             evaluator="env",
         )
         
-        task_trajectories = []
+        rollout_id = f"{task_id}_teacher_{rollout_idx}"
         
-        for rollout_idx in range(args.n_per_task):
-            rollout_id = f"{task_id}_teacher_{rollout_idx}"
-            
-            for retry in range(args.max_retries):
-                try:
-                    traj = executor.execute_rollout(
-                        task=task,
-                        rollout_id=rollout_id,
-                        thread_index=0,
-                    )
-                    
-                    if traj is None:
-                        logger.warning(f"Task {task_id} rollout {rollout_idx} returned None, "
-                                     f"retry {retry+1}/{args.max_retries}")
-                        continue
-                    
-                    # 检查是否成功
-                    success = traj.reward and traj.reward.outcome >= 1.0
-                    
-                    # 如果需要过滤成功，且当前失败，则重试
-                    if args.filter_success and not success:
-                        logger.debug(f"Task {task_id} rollout {rollout_idx} failed (reward={traj.reward.outcome if traj.reward else 0}), "
-                                   f"retry {retry+1}/{args.max_retries}")
-                        continue
-                    
-                    # 转换为字典
-                    traj_dict = executor.trajectory_to_dict(traj, teacher_llm.model_name)
-                    task_trajectories.append(traj_dict)
-                    
-                    if success:
-                        successful_count += 1
-                    else:
-                        failed_count += 1
-                    
-                    logger.debug(f"Task {task_id} rollout {rollout_idx}: success={success}, "
-                               f"steps={len(traj_dict['messages'])}")
-                    break  # 成功，跳出重试循环
-                    
-                except Exception as e:
-                    logger.warning(f"Task {task_id} rollout {rollout_idx} error: {e}, "
+        for retry in range(args.max_retries):
+            try:
+                traj = executor.execute_rollout(
+                    task=task,
+                    rollout_id=rollout_id,
+                    thread_index=thread_index,
+                )
+                
+                if traj is None:
+                    logger.warning(f"Task {task_id} rollout {rollout_idx} returned None, "
                                  f"retry {retry+1}/{args.max_retries}")
-                    if retry == args.max_retries - 1:
-                        logger.error(f"Task {task_id} rollout {rollout_idx} failed after "
-                                   f"{args.max_retries} retries")
+                    continue
+                
+                # 检查是否成功
+                success = traj.reward and traj.reward.outcome >= 1.0
+                
+                # 如果需要过滤成功，且当前失败，则重试
+                if args.filter_success and not success:
+                    logger.debug(f"Task {task_id} rollout {rollout_idx} failed (reward={traj.reward.outcome if traj.reward else 0}), "
+                               f"retry {retry+1}/{args.max_retries}")
+                    continue
+                
+                # 转换为字典
+                traj_dict = executor.trajectory_to_dict(traj, teacher_llm.model_name)
+                
+                logger.debug(f"Task {task_id} rollout {rollout_idx}: success={success}, "
+                           f"steps={len(traj_dict['messages'])}")
+                return traj_dict  # 成功，返回结果
+                
+            except Exception as e:
+                logger.warning(f"Task {task_id} rollout {rollout_idx} error: {e}, "
+                             f"retry {retry+1}/{args.max_retries}")
+                if retry == args.max_retries - 1:
+                    logger.error(f"Task {task_id} rollout {rollout_idx} failed after "
+                               f"{args.max_retries} retries")
         
-        all_trajectories.extend(task_trajectories)
+        return None  # 所有重试都失败
+    
+    # 9. 准备所有 (task, rollout) 组合
+    all_work_items = []
+    for task_id in task_ids:
+        for rollout_idx in range(args.n_per_task):
+            all_work_items.append((task_id, rollout_idx))
+    
+    total_work = len(all_work_items)
+    logger.info(f"Total work items: {total_work} (tasks={len(task_ids)}, rollouts_per_task={args.n_per_task})")
+    logger.info(f"Using {args.max_workers} parallel workers")
+    
+    # 10. 并行采集
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(total=total_work, desc="Collecting trajectories")
+    except ImportError:
+        pbar = None
+    
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor_pool:
+        # 提交所有任务
+        future_to_item = {}
+        thread_index = 0
+        for task_id, rollout_idx in all_work_items:
+            future = executor_pool.submit(process_single_rollout, task_id, rollout_idx, thread_index)
+            future_to_item[future] = (task_id, rollout_idx)
+            thread_index += 1
         
-        # 定期保存
-        if (i + 1) % args.save_every == 0 and all_trajectories:
-            mode = 'a' if args.resume or i >= args.save_every else 'w'
+        # 收集结果
+        for future in as_completed(future_to_item):
+            task_id, rollout_idx = future_to_item[future]
+            try:
+                traj_dict = future.result()
+                if traj_dict is not None:
+                    # 线程安全地添加轨迹和更新计数器
+                    with write_lock:
+                        collected_trajectories.append(traj_dict)
+                        checkpoint_counter[0] += 1
+                        current_count = checkpoint_counter[0]
+                        
+                        # 更新成功/失败计数
+                        success = traj_dict.get("success", False)
+                        if success:
+                            successful_count[0] += 1
+                        else:
+                            failed_count[0] += 1
+                        
+                        # 定期保存（在锁内检查，避免竞态条件）
+                        if current_count % args.save_every == 0:
+                            mode = 'a' if args.resume or current_count > args.save_every else 'w'
+                            with open(output_file, mode) as f:
+                                # 保存所有未保存的轨迹
+                                for traj in collected_trajectories:
+                                    f.write(json.dumps(traj, ensure_ascii=False) + '\n')
+                            logger.info(f"Checkpoint saved: {current_count}/{total_work} items, "
+                                       f"saved {len(collected_trajectories)} trajectories")
+                            collected_trajectories.clear()  # 清空已保存的
+                
+                if pbar:
+                    pbar.update(1)
+                    
+            except Exception as e:
+                logger.error(f"Error processing task {task_id} rollout {rollout_idx}: {e}")
+                if pbar:
+                    pbar.update(1)
+    
+    if pbar:
+        pbar.close()
+    
+    # 保存剩余轨迹（线程安全）
+    with write_lock:
+        if collected_trajectories:
+            mode = 'a' if args.resume else 'w'
             with open(output_file, mode) as f:
-                for traj in all_trajectories:
+                for traj in collected_trajectories:
                     f.write(json.dumps(traj, ensure_ascii=False) + '\n')
-            logger.info(f"Checkpoint saved at task {i+1}/{len(task_ids)}, "
-                       f"saved {len(all_trajectories)} trajectories")
-            all_trajectories = []
+            logger.info(f"Saved remaining {len(collected_trajectories)} trajectories")
     
-    # 保存剩余轨迹
-    if all_trajectories:
-        mode = 'a' if args.resume else 'w'
-        with open(output_file, mode) as f:
-            for traj in all_trajectories:
-                f.write(json.dumps(traj, ensure_ascii=False) + '\n')
-    
-    # 10. 统计结果
+    # 11. 统计结果
     if os.path.exists(output_file):
         total_collected = sum(1 for _ in open(output_file))
     else:
@@ -749,7 +819,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Collection completed!")
     logger.info(f"Total trajectories collected: {total_collected}")
-    logger.info(f"Successful: {successful_count}, Failed: {failed_count}")
+    logger.info(f"Successful: {successful_count[0]}, Failed: {failed_count[0]}")
     logger.info(f"Output file: {output_file}")
     logger.info("=" * 60)
 

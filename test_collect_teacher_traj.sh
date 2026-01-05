@@ -52,7 +52,8 @@ python scripts/collect_teacher_trajectories.py \
     --tensor_parallel_size 2 \
     --n_per_task 2 \
     --collect_log_prob true \
-    --max_steps 30
+    --max_steps 30 \
+    --max_workers 8
 
 # python scripts/validate_teacher_trajectories.py \
 #     --input data/teacher_trajectories/${MODEL_NAME}/alfworld_${MODEL_NAME}.jsonl \
