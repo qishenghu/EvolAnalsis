@@ -44,7 +44,7 @@ python scripts/collect_teacher_trajectories.py \
     --max_num_seqs 512 \
     \
     --n_per_task 10 \
-    --max_workers 12 \
+    --max_workers 8 \
     --max_steps 30 \
     --temperature 0.6 \
     --max_tokens 4096 \
@@ -65,7 +65,7 @@ python scripts/collect_teacher_trajectories.py \
 # 
 # 【采集配置】
 # --n_per_task 10                  # 每个task采集10个rollouts
-# --max_workers 12                  # 12个并行worker（可根据环境服务能力调整到8-16）
+# --max_workers 8                   # 8个并行worker（由于vLLM使用锁保护，建议8-12）
 # --max_steps 30                    # 每个轨迹最多30步
 # --temperature 0.6                 # 采样温度0.6（已设为默认值）
 # --max_tokens 4096                 # 每次LLM调用最多生成4096 tokens
@@ -81,8 +81,9 @@ python scripts/collect_teacher_trajectories.py \
 # ============================================================================
 # 
 # 1. 【max_workers 调整】
-#    - 如果环境服务是瓶颈：降低到 8-10
-#    - 如果GPU利用率低：可以提高到 16-20
+#    - ⚠️ 注意：vLLM 使用锁保护调用，高并发会串行化，建议 8-12
+#    - 如果环境服务是瓶颈：降低到 4-6
+#    - 如果GPU利用率低且稳定：可以提高到 12-16（但可能增加锁竞争）
 #    - 监控GPU利用率：nvidia-smi -l 1
 # 
 # 2. 【max_num_seqs 调整】

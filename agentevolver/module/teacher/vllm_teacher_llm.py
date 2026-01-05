@@ -7,6 +7,7 @@ via vLLM inference engine (Qwen, Llama, DeepSeek, Mistral, etc.)
 Also provides the factory function create_teacher_llm() for creating Teacher LLM instances.
 """
 
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 
 from loguru import logger
@@ -97,6 +98,9 @@ class VLLMTeacherLLM(BaseTeacherLLM):
         # 保存 SamplingParams 类引用
         self._SamplingParams = SamplingParams
         
+        # ⭐ 添加线程锁保护 vLLM 调用（vLLM 在高并发下可能不是完全线程安全的）
+        self._llm_lock = threading.Lock()
+        
         logger.info(f"[VLLMTeacherLLM] Initialized with model={model_path}, "
                    f"tp={tensor_parallel_size}, gpu_mem={gpu_memory_utilization}, "
                    f"max_num_seqs={max_num_seqs}, collect_log_prob={collect_log_prob}")
@@ -131,9 +135,20 @@ class VLLMTeacherLLM(BaseTeacherLLM):
                 logprobs=1 if self.collect_log_prob else None,
             )
             
-            # 调用 vLLM 生成
-            outputs = self.llm.generate([prompt], sampling_params)
+            # ⭐ 使用锁保护 vLLM 调用（确保线程安全）
+            # 注意：虽然这会降低并发性能，但可以避免 vLLM 内部状态冲突
+            # vLLM 的 generate() 在高并发多线程环境下可能出现内部状态冲突
+            with self._llm_lock:
+                outputs = self.llm.generate([prompt], sampling_params)
+            
+            if not outputs or len(outputs) == 0:
+                raise ValueError("vLLM returned empty outputs")
+            
             output = outputs[0]
+            
+            # 检查输出是否有效
+            if not output.outputs or len(output.outputs) == 0:
+                raise ValueError("vLLM output.outputs is empty")
             
             # 提取响应文本
             response_text = output.outputs[0].text
