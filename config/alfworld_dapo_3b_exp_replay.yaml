@@ -27,7 +27,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_dapo_bz8
+  experiment_name: alfworld_3b_dapo_exp_replay_bz8_expratio_0.5_1per
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -242,9 +242,9 @@ exp_manager:
   
   # ⭐ Experience Replay: DISABLED
   experience_replay:
-    enable: false  # ⭐ DISABLED - Pure on-policy DAPO training
-    replay_start_ratio: 1.0
-    exp_ratio: 0.0
+    enable: true  # ⭐ DISABLED - Pure on-policy DAPO training
+    replay_start_ratio: 0.1
+    exp_ratio: 0.5
     offpolicy_trajectories_per_task: 1
     experience_lbound: 2
     experience_rbound: 8

@@ -22,7 +22,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_exp_replay_bz8
+  experiment_name: alfworld_3b_grpo_exp_replay_bz8_expratio0.5_1per
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -267,7 +267,7 @@ exp_manager:
     # For example, if batch_size=8, exp_ratio=0.5, then:
     #   - 4 experience tasks (from replaytaskpool, with off-policy trajectories)
     #   - 4 on-policy tasks (from original training tasks)
-    exp_ratio: 0.25  # 50% experience tasks, 50% on-policy tasks (0.0-1.0)
+    exp_ratio: 0.5  # 50% experience tasks, 50% on-policy tasks (0.0-1.0)
     
     # Number of off-policy trajectories per experience task
     # For example, if n_rollout=8, offpolicy_trajectories_per_task=1, then:
