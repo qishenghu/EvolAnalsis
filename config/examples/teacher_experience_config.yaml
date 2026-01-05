@@ -1,0 +1,98 @@
+# ====================================================================
+# Teacher Experience (LUFFY) Configuration Example
+# ====================================================================
+# This example shows how to configure Teacher Experience Replay
+# alongside the existing ExGRPO self-generated experience replay.
+#
+# ⭐ 方案 C 比例分配说明：
+#   - experience_replay.exp_ratio 定义总 off-policy 比例
+#   - teacher_experience.exp_ratio 从总 off-policy 中分走一部分给 Teacher
+#   - 剩余的 off-policy 比例给 self-generated
+#
+# 示例：exp_ratio=0.5, teacher.exp_ratio=0.2
+#   → self_exp = 0.3 (30%), teacher_exp = 0.2 (20%), on_policy = 0.5 (50%)
+#
+# 这样设计的好处：
+#   1. 向后兼容：添加 teacher_experience 不需要修改原 exp_ratio
+#   2. on-policy 比例保持稳定（始终为 1 - exp_ratio）
+# ====================================================================
+
+exp_manager:
+  # ==================== Self-Generated Experience Replay (ExGRPO) ====================
+  experience_replay:
+    enable: true
+    exp_ratio: 0.5                # ⭐ 总 off-policy 比例 (50%)
+                                  # 当启用 teacher_experience 时，会被分割为：
+                                  # - self_exp_ratio = exp_ratio - teacher.exp_ratio
+                                  # - teacher_exp_ratio = teacher.exp_ratio
+    replay_start_ratio: 0.35      # 训练进度达到 35% 后开始 replay
+    max_trajectories_per_task: 10
+    experience_lbound: 0
+    experience_rbound: 8
+    exp_select_mode: "argmin"     # 选择 entropy 最低的轨迹
+    offpolicy_trajectories_per_task: 1
+    use_current_policy_entropy: true
+
+  # ==================== Teacher Experience Replay (LUFFY) ====================
+  teacher_experience:
+    enable: true                  # 启用 Teacher Experience
+    data_path: "data/teacher_trajectories/alfworld_gpt4.jsonl"  # Teacher 轨迹文件
+    exp_ratio: 0.2                # ⭐ Teacher 从总 off-policy 中占比 (20%)
+                                  # 实际效果：self=30%, teacher=20%, on_policy=50%
+    max_trajectories_per_task: 3  # 每个 task 最多使用 3 条 Teacher 轨迹
+    select_mode: "random"         # "random", "first", "all"
+    use_log_prob: false           # 是否使用 log_prob（LUFFY 默认不需要）
+
+# ==================== Algorithm Configuration ====================
+algorithm:
+  grpo:
+    # 标准 GRPO 配置
+    cliprange: 0.2
+    cliprange_low: 0.2
+    cliprange_high: 0.2
+    loss_agg_mode: "token-mean"
+    
+    # Off-policy 配置
+    off_cliprange_high: 1.0       # Self-generated off-policy 的 clip 上界
+    clip_ratio_c: 3.0
+    
+    # Self-generated off-policy shaping (ExGRPO)
+    off_policy_shaping_mode: "exgrpo_policy_shaping"
+    off_policy_shaping_beta: 0.1
+    
+    # Teacher off-policy shaping (LUFFY)
+    teacher_policy_shaping_enable: true   # 启用 LUFFY 的 policy shaping
+    teacher_policy_shaping_mode: "p_div_p_beta"  # f(x) = x / (x + β)
+    teacher_policy_shaping_beta: 0.1      # β 参数
+    teacher_use_log_prob: false           # Teacher 轨迹是否有 log_prob
+    teacher_use_clip: false               # Teacher 轨迹是否使用 clipping
+
+# ==================== Teacher Trajectory Collection (Optional) ====================
+# This section is for the collect_teacher_trajectories.py script
+teacher_collection:
+  # Backend: "openai" or "vllm"
+  backend: "openai"
+  
+  # OpenAI-compatible API configuration
+  openai:
+    model_name: "gpt-4"
+    api_base: "https://api.openai.com/v1"
+    # api_key: from OPENAI_API_KEY environment variable
+    temperature: 0.0
+    max_tokens: 4096
+    collect_log_prob: false       # OpenAI API 可能不支持 log_prob
+  
+  # vLLM local model configuration (alternative)
+  vllm:
+    model_path: "/data/models/Qwen2.5-72B-Instruct"
+    tensor_parallel_size: 4
+    gpu_memory_utilization: 0.85
+    temperature: 0.0
+    max_tokens: 4096
+    collect_log_prob: true        # vLLM 支持 log_prob
+  
+  # Collection settings
+  n_per_task: 2                   # 每个 task 采集 2 条轨迹
+  filter_success: true            # 只保留成功的轨迹
+  max_retries: 3                  # 失败重试次数
+

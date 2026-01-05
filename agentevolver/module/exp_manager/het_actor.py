@@ -148,7 +148,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
                     ##################
                     # ANNI 0814
-                    from .het_core_algos import het_compute_token_on_off_policy_loss, dapo_compute_policy_loss
+                    from .het_core_algos import het_compute_token_on_off_policy_loss, het_compute_teacher_aware_loss, dapo_compute_policy_loss
                     off_cliprange_high = self.config.get("off_cliprange_high", 1.0)
                     exp_mask = data["exp_mask"][:, -response_length:]
                     
@@ -158,6 +158,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     
                     # ⭐ DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) configuration
                     use_dapo = self.config.get("use_dapo", False)
+                    
+                    # ⭐ Teacher Experience configuration
+                    teacher_mask = data.get("teacher_mask", None)
+                    if teacher_mask is not None:
+                        teacher_mask = teacher_mask[:, -response_length:]
+                        # 检查是否有任何 teacher 数据
+                        has_teacher_data = teacher_mask.sum() > 0
+                    else:
+                        has_teacher_data = False
                     
                     if use_dapo:
                         # Use DAPO's decoupled asymmetric clipping mechanism
@@ -176,6 +185,37 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             off_policy_shaping_mode=off_policy_shaping_mode,
                             off_policy_shaping_beta=off_policy_shaping_beta,
                         )  # ⭐ Compute policy loss using DAPO's Clip-Higher mechanism (Experience-Replay compatible)
+                    elif has_teacher_data:
+                        # ⭐ Teacher Experience: 使用 het_compute_teacher_aware_loss
+                        # 获取 teacher 相关配置
+                        teacher_use_log_prob = self.config.get("teacher_use_log_prob", False)
+                        teacher_policy_shaping_enable = self.config.get("teacher_policy_shaping_enable", True)
+                        teacher_policy_shaping_mode = self.config.get("teacher_policy_shaping_mode", "p_div_p_beta")
+                        teacher_policy_shaping_beta = self.config.get("teacher_policy_shaping_beta", 0.1)
+                        teacher_use_clip = self.config.get("teacher_use_clip", False)
+                        
+                        ret_dict = het_compute_teacher_aware_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            exp_mask=exp_mask,
+                            teacher_mask=teacher_mask,  # ⭐ 传入 teacher_mask
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            off_cliprange_high=off_cliprange_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                            off_policy_shaping_mode=off_policy_shaping_mode,
+                            off_policy_shaping_beta=off_policy_shaping_beta,
+                            # Teacher-specific settings
+                            teacher_use_log_prob=teacher_use_log_prob,
+                            teacher_policy_shaping_enable=teacher_policy_shaping_enable,
+                            teacher_policy_shaping_mode=teacher_policy_shaping_mode,
+                            teacher_policy_shaping_beta=teacher_policy_shaping_beta,
+                            teacher_use_clip=teacher_use_clip,
+                        )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
                     else:
                         # Use original het_compute_token_on_off_policy_loss
                         ret_dict = het_compute_token_on_off_policy_loss(
@@ -202,6 +242,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     on_pg_clipfrac = ret_dict["on_pg_clipfrac"]
                     on_pg_clipfrac_lower = ret_dict["on_pg_clipfrac_lower"]
                     ppo_kl = ret_dict["ppo_kl"]
+                    # ⭐ Teacher Experience: 提取 teacher-specific metrics（如果有）
+                    self_off_pg_loss = ret_dict.get("self_off_pg_loss")
+                    teacher_off_pg_loss = ret_dict.get("teacher_off_pg_loss")
                     ##################
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate entropy loss
@@ -235,7 +278,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         "actor/on_pg_clipfrac": on_pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
                         "actor/on_pg_clipfrac_lower": on_pg_clipfrac_lower.detach().item(),
+                        "actor/on_pg_loss": on_pg_loss.detach().item(),
+                        "actor/off_pg_loss": off_pg_loss.detach().item(),
                     }
+                    # ⭐ Teacher Experience: 添加 teacher 专属 metrics
+                    if self_off_pg_loss is not None:
+                        data["actor/self_off_pg_loss"] = self_off_pg_loss.detach().item()
+                    if teacher_off_pg_loss is not None:
+                        data["actor/teacher_off_pg_loss"] = teacher_off_pg_loss.detach().item()
                     ##################
                     append_to_dict(metrics, data)
 

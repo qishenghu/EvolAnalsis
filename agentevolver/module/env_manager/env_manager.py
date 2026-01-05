@@ -403,6 +403,61 @@ class ParallelEnvManager(object):
 
         return dataproto
 
+    def _align_teacher_log_probs(
+        self,
+        teacher_log_probs: List[float],
+        response_loss_mask: List[int],
+        response_length: int,
+    ) -> torch.Tensor:
+        """
+        将 Teacher 的 log_probs 对齐到 tokenized response 序列。
+        
+        ⭐ 对齐策略：
+        - Teacher log_probs 只包含 LLM 生成的 token（不含环境响应）
+        - response_loss_mask 标记了 LLM 响应位置（=1）和非 LLM 位置（=0）
+        - 按顺序将 teacher_log_probs 填充到 loss_mask=1 的位置
+        - 其他位置填充 0（这些位置的 loss 会被 loss_mask 屏蔽）
+        
+        Args:
+            teacher_log_probs: Teacher 生成的 log_probs 列表（只有 LLM token）
+            response_loss_mask: Response 部分的 loss_mask（1=LLM, 0=非 LLM）
+            response_length: Response 序列长度
+            
+        Returns:
+            torch.Tensor: 对齐后的 log_probs，shape [response_length]
+        """
+        # 创建全零的对齐后 log_probs
+        aligned_log_probs = torch.zeros(response_length, dtype=torch.float32)
+        
+        if not teacher_log_probs:
+            return aligned_log_probs
+        
+        # 找到所有 LLM 响应位置（loss_mask=1）
+        llm_positions = []
+        for i, mask_val in enumerate(response_loss_mask):
+            if mask_val == 1:
+                llm_positions.append(i)
+        
+        # 将 teacher_log_probs 按顺序填充到 LLM 位置
+        num_to_fill = min(len(teacher_log_probs), len(llm_positions))
+        for i in range(num_to_fill):
+            pos = llm_positions[i]
+            aligned_log_probs[pos] = teacher_log_probs[i]
+        
+        # 如果 teacher_log_probs 比 LLM 位置多，记录警告
+        if len(teacher_log_probs) > len(llm_positions):
+            logger.warning(
+                f"[Teacher Log Prob Alignment] More teacher log_probs ({len(teacher_log_probs)}) "
+                f"than LLM positions ({len(llm_positions)}). Extra log_probs will be discarded."
+            )
+        elif len(teacher_log_probs) < len(llm_positions):
+            logger.debug(
+                f"[Teacher Log Prob Alignment] Fewer teacher log_probs ({len(teacher_log_probs)}) "
+                f"than LLM positions ({len(llm_positions)}). Remaining positions will be 0."
+            )
+        
+        return aligned_log_probs
+
     def convert_offpolicy_to_cmt(
         self,
         offpolicy_trajectories: List[Trajectory],
@@ -490,6 +545,15 @@ class ParallelEnvManager(object):
             cmt.metadata["entropy"] = traj.metadata.get("entropy")
             cmt.metadata["task_id"] = task_id
             
+            # ⭐ Teacher Experience: 传递 teacher 特有的 metadata
+            cmt.metadata["is_teacher"] = traj.metadata.get("is_teacher", False)
+            cmt.metadata["has_log_prob"] = traj.metadata.get("has_log_prob", False)
+            # Teacher log_probs 可能在 log_probs 或 log_probs_per_turn 字段
+            if traj.metadata.get("is_teacher", False):
+                # 优先使用累积的 log_probs，便于对齐
+                cmt.metadata["teacher_log_probs"] = traj.metadata.get("log_probs")
+                cmt.metadata["teacher_log_probs_per_turn"] = traj.metadata.get("log_probs_per_turn")
+            
             cmt_array.append(cmt)
         
         return cmt_array
@@ -515,6 +579,11 @@ class ParallelEnvManager(object):
             "old_log_probs": cmt.metadata.get("old_log_probs"),  # ⭐ Experience Replay: 历史策略的 log_prob
             "recorded_response_mask": cmt.metadata.get("response_mask"),  # ⭐ Multi-turn: 历史轨迹的 response_mask，用于对齐
             "task_id": cmt.task_id,  # ⭐ 保存 task_id 用于后续处理
+            # ⭐ Teacher Experience: 传递 teacher 特有字段
+            "is_teacher": cmt.metadata.get("is_teacher", False),
+            "has_log_prob": cmt.metadata.get("has_log_prob", False),
+            "teacher_log_probs": cmt.metadata.get("teacher_log_probs"),  # 累积的 log_probs
+            "teacher_log_probs_per_turn": cmt.metadata.get("teacher_log_probs_per_turn"),  # 分轮的 log_probs
         }
         return extras
 
@@ -712,34 +781,76 @@ class ParallelEnvManager(object):
         assert exp_mask.shape == loss_mask.shape, f"Shape mismatch: {exp_mask.shape} vs {loss_mask.shape}"
 
         # ⭐ Experience Replay: 处理 recorded_old_log_probs
+        # 对于 self-generated experience: 直接使用保存的 old_log_probs（已对齐）
+        # 对于 teacher experience: 需要将 teacher_log_probs 对齐到 response_loss_mask
         recorded_old_log_probs_list = []
+        teacher_mask_list = []  # ⭐ 新增：标记哪些样本是 teacher 轨迹
+        
         for sample in samples:
-            old_log_probs = sample.extras.get("old_log_probs")
-            if old_log_probs is not None:
-                # 转换为 tensor 并对齐长度
-                if isinstance(old_log_probs, (list, np.ndarray)):
-                    old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32)
-                # 对齐到 response_length
-                response_length = len(sample.response_ids)
-                if len(old_log_probs) > response_length:
-                    old_log_probs = old_log_probs[:response_length]
-                elif len(old_log_probs) < response_length:
-                    old_log_probs = torch.cat([
-                        old_log_probs,
-                        torch.zeros(response_length - len(old_log_probs), dtype=torch.float32)
-                    ])
-                recorded_old_log_probs_list.append(old_log_probs)
-            else:
-                # 如果没有记录，创建零向量（后续会重新计算）
+            is_teacher = sample.extras.get("is_teacher", False)
+            has_log_prob = sample.extras.get("has_log_prob", False)
+            response_length = len(sample.response_ids)
+            
+            if is_teacher and has_log_prob:
+                # ⭐ Teacher Experience: 对齐 teacher_log_probs 到 response_loss_mask
+                teacher_log_probs = sample.extras.get("teacher_log_probs")
+                if teacher_log_probs is not None:
+                    aligned_log_probs = self._align_teacher_log_probs(
+                        teacher_log_probs=teacher_log_probs,
+                        response_loss_mask=sample.response_loss_mask,
+                        response_length=response_length,
+                    )
+                    recorded_old_log_probs_list.append(aligned_log_probs)
+                else:
+                    # Teacher 有标记 has_log_prob 但没有实际数据，创建零向量
+                    recorded_old_log_probs_list.append(
+                        torch.zeros(response_length, dtype=torch.float32)
+                    )
+                # 标记为 teacher（用于 loss 计算）
+                teacher_mask_list.append(torch.ones(response_length, dtype=torch.int))
+            elif is_teacher:
+                # ⭐ Teacher Experience 但没有 log_prob：使用 LUFFY 模式，无需 old_log_probs
                 recorded_old_log_probs_list.append(
-                    torch.zeros(len(sample.response_ids), dtype=torch.float32)
+                    torch.zeros(response_length, dtype=torch.float32)
                 )
+                teacher_mask_list.append(torch.ones(response_length, dtype=torch.int))
+            else:
+                # ⭐ Self-generated Experience: 直接使用保存的 old_log_probs
+                old_log_probs = sample.extras.get("old_log_probs")
+                if old_log_probs is not None:
+                    # 转换为 tensor 并对齐长度
+                    if isinstance(old_log_probs, (list, np.ndarray)):
+                        old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32)
+                    # 对齐到 response_length
+                    if len(old_log_probs) > response_length:
+                        old_log_probs = old_log_probs[:response_length]
+                    elif len(old_log_probs) < response_length:
+                        old_log_probs = torch.cat([
+                            old_log_probs,
+                            torch.zeros(response_length - len(old_log_probs), dtype=torch.float32)
+                        ])
+                    recorded_old_log_probs_list.append(old_log_probs)
+                else:
+                    # 如果没有记录，创建零向量（后续会重新计算）
+                    recorded_old_log_probs_list.append(
+                        torch.zeros(response_length, dtype=torch.float32)
+                    )
+                # 非 teacher
+                teacher_mask_list.append(torch.zeros(response_length, dtype=torch.int))
         
         # Pad recorded_old_log_probs 到 max_response_length
         recorded_old_log_probs = pad_sequence(recorded_old_log_probs_list, batch_first=True, padding_value=0.0)
         recorded_old_log_probs = pad_sequence_to_length(
             recorded_old_log_probs, max_response_length_this_batch, 0.0
         )
+        
+        # ⭐ Teacher Experience: Pad teacher_mask 到 max_response_length
+        # teacher_mask 标记哪些样本是 teacher 轨迹，用于 het_compute_teacher_aware_loss
+        teacher_mask = pad_sequence(teacher_mask_list, batch_first=True, padding_value=0)
+        teacher_mask = pad_sequence_to_length(teacher_mask, max_response_length_this_batch, 0)
+        # 需要拼接 prompt 部分（prompt 部分 teacher_mask 全为 0）
+        prompt_teacher_mask = torch.zeros_like(prompt_ids, dtype=torch.int)
+        teacher_mask_full = torch.cat((prompt_teacher_mask, teacher_mask), dim=-1)
 
         # Construct the batch using TensorDict
         batch = TensorDict(
@@ -754,6 +865,7 @@ class ParallelEnvManager(object):
                 "step_ids": step_ids_pad,
                 "group_ids": group_ids,   # ★ add groupid
                 "recorded_old_log_probs": recorded_old_log_probs,  # ⭐ Experience Replay: 历史策略的 old_log_probs
+                "teacher_mask": teacher_mask_full,  # ⭐ Teacher Experience: 标记 teacher 轨迹位置
             },
             batch_size=len(samples),
         )

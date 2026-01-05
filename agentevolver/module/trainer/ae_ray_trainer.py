@@ -67,7 +67,7 @@ from agentevolver.utils.tracking import ValidationGenerationsLogger
 from agentevolver.module.adv_processor.adca_grpo_pipeline import apply_adca_grpo
 
 from agentevolver.module.exp_manager.exp_manager import ExperienceManager
-from agentevolver.module.exp_manager.experience_collate import ExperienceMixCollateFn
+from agentevolver.module.exp_manager.experience_collate import ExperienceMixCollateFn, TeacherExperienceMixCollateFn
 
 
 def parse_reward_from_dataproto(data: DataProto, return_dict=False) -> dict | torch.Tensor:
@@ -1004,6 +1004,141 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         
         return selected_trajectories
 
+    def _select_best_teacher_by_current_entropy(
+        self,
+        teacher_trajectories: List,
+        tasks: List,
+        num_trajectories_per_task: int = 1,
+    ) -> List:
+        """
+        使用当前 policy 计算 entropy，选择每个 task 的最优 teacher 轨迹。
+        
+        ⭐ 对于有 log_prob 的轨迹：已经由 get_teacher_trajectories 按 entropy 排序
+        ⭐ 对于没有 log_prob 的轨迹：使用当前 policy 计算 entropy 并排序
+        ⭐ Multi-turn 关键：只对 LLM 响应部分（loss_mask=1）计算 entropy。
+        
+        Args:
+            teacher_trajectories: Teacher 轨迹列表（可能包含有/无 log_prob 的混合）
+            tasks: teacher experience task 列表
+            num_trajectories_per_task: 每个 task 选择的轨迹数量
+            
+        Returns:
+            List[Trajectory]: 选中的 teacher 轨迹列表（按 entropy 从低到高排序）
+        """
+        if not teacher_trajectories:
+            return []
+        
+        # 按 task_id 分组轨迹
+        task_id_to_trajs = defaultdict(list)
+        for traj in teacher_trajectories:
+            task_id = traj.task_id if hasattr(traj, 'task_id') else traj.metadata.get('task_id')
+            if task_id:
+                task_id_to_trajs[task_id].append(traj)
+        
+        selected_trajectories = []
+        
+        for task in tasks:
+            task_id = task.task_id
+            candidates = task_id_to_trajs.get(task_id, [])
+            
+            if not candidates:
+                continue
+            
+            if len(candidates) == 1:
+                selected_trajectories.append(candidates[0])
+                continue
+            
+            # 分离有 log_prob 和没有 log_prob 的轨迹
+            trajs_with_logprob = []
+            trajs_without_logprob = []
+            
+            for traj in candidates:
+                if traj.metadata.get("has_log_prob", False) and "old_log_probs" in traj.metadata:
+                    trajs_with_logprob.append(traj)
+                else:
+                    trajs_without_logprob.append(traj)
+            
+            # 对于没有 log_prob 的轨迹，使用当前 policy 计算 entropy
+            if trajs_without_logprob:
+                try:
+                    # 转换为 CMT
+                    candidate_cmts = self.env_manager.convert_offpolicy_to_cmt(
+                        offpolicy_trajectories=trajs_without_logprob,
+                        config=self.config,
+                        tokenizer=self.tokenizer
+                    )
+                    
+                    if not candidate_cmts:
+                        logger.warning(f"Task {task_id}: Failed to convert teacher trajectories to CMT")
+                        # 回退：只使用有 log_prob 的轨迹
+                        selected_trajectories.extend(trajs_with_logprob[:num_trajectories_per_task])
+                        continue
+                    
+                    # 转换为 samples
+                    samples = []
+                    for cmt in candidate_cmts:
+                        extras = self.env_manager.get_extra(cmt)
+                        sample_arr = cmt.group_tokenize()
+                        for sample in sample_arr:
+                            sample.extras = extras
+                        samples.extend(sample_arr)
+                    
+                    if not samples:
+                        logger.warning(f"Task {task_id}: No samples generated from teacher CMTs")
+                        selected_trajectories.extend(trajs_with_logprob[:num_trajectories_per_task])
+                        continue
+                    
+                    # 对齐到 world_size（分布式计算需要）
+                    world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+                    original_num_samples = len(samples)
+                    remainder = original_num_samples % world_size
+                    if remainder != 0:
+                        padding_needed = world_size - remainder
+                        for i in range(padding_needed):
+                            samples.append(samples[i % original_num_samples])
+                    
+                    # 转换为 DataProto 并计算 entropy
+                    candidate_batch = self.env_manager.samples_to_dataproto(samples)
+                    log_prob_result = self.actor_rollout_wg.compute_log_prob(candidate_batch)
+                    entropys = log_prob_result.batch["entropys"][:original_num_samples]
+                    
+                    # 使用 loss_mask 计算 LLM 响应部分的平均 entropy
+                    response_length = candidate_batch.batch["responses"].shape[-1]
+                    response_masks = candidate_batch.batch["loss_mask"][:original_num_samples, -response_length:]
+                    
+                    # 计算每个候选的平均 entropy
+                    traj_entropys = []
+                    for i, traj in enumerate(trajs_without_logprob):
+                        if i < entropys.shape[0]:
+                            traj_entropy = entropys[i].cpu().numpy()
+                            traj_response_mask = response_masks[i].cpu().numpy()
+                            valid_entropys = traj_entropy[traj_response_mask.astype(bool)]
+                            avg_entropy = float(np.mean(valid_entropys)) if len(valid_entropys) > 0 else float('inf')
+                        else:
+                            avg_entropy = float('inf')
+                        traj_entropys.append((avg_entropy, traj))
+                    
+                    # 按 entropy 从低到高排序
+                    trajs_without_logprob = [traj for _, traj in sorted(traj_entropys, key=lambda x: x[0])]
+                    
+                    logger.debug(
+                        f"Task {task_id}: Computed entropy for {len(trajs_without_logprob)} teacher trajectories "
+                        f"without log_prob (avg_entropys: {[f'{e:.4f}' for e, _ in sorted(traj_entropys, key=lambda x: x[0])]})"
+                    )
+                    
+                except Exception as e:
+                    logger.warning(f"Task {task_id}: Failed to compute entropy for teacher trajectories without log_prob: {e}")
+                    # 回退：只使用有 log_prob 的轨迹
+                    trajs_without_logprob = []
+            
+            # 合并：先是有 log_prob 的（已排序），然后是没有 log_prob 的（已排序）
+            # 两者都按 entropy 从低到高排序
+            all_sorted = trajs_with_logprob + trajs_without_logprob
+            num_to_select = min(num_trajectories_per_task, len(all_sorted))
+            selected_trajectories.extend(all_sorted[:num_to_select])
+        
+        return selected_trajectories
+
     ##################
     # ANNI
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
@@ -1757,17 +1892,60 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             
                             # ⭐ Experience Replay: 混合 on-policy 和 off-policy tasks
                             exp_replay_config = self.config.exp_manager.get("experience_replay", {})
+                            teacher_exp_config = self.config.exp_manager.get("teacher_experience", {})
                             enable_exp_replay = exp_replay_config.get("enable", False)
-                            experience_tasks = []
-                            offpolicy_cmt_array = []
+                            enable_teacher_exp = teacher_exp_config.get("enable", False) and self.exp_manager.teacher_enabled
                             
-                            if enable_exp_replay:
+                            experience_tasks = []
+                            teacher_exp_tasks = []  # ⭐ 新增：Teacher experience tasks
+                            offpolicy_cmt_array = []
+                            teacher_offpolicy_cmt_array = []  # ⭐ 新增：Teacher off-policy trajectories
+                            
+                            if enable_exp_replay or enable_teacher_exp:
                                 # 计算当前训练进度
                                 training_progress = self.global_steps / self.total_training_steps
                                 replay_start_ratio = exp_replay_config.get("replay_start_ratio", 0.35)
                                 
                                 if training_progress >= replay_start_ratio:
-                                    # 使用 ExperienceMixCollateFn 混合 tasks
+                                    # ⭐ 判断是否使用 Teacher Experience
+                                    if enable_teacher_exp:
+                                        # ⭐ 方案 C：Teacher 从总 off-policy 比例中分走一部分
+                                        # 总 off-policy 比例 = exp_ratio（保持不变）
+                                        # teacher 占 teacher_exp_ratio，self-generated 占剩余部分
+                                        total_exp_ratio = exp_replay_config.get("exp_ratio", 0.5)
+                                        teacher_exp_ratio = teacher_exp_config.get("exp_ratio", 0.2)
+                                        # 确保 teacher 不超过总比例
+                                        teacher_exp_ratio = min(teacher_exp_ratio, total_exp_ratio)
+                                        # self-generated 占剩余部分
+                                        self_exp_ratio = max(0.0, total_exp_ratio - teacher_exp_ratio)
+                                        
+                                        logger.info(
+                                            f"[Teacher Experience] 方案 C 比例分配: "
+                                            f"total_exp={total_exp_ratio:.2f}, "
+                                            f"self_exp={self_exp_ratio:.2f}, "
+                                            f"teacher_exp={teacher_exp_ratio:.2f}, "
+                                            f"on_policy={1-total_exp_ratio:.2f}"
+                                        )
+                                        
+                                        # 使用 TeacherExperienceMixCollateFn（支持三种类型）
+                                        experience_mix_collate = TeacherExperienceMixCollateFn(
+                                            exp_manager=self.exp_manager,
+                                            train_task_manager=self.train_task_manager,
+                                            self_exp_ratio=self_exp_ratio,
+                                            teacher_exp_ratio=teacher_exp_ratio,
+                                            teacher_exp_enabled=True,
+                                            replay_start_ratio=replay_start_ratio,
+                                            offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
+                                            n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                        )
+                                        
+                                        experience_tasks, teacher_exp_tasks, on_policy_tasks = experience_mix_collate(
+                                            training_tasks=tasks,
+                                            training_progress=training_progress,
+                                            enable_replay=True,
+                                        )
+                                    else:
+                                        # 使用原有的 ExperienceMixCollateFn（向后兼容）
                                     experience_mix_collate = ExperienceMixCollateFn(
                                         exp_manager=self.exp_manager,
                                         train_task_manager=self.train_task_manager,
@@ -1783,10 +1961,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         enable_replay=True,
                                     )
                                     
-                                    # 合并 tasks（experience_tasks 在前，on_policy_tasks 在后）
-                                    tasks = experience_tasks + on_policy_tasks
+                                    # 合并 tasks（experience_tasks + teacher_exp_tasks + on_policy_tasks）
+                                    tasks = experience_tasks + teacher_exp_tasks + on_policy_tasks
                                     
-                                    # 为 experience tasks 获取 off-policy trajectories
+                                    # 为 self-generated experience tasks 获取 off-policy trajectories
                                     if experience_tasks:
                                         # ⭐ ExGRPO 方式：使用当前 policy 计算 entropy 选择最优轨迹
                                         use_current_policy_entropy = exp_replay_config.get("use_current_policy_entropy", True)
@@ -1813,9 +1991,6 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         
                                         if offpolicy_trajectories:
                                             # ⭐ ExGRPO 设计：构建 task_id 到 data_id 的映射
-                                            # 确保 off-policy trajectory 使用与对应 on-policy trajectory 相同的 data_id
-                                            # tasks = experience_tasks + on_policy_tasks，experience_tasks 在前面
-                                            # experience_tasks[i] 的 data_id 是 i
                                             task_id_to_data_id = {
                                                 task.task_id: idx
                                                 for idx, task in enumerate(tasks)
@@ -1827,7 +2002,42 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                                 tokenizer=self.tokenizer,
                                                 task_id_to_data_id=task_id_to_data_id
                                             )
-                                            logger.info(f"Got {len(offpolicy_cmt_array)} off-policy trajectories")
+                                            logger.info(f"Got {len(offpolicy_cmt_array)} self-generated off-policy trajectories")
+                                    
+                                    # ⭐ 新增：为 teacher experience tasks 获取 off-policy trajectories
+                                    if teacher_exp_tasks:
+                                        teacher_num_per_task = teacher_exp_config.get("max_trajectories_per_task", 1)
+                                        teacher_offpolicy_trajectories = self.exp_manager.get_teacher_offpolicy_batch(
+                                            tasks=teacher_exp_tasks,
+                                            num_trajectories_per_task=teacher_num_per_task,
+                                        )
+                                        
+                                        if teacher_offpolicy_trajectories:
+                                            # ⭐ 如果 teacher_select_mode == 'entropy'，对没有 log_prob 的轨迹使用当前 policy 计算 entropy
+                                            teacher_select_mode = teacher_exp_config.get("select_mode", "random")
+                                            if teacher_select_mode == "entropy":
+                                                teacher_offpolicy_trajectories = self._select_best_teacher_by_current_entropy(
+                                                    teacher_trajectories=teacher_offpolicy_trajectories,
+                                                    tasks=teacher_exp_tasks,
+                                                    num_trajectories_per_task=teacher_num_per_task,
+                                                )
+                                            
+                                            # 构建 task_id 到 data_id 的映射
+                                            task_id_to_data_id = {
+                                                task.task_id: idx
+                                                for idx, task in enumerate(tasks)
+                                            }
+                                            
+                                            teacher_offpolicy_cmt_array = self.env_manager.convert_offpolicy_to_cmt(
+                                                offpolicy_trajectories=teacher_offpolicy_trajectories,
+                                                config=self.config,
+                                                tokenizer=self.tokenizer,
+                                                task_id_to_data_id=task_id_to_data_id
+                                            )
+                                            # 标记为 teacher trajectory
+                                            for cmt in teacher_offpolicy_cmt_array:
+                                                cmt.metadata["is_teacher"] = True
+                                            logger.info(f"Got {len(teacher_offpolicy_cmt_array)} teacher off-policy trajectories")
                             
                             task_exp_configs = self.exp_manager.get_complete_exp_configs(tasks, mode="sample")
                             assert len(task_exp_configs)==len(tasks), "{len(task_exp_configs)=}, {len(gen_batch)=}"
@@ -1839,19 +2049,28 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             print("=" * 10 + "end fit rollout" + "=" * 10)
                             
                             # ⭐ Experience Replay: 更新 difficulty2task_dict 并合并轨迹
-                            if enable_exp_replay:
+                            if enable_exp_replay or enable_teacher_exp:
                                 # 更新 difficulty2task_dict（只用 on-policy 轨迹）
                                 self.exp_manager.update_difficulty2task_dict(trajectories)
                                 
-                                # 合并 on-policy 和 off-policy 轨迹
+                                # 合并 on-policy、self-generated off-policy、teacher off-policy 轨迹
+                                all_trajectories = trajectories.copy()
+                                
                                 if offpolicy_cmt_array:
-                                    all_trajectories = trajectories + offpolicy_cmt_array
+                                    all_trajectories.extend(offpolicy_cmt_array)
+                                    logger.info(f"Added {len(offpolicy_cmt_array)} self-generated off-policy trajectories")
+                                
+                                if teacher_offpolicy_cmt_array:
+                                    all_trajectories.extend(teacher_offpolicy_cmt_array)
+                                    logger.info(f"Added {len(teacher_offpolicy_cmt_array)} teacher off-policy trajectories")
+                                
+                                if offpolicy_cmt_array or teacher_offpolicy_cmt_array:
                                     logger.info(
-                                        f"Merged {len(trajectories)} on-policy + {len(offpolicy_cmt_array)} off-policy = "
+                                        f"Merged {len(trajectories)} on-policy + "
+                                        f"{len(offpolicy_cmt_array)} self-off-policy + "
+                                        f"{len(teacher_offpolicy_cmt_array)} teacher-off-policy = "
                                         f"{len(all_trajectories)} total trajectories"
                                     )
-                                else:
-                                    all_trajectories = trajectories
                             else:
                                 all_trajectories = trajectories
                             
@@ -2041,6 +2260,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 "exp_replay/total_tasks_in_pool": len(self.exp_manager.get_valid_replay_task_ids()),
                                 "exp_replay/num_experience_tasks": len(experience_tasks),
                                 "exp_replay/num_offpolicy_trajectories": len(offpolicy_cmt_array),
+                                # ⭐ 新增：Teacher Experience Metrics
+                                "teacher_exp/num_teacher_tasks": len(teacher_exp_tasks),
+                                "teacher_exp/num_teacher_trajectories": len(teacher_offpolicy_cmt_array),
+                                "teacher_exp/total_teacher_pool_size": len(self.exp_manager.get_valid_teacher_task_ids()) if self.exp_manager.teacher_enabled else 0,
                             })
 
                         if "rollout_log_probs" in batch.batch.keys():

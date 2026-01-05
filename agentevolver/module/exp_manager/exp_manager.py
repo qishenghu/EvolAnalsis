@@ -56,7 +56,7 @@ class ExperienceManager(object):
         self.thread_pool = ThreadPoolExecutor(max_workers=self.config.thread_pool.max_workers)
         self.em_client = EMClient(base_url=self.reme_config.base_url)
         
-        # ⭐ Experience Replay 相关属性
+        # ⭐ Experience Replay 相关属性 (Self-Generated / ExGRPO)
         exp_replay_config = self.exp_manager_config.get("experience_replay", {})
         self.difficulty2task_dict: Dict[int, List[str]] = defaultdict(list)  # 按难度分桶存储 task_id
         self.task2trajectories: Dict[str, List[Trajectory]] = defaultdict(list)  # 按 task_id 存储 Trajectory 列表
@@ -67,6 +67,25 @@ class ExperienceManager(object):
         self.experience_rbound = exp_replay_config.get("experience_rbound", 8)
         self.exp_select_mode = exp_replay_config.get("exp_select_mode", "argmin")
         self.exp_ratio = exp_replay_config.get("exp_ratio", 0.5)
+        
+        # ⭐ Teacher Experience Replay 相关属性 (LUFFY)
+        teacher_config = self.exp_manager_config.get("teacher_experience", {})
+        self.teacher_enabled = teacher_config.get("enable", False)
+        self.teacher_data_path = teacher_config.get("data_path", None)
+        self.teacher_exp_ratio = teacher_config.get("exp_ratio", 0.2)
+        self.teacher_max_per_task = teacher_config.get("max_trajectories_per_task", 3)
+        self.teacher_select_mode = teacher_config.get("select_mode", "random")
+        self.teacher_use_log_prob = teacher_config.get("use_log_prob", False)
+        
+        # Teacher 轨迹存储（与 self-generated 分开存储）
+        self.teacher_task2trajectories: Dict[str, List[Trajectory]] = defaultdict(list)
+        
+        # 如果配置了 data_path，尝试加载 Teacher 轨迹
+        if self.teacher_enabled and self.teacher_data_path:
+            try:
+                self.load_teacher_trajectories(self.teacher_data_path)
+            except Exception as e:
+                logger.warning(f"Failed to load teacher trajectories from {self.teacher_data_path}: {e}")
     
     def summarize_in_batch(self, trajectories: List[Trajectory]) -> None:
         trajectories_sorted = sorted(trajectories, key=lambda traj: traj.task_id)
@@ -595,6 +614,351 @@ class ExperienceManager(object):
                     if task_id in self.task2trajectories and len(self.task2trajectories[task_id]) > 0:
                         valid_task_ids.append(task_id)
         return valid_task_ids
+
+    # ==================== Teacher Experience Replay Methods (LUFFY) ====================
+    
+    def load_teacher_trajectories(self, data_path: str) -> int:
+        """
+        从磁盘加载预采集的 Teacher 轨迹。
+        
+        支持格式：
+        - JSONL：每行一个轨迹（推荐）
+        - Pickle：序列化的轨迹列表
+        
+        Args:
+            data_path: Teacher 轨迹文件路径
+            
+        Returns:
+            加载的轨迹数量
+        """
+        import json
+        import pickle
+        import os
+        
+        if not os.path.exists(data_path):
+            logger.warning(f"[ExperienceManager] Teacher trajectory file not found: {data_path}")
+            return 0
+        
+        count = 0
+        
+        if data_path.endswith('.jsonl'):
+            with open(data_path, 'r') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        traj_dict = json.loads(line.strip())
+                        traj = self._dict_to_teacher_trajectory(traj_dict)
+                        self.teacher_task2trajectories[traj.task_id].append(traj)
+                        count += 1
+                    except Exception as e:
+                        logger.warning(f"[ExperienceManager] Failed to parse teacher trajectory: {e}")
+                        continue
+                        
+        elif data_path.endswith('.pkl'):
+            with open(data_path, 'rb') as f:
+                trajectories = pickle.load(f)
+                for traj in trajectories:
+                    # 标记为 Teacher 轨迹
+                    if not hasattr(traj, 'metadata') or traj.metadata is None:
+                        traj.metadata = {}
+                    traj.metadata["is_teacher"] = True
+                    self.teacher_task2trajectories[traj.task_id].append(traj)
+                    count += 1
+        else:
+            raise ValueError(f"Unsupported file format: {data_path}. Use .jsonl or .pkl")
+        
+        logger.info(f"[ExperienceManager] Loaded {count} teacher trajectories from {data_path}")
+        logger.info(f"[ExperienceManager] Teacher tasks: {len(self.teacher_task2trajectories)}")
+        
+        return count
+    
+    def _dict_to_teacher_trajectory(self, traj_dict: Dict) -> Trajectory:
+        """
+        将字典转换为 Trajectory 对象。
+        
+        ⭐ Multi-turn 关键：保持与 on-policy 轨迹相同的结构
+        ⭐ Log Prob 处理：根据数据中是否有 log_prob 设置 has_log_prob 标记
+        """
+        from agentevolver.schema.trajectory import Reward
+        
+        # 获取 task_id（用于后续存储）
+        task_id = traj_dict.get("task_id", "")
+        
+        # 创建 Trajectory 对象
+        # 注意：Trajectory 类没有 task_id 属性，使用 data_id 存储
+        traj = Trajectory(
+            data_id=traj_dict.get("data_id", task_id),  # 使用 task_id 作为 data_id
+            rollout_id=traj_dict.get("rollout_id", ""),
+            steps=traj_dict.get("messages", []),  # ⭐ Multi-turn 对话历史
+        )
+        
+        # ⭐ 将 task_id 存储到 metadata 中
+        traj.task_id = task_id  # 动态添加属性
+        
+        # 设置 reward
+        reward_val = traj_dict.get("reward", 0.0)
+        success = traj_dict.get("success", reward_val == 1.0)
+        traj.reward = Reward(outcome=reward_val if success else 0.0)
+        
+        # 设置 metadata
+        traj.metadata = traj_dict.get("metadata", {})
+        traj.metadata["is_teacher"] = True
+        traj.metadata["is_experience_replay"] = True  # 标记为 off-policy
+        traj.metadata["teacher_model"] = traj_dict.get("teacher_model", 
+                                                        traj.metadata.get("teacher_model", "unknown"))
+        
+        # ⭐ 处理 log_prob（关键）
+        # 检查轨迹数据中是否包含 log_prob
+        log_probs = (traj_dict.get("log_probs") or 
+                     traj_dict.get("metadata", {}).get("old_log_probs"))
+        
+        if log_probs and len(log_probs) > 0:
+            # ⭐ 保存到 log_probs 字段（供 _align_teacher_log_probs 使用）
+            # 注意：这是累积的 log_probs，只包含 LLM 生成的 token
+            traj.metadata["log_probs"] = log_probs
+            traj.metadata["has_log_prob"] = True
+            
+            # 也保存分轮的 log_probs（如果有）
+            log_probs_per_turn = traj_dict.get("log_probs_per_turn")
+            if log_probs_per_turn:
+                traj.metadata["log_probs_per_turn"] = log_probs_per_turn
+        else:
+            traj.metadata["has_log_prob"] = False
+        
+        return traj
+    
+    def get_teacher_trajectories(
+        self, 
+        task_ids: List[str],
+        num_per_task: int = 1,
+    ) -> List[Trajectory]:
+        """
+        获取指定 task 的 Teacher 轨迹。
+        
+        ⭐ 支持多种选择模式：
+        - "all": 返回所有轨迹
+        - "first": 返回前 N 个
+        - "random": 随机选择 N 个
+        - "entropy": 按 entropy 从低到高排序
+                     * 对于有 log_prob 的轨迹：直接计算 entropy 并排序
+                     * 对于没有 log_prob 的轨迹：在 trainer 中使用当前 policy 计算 entropy
+                     * 两部分合并后按 entropy 从低到高排序
+        - "confidence": 按 Teacher 的平均 log_prob 从高到低排序（越高 = 越确信）
+                        ⭐ 适用于 OpenAI 等 API 返回的 log_prob
+                        ⭐ 只能对有 log_prob 的轨迹排序
+        
+        Args:
+            task_ids: 任务 ID 列表
+            num_per_task: 每个任务获取的轨迹数
+            
+        Returns:
+            Teacher 轨迹列表（格式与 self-generated 一致）
+        """
+        import copy
+        import numpy as np
+        
+        trajectories = []
+        
+        for task_id in task_ids:
+            if task_id not in self.teacher_task2trajectories:
+                continue
+            
+            task_trajs = self.teacher_task2trajectories[task_id]
+            
+            if self.teacher_select_mode == "all":
+                selected = task_trajs
+            elif self.teacher_select_mode == "first":
+                selected = task_trajs[:num_per_task]
+            elif self.teacher_select_mode == "random":
+                selected = random.sample(task_trajs, min(num_per_task, len(task_trajs)))
+            elif self.teacher_select_mode == "entropy":
+                # ⭐ Entropy 模式：按 entropy 从低到高排序
+                # 只处理有 log_prob 的轨迹，没有 log_prob 的轨迹需要在 trainer 中处理
+                trajs_with_logprob = []
+                trajs_without_logprob = []
+                
+                for traj in task_trajs:
+                    # 检查 log_probs 或 old_log_probs（兼容两种命名）
+                    log_probs = (traj.metadata.get("log_probs") or 
+                                traj.metadata.get("old_log_probs"))
+                    if traj.metadata.get("has_log_prob", False) and log_probs:
+                        trajs_with_logprob.append(traj)
+                    else:
+                        trajs_without_logprob.append(traj)
+                
+                # 对于有 log_prob 的轨迹，计算 "entropy"（实际是负平均 log_prob）
+                # ⭐ 注意：这里的 "entropy" 实际上是 -mean(log_probs)，不是真正的信息论 entropy
+                # 真正的 entropy H = -Σ P(x) * log P(x) 需要完整的概率分布
+                # 但 API 只返回被选中 token 的 log_prob，无法计算真正的 entropy
+                # 
+                # 这里使用 -mean(log_probs) 作为 "不确定性" 的代理指标：
+                # - 值越低 → Teacher 对这个响应越确信（log_prob 越接近 0）
+                # - 值越高 → Teacher 对这个响应不确定（log_prob 越负）
+                # 
+                # 与 confidence 的关系：entropy ≈ -confidence
+                if trajs_with_logprob:
+                    traj_entropys = []
+                    for traj in trajs_with_logprob:
+                        log_probs = (traj.metadata.get("log_probs") or 
+                                    traj.metadata.get("old_log_probs"))
+                        old_log_probs = np.array(log_probs)
+                        # ⭐ 使用 -mean(log_probs) 作为 "entropy" 代理
+                        # 这与 confidence = mean(log_probs) 相反
+                        entropy_proxy = -np.mean(old_log_probs)
+                        traj_entropys.append((entropy_proxy, traj))
+                    
+                    # 按 entropy 从低到高排序
+                    trajs_with_logprob = [traj for _, traj in sorted(traj_entropys, key=lambda x: x[0])]
+                
+                # 合并：先是有 log_prob 的（已排序），然后是没有 log_prob 的（需要在 trainer 中处理）
+                selected = trajs_with_logprob + trajs_without_logprob
+                selected = selected[:num_per_task]
+                
+                if trajs_without_logprob:
+                    logger.debug(
+                        f"Task {task_id}: {len(trajs_with_logprob)} trajectories with log_prob "
+                        f"(sorted by entropy), {len(trajs_without_logprob)} without log_prob "
+                        f"(will use current policy to compute entropy in trainer)"
+                    )
+            elif self.teacher_select_mode == "confidence":
+                # ⭐ Confidence 模式：按 Teacher 的平均 log_prob 从高到低排序
+                # 适用于 OpenAI 等 API 返回的 log_prob
+                # 越高的平均 log_prob 意味着 Teacher 对这个响应越确信
+                trajs_with_logprob = []
+                trajs_without_logprob = []
+                
+                for traj in task_trajs:
+                    # 检查是否有 log_probs（注意：可能是 log_probs 或 old_log_probs）
+                    log_probs = (traj.metadata.get("log_probs") or 
+                                traj.metadata.get("old_log_probs"))
+                    if log_probs and len(log_probs) > 0:
+                        trajs_with_logprob.append(traj)
+                    else:
+                        trajs_without_logprob.append(traj)
+                
+                # 对于有 log_prob 的轨迹，计算平均 log_prob
+                if trajs_with_logprob:
+                    traj_confidences = []
+                    for traj in trajs_with_logprob:
+                        log_probs = (traj.metadata.get("log_probs") or 
+                                    traj.metadata.get("old_log_probs"))
+                        log_probs = np.array(log_probs)
+                        # 平均 log_prob（越高越好）
+                        avg_log_prob = np.mean(log_probs)
+                        traj_confidences.append((avg_log_prob, traj))
+                    
+                    # 按平均 log_prob 从高到低排序（reverse=True）
+                    trajs_with_logprob = [traj for _, traj in sorted(traj_confidences, key=lambda x: x[0], reverse=True)]
+                    
+                    if len(traj_confidences) > 0:
+                        best_conf = traj_confidences[0][0] if traj_confidences else 0
+                        worst_conf = traj_confidences[-1][0] if traj_confidences else 0
+                        logger.debug(
+                            f"Task {task_id}: {len(trajs_with_logprob)} trajectories with log_prob "
+                            f"(sorted by confidence: best={best_conf:.4f}, worst={worst_conf:.4f})"
+                        )
+                
+                # 合并：先是有 log_prob 的（按 confidence 排序），然后是没有的
+                selected = trajs_with_logprob + trajs_without_logprob
+                selected = selected[:num_per_task]
+                
+                if trajs_without_logprob:
+                    logger.debug(
+                        f"Task {task_id}: {len(trajs_without_logprob)} trajectories without log_prob "
+                        f"(cannot compute confidence, placed at end)"
+                    )
+            else:
+                selected = task_trajs[:num_per_task]
+            
+            # 深拷贝以避免修改原始轨迹
+            for traj in selected:
+                traj_copy = copy.deepcopy(traj)
+                traj_copy.metadata["is_experience_replay"] = True
+                traj_copy.metadata["is_teacher"] = True
+                trajectories.append(traj_copy)
+        
+        return trajectories
+    
+    def get_valid_teacher_task_ids(self) -> List[str]:
+        """
+        获取所有有 Teacher 轨迹的 task_id。
+        
+        排除已在 skip_uid_set 中的 task（已完全解决）。
+        
+        Returns:
+            List[str]: 有效的 Teacher task_id 列表
+        """
+        valid_ids = [
+            task_id for task_id in self.teacher_task2trajectories.keys()
+            if task_id not in self.skip_uid_set
+        ]
+        return valid_ids
+    
+    def has_teacher_trajectory(self, task_id: str) -> bool:
+        """
+        检查某个 task 是否有 Teacher 轨迹。
+        
+        Args:
+            task_id: 任务 ID
+            
+        Returns:
+            bool: 是否有 Teacher 轨迹
+        """
+        return (task_id in self.teacher_task2trajectories 
+                and len(self.teacher_task2trajectories[task_id]) > 0)
+    
+    def get_teacher_stats(self) -> Dict:
+        """
+        获取 Teacher 轨迹统计信息。
+        
+        Returns:
+            Dict: 统计信息
+        """
+        total_tasks = len(self.teacher_task2trajectories)
+        total_trajectories = sum(len(trajs) for trajs in self.teacher_task2trajectories.values())
+        
+        # 统计有/无 log_prob 的轨迹数量
+        with_log_prob = 0
+        without_log_prob = 0
+        for trajs in self.teacher_task2trajectories.values():
+            for traj in trajs:
+                if traj.metadata.get("has_log_prob", False):
+                    with_log_prob += 1
+                else:
+                    without_log_prob += 1
+        
+        return {
+            "enabled": self.teacher_enabled,
+            "total_tasks": total_tasks,
+            "total_trajectories": total_trajectories,
+            "avg_trajectories_per_task": total_trajectories / total_tasks if total_tasks > 0 else 0,
+            "with_log_prob": with_log_prob,
+            "without_log_prob": without_log_prob,
+        }
+    
+    def get_teacher_offpolicy_batch(
+        self, 
+        tasks: List[Task], 
+        num_trajectories_per_task: int = 1,
+    ) -> List[Trajectory]:
+        """
+        为给定的任务列表获取 Teacher off-policy 轨迹。
+        
+        ⭐ 与 get_offpolicy_batch 类似，但从 teacher_task2trajectories 获取
+        
+        Args:
+            tasks: 任务列表
+            num_trajectories_per_task: 每个任务期望获取的轨迹数量
+            
+        Returns:
+            List[Trajectory]: Teacher off-policy trajectory 列表
+        """
+        task_ids = [task.task_id for task in tasks]
+        return self.get_teacher_trajectories(
+            task_ids=task_ids,
+            num_per_task=num_trajectories_per_task,
+        )
 
     def save_experience_pool_to_disk(self, save_dir: str) -> None:
         """

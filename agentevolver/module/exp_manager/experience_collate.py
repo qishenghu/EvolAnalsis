@@ -1,8 +1,14 @@
 """
 Experience Mix Collate Function for Experience Replay.
 
-This module provides the ExperienceMixCollateFn class that handles
-mixing on-policy and off-policy tasks based on the exp_ratio configuration.
+This module provides:
+- ExperienceMixCollateFn: Original collate function for ExGRPO self-generated experience replay
+- TeacherExperienceMixCollateFn: Extended collate function supporting both self-generated and teacher experience (LUFFY)
+
+Backward Compatibility:
+- ExperienceMixCollateFn returns Tuple[List[Task], List[Task]] (experience_tasks, on_policy_tasks)
+- TeacherExperienceMixCollateFn returns Tuple[List[Task], List[Task], List[Task]] 
+  (self_exp_tasks, teacher_exp_tasks, on_policy_tasks)
 """
 
 import random
@@ -147,4 +153,165 @@ class ExperienceMixCollateFn:
                     return task
         
         return None
+
+
+class TeacherExperienceMixCollateFn(ExperienceMixCollateFn):
+    """
+    扩展的 Experience 混合函数，支持三种数据类型：
+    1. On-policy: 当前策略生成的新轨迹
+    2. Self-generated off-policy: 自身历史成功轨迹（ExGRPO）
+    3. Teacher off-policy: 外部 Teacher 模型的轨迹（LUFFY）
+    
+    ⭐ 向后兼容设计：
+    - 继承 ExperienceMixCollateFn
+    - 返回三元组 (self_exp_tasks, teacher_exp_tasks, on_policy_tasks)
+    - 原有 ExperienceMixCollateFn 不受影响
+    """
+    
+    def __init__(
+        self,
+        exp_manager: "ExperienceManager",
+        train_task_manager,
+        # Self-generated experience 配置
+        self_exp_ratio: float = 0.3,
+        # Teacher experience 配置
+        teacher_exp_ratio: float = 0.2,
+        teacher_exp_enabled: bool = True,
+        # 共同配置
+        replay_start_ratio: float = 0.35,
+        offpolicy_trajectories_per_task: int = 1,
+        n_rollout: int = 8,
+    ):
+        """
+        初始化 TeacherExperienceMixCollateFn。
+        
+        Args:
+            exp_manager: ExperienceManager 实例（统一管理 self-generated 和 teacher）
+            train_task_manager: TaskManager 实例
+            self_exp_ratio: Self-generated experience 比例
+            teacher_exp_ratio: Teacher experience 比例
+            teacher_exp_enabled: 是否启用 teacher experience
+            replay_start_ratio: 开始 replay 的训练进度
+            offpolicy_trajectories_per_task: 每个任务的 off-policy 轨迹数
+            n_rollout: 每个 task 的 rollout 数量
+        """
+        # 调用父类构造函数（用于 self-generated experience）
+        super().__init__(
+            exp_manager=exp_manager,
+            train_task_manager=train_task_manager,
+            exp_ratio=self_exp_ratio,  # 父类的 exp_ratio 用于 self-generated
+            replay_start_ratio=replay_start_ratio,
+            offpolicy_trajectories_per_task=offpolicy_trajectories_per_task,
+            n_rollout=n_rollout,
+        )
+        
+        self.self_exp_ratio = self_exp_ratio
+        self.teacher_exp_ratio = teacher_exp_ratio
+        # 检查 exp_manager 是否启用了 teacher
+        self.teacher_exp_enabled = (teacher_exp_enabled and 
+                                    getattr(exp_manager, 'teacher_enabled', False))
+    
+    def __call__(
+        self,
+        training_tasks: List["Task"],
+        training_progress: float,
+        enable_replay: bool = True,
+    ) -> Tuple[List["Task"], List["Task"], List["Task"]]:
+        """
+        混合三种类型的 tasks。
+        
+        ⭐ Multi-turn 支持：所有轨迹格式一致，无需额外处理
+        
+        Args:
+            training_tasks: 原始 training tasks 列表（batch_size 个）
+            training_progress: 当前训练进度
+            enable_replay: 是否启用 replay
+            
+        Returns:
+            Tuple[List[Task], List[Task], List[Task]]:
+            - self_exp_tasks: 使用 self-generated experience 的 tasks
+            - teacher_exp_tasks: 使用 teacher experience 的 tasks
+            - on_policy_tasks: 纯 on-policy 的 tasks
+        """
+        batch_size = len(training_tasks)
+        
+        # 检查是否达到 replay 开始条件
+        if not enable_replay or training_progress < self.replay_start_ratio:
+            return [], [], training_tasks
+        
+        # 计算各类型的 task 数量
+        target_self_exp_count = int(batch_size * self.self_exp_ratio)
+        target_teacher_exp_count = int(batch_size * self.teacher_exp_ratio) if self.teacher_exp_enabled else 0
+        
+        # 获取可用的 self-generated experience task_ids
+        valid_self_exp_task_ids = self.exp_manager.get_valid_replay_task_ids()
+        
+        # 获取可用的 teacher experience task_ids
+        valid_teacher_task_ids = []
+        if self.teacher_exp_enabled:
+            valid_teacher_task_ids = self.exp_manager.get_valid_teacher_task_ids()
+        
+        # 采样 self-generated experience tasks
+        n_self_exp = min(len(valid_self_exp_task_ids), target_self_exp_count)
+        sampled_self_exp_task_ids = random.sample(valid_self_exp_task_ids, n_self_exp) if n_self_exp > 0 else []
+        
+        # 采样 teacher experience tasks
+        # 优先选择没有在 self_exp 中的 task，避免同一 task 同时用两种 off-policy
+        available_teacher_task_ids = [
+            tid for tid in valid_teacher_task_ids 
+            if tid not in sampled_self_exp_task_ids
+        ]
+        n_teacher_exp = min(len(available_teacher_task_ids), target_teacher_exp_count)
+        sampled_teacher_task_ids = random.sample(available_teacher_task_ids, n_teacher_exp) if n_teacher_exp > 0 else []
+        
+        # 转换为 Task 对象
+        self_exp_tasks = self._task_ids_to_tasks(sampled_self_exp_task_ids, is_teacher=False)
+        teacher_exp_tasks = self._task_ids_to_tasks(sampled_teacher_task_ids, is_teacher=True)
+        
+        # 补充 on-policy tasks
+        used_task_ids = set(sampled_self_exp_task_ids + sampled_teacher_task_ids)
+        remaining_tasks = [t for t in training_tasks if t.task_id not in used_task_ids]
+        n_on_policy = batch_size - len(self_exp_tasks) - len(teacher_exp_tasks)
+        on_policy_tasks = remaining_tasks[:n_on_policy]
+        
+        # 如果 remaining_tasks 不够，从 training_tasks 补充
+        if len(on_policy_tasks) < n_on_policy:
+            needed = n_on_policy - len(on_policy_tasks)
+            additional = [t for t in training_tasks if t not in on_policy_tasks][:needed]
+            on_policy_tasks.extend(additional)
+        
+        if self_exp_tasks or teacher_exp_tasks:
+            logger.info(f"[TeacherExperienceMixCollateFn] Batch split: "
+                       f"self_exp={len(self_exp_tasks)}, teacher_exp={len(teacher_exp_tasks)}, "
+                       f"on_policy={len(on_policy_tasks)}")
+        
+        return self_exp_tasks, teacher_exp_tasks, on_policy_tasks
+    
+    def _task_ids_to_tasks(
+        self, 
+        task_ids: List[str], 
+        is_teacher: bool = False
+    ) -> List["Task"]:
+        """
+        将 task_id 转换为 Task 对象。
+        
+        Args:
+            task_ids: task_id 列表
+            is_teacher: 是否是 teacher experience
+            
+        Returns:
+            Task 对象列表
+        """
+        tasks = []
+        for task_id in task_ids:
+            task = self._get_task_by_id(task_id)
+            if task is not None:
+                # 初始化 metadata
+                task.metadata = task.metadata if hasattr(task, 'metadata') and task.metadata else {}
+                task.metadata["n_offpolicy_trajectories"] = self.offpolicy_trajectories_per_task
+                task.metadata["is_teacher_task"] = is_teacher
+                tasks.append(task)
+            else:
+                logger.warning(f"Failed to get Task object for task_id={task_id}, skipping")
+        return tasks
 

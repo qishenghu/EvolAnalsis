@@ -1,6 +1,15 @@
+"""
+Heterogeneous Core Algorithms for Experience Replay.
+
+This module provides loss computation functions for:
+- het_compute_token_on_off_policy_loss: Original ExGRPO self-generated experience
+- het_compute_teacher_aware_loss: Extended version supporting teacher experience (LUFFY)
+"""
+
 import numpy as np
 import torch
 from collections import defaultdict
+from typing import Optional
 
 import verl.utils.torch_functional as verl_F
 
@@ -147,6 +156,211 @@ def het_compute_token_on_off_policy_loss(
         "ppo_kl": ppo_kl,
     }
 
+
+def het_compute_teacher_aware_loss(
+    old_log_prob,
+    log_prob,
+    advantages,
+    response_mask,
+    exp_mask,
+    teacher_mask: Optional[torch.Tensor] = None,  # ⭐ 新增：标记 Teacher 轨迹
+    cliprange=None,
+    cliprange_low=None,
+    cliprange_high=None,
+    off_cliprange_high=1.0,
+    clip_ratio_c=3.0,
+    loss_agg_mode: str = "token-mean",
+    off_policy_shaping_mode: str = "higher_clip_bound",
+    off_policy_shaping_beta: float = 0.1,
+    # ⭐ Teacher 专用配置
+    teacher_use_log_prob: bool = False,  # 是否使用 log_prob（有则用 ExGRPO，无则用 LUFFY）
+    teacher_policy_shaping_enable: bool = True,  # 是否启用 policy shaping
+    teacher_policy_shaping_mode: str = "p_div_p_beta",  # Policy shaping 模式
+    teacher_policy_shaping_beta: float = 0.1,  # Policy shaping 参数 β
+    teacher_use_clip: bool = False,  # Teacher 轨迹是否使用 clipping
+):
+    """
+    计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
+    
+    ⭐ 扩展自 het_compute_token_on_off_policy_loss，增加 teacher_mask 支持
+    
+    Teacher 轨迹的两种处理模式：
+    1. teacher_use_log_prob=True: 使用 ExGRPO 形式，ratio = π_current / π_old（需要 log_prob）
+    2. teacher_use_log_prob=False: 使用 LUFFY 形式，ratio = π_current（分母=1）
+    
+    Args:
+        old_log_prob: [batch, seq_len] - 旧策略的 log prob
+        log_prob: [batch, seq_len] - 当前策略的 log prob
+        advantages: [batch, seq_len] - 优势值
+        response_mask: [batch, seq_len] - 响应 token mask
+        exp_mask: [batch, seq_len] - Off-policy mask (1=off-policy, 0=on-policy)
+        teacher_mask: [batch, seq_len] - Teacher 轨迹 mask (1=teacher, 0=非 teacher)
+        teacher_use_log_prob: 是否使用 log_prob 进行重要性采样
+        teacher_policy_shaping_enable: 是否启用 policy shaping（teacher_use_log_prob=False 时推荐）
+        teacher_policy_shaping_mode: Policy shaping 模式 ("p_div_p_beta", "sqrt", "no_shaping")
+        teacher_policy_shaping_beta: β 参数
+        teacher_use_clip: Teacher 轨迹是否使用 clipping
+        
+    Returns:
+        dict: 包含各种 loss 和 metrics
+    """
+    # 如果没有 teacher_mask，直接调用原函数
+    if teacher_mask is None:
+        return het_compute_token_on_off_policy_loss(
+            old_log_prob=old_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=response_mask,
+            exp_mask=exp_mask,
+            cliprange=cliprange,
+            cliprange_low=cliprange_low,
+            cliprange_high=cliprange_high,
+            off_cliprange_high=off_cliprange_high,
+            clip_ratio_c=clip_ratio_c,
+            loss_agg_mode=loss_agg_mode,
+            off_policy_shaping_mode=off_policy_shaping_mode,
+            off_policy_shaping_beta=off_policy_shaping_beta,
+        )
+    
+    # =============== 基础计算 ===============
+    negative_approx_kl = log_prob - old_log_prob
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    ratio = torch.exp(negative_approx_kl)  # 标准 ratio = π_new / π_old
+    
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    
+    # =============== On-policy loss（与现有逻辑相同） ===============
+    on_pg_losses1 = -advantages * ratio
+    on_pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    on_clip_pg_losses1 = torch.maximum(on_pg_losses1, on_pg_losses2)
+    on_pg_losses3 = -advantages * clip_ratio_c
+    on_clip_pg_losses2 = torch.min(on_pg_losses3, on_clip_pg_losses1)
+    on_pg_losses = torch.where(advantages < 0, on_clip_pg_losses2, on_clip_pg_losses1)
+    
+    on_pg_clipfrac = verl_F.masked_mean(torch.gt(on_pg_losses2, on_pg_losses1).float(), response_mask)
+    on_pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(on_clip_pg_losses1, on_pg_losses3) * (advantages < 0).float(), response_mask
+    )
+    
+    on_pg_loss = verl_F.masked_mean(on_pg_losses, (1.0 - exp_mask) * response_mask)
+    
+    # =============== Self-generated off-policy loss ===============
+    # 使用现有的 off_policy_shaping_mode
+    if off_policy_shaping_mode == "exgrpo_policy_shaping":
+        self_off_ratio = ratio
+        self_off_ratio_shaped = self_off_ratio / (self_off_ratio + off_policy_shaping_beta)
+        self_off_pg_losses = -advantages * self_off_ratio_shaped
+    else:  # higher_clip_bound
+        self_off_pg_losses1 = -advantages * ratio
+        self_off_pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + off_cliprange_high)
+        self_off_pg_losses = torch.maximum(self_off_pg_losses1, self_off_pg_losses2)
+    
+    # =============== Teacher off-policy loss（LUFFY） ===============
+    teacher_mask_float = teacher_mask.float()
+    
+    if teacher_use_log_prob:
+        # ========== 模式 1: 使用 log_prob（ExGRPO 形式） ==========
+        # Teacher 轨迹有 log_prob，使用标准重要性采样
+        # ratio = π_current / π_old = exp(log_prob - old_log_prob)
+        teacher_ratio = ratio  # 直接使用标准 ratio
+    else:
+        # ========== 模式 2: 无 log_prob（LUFFY 形式） ==========
+        # Teacher 轨迹无 log_prob，使用简化计算
+        # 假设 π_old = 1，ratio = π_current / 1 = π_current
+        teacher_ratio = torch.exp(log_prob)
+    
+    # Policy shaping（LUFFY 推荐使用）
+    if teacher_policy_shaping_enable:
+        teacher_ratio = _apply_policy_shaping(
+            teacher_ratio,
+            mode=teacher_policy_shaping_mode,
+            beta=teacher_policy_shaping_beta,
+        )
+    
+    # Teacher loss 计算
+    teacher_off_pg_losses_raw = -advantages * teacher_ratio
+    
+    if teacher_use_clip:
+        teacher_off_pg_losses2 = -advantages * torch.clamp(teacher_ratio, 1 - cliprange_low, 1 + off_cliprange_high)
+        teacher_off_pg_losses = torch.maximum(teacher_off_pg_losses_raw, teacher_off_pg_losses2)
+    else:
+        teacher_off_pg_losses = teacher_off_pg_losses_raw  # 不 clip
+    
+    # =============== 混合 off-policy loss ===============
+    # 根据 teacher_mask 选择使用哪种 off-policy loss
+    # - teacher_mask=1: Teacher 轨迹，使用 teacher_off_pg_losses
+    # - teacher_mask=0 且 exp_mask=1: Self-generated，使用 self_off_pg_losses
+    off_pg_losses = torch.where(
+        teacher_mask_float.bool(),
+        teacher_off_pg_losses,
+        self_off_pg_losses
+    )
+    
+    # 计算各类型的 off-policy loss（用于 logging）
+    # Self-generated off-policy loss（排除 teacher）
+    self_exp_mask = exp_mask * (1.0 - teacher_mask_float)
+    self_off_pg_loss = verl_F.masked_mean(self_off_pg_losses, self_exp_mask * response_mask)
+    self_off_pg_loss = torch.tensor(0.0, device=log_prob.device) if self_off_pg_loss.isnan().item() else self_off_pg_loss
+    
+    # Teacher off-policy loss
+    teacher_exp_mask = exp_mask * teacher_mask_float
+    teacher_off_pg_loss = verl_F.masked_mean(teacher_off_pg_losses, teacher_exp_mask * response_mask)
+    teacher_off_pg_loss = torch.tensor(0.0, device=log_prob.device) if teacher_off_pg_loss.isnan().item() else teacher_off_pg_loss
+    
+    # 总 off-policy loss
+    off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)
+    off_pg_loss = torch.tensor(0.0, device=log_prob.device) if off_pg_loss.isnan().item() else off_pg_loss
+    
+    # =============== 合并 loss ===============
+    exp_mask_float = exp_mask.float()
+    pg_losses = off_pg_losses * exp_mask_float + on_pg_losses * (1.0 - exp_mask_float)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    return {
+        "pg_loss": pg_loss,
+        "pg_losses": pg_losses,
+        "on_pg_losses": on_pg_losses,
+        "off_pg_losses": off_pg_losses,
+        "on_pg_loss": on_pg_loss,
+        "off_pg_loss": off_pg_loss,
+        # ⭐ 新增：分开统计 self-generated 和 teacher loss
+        "self_off_pg_loss": self_off_pg_loss,
+        "teacher_off_pg_loss": teacher_off_pg_loss,
+        "on_pg_clipfrac": on_pg_clipfrac,
+        "on_pg_clipfrac_lower": on_pg_clipfrac_lower,
+        "ppo_kl": ppo_kl,
+    }
+
+
+def _apply_policy_shaping(ratio: torch.Tensor, mode: str, beta: float = 0.1) -> torch.Tensor:
+    """
+    应用 Policy Shaping。
+    
+    Args:
+        ratio: 原始 ratio
+        mode: shaping 模式
+            - "p_div_p_beta": LUFFY 的 f(x) = x / (x + β)，放大低概率信号
+            - "sqrt": f(x) = sqrt(x)
+            - "no_shaping": 不使用 shaping
+        beta: β 参数
+    
+    Returns:
+        shaped_ratio: 处理后的 ratio
+    """
+    if mode == "p_div_p_beta":
+        # LUFFY 的 policy shaping: f(x) = x / (x + β)
+        # 放大低概率信号，抑制高概率信号
+        return ratio / (ratio + beta)
+    elif mode == "sqrt":
+        return torch.sqrt(ratio + 1e-8)
+    elif mode == "no_shaping":
+        return ratio
+    else:
+        raise ValueError(f"Unknown policy_shaping_mode: {mode}. "
+                        f"Supported: 'p_div_p_beta', 'sqrt', 'no_shaping'")
 
 
 def bam_compute_token_on_off_policy_loss(
