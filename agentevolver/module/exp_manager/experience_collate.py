@@ -2,21 +2,28 @@
 Experience Mix Collate Function for Experience Replay.
 
 This module provides:
-- ExperienceMixCollateFn: Original collate function for ExGRPO self-generated experience replay
-- TeacherExperienceMixCollateFn: Extended collate function supporting both self-generated and teacher experience (LUFFY)
+- ExperienceMixCollateFn: Original collate function for ExGRPO self-generated experience replay (Task-level mixing)
+- TeacherExperienceMixCollateFn: Extended collate function supporting both self-generated and teacher experience (Task-level)
+- LUFFYTeacherRolloutMixer: LUFFY-style rollout-level mixing (each task mixes on-policy and teacher rollouts)
+
+⭐ Key Design Difference:
+- Task-level mixing (ExGRPO): Some tasks in batch are entirely off-policy, others entirely on-policy
+- Rollout-level mixing (LUFFY): Each task's n rollouts mix on-policy and teacher rollouts
 
 Backward Compatibility:
 - ExperienceMixCollateFn returns Tuple[List[Task], List[Task]] (experience_tasks, on_policy_tasks)
 - TeacherExperienceMixCollateFn returns Tuple[List[Task], List[Task], List[Task]] 
   (self_exp_tasks, teacher_exp_tasks, on_policy_tasks)
+- LUFFYTeacherRolloutMixer.mix_trajectories returns Tuple[List[Trajectory], Dict] (mixed_trajectories, stats)
 """
 
 import random
-from typing import List, Tuple, Optional, TYPE_CHECKING
+from typing import List, Tuple, Optional, Dict, TYPE_CHECKING
 from loguru import logger
 
 if TYPE_CHECKING:
     from agentevolver.schema.task import Task
+    from agentevolver.schema.trajectory import Trajectory
     from agentevolver.module.exp_manager.exp_manager import ExperienceManager
 
 
@@ -314,4 +321,153 @@ class TeacherExperienceMixCollateFn(ExperienceMixCollateFn):
             else:
                 logger.warning(f"Failed to get Task object for task_id={task_id}, skipping")
         return tasks
+
+
+class LUFFYTeacherRolloutMixer:
+    """
+    ⭐ LUFFY 风格的 Teacher Rollout 混合器。
+    
+    核心设计差异：
+    - ExGRPO (Task 级别): batch 中某些 task 完全是 off-policy，某些完全是 on-policy
+    - LUFFY (Rollout 级别): 每个 task 的 n 个 rollouts 中混合 on-policy 和 teacher rollouts
+    
+    例如：batch_size=8, n_rollout=8, n_teacher_rollouts_per_task=1
+        Task 1: 7 on-policy + 1 teacher
+        Task 2: 7 on-policy + 1 teacher
+        ...
+        Task 8: 7 on-policy + 1 teacher
+        
+    这样 GRPO 在同一 task 内计算 advantage 时，teacher 的高 reward 会影响
+    on-policy rollouts 的 baseline，从而引导策略学习。
+    """
+    
+    def __init__(
+        self,
+        exp_manager: "ExperienceManager",
+        n_teacher_rollouts_per_task: int = 1,
+        n_rollout: int = 8,
+    ):
+        """
+        初始化 LUFFY Teacher Rollout Mixer。
+        
+        Args:
+            exp_manager: ExperienceManager 实例
+            n_teacher_rollouts_per_task: 每个 task 混入的 teacher rollout 数量
+            n_rollout: 每个 task 的总 rollout 数量
+        """
+        self.exp_manager = exp_manager
+        self.n_teacher_rollouts_per_task = n_teacher_rollouts_per_task
+        self.n_rollout = n_rollout
+        
+        # 验证配置
+        if n_teacher_rollouts_per_task >= n_rollout:
+            raise ValueError(
+                f"n_teacher_rollouts_per_task ({n_teacher_rollouts_per_task}) "
+                f"must be less than n_rollout ({n_rollout})"
+            )
+    
+    def get_n_onpolicy_rollouts_per_task(self) -> int:
+        """返回每个 task 需要生成的 on-policy rollout 数量。"""
+        return self.n_rollout - self.n_teacher_rollouts_per_task
+    
+    def mix_trajectories(
+        self,
+        on_policy_trajectories: List["Trajectory"],
+        tasks: List["Task"],
+    ) -> Tuple[List["Trajectory"], Dict[str, int]]:
+        """
+        将 teacher rollouts 混入 on-policy trajectories。
+        
+        ⭐ 核心逻辑：
+        1. 对于每个 task，获取其 on-policy trajectories
+        2. 获取该 task 的 teacher trajectories
+        3. 将 teacher trajectories 添加到该 task 的 rollout 列表中
+        4. 确保 teacher trajectories 的 data_id 与 task 一致（用于 GRPO 分组）
+        
+        Args:
+            on_policy_trajectories: 从 env_manager.rollout 生成的 on-policy 轨迹
+            tasks: 当前 batch 的 tasks
+            
+        Returns:
+            Tuple[List[Trajectory], Dict[str, int]]:
+            - 混合后的所有轨迹（on-policy + teacher）
+            - 统计信息字典
+        """
+        from collections import defaultdict
+        
+        # 按 task_id 分组 on-policy trajectories
+        task_id_to_onpolicy: Dict[str, List] = defaultdict(list)
+        for traj in on_policy_trajectories:
+            task_id = traj.data_id  # Trajectory 使用 data_id
+            task_id_to_onpolicy[task_id].append(traj)
+        
+        # 获取每个 task 的 teacher rollouts
+        teacher_rollouts_map = self.exp_manager.get_teacher_rollouts_for_luffy_mixing(
+            tasks=tasks,
+            n_teacher_rollouts_per_task=self.n_teacher_rollouts_per_task,
+        )
+        
+        # 混合轨迹
+        mixed_trajectories = []
+        stats = {
+            "total_tasks": len(tasks),
+            "tasks_with_teacher": 0,
+            "total_onpolicy": len(on_policy_trajectories),
+            "total_teacher": 0,
+        }
+        
+        for task in tasks:
+            task_id = task.task_id
+            
+            # 获取该 task 的 on-policy trajectories
+            onpolicy_trajs = task_id_to_onpolicy.get(task_id, [])
+            
+            # 获取该 task 的 teacher trajectories
+            teacher_trajs = teacher_rollouts_map.get(task_id, [])
+            
+            if teacher_trajs:
+                stats["tasks_with_teacher"] += 1
+                stats["total_teacher"] += len(teacher_trajs)
+                
+                # ⭐ 确保 teacher trajectories 的 data_id 与 task 一致
+                # 这是 GRPO 分组的关键：同一 data_id 的轨迹会被分到同一组
+                for traj in teacher_trajs:
+                    traj.data_id = task_id
+                    traj.metadata["is_teacher"] = True
+                    traj.metadata["source"] = "teacher"
+            
+            # 合并：on-policy + teacher
+            task_trajs = onpolicy_trajs + teacher_trajs
+            mixed_trajectories.extend(task_trajs)
+        
+        logger.info(
+            f"[LUFFYMixer] Mixed {stats['total_onpolicy']} on-policy + "
+            f"{stats['total_teacher']} teacher = {len(mixed_trajectories)} total trajectories. "
+            f"Tasks with teacher: {stats['tasks_with_teacher']}/{stats['total_tasks']}"
+        )
+        
+        return mixed_trajectories, stats
+    
+    def should_use_reduced_rollout(self) -> bool:
+        """
+        返回是否应该减少 on-policy rollout 数量。
+        
+        ⭐ LUFFY 设计：如果 n_teacher_rollouts_per_task > 0，
+        需要减少 on-policy rollout 数量以保持总数不变。
+        
+        Returns:
+            bool: 是否需要减少 on-policy rollout 数量
+        """
+        return self.n_teacher_rollouts_per_task > 0
+    
+    def get_rollout_config_override(self) -> Dict[str, int]:
+        """
+        返回需要覆盖的 rollout 配置。
+        
+        ⭐ 用于在 rollout 时减少生成的 on-policy 数量。
+        
+        Returns:
+            Dict: {"n": reduced_n_rollout}
+        """
+        return {"n": self.get_n_onpolicy_rollouts_per_task()}
 

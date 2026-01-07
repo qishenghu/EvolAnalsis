@@ -279,7 +279,14 @@ class ParallelEnvManager(object):
                     logger.bind(exception=True).exception(f"rollout_env_worker failed after {max_retry} retries: {e.args}")
                     raise e
 
-    def rollout(self, tasks: List[Task], task_exp_configs: List[TaskExpConfig], mode: Literal["sample", "validate"], epoch: str) -> List[Trajectory]:
+    def rollout(
+        self, 
+        tasks: List[Task], 
+        task_exp_configs: List[TaskExpConfig], 
+        mode: Literal["sample", "validate"], 
+        epoch: str,
+        n_rollout_override: Optional[int] = None,
+    ) -> List[Trajectory]:
         """
         Executes a list of tasks in a parallel environment using a thread pool, with automatic retries for failed tasks.
 
@@ -288,12 +295,18 @@ class ParallelEnvManager(object):
             task_exp_configs (List[TaskExpConfig]): A list of experience configurations corresponding to each task.
             mode (Literal["sample", "validate"]): The mode of operation, either 'sample' or 'validate'.
             epoch (str): The current epoch identifier, used for logging and progress bar.
+            n_rollout_override (Optional[int]): Override the number of rollouts per task (for LUFFY-style mixing).
+                If provided, this value will be used instead of the default rollout_n.
 
         Returns:
             List[Trajectory]: A sorted list of Trajectory objects representing the results of the successfully completed tasks.
         """
         traj_cmt_array = []
-        base_rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
+        # ⭐ LUFFY: 支持 n_rollout_override 参数
+        if n_rollout_override is not None:
+            base_rollout_n = n_rollout_override
+        else:
+            base_rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
         future_to_params: Dict[Future, Tuple[Task, TrajExpConfig, str, str, str, int, dict, list[bool]]] = {}
 
         # ⭐ Experience Replay: 计算每个 task 的实际 on-policy rollout 数量

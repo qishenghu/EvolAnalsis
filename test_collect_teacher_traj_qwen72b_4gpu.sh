@@ -65,6 +65,10 @@ python scripts/collect_teacher_trajectories.py \
 # --gpu_memory_utilization 0.88    # GPU内存使用率88%（留12%缓冲）
 # --max_num_seqs 512                # vLLM并发序列数（512-1024之间，根据内存调整）
 # 
+# ⚠️ 注意：代码中已自动设置 enforce_eager=True 来禁用 CUDA Graph
+#    这可以避免多 GPU tensor parallel 下的 NCCL 卡住问题
+#    虽然会略微降低性能，但能保证稳定性
+# 
 # 【采集配置】
 # --n_per_task 10                  # 每个task采集10个rollouts
 # --max_workers 8                   # 8个并行worker（由于vLLM使用锁保护，建议8-12）
@@ -92,6 +96,12 @@ python scripts/collect_teacher_trajectories.py \
 #    - 如果GPU内存不足（OOM）：降低到 256
 #    - 如果GPU利用率低：可以提高到 1024
 #    - 72B模型在4卡80G上，512通常是最优值
+# 
+# 2.5. 【CUDA Graph 说明】
+#    - ⚠️ 代码已自动设置 enforce_eager=True（禁用 CUDA Graph）
+#    - 这可以避免多 GPU tensor parallel 下的 NCCL 卡住问题
+#    - 虽然会略微降低性能（约5-10%），但能保证稳定性
+#    - 如果单 GPU 或不需要 tensor parallel，可以尝试移除 enforce_eager
 # 
 # 3. 【gpu_memory_utilization 调整】
 #    - 如果经常OOM：降低到 0.8-0.85

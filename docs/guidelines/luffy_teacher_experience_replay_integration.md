@@ -1,9 +1,17 @@
 # LUFFY Teacher Experience Replay 集成分析
 
 > **状态**: ✅ 实现完成  
-> **更新日期**: 2026-01-04
+> **更新日期**: 2026-01-07
 
 本文档分析如何在 AgentEvolver 中集成 LUFFY 风格的 Teacher Experience Replay 算法，在现有 ExGRPO（self-generated experience replay）基础上增加外部 Teacher 轨迹支持。
+
+> ⚠️ **重要设计变更（2026-01-05）**：  
+> LUFFY 的混合粒度是 **Rollout 级别**（每个 task 内部混合 on-policy 和 teacher rollouts），而不是 ExGRPO 的 **Task 级别**（某些 tasks 全部用 replay，某些 tasks 全部用 on-policy）。本文档已更新以反映这一关键设计差异。
+>
+> **代码实现完成（2026-01-07）**：  
+> - `LUFFYTeacherRolloutMixer` 类已实现 Rollout 级别混合逻辑
+> - `ExperienceManager` 已支持 `n_teacher_rollouts_per_task` 配置
+> - Trainer 已支持 `mix_mode: rollout_level` 配置
 
 ## ⭐ 快速开始
 
@@ -42,9 +50,10 @@ exp_manager:
   teacher_experience:
     enable: true
     data_path: "data/teacher_trajectories/alfworld_qwen72b.jsonl"
-    exp_ratio: 0.2
-    max_trajectories_per_task: 3
-    use_log_prob: true  # vLLM 模型有 log_prob
+    # ⭐ LUFFY 风格：每个 task 内混入的 teacher rollout 数量
+    n_teacher_rollouts_per_task: 1  # 每个 task 的 8 个 rollouts 中有 1 个是 teacher
+    max_trajectories_per_task: 3    # 每个 task 最多存储 3 条 teacher 轨迹
+    use_log_prob: true              # vLLM 模型有 log_prob
 ```
 
 ### 3. 启动训练
@@ -105,6 +114,38 @@ LUFFY 引入外部 Teacher 模型的轨迹：
 | **采集时机** | 训练过程中动态采集 | 预先采集或训练时在线采集 |
 | **Importance Sampling** | `ratio = π_current / π_old` | `ratio = π_current / 1 = π_current`（简化） |
 | **Policy Shaping** | 可选 | 推荐使用 `f(x) = x/(x+β)` |
+| ⭐ **混合粒度** | **Task 级别**：某些 tasks 全部用 replay | **Rollout 级别**：每个 task 内部混合 |
+
+### ⭐⭐ 关键设计差异：混合粒度
+
+这是 LUFFY 和 ExGRPO 最核心的设计差异：
+
+**ExGRPO（Task 级别混合）**：
+```
+Batch: 8 tasks × 8 rollouts/task = 64 rollouts
+├── Task 1: 8 rollouts (全部 on-policy)
+├── Task 2: 8 rollouts (全部 off-policy/replay)  ← exp_ratio 控制多少 tasks 用 replay
+├── Task 3: 8 rollouts (全部 on-policy)
+├── Task 4: 8 rollouts (全部 off-policy/replay)
+├── ...
+某些 tasks 100% on-policy，某些 tasks 100% off-policy
+```
+
+**LUFFY（Rollout 级别混合）**：
+```
+Batch: 8 tasks × 8 rollouts/task = 64 rollouts
+├── Task 1: 7 on-policy + 1 teacher  ← 每个 task 内部混合
+├── Task 2: 7 on-policy + 1 teacher
+├── Task 3: 7 on-policy + 1 teacher
+├── Task 4: 7 on-policy + 1 teacher
+├── ...
+每个 task 都同时包含 on-policy 和 teacher rollouts
+```
+
+**为什么 LUFFY 这样设计？**
+1. **GRPO 算法需要**：GRPO 对同一 task 的多个 rollouts 计算 group-relative advantage
+2. **混合学习信号**：每个 task 的 GRPO 计算同时受到 on-policy（探索）和 teacher（指导）的影响
+3. **更稳定的梯度**：避免 batch 中某些 tasks 完全依赖 off-policy 数据
 
 ### 关键公式差异
 
@@ -1389,116 +1430,281 @@ if teacher_exp_tasks:
         )
 ```
 
-### 4.4 ExperienceMixCollateFn 扩展
+### 4.4 ⭐ LUFFY 风格的 Rollout 级别混合（核心设计变更）
+
+> **重要**：LUFFY 的混合粒度是 **Rollout 级别**，不是 Task 级别。这意味着：
+> - 每个 task 内部同时包含 on-policy 和 teacher rollouts
+> - 例如：8 rollouts/task = 7 on-policy + 1 teacher
+> - GRPO 计算时，同一 task 的所有 rollouts（包括 on-policy 和 teacher）一起计算 group-relative advantage
 
 ```python
-# agentevolver/module/exp_manager/experience_collate.py
+# agentevolver/module/exp_manager/teacher_experience_mixer.py
+# 
+# ⭐ LUFFY 风格：Rollout 级别混合，每个 task 内部混入 teacher rollouts
 
-class ExperienceMixCollateFn:
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+import random
+from loguru import logger
+
+from agentevolver.schema.trajectory import Trajectory
+from agentevolver.schema.task import Task
+
+
+@dataclass
+class TaskRolloutConfig:
     """
-    扩展的 Experience 混合函数，支持三种数据类型：
-    1. On-policy: 当前策略生成的新轨迹
-    2. Self-generated off-policy: 自身历史成功轨迹（ExGRPO）
-    3. Teacher off-policy: 外部 Teacher 模型的轨迹（LUFFY）
+    每个 task 的 rollout 配置
     
-    ⭐ 设计变更：使用统一的 ExperienceManager（不再分离 TeacherExperienceManager）
+    ⭐ LUFFY 风格：指定每个 task 内部的 on-policy 和 teacher rollout 数量
+    """
+    task_id: str
+    n_onpolicy_rollouts: int    # 该 task 需要生成的 on-policy rollout 数量
+    teacher_trajectories: List[Trajectory]  # 该 task 使用的 teacher trajectories
+
+
+class LUFFYTeacherExperienceMixer:
+    """
+    LUFFY 风格的 Teacher Experience 混合器
+    
+    ⭐ 核心设计：Rollout 级别混合
+    - 不是选择某些 tasks 用 teacher，某些用 on-policy
+    - 而是每个 task 内部同时包含 on-policy 和 teacher rollouts
+    
+    示例：
+        n_rollout = 8, n_teacher_rollouts_per_task = 1
+        → 每个 task: 7 on-policy rollouts + 1 teacher trajectory
+        
+        n_rollout = 8, n_teacher_rollouts_per_task = 2
+        → 每个 task: 6 on-policy rollouts + 2 teacher trajectories
+    
+    与 ExGRPO 的区别：
+        ExGRPO: batch 中 30% tasks 全部用 replay，70% tasks 全部用 on-policy
+        LUFFY:  batch 中每个 task 都混合使用 on-policy 和 teacher
     """
     
     def __init__(
         self,
-        exp_manager,  # ⭐ 统一的 ExperienceManager（同时管理 self-generated 和 teacher）
-        train_task_manager,
-        # Self-generated experience 配置
-        self_exp_ratio: float = 0.3,
-        # Teacher experience 配置
-        teacher_exp_ratio: float = 0.2,
-        teacher_exp_enabled: bool = True,
-        # 共同配置
-        n_rollout: int = 8,
-        offpolicy_trajectories_per_task: int = 1,
-        replay_start_ratio: float = 0.35,
-        **kwargs,
+        exp_manager,  # ExperienceManager 实例
+        n_rollout: int = 8,  # 每个 task 的总 rollout 数量
+        n_teacher_rollouts_per_task: int = 1,  # ⭐ 每个 task 混入的 teacher rollout 数量
+        teacher_select_mode: str = "confidence",  # teacher 轨迹选择模式
+        replay_start_ratio: float = 0.0,  # 训练进度达到此比例后开始混入 teacher
     ):
-        self.exp_manager = exp_manager  # ⭐ 统一的 manager
-        self.train_task_manager = train_task_manager
-        self.self_exp_ratio = self_exp_ratio
-        self.teacher_exp_ratio = teacher_exp_ratio
-        self.teacher_exp_enabled = teacher_exp_enabled and exp_manager.teacher_enabled
+        self.exp_manager = exp_manager
         self.n_rollout = n_rollout
-        self.offpolicy_trajectories_per_task = offpolicy_trajectories_per_task
+        self.n_teacher_rollouts_per_task = n_teacher_rollouts_per_task
+        self.teacher_select_mode = teacher_select_mode
         self.replay_start_ratio = replay_start_ratio
+        
+        # 验证配置
+        if n_teacher_rollouts_per_task >= n_rollout:
+            raise ValueError(
+                f"n_teacher_rollouts_per_task ({n_teacher_rollouts_per_task}) "
+                f"must be less than n_rollout ({n_rollout})"
+            )
     
-    def __call__(
+    def prepare_task_rollout_configs(
         self,
-        training_tasks: List[Task],
-        training_progress: float,
-        enable_replay: bool = True,
-    ) -> Tuple[List[Task], List[Task], List[Task]]:
+        tasks: List[Task],
+        training_progress: float = 1.0,
+    ) -> List[TaskRolloutConfig]:
         """
-        混合三种类型的 tasks
+        为每个 task 准备 rollout 配置
         
-        ⭐ Multi-turn 支持：所有轨迹格式一致，无需额外处理
+        ⭐ LUFFY 核心逻辑：
+        1. 对于有 teacher 轨迹的 task：混入 n_teacher_rollouts_per_task 条 teacher
+        2. 对于没有 teacher 轨迹的 task：全部使用 on-policy
         
+        Args:
+            tasks: 当前 batch 的 tasks
+            training_progress: 训练进度 (0.0 ~ 1.0)
+            
         Returns:
-            - self_exp_tasks: 使用 self-generated experience 的 tasks
-            - teacher_exp_tasks: 使用 teacher experience 的 tasks
-            - on_policy_tasks: 纯 on-policy 的 tasks
+            每个 task 的 rollout 配置列表
         """
-        batch_size = len(training_tasks)
+        configs = []
         
-        # 检查是否达到 replay 开始条件
-        if not enable_replay or training_progress < self.replay_start_ratio:
-            return [], [], training_tasks
+        # 检查是否达到开始混入 teacher 的条件
+        enable_teacher = (
+            training_progress >= self.replay_start_ratio and
+            self.exp_manager.teacher_enabled and
+            self.n_teacher_rollouts_per_task > 0
+        )
         
-        # 计算各类型的 task 数量
-        target_self_exp_count = int(batch_size * self.self_exp_ratio)
-        target_teacher_exp_count = int(batch_size * self.teacher_exp_ratio) if self.teacher_exp_enabled else 0
+        for task in tasks:
+            task_id = task.task_id
+            
+            # 获取该 task 的 teacher 轨迹
+            teacher_trajs = []
+            if enable_teacher and self.exp_manager.has_teacher_trajectory(task_id):
+                teacher_trajs = self.exp_manager.get_teacher_trajectories(
+                    task_ids=[task_id],
+                    num_per_task=self.n_teacher_rollouts_per_task,
+                )
+            
+            # 计算 on-policy rollout 数量
+            n_teacher = len(teacher_trajs)
+            n_onpolicy = self.n_rollout - n_teacher
+            
+            configs.append(TaskRolloutConfig(
+                task_id=task_id,
+                n_onpolicy_rollouts=n_onpolicy,
+                teacher_trajectories=teacher_trajs,
+            ))
+            
+            if n_teacher > 0:
+                logger.debug(
+                    f"Task {task_id}: {n_onpolicy} on-policy + {n_teacher} teacher rollouts"
+                )
         
-        # 获取可用的 self-generated experience task_ids（从统一的 exp_manager）
-        valid_self_exp_task_ids = self.exp_manager.get_valid_replay_task_ids()
+        # 统计
+        total_onpolicy = sum(c.n_onpolicy_rollouts for c in configs)
+        total_teacher = sum(len(c.teacher_trajectories) for c in configs)
+        logger.info(
+            f"[LUFFYMixer] Batch config: {len(tasks)} tasks, "
+            f"{total_onpolicy} on-policy + {total_teacher} teacher rollouts"
+        )
         
-        # 获取可用的 teacher experience task_ids（从统一的 exp_manager）
-        valid_teacher_task_ids = []
-        if self.teacher_exp_enabled:
-            valid_teacher_task_ids = self.exp_manager.get_valid_teacher_task_ids()
-        
-        # 采样 self-generated experience tasks
-        n_self_exp = min(len(valid_self_exp_task_ids), target_self_exp_count)
-        sampled_self_exp_task_ids = random.sample(valid_self_exp_task_ids, n_self_exp) if n_self_exp > 0 else []
-        
-        # 采样 teacher experience tasks
-        # 优先选择没有在 self_exp 中的 task，避免同一 task 同时用两种 off-policy
-        available_teacher_task_ids = [
-            tid for tid in valid_teacher_task_ids 
-            if tid not in sampled_self_exp_task_ids
-        ]
-        n_teacher_exp = min(len(available_teacher_task_ids), target_teacher_exp_count)
-        sampled_teacher_task_ids = random.sample(available_teacher_task_ids, n_teacher_exp) if n_teacher_exp > 0 else []
-        
-        # 转换为 Task 对象
-        self_exp_tasks = self._task_ids_to_tasks(sampled_self_exp_task_ids)
-        teacher_exp_tasks = self._task_ids_to_tasks(sampled_teacher_task_ids)
-        
-        # 补充 on-policy tasks
-        used_task_ids = set(sampled_self_exp_task_ids + sampled_teacher_task_ids)
-        on_policy_tasks = [t for t in training_tasks if t.task_id not in used_task_ids]
-        n_on_policy = batch_size - len(self_exp_tasks) - len(teacher_exp_tasks)
-        on_policy_tasks = on_policy_tasks[:n_on_policy]
-        
-        logger.debug(f"[ExperienceMixCollateFn] Batch split: "
-                    f"self_exp={len(self_exp_tasks)}, teacher_exp={len(teacher_exp_tasks)}, "
-                    f"on_policy={len(on_policy_tasks)}")
-        
-        return self_exp_tasks, teacher_exp_tasks, on_policy_tasks
+        return configs
     
-    def _task_ids_to_tasks(self, task_ids: List[str]) -> List[Task]:
-        """将 task_id 转换为 Task 对象"""
-        tasks = []
-        for task_id in task_ids:
-            task = self.train_task_manager.get_task_by_id(task_id)
-            if task is not None:
-                tasks.append(task)
-        return tasks
+    def get_batch_teacher_ratio(self, configs: List[TaskRolloutConfig]) -> float:
+        """计算 batch 中 teacher rollouts 的比例"""
+        total_rollouts = len(configs) * self.n_rollout
+        total_teacher = sum(len(c.teacher_trajectories) for c in configs)
+        return total_teacher / total_rollouts if total_rollouts > 0 else 0.0
+
+
+# ============================================================
+# 与 EnvManager 集成的示例
+# ============================================================
+
+def luffy_style_rollout(
+    env_manager,
+    tasks: List[Task],
+    task_rollout_configs: List[TaskRolloutConfig],
+    agent_flow,
+    tokenizer,
+) -> List[Trajectory]:
+    """
+    LUFFY 风格的 rollout：每个 task 内部混合 on-policy 和 teacher
+    
+    ⭐ 核心流程：
+    1. 对于每个 task，执行 n_onpolicy_rollouts 次 on-policy rollout
+    2. 将 teacher_trajectories 作为额外的 rollouts 加入
+    3. 所有 rollouts 一起参与 GRPO 计算
+    """
+    all_trajectories = []
+    
+    for task, config in zip(tasks, task_rollout_configs):
+        # Step 1: 执行 on-policy rollouts
+        onpolicy_trajs = env_manager.rollout_single_task(
+            task=task,
+            n_rollout=config.n_onpolicy_rollouts,
+            agent_flow=agent_flow,
+        )
+        
+        # Step 2: 添加 teacher trajectories（标记为 off-policy）
+        teacher_trajs = config.teacher_trajectories
+        for traj in teacher_trajs:
+            traj.metadata["is_teacher"] = True
+            traj.metadata["is_experience_replay"] = True
+        
+        # Step 3: 合并 on-policy 和 teacher（同一 task 内部）
+        task_all_trajs = onpolicy_trajs + teacher_trajs
+        
+        # ⭐ 关键：设置相同的 data_id，使它们在 GRPO 中被分为同一组
+        data_id = task.task_id
+        for traj in task_all_trajs:
+            traj.data_id = data_id
+        
+        all_trajectories.extend(task_all_trajs)
+    
+    return all_trajectories
+```
+
+### 4.4.1 与现有 ExGRPO 的对比
+
+```python
+# ============================================================
+# ExGRPO 风格（Task 级别混合）- 现有实现
+# ============================================================
+
+# ExGRPO: 某些 tasks 全部用 replay，某些 tasks 全部用 on-policy
+def exgrpo_style_mix(tasks, exp_ratio=0.3):
+    """
+    ExGRPO: Task 级别混合
+    
+    batch 8 tasks:
+      - Task 1: 8 rollouts (全部 on-policy)
+      - Task 2: 8 rollouts (全部 replay)  ← 30% tasks 用 replay
+      - Task 3: 8 rollouts (全部 on-policy)
+      - ...
+    """
+    n_replay_tasks = int(len(tasks) * exp_ratio)
+    replay_tasks = tasks[:n_replay_tasks]
+    onpolicy_tasks = tasks[n_replay_tasks:]
+    return replay_tasks, onpolicy_tasks
+
+
+# ============================================================
+# LUFFY 风格（Rollout 级别混合）- 新设计
+# ============================================================
+
+# LUFFY: 每个 task 内部混合 on-policy 和 teacher
+def luffy_style_mix(tasks, n_rollout=8, n_teacher_per_task=1):
+    """
+    LUFFY: Rollout 级别混合
+    
+    batch 8 tasks:
+      - Task 1: 7 on-policy + 1 teacher
+      - Task 2: 7 on-policy + 1 teacher
+      - Task 3: 7 on-policy + 1 teacher
+      - ...
+    
+    每个 task 都同时包含 on-policy 和 teacher rollouts
+    """
+    configs = []
+    for task in tasks:
+        configs.append({
+            "task_id": task.task_id,
+            "n_onpolicy": n_rollout - n_teacher_per_task,
+            "n_teacher": n_teacher_per_task,
+        })
+    return configs
+```
+
+### 4.4.2 GRPO 计算中的影响
+
+```python
+# ⭐ LUFFY 风格对 GRPO 计算的影响
+#
+# GRPO 计算 group-relative advantage：
+#   A_i = r_i - mean(r_j for j in same_task)
+#
+# 在 LUFFY 中，同一个 task 的 rollouts 包括：
+#   - 7 个 on-policy rollouts（奖励来自 student model 的探索）
+#   - 1 个 teacher trajectory（奖励通常 = 1.0，成功的轨迹）
+#
+# 这意味着：
+#   1. Teacher 轨迹提供了一个 "正例" 的参考
+#   2. On-policy rollouts 的 advantage 会相对于这个 "正例" 计算
+#   3. 如果 on-policy 全部失败（reward=0），teacher 的 advantage > 0
+#   4. 如果 on-policy 部分成功，teacher 和成功的 on-policy 会竞争
+#
+# 示例：
+#   Task A: 7 on-policy (all reward=0) + 1 teacher (reward=1)
+#     - mean_reward = (0*7 + 1*1) / 8 = 0.125
+#     - on-policy advantages = 0 - 0.125 = -0.125 (负)
+#     - teacher advantage = 1 - 0.125 = 0.875 (正)
+#     → 模型学习 "teacher 的行为比当前策略好"
+#
+#   Task B: 6 on-policy (reward=0) + 1 on-policy (reward=1) + 1 teacher (reward=1)
+#     - mean_reward = (0*6 + 1*1 + 1*1) / 8 = 0.25
+#     - failed on-policy advantages = -0.25 (负)
+#     - successful on-policy advantage = 0.75 (正)
+#     - teacher advantage = 0.75 (正)
+#     → 模型同时从自己的成功和 teacher 学习
 ```
 
 ### 4.5 Multi-turn 场景的关键考虑
@@ -1599,28 +1805,30 @@ class TeacherTrajectorySchema:
 
 ### 6.1 YAML 配置示例
 
-**⭐ 方案 C 比例分配说明**：
+**⭐ LUFFY 风格：Rollout 级别混合**
 
 ```
-experience_replay.exp_ratio 定义总 off-policy 比例
-teacher_experience.exp_ratio 从总 off-policy 中分走一部分给 Teacher
-剩余的 off-policy 比例给 self-generated
+关键设计：每个 task 内部混合 on-policy 和 teacher rollouts
 
-示例：exp_ratio=0.5, teacher.exp_ratio=0.2
-  → self_exp = 0.3 (30%), teacher_exp = 0.2 (20%), on_policy = 0.5 (50%)
+n_rollout = 8, n_teacher_rollouts_per_task = 1
+  → 每个 task: 7 on-policy + 1 teacher
 
-好处：
-1. 向后兼容：添加 teacher_experience 不需要修改原 exp_ratio
-2. on-policy 比例保持稳定（始终为 1 - exp_ratio）
+n_rollout = 8, n_teacher_rollouts_per_task = 2
+  → 每个 task: 6 on-policy + 2 teacher
+
+与 ExGRPO 的区别：
+  ExGRPO: 某些 tasks 100% replay，某些 tasks 100% on-policy
+  LUFFY:  每个 task 都混合 on-policy + teacher
 ```
 
 ```yaml
 exp_manager:
   # ===== Self-Generated Experience Replay (ExGRPO) =====
+  # 注意：ExGRPO 是 Task 级别混合，与 LUFFY 不同
   experience_replay:
     enable: true
-    exp_ratio: 0.5                    # ⭐ 总 off-policy 比例（包含 self + teacher）
-    replay_start_ratio: 0.35          # 训练进度达到 35% 时开始 replay
+    exp_ratio: 0.3                    # ExGRPO: 30% tasks 使用 self-generated replay
+    replay_start_ratio: 0.35          # 训练进度达到 35% 时开始 ExGRPO replay
     offpolicy_trajectories_per_task: 1
     experience_lbound: 0
     experience_rbound: 8
@@ -1630,104 +1838,88 @@ exp_manager:
     use_current_policy_entropy: true
   
   # ===== Teacher Experience Replay (LUFFY) =====
+  # ⭐ 核心设计变更：Rollout 级别混合
   teacher_experience:
     enable: true                      # 是否启用 Teacher Experience
     data_path: "data/teacher_trajectories/alfworld_gpt4.jsonl"  # Teacher 轨迹文件路径
-    exp_ratio: 0.2                    # ⭐ Teacher 从总 off-policy 中占比
-                                      # 实际分配：self=30%, teacher=20%, on_policy=50%
-    max_trajectories_per_task: 3      # 每个 task 最多使用的 Teacher 轨迹数
-    select_mode: "entropy"            # ⭐ 轨迹选择模式
-                                      # - "random": 随机选择（默认）
+    
+    # ⭐⭐ LUFFY 核心配置：每个 task 内混入的 teacher rollout 数量
+    n_teacher_rollouts_per_task: 1    # 每个 task 的 N 个 rollouts 中有 1 个是 teacher
+                                      # 示例：n_rollout=8, n_teacher=1 → 7 on-policy + 1 teacher
+                                      # 范围：0 < n_teacher < n_rollout
+    
+    max_trajectories_per_task: 3      # 每个 task 最多存储的 Teacher 轨迹数（用于轮换）
+    
+    select_mode: "confidence"         # ⭐ 轨迹选择模式
+                                      # - "random": 随机选择
+                                      # - "confidence": 按 confidence 从高到低选择（推荐）
+                                      # - "entropy": 按 entropy 从低到高选择
                                       # - "first": 选择前 N 个
-                                      # - "all": 返回所有轨迹
-                                      # - "entropy": 按 entropy 从低到高排序选择
-                                      #   * 对于有 log_prob 的轨迹：直接计算 entropy
-                                      #   * 对于没有 log_prob 的轨迹：使用当前 policy 计算 entropy
-                                      #   * 两部分合并后按 entropy 从低到高排序
-                                      #   推荐：与 self-generated experience 的 exp_select_mode="argmin" 一致
+    
+    replay_start_ratio: 0.0           # 开始混入 teacher 的训练进度
+                                      # 0.0 表示从训练开始就混入 teacher
     
     # ⭐ Log Prob 配置（关键选项）
-    use_log_prob: false               # 是否使用 log_prob 进行重要性采样
-                                      # - true: 使用 ExGRPO 形式 ratio = π_current / π_old
-                                      #         适用于：开源模型采集的轨迹（有 log_prob）
-                                      # - false: 使用 LUFFY 形式 ratio = π_current（分母=1）
-                                      #          适用于：闭源 API 采集的轨迹（无 log_prob）
+    use_log_prob: true                # 是否使用 log_prob 进行重要性采样
+                                      # - true: ratio = π_current / π_old（需要 log_prob）
+                                      # - false: ratio = π_current（LUFFY 简化形式）
     
-    # Policy Shaping 配置（当 use_log_prob=false 时使用）
+    # Policy Shaping 配置
     policy_shaping:
       enable: true                    # 是否启用 policy shaping
       mode: "p_div_p_beta"            # Policy shaping 模式
-                                      # - "p_div_p_beta": f(x) = x / (x + β)，LUFFY 推荐
-                                      # - "sqrt": f(x) = sqrt(x)
-                                      # - "no_shaping": 不使用 shaping
-      beta: 0.1                       # β 参数（mode="p_div_p_beta" 时使用）
+      beta: 0.1                       # β 参数
     
     # Loss 计算配置
     loss:
       use_clip: false                 # Teacher 轨迹是否使用 clipping
       clip_upper_bound: 1.0           # 如果使用 clipping，上界
-  
-  # ===== Teacher Trajectory Collector（在线采集） =====
-  
-  # ===== Teacher 轨迹选择模式详解 =====
-  # 
-  # select_mode: "entropy" 模式说明：
-  # 
-  # 1. 对于有 log_prob 的轨迹（如 vLLM 采集的轨迹）：
-  #    - 直接使用轨迹中的 old_log_probs 计算 entropy
-  #    - entropy = -sum(p * log(p))，其中 p = exp(log_prob)
-  #    - 按 entropy 从低到高排序（低 entropy = 高确定性 = 高质量）
-  # 
-  # 2. 对于没有 log_prob 的轨迹（如 GPT-4 API 采集的轨迹）：
-  #    - 在 trainer 中使用当前 policy 计算 log_prob
-  #    - 然后计算 entropy 并排序
-  #    - 与 self-generated experience 的 exp_select_mode="argmin" 行为一致
-  # 
-  # 3. 最终选择：
-  #    - 两部分轨迹合并后按 entropy 从低到高排序
-  #    - 选择前 num_trajectories_per_task 个
-  # 
-  # 推荐配置：
-  #   - 如果 Teacher 轨迹有 log_prob：select_mode="entropy"（推荐）
-  #   - 如果 Teacher 轨迹无 log_prob：select_mode="entropy" 或 "random"
-  #   - 与 self-generated 的 exp_select_mode="argmin" 保持一致
-  # =====
-  teacher_collector:
-    enable: false                     # 是否启用在线采集（通常预采集更高效）
-    n_trajectories_per_task: 1        # 每个 task 采集的轨迹数
-    filter_success_only: true         # 只保留成功的轨迹
-    output_path: "data/teacher_trajectories/output.jsonl"  # 保存路径
-    
-    # ===== Teacher LLM 后端配置 =====
-    # 支持两种后端：OpenAI-compatible API 或 vLLM 本地模型
-    
-    teacher_llm:
-      type: "openai"                  # ⭐ 后端类型："openai" 或 "vllm"
-      
-      # --- OpenAI-compatible API 配置（type="openai" 时使用）---
-      model_name: "gpt-4"
-      api_base: "https://api.openai.com/v1"
-      api_key: "${OPENAI_API_KEY}"
-      temperature: 0.0
-      max_tokens: 4096
-      collect_log_prob: false         # 是否采集 log_prob（OpenAI API 可选支持）
-      
-      # --- vLLM 本地模型配置（type="vllm" 时使用）---
-      # model_path: "/path/to/qwen-72b"
-      # tensor_parallel_size: 4
-      # gpu_memory_utilization: 0.85
-      # trust_remote_code: true
-      # collect_log_prob: true        # vLLM 默认支持 log_prob
 
+# ⭐⭐ Rollout 配置
 actor_rollout_ref:
+  rollout:
+    n: 8                              # 每个 task 的总 rollout 数量
+                                      # 实际分配：n - n_teacher_rollouts_per_task 个 on-policy
+                                      #          + n_teacher_rollouts_per_task 个 teacher
+  
   actor:
     # Loss 计算配置
     off_policy_shaping_mode: "exgrpo_policy_shaping"  # Self-generated: ExGRPO 方式
     off_policy_shaping_beta: 0.1
     
-    # Teacher 轨迹特殊配置（当 use_log_prob=false 时生效）
+    # Teacher 轨迹特殊配置
     teacher_policy_shaping_mode: "p_div_p_beta"       # Teacher: LUFFY 方式
     teacher_policy_shaping_beta: 0.1
+```
+
+### 6.1.1 LUFFY vs ExGRPO 配置对比
+
+```yaml
+# ============================================================
+# ExGRPO 配置（Task 级别混合）
+# ============================================================
+# 
+# 8 tasks × 8 rollouts = 64 rollouts
+#   - 30% tasks (≈2 tasks) 全部使用 self-generated replay
+#   - 70% tasks (≈6 tasks) 全部使用 on-policy
+# 
+exp_manager:
+  experience_replay:
+    enable: true
+    exp_ratio: 0.3                    # 30% tasks 用 replay
+
+# ============================================================
+# LUFFY 配置（Rollout 级别混合）
+# ============================================================
+# 
+# 8 tasks × 8 rollouts = 64 rollouts
+#   - 每个 task: 7 on-policy + 1 teacher
+#   - 总计：56 on-policy + 8 teacher
+# 
+exp_manager:
+  teacher_experience:
+    enable: true
+    n_teacher_rollouts_per_task: 1    # 每个 task 混入 1 条 teacher
 ```
 
 ### 6.2 配置场景示例
@@ -1739,11 +1931,15 @@ exp_manager:
   teacher_experience:
     enable: true
     data_path: "data/teacher_trajectories/alfworld_gpt4.jsonl"
+    n_teacher_rollouts_per_task: 1    # ⭐ 每个 task 混入 1 条 teacher
     use_log_prob: false               # ⭐ 无 log_prob，使用 LUFFY 形式
     policy_shaping:
       enable: true
       mode: "p_div_p_beta"
       beta: 0.1
+
+# 结果：8 tasks × 8 rollouts
+#   每个 task: 7 on-policy + 1 teacher (GPT-4)
 ```
 
 #### 场景 2：使用 Qwen-72B 采集的轨迹（有 log_prob）
@@ -1753,28 +1949,42 @@ exp_manager:
   teacher_experience:
     enable: true
     data_path: "data/teacher_trajectories/alfworld_qwen72b.jsonl"
-    use_log_prob: true                # ⭐ 有 log_prob，使用 ExGRPO 形式
+    n_teacher_rollouts_per_task: 1    # ⭐ 每个 task 混入 1 条 teacher
+    use_log_prob: true                # ⭐ 有 log_prob，使用标准 importance sampling
     policy_shaping:
       enable: false                   # 有 log_prob 时通常不需要 shaping
+
+# 结果：8 tasks × 8 rollouts
+#   每个 task: 7 on-policy + 1 teacher (Qwen-72B, with log_prob)
 ```
 
-#### 场景 3：同时使用 Self-generated + Teacher（混合模式）
+#### 场景 3：同时使用 ExGRPO + LUFFY Teacher（混合两种 Replay 模式）
 
 ```yaml
 exp_manager:
+  # ExGRPO: Task 级别混合（某些 tasks 全部用 self-generated replay）
   experience_replay:
     enable: true
-    exp_ratio: 0.3                    # 30% self-generated
+    exp_ratio: 0.2                    # 20% tasks 用 self-generated replay
   
+  # LUFFY: Rollout 级别混合（每个 task 内混入 teacher）
   teacher_experience:
     enable: true
-    exp_ratio: 0.2                    # 20% teacher
+    n_teacher_rollouts_per_task: 1    # 每个 task 混入 1 条 teacher
     use_log_prob: false               # Teacher 来自 GPT-4，无 log_prob
     
-# 最终 batch 构成：
-# - 30% self-generated off-policy（使用 ExGRPO ratio）
-# - 20% teacher off-policy（使用 LUFFY ratio）
-# - 50% on-policy（使用标准 ratio ≈ 1.0）
+# 最终 batch 构成（8 tasks × 8 rollouts = 64 rollouts）：
+# 
+# ExGRPO tasks (20% = ~2 tasks):
+#   - Task A: 8 self-generated rollouts（全部 off-policy）
+#   - Task B: 8 self-generated rollouts（全部 off-policy）
+# 
+# LUFFY + On-policy tasks (80% = ~6 tasks):
+#   - Task C: 7 on-policy + 1 teacher
+#   - Task D: 7 on-policy + 1 teacher
+#   - ...
+# 
+# 注意：ExGRPO 和 LUFFY 可以同时使用，作用于不同的 tasks
 ```
 
 #### 场景 4：使用 vLLM 本地模型采集 Teacher 轨迹
@@ -1783,7 +1993,7 @@ exp_manager:
 exp_manager:
   teacher_collector:
     enable: true
-    n_trajectories_per_task: 2
+    n_trajectories_per_task: 2        # 每个 task 采集 2 条轨迹（用于轮换）
     filter_success_only: true
     output_path: "data/teacher_trajectories/alfworld_qwen72b.jsonl"
     
@@ -1800,6 +2010,8 @@ exp_manager:
   teacher_experience:
     enable: true
     data_path: "data/teacher_trajectories/alfworld_qwen72b.jsonl"
+    n_teacher_rollouts_per_task: 1    # ⭐ 每个 task 混入 1 条 teacher
+    max_trajectories_per_task: 2      # 与采集数量一致，用于轮换
     use_log_prob: true                # ⭐ 使用采集的 log_prob
 ```
 
@@ -1892,39 +2104,47 @@ exp_manager:
 
 ### Phase 3: 训练集成（2-3 天）
 
-7. **扩展 ExperienceMixCollateFn**
-   - 修改 `agentevolver/module/exp_manager/experience_collate.py`
-   - 支持三种数据类型混合
-   - 使用统一的 `exp_manager` 获取轨迹
+7. **⭐ 实现 LUFFY 风格的 Rollout 级别混合**
+   - 创建 `agentevolver/module/exp_manager/teacher_experience_mixer.py`
+   - 实现 `LUFFYTeacherExperienceMixer` 类
+   - 核心逻辑：为每个 task 准备 `n_onpolicy_rollouts + n_teacher_rollouts`
+   - 修改 `env_manager.rollout()` 支持混合 rollout 配置
 
-8. **修改 Loss 计算**
+8. **修改 EnvManager Rollout 流程**
+   - 在 `env_manager.py` 中支持 `TaskRolloutConfig`
+   - 每个 task 分别执行 on-policy rollout 和获取 teacher trajectory
+   - 合并时确保同一 task 的所有 rollouts 共享相同的 `data_id`
+
+9. **修改 Loss 计算**
    - 修改 `agentevolver/module/exp_manager/het_core_algos.py`
    - 添加 `teacher_mask` 参数
    - 实现 LUFFY 风格的 policy shaping（`ratio = π / (π + β)`）
    - Teacher 轨迹不使用 clipping
 
-9. **修改 Trainer**
-   - 修改 `agentevolver/module/trainer/ae_ray_trainer.py`
-   - 在数据准备阶段获取 Teacher 轨迹
-   - 生成 `teacher_mask` 并传递给 loss 计算
-   - 处理 Teacher 轨迹的 dataproto 转换
+10. **修改 Trainer**
+    - 修改 `agentevolver/module/trainer/ae_ray_trainer.py`
+    - 使用 `LUFFYTeacherExperienceMixer` 准备每个 task 的 rollout 配置
+    - 在 `_collect_training_trajectories()` 中支持混合 rollout
+    - 生成 `teacher_mask` 并传递给 loss 计算
 
-10. **扩展 env_manager**
+11. **扩展 env_manager**
     - 修改 `convert_offpolicy_to_cmt()` 识别 Teacher 轨迹
     - 在 `samples_to_dataproto()` 中生成 `teacher_mask`
+    - 确保 GRPO 分组正确（同一 task 的 on-policy + teacher 在同一组）
 
 ### Phase 4: 测试与验证（1-2 天）
 
-11. **单元测试**
+12. **单元测试**
     - `test_exp_manager_teacher.py`：ExperienceManager Teacher 功能
     - `test_teacher_llm_backends.py`：测试 OpenAI 和 vLLM 两种后端
     - `test_teacher_collector.py`：TeacherTrajectoryCollector
     - `test_loss_computation_teacher.py`：LUFFY loss 计算
-    - `test_experience_mix_three_types.py`：三种数据类型混合
+    - `test_luffy_rollout_mixing.py`：⭐ LUFFY Rollout 级别混合
+    - `test_grpo_with_teacher.py`：⭐ GRPO 计算包含 teacher rollouts
 
-12. **集成测试**
+13. **集成测试**
     - 预采集 Teacher 轨迹（使用 GPT-4 或本地 vLLM 模型）
-    - 运行混合训练（Self-generated + Teacher + On-policy）
+    - 运行 LUFFY 风格混合训练（每个 task: on-policy + teacher）
     - 验证 Multi-turn 场景的 mask 正确性
     - 对比 ExGRPO-only vs LUFFY+ExGRPO 训练效果
     - 对比有/无 log_prob 的 Teacher 轨迹训练效果
@@ -2770,11 +2990,22 @@ python -m agentevolver.main \
 
 | 决策点 | 选择 | 原因 |
 |--------|------|------|
+| ⭐ **混合粒度** | **Rollout 级别**（每个 task 内混合） | LUFFY 原论文设计，GRPO 需要同一 task 的多个 rollouts |
 | Teacher Experience 存储 | 扩展现有 `ExperienceManager` | 便于混合使用 LUFFY + ExGRPO，共享基础设施 |
 | Teacher Trajectory 采集 | 复用 `EnvManager.rollout()` | 数据格式一致，Multi-turn 自动支持 |
 | LLM 调用 | 通过 `TeacherAgentFlow` 替换 `agent_flow` | 保持接口一致，最小化修改 |
 | Teacher LLM 后端 | 支持 OpenAI API + vLLM 双后端 | 兼容闭源 API 和开源本地模型，VERL 默认使用 vLLM |
 | Log Prob 处理 | 配置化 `use_log_prob` 选项 | 灵活支持有/无 log_prob 的不同场景 |
+
+### A.0 ⭐ LUFFY vs ExGRPO 混合粒度对比
+
+| 特性 | LUFFY | ExGRPO |
+|------|-------|--------|
+| **混合粒度** | Rollout 级别 | Task 级别 |
+| **配置参数** | `n_teacher_rollouts_per_task: 1` | `exp_ratio: 0.3` |
+| **含义** | 每个 task: 7 on-policy + 1 teacher | 30% tasks 用 replay |
+| **GRPO 分组** | 同一 task 的 on-policy + teacher 在同一组 | replay tasks 和 on-policy tasks 分开 |
+| **适用场景** | Teacher 轨迹引导学习 | 自身历史经验复用 |
 
 ### A.1 Teacher LLM 后端选择指南
 
@@ -2793,9 +3024,9 @@ python -m agentevolver.main \
 |------|-------------|---------|----------|
 | `ExperienceManager` | ⭐ 中等 | 扩展 | 添加 `teacher_task2trajectories`、`load_teacher_trajectories()` 等 |
 | `het_core_algos.py` | 中等 | 扩展 | 添加 `teacher_mask` 和 LUFFY policy shaping |
-| `ExperienceMixCollateFn` | 中等 | 扩展 | 支持三种数据类型，使用统一的 `exp_manager` |
-| `ae_ray_trainer.py` | 中等 | 扩展 | 处理 `teacher_mask`，获取 Teacher 轨迹 |
-| `env_manager.py` | 轻微 | 扩展 | `convert_offpolicy_to_cmt` 识别 Teacher 轨迹 |
+| `ae_ray_trainer.py` | ⭐ 较大 | 扩展 | 支持 Rollout 级别混合，处理 `teacher_mask` |
+| `env_manager.py` | 中等 | 扩展 | 支持混合 rollout 配置，`convert_offpolicy_to_cmt` 识别 Teacher |
+| ⭐ 新增 `teacher_experience_mixer.py` | 新文件 | - | LUFFY 风格 Rollout 级别混合器 |
 | ⭐ 新增 `teacher_collector.py` | 新文件 | - | Teacher 轨迹采集器 |
 | ⭐ 新增 `teacher_agent_flow.py` | 新文件 | - | Teacher LLM 调用封装 |
 
@@ -2806,8 +3037,15 @@ python -m agentevolver.main \
 - [ ] **exp_mask 生成**：只对 LLM 响应位置（`loss_mask=1`）设置 `exp_mask=1`
 - [ ] **response_mask 计算**：基于 `loss_mask`，只包含 LLM tokens
 - [ ] **teacher_mask 新增**：标记 Teacher 轨迹位置，用于 loss 计算时区分
-- [ ] **data_id 分配**：同一 task 的 on-policy 和 off-policy 共享 data_id（GRPO 分组）
+- [ ] ⭐ **data_id 分配（LUFFY 关键）**：同一 task 的 on-policy 和 teacher rollouts 必须共享相同的 `data_id`，确保 GRPO 将它们分为同一组
 - [ ] **author 设置**：LLM 消息保持 `author="llm"`，确保 `loss_mask=1`
+
+#### ⭐ LUFFY Rollout 级别混合检查
+
+- [ ] **n_teacher_rollouts_per_task 配置**：确保 `n_teacher < n_rollout`
+- [ ] **TaskRolloutConfig 生成**：每个 task 正确计算 `n_onpolicy_rollouts = n_rollout - n_teacher`
+- [ ] **GRPO 分组正确**：同一 task 的 7 on-policy + 1 teacher 在同一组计算 advantage
+- [ ] **Rollout 执行顺序**：先执行 on-policy，再添加 teacher（或并行）
 
 #### ⭐ Log Prob 处理检查
 
@@ -2834,26 +3072,29 @@ python -m agentevolver.main \
 
 ### E. 文件新增/修改一览
 
-> **✅ 已实现文件** - 以下所有文件已经创建并完成实现
+> **🔄 设计修订中** - 根据 LUFFY 原论文的 Rollout 级别混合设计进行更新
 
 ```
 agentevolver/
 ├── module/
 │   ├── exp_manager/
 │   │   ├── exp_manager.py           # ✅ 修改：添加 teacher_task2trajectories、load_teacher_trajectories() 等
-│   │   ├── experience_collate.py    # ✅ 修改：新增 TeacherExperienceMixCollateFn 支持三种数据类型
-│   │   ├── het_core_algos.py        # ✅ 修改：新增 het_compute_teacher_aware_loss() 支持 teacher_mask
-│   │   └── teacher_collector.py     # ✅ 新增：TeacherTrajectoryCollector 轨迹采集器
+│   │   ├── teacher_experience_mixer.py  # ⭐ 新增：LUFFYTeacherExperienceMixer（Rollout 级别混合）
+│   │   ├── het_core_algos.py        # 🔄 待修改：添加 teacher_mask 和 LUFFY policy shaping
+│   │   └── teacher_collector.py     # 🔄 待实现：TeacherTrajectoryCollector 轨迹采集器
 │   │
-│   ├── teacher/                     # ✅ 新增：Teacher LLM 后端模块
-│   │   ├── __init__.py              # ✅ 模块导出
-│   │   ├── base_teacher_llm.py      # ✅ 抽象基类 BaseTeacherLLM
-│   │   ├── openai_teacher_llm.py    # ✅ OpenAI-compatible API 后端
-│   │   ├── vllm_teacher_llm.py      # ✅ vLLM 本地推理后端 + create_teacher_llm() 工厂函数
-│   │   └── teacher_agent_flow.py    # ✅ TeacherAgentFlow 适配层
+│   ├── teacher/                     # 🔄 待实现：Teacher LLM 后端模块
+│   │   ├── __init__.py              # 模块导出
+│   │   ├── base_teacher_llm.py      # 抽象基类 BaseTeacherLLM
+│   │   ├── openai_teacher_llm.py    # OpenAI-compatible API 后端
+│   │   ├── vllm_teacher_llm.py      # vLLM 本地推理后端 + create_teacher_llm() 工厂函数
+│   │   └── teacher_agent_flow.py    # TeacherAgentFlow 适配层
+│   │
+│   ├── env_manager/
+│   │   └── env_manager.py           # 🔄 待修改：支持混合 rollout 配置
 │   │
 │   └── trainer/
-│       └── ae_ray_trainer.py        # ✅ 修改：集成 TeacherExperienceMixCollateFn
+│       └── ae_ray_trainer.py        # 🔄 待修改：集成 LUFFYTeacherExperienceMixer
 │
 └── ...
 

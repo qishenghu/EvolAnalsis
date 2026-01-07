@@ -229,7 +229,18 @@ exp_manager:
   # ============================================================================
   # Teacher Experience Replay Configuration (ENABLED - LUFFY Style)
   # ============================================================================
-  # ⭐ 使用预采集的 Teacher 轨迹进行经验回放
+  # ⭐ LUFFY 风格：Rollout 级别混合（每个 task 内部混合 on-policy 和 teacher rollouts）
+  #
+  # 与 ExGRPO Task 级别混合的区别：
+  # - ExGRPO: batch 中某些 task 完全是 replay，某些完全是 on-policy
+  # - LUFFY:  每个 task 的 n 个 rollouts 中，部分是 on-policy，部分是 teacher
+  #
+  # 例如：batch_size=8, n_rollout=8, n_teacher_rollouts_per_task=1
+  #   Task 1: 7 on-policy + 1 teacher    ← 同一 task 内混合
+  #   Task 2: 7 on-policy + 1 teacher
+  #   ...
+  #   Task 8: 7 on-policy + 1 teacher
+  #   → GRPO 在同一 task 内计算 advantage，teacher 的 reward 影响 on-policy 的 baseline
   #
   # 数据格式（JSONL，每行一个轨迹）：
   # {
@@ -253,19 +264,28 @@ exp_manager:
     # ⭐ 主开关：启用 Teacher Experience Replay
     enable: true
     
+    # ⭐ 混合模式：
+    # - "rollout_level": LUFFY 风格，每个 task 内混合 on-policy 和 teacher rollouts（推荐）
+    # - "task_level": ExGRPO 风格，batch 中某些 task 完全是 teacher experience（兼容旧版）
+    mix_mode: "rollout_level"
+    
     # ⭐ Teacher 轨迹数据路径（JSONL 格式）
     # 需要预先使用 scripts/collect_teacher_trajectories.py 采集
     data_path: "data/teacher_trajectories/alfworld_gpt4.jsonl"
     
-    # ⭐ Teacher 经验任务比例：每个 batch 中使用 teacher 经验的任务占比
-    # 例如：batch_size=8, exp_ratio=0.25
-    #   → 2 个 teacher experience tasks（使用 teacher 轨迹）
-    #   → 6 个 on-policy tasks（标准 rollout）
-    exp_ratio: 0.25
+    # ⭐⭐⭐ LUFFY 风格核心配置（mix_mode: rollout_level）⭐⭐⭐
+    # 每个 task 混入的 teacher rollout 数量
+    # 例如：n_rollout=8, n_teacher_rollouts_per_task=1
+    #   → 每个 task 有 7 个 on-policy + 1 个 teacher rollout
+    # 注意：n_teacher_rollouts_per_task < n_rollout
+    n_teacher_rollouts_per_task: 1
     
-    # 每个 task 获取的 Teacher 轨迹数量
-    # 通常设为 1，因为 teacher 轨迹质量较高
-    max_trajectories_per_task: 1
+    # ⭐ Task 级别配置（mix_mode: task_level，兼容旧版 ExGRPO 风格）
+    # 当 mix_mode=task_level 时使用此参数
+    # exp_ratio: 0.25  # batch 中 25% 的 task 使用 teacher experience
+    
+    # 每个 task 最多存储/使用的 Teacher 轨迹数量
+    max_trajectories_per_task: 3
     
     # ⭐ 轨迹选择模式
     # - "random": 随机选择（默认，简单高效）

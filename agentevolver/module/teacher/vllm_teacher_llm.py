@@ -90,6 +90,9 @@ class VLLMTeacherLLM(BaseTeacherLLM):
             "tensor_parallel_size": tensor_parallel_size,
             "gpu_memory_utilization": gpu_memory_utilization,
             "trust_remote_code": trust_remote_code,
+            # ⭐ 禁用 CUDA Graph，避免多 GPU tensor parallel 下的 NCCL 卡住问题
+            # 参考：https://github.com/vllm-project/vllm/issues/xxx
+            "enforce_eager": True,
         }
         if max_num_seqs is not None:
             llm_kwargs["max_num_seqs"] = max_num_seqs
@@ -103,7 +106,8 @@ class VLLMTeacherLLM(BaseTeacherLLM):
         
         logger.info(f"[VLLMTeacherLLM] Initialized with model={model_path}, "
                    f"tp={tensor_parallel_size}, gpu_mem={gpu_memory_utilization}, "
-                   f"max_num_seqs={max_num_seqs}, collect_log_prob={collect_log_prob}")
+                   f"max_num_seqs={max_num_seqs}, enforce_eager=True (disabled CUDA Graph for multi-GPU stability), "
+                   f"collect_log_prob={collect_log_prob}")
     
     def __call__(
         self, 

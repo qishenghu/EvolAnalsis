@@ -67,7 +67,11 @@ from agentevolver.utils.tracking import ValidationGenerationsLogger
 from agentevolver.module.adv_processor.adca_grpo_pipeline import apply_adca_grpo
 
 from agentevolver.module.exp_manager.exp_manager import ExperienceManager
-from agentevolver.module.exp_manager.experience_collate import ExperienceMixCollateFn, TeacherExperienceMixCollateFn
+from agentevolver.module.exp_manager.experience_collate import (
+    ExperienceMixCollateFn, 
+    TeacherExperienceMixCollateFn,
+    LUFFYTeacherRolloutMixer,
+)
 
 
 def parse_reward_from_dataproto(data: DataProto, return_dict=False) -> dict | torch.Tensor:
@@ -1896,38 +1900,67 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             enable_exp_replay = exp_replay_config.get("enable", False)
                             enable_teacher_exp = teacher_exp_config.get("enable", False) and self.exp_manager.teacher_enabled
                             
-                            experience_tasks = []
-                            teacher_exp_tasks = []  # ⭐ 新增：Teacher experience tasks
-                            offpolicy_cmt_array = []
-                            teacher_offpolicy_cmt_array = []  # ⭐ 新增：Teacher off-policy trajectories
+                            # ⭐ LUFFY vs ExGRPO: 检查混合模式
+                            # - "rollout_level": LUFFY 风格，每个 task 内混合 on-policy 和 teacher rollouts
+                            # - "task_level": ExGRPO 风格，batch 中某些 task 完全是 teacher experience
+                            teacher_mix_mode = teacher_exp_config.get("mix_mode", "rollout_level")
+                            use_luffy_rollout_level = (
+                                enable_teacher_exp and 
+                                teacher_mix_mode == "rollout_level"
+                            )
                             
-                            if enable_exp_replay or enable_teacher_exp:
+                            experience_tasks = []
+                            teacher_exp_tasks = []  # ⭐ Task 级别：Teacher experience tasks
+                            offpolicy_cmt_array = []
+                            teacher_offpolicy_cmt_array = []  # ⭐ Task 级别：Teacher off-policy trajectories
+                            luffy_mixer = None  # ⭐ Rollout 级别：LUFFY mixer
+                            
+                            if use_luffy_rollout_level:
+                                # ⭐⭐⭐ LUFFY 风格：Rollout 级别混合 ⭐⭐⭐
+                                # 每个 task 的 n 个 rollouts 中混合 on-policy 和 teacher rollouts
+                                n_teacher_rollouts = teacher_exp_config.get("n_teacher_rollouts_per_task", 1)
+                                n_rollout = self.config.actor_rollout_ref.rollout.n
+                                
+                                logger.info(
+                                    f"[LUFFY] Rollout-level mixing: "
+                                    f"n_rollout={n_rollout}, n_teacher_per_task={n_teacher_rollouts}, "
+                                    f"n_onpolicy_per_task={n_rollout - n_teacher_rollouts}"
+                                )
+                                
+                                # 创建 LUFFY mixer
+                                luffy_mixer = LUFFYTeacherRolloutMixer(
+                                    exp_manager=self.exp_manager,
+                                    n_teacher_rollouts_per_task=n_teacher_rollouts,
+                                    n_rollout=n_rollout,
+                                )
+                                
+                                # ⭐ 所有 tasks 都进行 on-policy rollout，但数量减少
+                                # 不需要修改 tasks 列表，因为我们会在 rollout 后混入 teacher
+                                # 注意：需要修改 rollout 的 n 参数
+                                
+                            elif enable_exp_replay or enable_teacher_exp:
+                                # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐
                                 # 计算当前训练进度
                                 training_progress = self.global_steps / self.total_training_steps
                                 replay_start_ratio = exp_replay_config.get("replay_start_ratio", 0.35)
                                 
                                 if training_progress >= replay_start_ratio:
                                     # ⭐ 判断是否使用 Teacher Experience
-                                    if enable_teacher_exp:
-                                        # ⭐ 方案 C：Teacher 从总 off-policy 比例中分走一部分
-                                        # 总 off-policy 比例 = exp_ratio（保持不变）
-                                        # teacher 占 teacher_exp_ratio，self-generated 占剩余部分
+                                    if enable_teacher_exp and teacher_mix_mode == "task_level":
+                                        # ⭐ Task 级别：Teacher 从总 off-policy 比例中分走一部分
                                         total_exp_ratio = exp_replay_config.get("exp_ratio", 0.5)
                                         teacher_exp_ratio = teacher_exp_config.get("exp_ratio", 0.2)
-                                        # 确保 teacher 不超过总比例
                                         teacher_exp_ratio = min(teacher_exp_ratio, total_exp_ratio)
-                                        # self-generated 占剩余部分
                                         self_exp_ratio = max(0.0, total_exp_ratio - teacher_exp_ratio)
                                         
                                         logger.info(
-                                            f"[Teacher Experience] 方案 C 比例分配: "
+                                            f"[Task-level] 比例分配: "
                                             f"total_exp={total_exp_ratio:.2f}, "
                                             f"self_exp={self_exp_ratio:.2f}, "
                                             f"teacher_exp={teacher_exp_ratio:.2f}, "
                                             f"on_policy={1-total_exp_ratio:.2f}"
                                         )
                                         
-                                        # 使用 TeacherExperienceMixCollateFn（支持三种类型）
                                         experience_mix_collate = TeacherExperienceMixCollateFn(
                                             exp_manager=self.exp_manager,
                                             train_task_manager=self.train_task_manager,
@@ -1944,45 +1977,41 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             training_progress=training_progress,
                                             enable_replay=True,
                                         )
-                                    else:
+                                    elif enable_exp_replay:
                                         # 使用原有的 ExperienceMixCollateFn（向后兼容）
-                                    experience_mix_collate = ExperienceMixCollateFn(
-                                        exp_manager=self.exp_manager,
-                                        train_task_manager=self.train_task_manager,
-                                        exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
-                                        replay_start_ratio=replay_start_ratio,
-                                        offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
-                                        n_rollout=self.config.actor_rollout_ref.rollout.n,
-                                    )
-                                    
-                                    experience_tasks, on_policy_tasks = experience_mix_collate(
-                                        training_tasks=tasks,
-                                        training_progress=training_progress,
-                                        enable_replay=True,
-                                    )
+                                        experience_mix_collate = ExperienceMixCollateFn(
+                                            exp_manager=self.exp_manager,
+                                            train_task_manager=self.train_task_manager,
+                                            exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
+                                            replay_start_ratio=replay_start_ratio,
+                                            offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
+                                            n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                        )
+                                        
+                                        experience_tasks, on_policy_tasks = experience_mix_collate(
+                                            training_tasks=tasks,
+                                            training_progress=training_progress,
+                                            enable_replay=True,
+                                        )
                                     
                                     # 合并 tasks（experience_tasks + teacher_exp_tasks + on_policy_tasks）
                                     tasks = experience_tasks + teacher_exp_tasks + on_policy_tasks
                                     
                                     # 为 self-generated experience tasks 获取 off-policy trajectories
                                     if experience_tasks:
-                                        # ⭐ ExGRPO 方式：使用当前 policy 计算 entropy 选择最优轨迹
                                         use_current_policy_entropy = exp_replay_config.get("use_current_policy_entropy", True)
                                         num_trajectories_per_task = exp_replay_config.get("offpolicy_trajectories_per_task", 1)
                                         
                                         if use_current_policy_entropy:
-                                            # 获取所有候选轨迹
                                             task_to_candidates = self.exp_manager.get_all_candidates_batch(
                                                 tasks=experience_tasks
                                             )
-                                            # 使用当前 policy 计算 entropy 选择最优轨迹
                                             offpolicy_trajectories = self._select_best_offpolicy_by_current_entropy(
                                                 task_to_candidates=task_to_candidates,
                                                 tasks=experience_tasks,
                                                 num_trajectories_per_task=num_trajectories_per_task,
                                             )
                                         else:
-                                            # 使用保存时的 entropy 选择轨迹
                                             offpolicy_trajectories = self.exp_manager.get_offpolicy_batch(
                                                 tasks=experience_tasks,
                                                 num_trajectories_per_task=num_trajectories_per_task,
@@ -1990,7 +2019,6 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             )
                                         
                                         if offpolicy_trajectories:
-                                            # ⭐ ExGRPO 设计：构建 task_id 到 data_id 的映射
                                             task_id_to_data_id = {
                                                 task.task_id: idx
                                                 for idx, task in enumerate(tasks)
@@ -2004,7 +2032,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             )
                                             logger.info(f"Got {len(offpolicy_cmt_array)} self-generated off-policy trajectories")
                                     
-                                    # ⭐ 新增：为 teacher experience tasks 获取 off-policy trajectories
+                                    # ⭐ Task 级别：为 teacher experience tasks 获取 off-policy trajectories
                                     if teacher_exp_tasks:
                                         teacher_num_per_task = teacher_exp_config.get("max_trajectories_per_task", 1)
                                         teacher_offpolicy_trajectories = self.exp_manager.get_teacher_offpolicy_batch(
@@ -2013,7 +2041,6 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         )
                                         
                                         if teacher_offpolicy_trajectories:
-                                            # ⭐ 如果 teacher_select_mode == 'entropy'，对没有 log_prob 的轨迹使用当前 policy 计算 entropy
                                             teacher_select_mode = teacher_exp_config.get("select_mode", "random")
                                             if teacher_select_mode == "entropy":
                                                 teacher_offpolicy_trajectories = self._select_best_teacher_by_current_entropy(
@@ -2022,7 +2049,6 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                                     num_trajectories_per_task=teacher_num_per_task,
                                                 )
                                             
-                                            # 构建 task_id 到 data_id 的映射
                                             task_id_to_data_id = {
                                                 task.task_id: idx
                                                 for idx, task in enumerate(tasks)
@@ -2034,7 +2060,6 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                                 tokenizer=self.tokenizer,
                                                 task_id_to_data_id=task_id_to_data_id
                                             )
-                                            # 标记为 teacher trajectory
                                             for cmt in teacher_offpolicy_cmt_array:
                                                 cmt.metadata["is_teacher"] = True
                                             logger.info(f"Got {len(teacher_offpolicy_cmt_array)} teacher off-policy trajectories")
@@ -2044,12 +2069,49 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                             # TODO enable tracing by jinli 0619
                             print("=" * 10 + "start fit rollout" + "=" * 10)
-                            trajectories = self.env_manager.rollout(tasks, task_exp_configs, mode="sample", epoch=f"train.{epoch}.{i}")  # ⭐ Generate trajectories using the environment manager
+                            
+                            # ⭐ LUFFY 模式：需要减少 on-policy rollout 数量
+                            rollout_n_override = None
+                            if use_luffy_rollout_level and luffy_mixer:
+                                rollout_n_override = luffy_mixer.get_n_onpolicy_rollouts_per_task()
+                                logger.info(f"[LUFFY] Reducing rollout n from {self.config.actor_rollout_ref.rollout.n} to {rollout_n_override}")
+                            
+                            trajectories = self.env_manager.rollout(
+                                tasks, 
+                                task_exp_configs, 
+                                mode="sample", 
+                                epoch=f"train.{epoch}.{i}",
+                                n_rollout_override=rollout_n_override,  # ⭐ LUFFY: 减少 on-policy 数量
+                            )
                             assert len(trajectories)>0, "{len(trajectories)=}?"
                             print("=" * 10 + "end fit rollout" + "=" * 10)
                             
                             # ⭐ Experience Replay: 更新 difficulty2task_dict 并合并轨迹
-                            if enable_exp_replay or enable_teacher_exp:
+                            if use_luffy_rollout_level and luffy_mixer:
+                                # ⭐⭐⭐ LUFFY 风格：Rollout 级别混合 ⭐⭐⭐
+                                # 更新 difficulty2task_dict（只用 on-policy 轨迹）
+                                self.exp_manager.update_difficulty2task_dict(trajectories)
+                                
+                                # 使用 LUFFY mixer 混入 teacher rollouts
+                                all_trajectories, luffy_stats = luffy_mixer.mix_trajectories(
+                                    on_policy_trajectories=trajectories,
+                                    tasks=tasks,
+                                )
+                                
+                                # 更新 metrics
+                                metrics.update({
+                                    "luffy/tasks_with_teacher": luffy_stats["tasks_with_teacher"],
+                                    "luffy/total_teacher_rollouts": luffy_stats["total_teacher"],
+                                    "luffy/total_onpolicy_rollouts": luffy_stats["total_onpolicy"],
+                                })
+                                
+                                logger.info(
+                                    f"[LUFFY] Mixed {luffy_stats['total_onpolicy']} on-policy + "
+                                    f"{luffy_stats['total_teacher']} teacher = {len(all_trajectories)} total"
+                                )
+                                
+                            elif enable_exp_replay or enable_teacher_exp:
+                                # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐
                                 # 更新 difficulty2task_dict（只用 on-policy 轨迹）
                                 self.exp_manager.update_difficulty2task_dict(trajectories)
                                 

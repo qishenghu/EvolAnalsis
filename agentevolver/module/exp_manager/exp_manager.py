@@ -72,7 +72,19 @@ class ExperienceManager(object):
         teacher_config = self.exp_manager_config.get("teacher_experience", {})
         self.teacher_enabled = teacher_config.get("enable", False)
         self.teacher_data_path = teacher_config.get("data_path", None)
+        
+        # ⭐ LUFFY 风格配置：混合模式
+        # - "rollout_level": LUFFY 风格，每个 task 内混合 on-policy 和 teacher rollouts
+        # - "task_level": ExGRPO 风格，batch 中某些 task 完全是 teacher experience
+        self.teacher_mix_mode = teacher_config.get("mix_mode", "rollout_level")
+        
+        # ⭐ LUFFY 风格：每个 task 混入的 teacher rollout 数量
+        # 例如：n_rollout=8, n_teacher_rollouts_per_task=1 → 7 on-policy + 1 teacher
+        self.n_teacher_rollouts_per_task = teacher_config.get("n_teacher_rollouts_per_task", 1)
+        
+        # Task 级别配置（兼容旧版 ExGRPO 风格）
         self.teacher_exp_ratio = teacher_config.get("exp_ratio", 0.2)
+        
         self.teacher_max_per_task = teacher_config.get("max_trajectories_per_task", 3)
         self.teacher_select_mode = teacher_config.get("select_mode", "random")
         self.teacher_use_log_prob = teacher_config.get("use_log_prob", False)
@@ -658,11 +670,20 @@ class ExperienceManager(object):
         elif data_path.endswith('.pkl'):
             with open(data_path, 'rb') as f:
                 trajectories = pickle.load(f)
-                for traj in trajectories:
-                    # 标记为 Teacher 轨迹
-                    if not hasattr(traj, 'metadata') or traj.metadata is None:
-                        traj.metadata = {}
-                    traj.metadata["is_teacher"] = True
+                for item in trajectories:
+                    # ⭐ 支持两种格式：
+                    # 1. Trajectory 对象（直接使用）
+                    # 2. 字典（由 filter_teacher_trajectories.py 生成，需要转换）
+                    if isinstance(item, dict):
+                        # 字典格式：转换为 Trajectory 对象
+                        traj = self._dict_to_teacher_trajectory(item)
+                    else:
+                        # Trajectory 对象：直接使用
+                        traj = item
+                        if not hasattr(traj, 'metadata') or traj.metadata is None:
+                            traj.metadata = {}
+                        traj.metadata["is_teacher"] = True
+                    
                     self.teacher_task2trajectories[traj.task_id].append(traj)
                     count += 1
         else:
@@ -959,6 +980,70 @@ class ExperienceManager(object):
             task_ids=task_ids,
             num_per_task=num_trajectories_per_task,
         )
+
+    def get_teacher_rollouts_for_luffy_mixing(
+        self,
+        tasks: List[Task],
+        n_teacher_rollouts_per_task: int = 1,
+    ) -> Dict[str, List[Trajectory]]:
+        """
+        ⭐ LUFFY 风格：为每个 task 获取 teacher rollouts 用于 rollout 级别混合。
+        
+        与 get_teacher_offpolicy_batch 的区别：
+        - get_teacher_offpolicy_batch: 返回扁平化的轨迹列表（Task 级别混合）
+        - get_teacher_rollouts_for_luffy_mixing: 返回 task_id -> trajectories 的字典（Rollout 级别混合）
+        
+        Args:
+            tasks: 任务列表（batch 中的所有 tasks）
+            n_teacher_rollouts_per_task: 每个 task 需要混入的 teacher rollout 数量
+            
+        Returns:
+            Dict[str, List[Trajectory]]: task_id -> teacher trajectories 的映射
+            - 只返回有 teacher 轨迹的 task
+            - 每个 task 最多返回 n_teacher_rollouts_per_task 条轨迹
+        """
+        result: Dict[str, List[Trajectory]] = {}
+        
+        for task in tasks:
+            task_id = task.task_id
+            
+            # 检查该 task 是否有 teacher 轨迹
+            if task_id not in self.teacher_task2trajectories:
+                continue
+            
+            teacher_trajs = self.teacher_task2trajectories[task_id]
+            if not teacher_trajs:
+                continue
+            
+            # 选择 teacher 轨迹
+            if len(teacher_trajs) <= n_teacher_rollouts_per_task:
+                selected = teacher_trajs.copy()
+            elif self.teacher_select_mode == "random":
+                import random
+                selected = random.sample(teacher_trajs, n_teacher_rollouts_per_task)
+            elif self.teacher_select_mode == "first":
+                selected = teacher_trajs[:n_teacher_rollouts_per_task]
+            else:
+                # 默认随机选择
+                import random
+                selected = random.sample(teacher_trajs, n_teacher_rollouts_per_task)
+            
+            # 为每条轨迹添加元数据
+            for traj in selected:
+                traj.metadata["is_teacher"] = True
+                traj.metadata["source"] = "teacher"
+                # 确保 data_id 与 task_id 一致（用于 GRPO 分组）
+                if not traj.data_id:
+                    traj.data_id = task_id
+            
+            result[task_id] = selected
+            
+        logger.info(
+            f"[LUFFY] Got teacher rollouts for {len(result)}/{len(tasks)} tasks, "
+            f"{n_teacher_rollouts_per_task} rollouts per task"
+        )
+        
+        return result
 
     def save_experience_pool_to_disk(self, save_dir: str) -> None:
         """
