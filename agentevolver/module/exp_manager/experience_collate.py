@@ -440,12 +440,32 @@ class LUFFYTeacherRolloutMixer:
         """
         from collections import defaultdict
         
-        # 按 task_id/data_id 分组 on-policy CMT
+        # ⭐ 按 task_id 分组 on-policy CMT
+        # 注意：CMT 对象的 task_id 属性存储的是真正的 task_id（如 "pick_cool_then_place..."）
+        # 而 data_id 是数字索引（如 0, 1, 2），用于 GRPO 分组
         task_id_to_onpolicy: Dict[str, List] = defaultdict(list)
+        data_id_to_task_id: Dict[str, str] = {}  # data_id -> task_id 映射
+        
         for cmt in on_policy_cmt_array:
-            # CMT 对象使用 data_id
-            task_id = str(cmt.data_id) if hasattr(cmt, 'data_id') else str(cmt.task_id)
+            # ⭐ 使用 task_id 作为分组 key（而不是 data_id）
+            # CMT 对象应该有 task_id 属性，如果没有则从 metadata 获取
+            if hasattr(cmt, 'task_id') and cmt.task_id:
+                task_id = str(cmt.task_id)
+            elif hasattr(cmt, 'metadata') and cmt.metadata.get('task_id'):
+                task_id = str(cmt.metadata['task_id'])
+            else:
+                # fallback: 使用 data_id（不推荐，可能导致问题）
+                task_id = str(cmt.data_id) if hasattr(cmt, 'data_id') else "unknown"
+                logger.warning(f"[LUFFYMixer] CMT missing task_id, using data_id={task_id}")
+            
             task_id_to_onpolicy[task_id].append(cmt)
+            
+            # 记录 data_id -> task_id 映射
+            if hasattr(cmt, 'data_id'):
+                data_id_to_task_id[str(cmt.data_id)] = task_id
+        
+        logger.debug(f"[LUFFYMixer] on-policy CMT grouped by task_id: {list(task_id_to_onpolicy.keys())[:5]}...")
+        logger.debug(f"[LUFFYMixer] on-policy counts per task: {[len(v) for v in list(task_id_to_onpolicy.values())[:5]]}...")
         
         # 获取每个 task 的 teacher rollouts（Trajectory 对象）
         teacher_rollouts_map = self.exp_manager.get_teacher_rollouts_for_luffy_mixing(
@@ -466,6 +486,11 @@ class LUFFYTeacherRolloutMixer:
                     task_id_to_data_id[task_id] = int(data_id)
                 except (ValueError, TypeError):
                     task_id_to_data_id[task_id] = hash(task_id) % 100000
+            else:
+                # ⭐ 如果没有找到对应的 on-policy CMT，使用 task 在列表中的索引作为 data_id
+                task_idx = tasks.index(task)
+                task_id_to_data_id[task_id] = task_idx
+                logger.warning(f"[LUFFYMixer] No on-policy CMT found for task {task_id}, using idx={task_idx}")
             
             # 收集 teacher trajectories
             if task_id in teacher_rollouts_map:
