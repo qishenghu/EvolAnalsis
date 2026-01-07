@@ -421,20 +421,35 @@ class ParallelEnvManager(object):
         teacher_log_probs: List[float],
         response_loss_mask: List[int],
         response_length: int,
+        response_ids: Optional[List[int]] = None,
+        teacher_token_ids: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """
         将 Teacher 的 log_probs 对齐到 tokenized response 序列。
         
-        ⭐ 对齐策略：
-        - Teacher log_probs 只包含 LLM 生成的 token（不含环境响应）
-        - response_loss_mask 标记了 LLM 响应位置（=1）和非 LLM 位置（=0）
-        - 按顺序将 teacher_log_probs 填充到 loss_mask=1 的位置
-        - 其他位置填充 0（这些位置的 loss 会被 loss_mask 屏蔽）
+        ⭐ 对齐策略（两种模式）：
+        
+        模式 1（精确对齐，推荐）：如果提供了 response_ids 和 teacher_token_ids
+        - 使用 token_ids 匹配，找到 teacher token 在 response 中的精确位置
+        - 这样可以正确跳过 chat template 添加的特殊标记
+        
+        模式 2（简单对齐）：如果没有提供 token_ids
+        - 按顺序填充到 loss_mask=1 的位置
+        - 可能会因为 chat template 特殊标记导致位置偏移
+        
+        ⭐ Chat Template 问题说明：
+        - Qwen 的 chat template 在每条 assistant 消息前后添加特殊标记：
+          <|im_start|>assistant\n[实际内容]<|im_end|>
+        - 采集时的 log_probs 只包含 [实际内容] 部分
+        - 训练时 tokenize 后 loss_mask=1 包含了整个消息（含特殊标记）
+        - 所以需要跳过特殊标记，只对 [实际内容] 部分对齐
         
         Args:
-            teacher_log_probs: Teacher 生成的 log_probs 列表（只有 LLM token）
+            teacher_log_probs: Teacher 生成的 log_probs 列表（只有 LLM 生成的 token）
             response_loss_mask: Response 部分的 loss_mask（1=LLM, 0=非 LLM）
             response_length: Response 序列长度
+            response_ids: Response 部分的 token ids（用于精确对齐）
+            teacher_token_ids: Teacher 生成的 token ids（用于精确对齐）
             
         Returns:
             torch.Tensor: 对齐后的 log_probs，shape [response_length]
@@ -451,11 +466,44 @@ class ParallelEnvManager(object):
             if mask_val == 1:
                 llm_positions.append(i)
         
-        # 将 teacher_log_probs 按顺序填充到 LLM 位置
+        # ⭐ 模式 1：精确对齐（使用 token_ids）
+        if response_ids is not None and teacher_token_ids is not None and len(teacher_token_ids) > 0:
+            # 使用滑动窗口匹配 teacher_token_ids 在 response_ids 中的位置
+            filled_count = self._align_by_token_ids(
+                aligned_log_probs=aligned_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                teacher_token_ids=teacher_token_ids,
+                response_ids=response_ids,
+                llm_positions=llm_positions,
+            )
+            
+            if filled_count > 0:
+                coverage = filled_count / len(teacher_log_probs) if teacher_log_probs else 0
+                if coverage < 0.9:
+                    logger.warning(
+                        f"[Teacher Log Prob Alignment] Token-based alignment only matched "
+                        f"{filled_count}/{len(teacher_log_probs)} tokens ({coverage:.1%}). "
+                        f"Falling back to sequential alignment for remaining."
+                    )
+                else:
+                    logger.debug(
+                        f"[Teacher Log Prob Alignment] Token-based alignment: "
+                        f"{filled_count}/{len(teacher_log_probs)} tokens matched ({coverage:.1%})."
+                    )
+                return aligned_log_probs
+        
+        # ⭐ 模式 2：简单对齐（按顺序填充）
+        # 为了处理 chat template 问题，我们从后往前填充
+        # 因为 chat template 主要在消息开头添加标记（<|im_start|>assistant\n）
+        # 而结尾的 <|im_end|> 通常在 loss_mask=0 的区域（env response 后）
         num_to_fill = min(len(teacher_log_probs), len(llm_positions))
+        
+        # 从后往前填充（末尾对齐）
         for i in range(num_to_fill):
-            pos = llm_positions[i]
-            aligned_log_probs[pos] = teacher_log_probs[i]
+            teacher_idx = len(teacher_log_probs) - 1 - i
+            llm_idx = len(llm_positions) - 1 - i
+            pos = llm_positions[llm_idx]
+            aligned_log_probs[pos] = teacher_log_probs[teacher_idx]
         
         # 如果 teacher_log_probs 比 LLM 位置多，记录警告
         if len(teacher_log_probs) > len(llm_positions):
@@ -464,12 +512,50 @@ class ParallelEnvManager(object):
                 f"than LLM positions ({len(llm_positions)}). Extra log_probs will be discarded."
             )
         elif len(teacher_log_probs) < len(llm_positions):
+            unfilled = len(llm_positions) - len(teacher_log_probs)
             logger.debug(
                 f"[Teacher Log Prob Alignment] Fewer teacher log_probs ({len(teacher_log_probs)}) "
-                f"than LLM positions ({len(llm_positions)}). Remaining positions will be 0."
+                f"than LLM positions ({len(llm_positions)}). {unfilled} leading positions "
+                f"(likely chat template tokens) will be 0."
             )
         
         return aligned_log_probs
+    
+    def _align_by_token_ids(
+        self,
+        aligned_log_probs: torch.Tensor,
+        teacher_log_probs: List[float],
+        teacher_token_ids: List[int],
+        response_ids: List[int],
+        llm_positions: List[int],
+    ) -> int:
+        """
+        使用 token_ids 进行精确对齐。
+        
+        找到 teacher_token_ids 在 response_ids 中的位置，并填充对应的 log_probs。
+        
+        Returns:
+            int: 成功匹配的 token 数量
+        """
+        if not teacher_token_ids or not response_ids:
+            return 0
+        
+        filled_count = 0
+        teacher_idx = 0
+        
+        # 遍历 llm_positions，尝试匹配 teacher_token_ids
+        for pos in llm_positions:
+            if teacher_idx >= len(teacher_token_ids):
+                break
+            
+            if pos < len(response_ids) and response_ids[pos] == teacher_token_ids[teacher_idx]:
+                # 匹配成功
+                if teacher_idx < len(teacher_log_probs):
+                    aligned_log_probs[pos] = teacher_log_probs[teacher_idx]
+                    filled_count += 1
+                teacher_idx += 1
+        
+        return filled_count
 
     def convert_offpolicy_to_cmt(
         self,
@@ -566,6 +652,16 @@ class ParallelEnvManager(object):
                 # 优先使用累积的 log_probs，便于对齐
                 cmt.metadata["teacher_log_probs"] = traj.metadata.get("log_probs")
                 cmt.metadata["teacher_log_probs_per_turn"] = traj.metadata.get("log_probs_per_turn")
+                
+                # ⭐ 提取累积的 token_ids（用于精确对齐）
+                log_probs_per_turn = traj.metadata.get("log_probs_per_turn", [])
+                if log_probs_per_turn:
+                    accumulated_token_ids = []
+                    for turn_info in log_probs_per_turn:
+                        if isinstance(turn_info, dict) and "token_ids" in turn_info:
+                            accumulated_token_ids.extend(turn_info["token_ids"])
+                    if accumulated_token_ids:
+                        cmt.metadata["teacher_token_ids"] = accumulated_token_ids
             
             cmt_array.append(cmt)
         
@@ -597,6 +693,7 @@ class ParallelEnvManager(object):
             "has_log_prob": cmt.metadata.get("has_log_prob", False),
             "teacher_log_probs": cmt.metadata.get("teacher_log_probs"),  # 累积的 log_probs
             "teacher_log_probs_per_turn": cmt.metadata.get("teacher_log_probs_per_turn"),  # 分轮的 log_probs
+            "teacher_token_ids": cmt.metadata.get("teacher_token_ids"),  # 累积的 token_ids（用于精确对齐）
         }
         return extras
 
@@ -807,11 +904,14 @@ class ParallelEnvManager(object):
             if is_teacher and has_log_prob:
                 # ⭐ Teacher Experience: 对齐 teacher_log_probs 到 response_loss_mask
                 teacher_log_probs = sample.extras.get("teacher_log_probs")
+                teacher_token_ids = sample.extras.get("teacher_token_ids")  # 用于精确对齐
                 if teacher_log_probs is not None:
                     aligned_log_probs = self._align_teacher_log_probs(
                         teacher_log_probs=teacher_log_probs,
                         response_loss_mask=sample.response_loss_mask,
                         response_length=response_length,
+                        response_ids=sample.response_ids,  # 用于精确对齐
+                        teacher_token_ids=teacher_token_ids,  # 用于精确对齐
                     )
                     recorded_old_log_probs_list.append(aligned_log_probs)
                 else:
