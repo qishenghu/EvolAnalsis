@@ -2070,45 +2070,43 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             # TODO enable tracing by jinli 0619
                             print("=" * 10 + "start fit rollout" + "=" * 10)
                             
-                            # ⭐ LUFFY 模式：需要减少 on-policy rollout 数量
-                            rollout_n_override = None
-                            if use_luffy_rollout_level and luffy_mixer:
-                                rollout_n_override = luffy_mixer.get_n_onpolicy_rollouts_per_task()
-                                logger.info(f"[LUFFY] Reducing rollout n from {self.config.actor_rollout_ref.rollout.n} to {rollout_n_override}")
-                            
+                            # ⭐ LUFFY 模式：生成完整的 n_rollout on-policy，然后用 teacher 替换部分
+                            # 不再减少 on-policy 数量，这样可以自动处理 teacher 不足的情况
                             trajectories = self.env_manager.rollout(
                                 tasks, 
                                 task_exp_configs, 
                                 mode="sample", 
                                 epoch=f"train.{epoch}.{i}",
-                                n_rollout_override=rollout_n_override,  # ⭐ LUFFY: 减少 on-policy 数量
                             )
                             assert len(trajectories)>0, "{len(trajectories)=}?"
                             print("=" * 10 + "end fit rollout" + "=" * 10)
                             
                             # ⭐ Experience Replay: 更新 difficulty2task_dict 并合并轨迹
                             if use_luffy_rollout_level and luffy_mixer:
-                                # ⭐⭐⭐ LUFFY 风格：Rollout 级别混合 ⭐⭐⭐
-                                # 更新 difficulty2task_dict（只用 on-policy 轨迹）
+                                # ⭐⭐⭐ LUFFY 风格：Rollout 级别混合（替换模式）⭐⭐⭐
+                                # 1. 更新 difficulty2task_dict（用完整的 on-policy 轨迹）
                                 self.exp_manager.update_difficulty2task_dict(trajectories)
                                 
-                                # 使用 LUFFY mixer 混入 teacher rollouts
+                                # 2. 使用 LUFFY mixer 用 teacher rollouts 替换部分 on-policy
+                                # 如果 teacher 不足，会自动保留更多 on-policy（总数保持 n_rollout）
+                                # trajectories 是 CMT 对象列表（不是 Trajectory）
                                 all_trajectories, luffy_stats = luffy_mixer.mix_trajectories(
-                                    on_policy_trajectories=trajectories,
+                                    on_policy_cmt_array=trajectories,
                                     tasks=tasks,
+                                    env_manager=self.env_manager,
+                                    config=self.config,
+                                    tokenizer=self.tokenizer,
                                 )
                                 
                                 # 更新 metrics
                                 metrics.update({
-                                    "luffy/tasks_with_teacher": luffy_stats["tasks_with_teacher"],
+                                    "luffy/tasks_with_full_teacher": luffy_stats.get("tasks_with_full_teacher", 0),
+                                    "luffy/tasks_with_partial_teacher": luffy_stats.get("tasks_with_partial_teacher", 0),
+                                    "luffy/tasks_without_teacher": luffy_stats.get("tasks_without_teacher", 0),
                                     "luffy/total_teacher_rollouts": luffy_stats["total_teacher"],
-                                    "luffy/total_onpolicy_rollouts": luffy_stats["total_onpolicy"],
+                                    "luffy/total_onpolicy_kept": luffy_stats.get("total_onpolicy_kept", 0),
+                                    "luffy/onpolicy_replaced_by_teacher": luffy_stats.get("total_onpolicy_replaced", 0),
                                 })
-                                
-                                logger.info(
-                                    f"[LUFFY] Mixed {luffy_stats['total_onpolicy']} on-policy + "
-                                    f"{luffy_stats['total_teacher']} teacher = {len(all_trajectories)} total"
-                                )
                                 
                             elif enable_exp_replay or enable_teacher_exp:
                                 # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐

@@ -75,11 +75,28 @@ actor_rollout_ref:
     off_cliprange_high: 0.6
     clip_ratio_high: 0.28
     loss_agg_mode: token-mean
-    # ⭐ Off-policy Policy Shaping Configuration
-    # For teacher experience, recommend using "exgrpo_policy_shaping" when log_prob is available
-    # If no log_prob (e.g., from GPT-4), the system will use LUFFY-style importance ratio
+    # ⭐ Off-policy Policy Shaping Configuration (Self-generated Experience)
+    # For self-generated experience, recommend using "exgrpo_policy_shaping"
     off_policy_shaping_mode: "exgrpo_policy_shaping"
     off_policy_shaping_beta: 0.1
+    
+    # ⭐ Teacher Experience Loss Configuration (LUFFY)
+    # 这些配置只在 teacher_experience.enable=true 时生效
+    # teacher_use_log_prob: 是否使用 teacher 的 log_prob
+    #   - true: 使用 ExGRPO 形式 ratio = π_current / π_teacher（需要相同 tokenizer）
+    #   - false: 使用 LUFFY 形式 ratio = π_current（适用于不同 tokenizer，如 GPT-4）
+    teacher_use_log_prob: false  # GPT-4 与 Qwen tokenizer 不同，使用 LUFFY 形式
+    
+    # teacher_policy_shaping_enable: 是否启用 LUFFY 的 policy shaping
+    # Policy shaping f(x) = x/(x+β) 可以放大低概率动作的梯度信号
+    teacher_policy_shaping_enable: true
+    teacher_policy_shaping_mode: "p_div_p_beta"  # f(x) = x / (x + β)
+    teacher_policy_shaping_beta: 0.1             # β 参数
+    
+    # teacher_use_clip: Teacher 轨迹是否使用 clipping
+    # LUFFY 论文建议不使用 clipping，以充分利用 teacher 信号
+    teacher_use_clip: false
+    
     use_dapo: false
     fsdp_config:
       param_offload: true
