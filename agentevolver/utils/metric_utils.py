@@ -143,15 +143,50 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
+    # ⭐ 分开统计 on-policy 和 teacher 的 reward
+    # 使用 exp_mask 的第一个 token 判断（off-policy 样本的 exp_mask[0] = 1）
+    exp_mask = batch.batch.get("exp_mask", None)
+    teacher_mask = batch.batch.get("teacher_mask", None)
+    
+    # 判断每个样本是否是 on-policy（exp_mask 全为 0）
+    if exp_mask is not None:
+        # exp_mask shape: [batch_size, seq_len]
+        # 如果任意位置 exp_mask=1，则为 off-policy
+        is_offpolicy = exp_mask.sum(dim=-1) > 0  # [batch_size]
+        is_onpolicy = ~is_offpolicy
+    else:
+        is_onpolicy = torch.ones(sequence_reward.size(0), dtype=torch.bool, device=sequence_reward.device)
+        is_offpolicy = torch.zeros(sequence_reward.size(0), dtype=torch.bool, device=sequence_reward.device)
+    
+    # 判断每个样本是否是 teacher（teacher_mask 任意位置为 1）
+    if teacher_mask is not None:
+        is_teacher = teacher_mask.sum(dim=-1) > 0  # [batch_size]
+    else:
+        is_teacher = torch.zeros(sequence_reward.size(0), dtype=torch.bool, device=sequence_reward.device)
+    
+    # 计算分组统计
+    onpolicy_rewards = sequence_reward[is_onpolicy] if is_onpolicy.any() else torch.tensor([0.0])
+    teacher_rewards = sequence_reward[is_teacher] if is_teacher.any() else torch.tensor([0.0])
+    
     metrics = {
         # score
         "critic/score/mean": torch.mean(sequence_score).detach().item(),
         "critic/score/max": torch.max(sequence_score).detach().item(),
         "critic/score/min": torch.min(sequence_score).detach().item(),
-        # reward
+        # reward (all)
         "critic/rewards/mean": torch.mean(sequence_reward).detach().item(),
         "critic/rewards/max": torch.max(sequence_reward).detach().item(),
         "critic/rewards/min": torch.min(sequence_reward).detach().item(),
+        # ⭐ on-policy rewards
+        "critic/rewards_onpolicy/mean": torch.mean(onpolicy_rewards).detach().item() if is_onpolicy.any() else 0.0,
+        "critic/rewards_onpolicy/max": torch.max(onpolicy_rewards).detach().item() if is_onpolicy.any() else 0.0,
+        "critic/rewards_onpolicy/min": torch.min(onpolicy_rewards).detach().item() if is_onpolicy.any() else 0.0,
+        "critic/rewards_onpolicy/count": is_onpolicy.sum().detach().item(),
+        # ⭐ teacher rewards
+        "critic/rewards_teacher/mean": torch.mean(teacher_rewards).detach().item() if is_teacher.any() else 0.0,
+        "critic/rewards_teacher/max": torch.max(teacher_rewards).detach().item() if is_teacher.any() else 0.0,
+        "critic/rewards_teacher/min": torch.min(teacher_rewards).detach().item() if is_teacher.any() else 0.0,
+        "critic/rewards_teacher/count": is_teacher.sum().detach().item(),
         # reward (debug variants)
         "critic/rewards_sum/mean": torch.mean(sequence_reward).detach().item(),
         "critic/rewards_sum/max": torch.max(sequence_reward).detach().item(),
