@@ -26,7 +26,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_teacher_only_bz8
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -82,16 +82,16 @@ actor_rollout_ref:
     
     # ⭐ Teacher Experience Loss Configuration (LUFFY)
     # 这些配置只在 teacher_experience.enable=true 时生效
-    # teacher_use_log_prob: 是否使用 teacher 的 log_prob
-    #   - true: 使用 ExGRPO 形式 ratio = π_current / π_teacher（需要相同 tokenizer）
-    #   - false: 使用 LUFFY 形式 ratio = π_current（适用于不同 tokenizer，如 GPT-4）
-    teacher_use_log_prob: false  # GPT-4 与 Qwen tokenizer 不同，使用 LUFFY 形式
+    # 注意：teacher_use_log_prob 应与 exp_manager.teacher_experience.use_log_prob 保持一致
+    # ⚠️ 此处的值会被 exp_manager.teacher_experience.use_log_prob 覆盖（如果设置了的话）
+    # 建议：只在 exp_manager.teacher_experience 中配置 use_log_prob
+    teacher_use_log_prob: ${exp_manager.teacher_experience.use_log_prob}  # ← 引用 exp_manager 的配置
     
     # teacher_policy_shaping_enable: 是否启用 LUFFY 的 policy shaping
     # Policy shaping f(x) = x/(x+β) 可以放大低概率动作的梯度信号
-    teacher_policy_shaping_enable: true
-    teacher_policy_shaping_mode: "p_div_p_beta"  # f(x) = x / (x + β)
-    teacher_policy_shaping_beta: 0.1             # β 参数
+    teacher_policy_shaping_enable: ${exp_manager.teacher_experience.policy_shaping.enable}
+    teacher_policy_shaping_mode: ${exp_manager.teacher_experience.policy_shaping.mode}
+    teacher_policy_shaping_beta: ${exp_manager.teacher_experience.policy_shaping.beta}
     
     # teacher_use_clip: Teacher 轨迹是否使用 clipping
     # LUFFY 论文建议不使用 clipping，以充分利用 teacher 信号
@@ -288,7 +288,7 @@ exp_manager:
     
     # ⭐ Teacher 轨迹数据路径（JSONL 格式）
     # 需要预先使用 scripts/collect_teacher_trajectories.py 采集
-    data_path: "data/teacher_trajectories/alfworld_gpt4.jsonl"
+    data_path: "data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered.pkl"
     
     # ⭐⭐⭐ LUFFY 风格核心配置（mix_mode: rollout_level）⭐⭐⭐
     # 每个 task 混入的 teacher rollout 数量
@@ -301,8 +301,14 @@ exp_manager:
     # 当 mix_mode=task_level 时使用此参数
     # exp_ratio: 0.25  # batch 中 25% 的 task 使用 teacher experience
     
-    # 每个 task 最多存储/使用的 Teacher 轨迹数量
-    max_trajectories_per_task: 3
+    # ⭐ 每个 task 最多存储的 Teacher 轨迹数量（用于提供选择多样性）
+    # 与 n_teacher_rollouts_per_task 的区别：
+    #   - max_trajectories_per_task: 存储多少条（从 JSONL 加载时的上限）
+    #   - n_teacher_rollouts_per_task: 每个 batch 使用多少条
+    # 例如：max=3, n=1, select_mode=entropy
+    #   → 每个 task 存储 3 条，每次从中选 entropy 最低的 1 条使用
+    # 如果 select_mode=random 且 n=1，可以简单设置 max=1
+    max_trajectories_per_task: 6  # 简化：存储数=使用数，random 选择时不需要存更多
     
     # ⭐ 轨迹选择模式
     # - "random": 随机选择（默认，简单高效）
@@ -314,7 +320,7 @@ exp_manager:
     # - "confidence": 按 Teacher 的平均 log_prob 从高到低排序（适用于 OpenAI API）
     #   * 需要轨迹包含 log_prob
     #   * 越高的 log_prob 表示 Teacher 越确信
-    select_mode: "random"
+    select_mode: "confidence"
     
     # ⭐ 是否使用 Teacher 轨迹的 log_prob 计算 importance ratio
     # - true: 使用标准重要性采样 ratio = π_current / π_teacher
