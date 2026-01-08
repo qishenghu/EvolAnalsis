@@ -74,6 +74,180 @@ from agentevolver.module.exp_manager.experience_collate import (
 )
 
 
+def _safe_masked_mean(x: torch.Tensor, mask: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return masked mean; None if empty."""
+    m = mask.bool()
+    if m.sum() == 0:
+        return None
+    return x[m].mean()
+
+
+def _safe_masked_std(x: torch.Tensor, mask: torch.Tensor) -> Optional[torch.Tensor]:
+    """Return masked std; None if empty or single element."""
+    m = mask.bool()
+    if m.sum() == 0:
+        return None
+    vals = x[m]
+    if vals.numel() <= 1:
+        return torch.tensor(0.0, device=x.device)
+    return vals.std()
+
+
+def compute_teacher_effect_metrics(batch: DataProto, entropys: Optional[torch.Tensor] = None) -> dict:
+    """
+    Compute batch-level diagnostics to interpret teacher experience effects.
+    This is designed to be cheap and robust (works even if some masks are absent).
+    """
+    metrics: dict[str, float] = {}
+
+    if "responses" not in batch.batch:
+        return metrics
+
+    response_len = batch.batch["responses"].shape[-1]
+
+    # response mask: for multi-turn, trainer uses compute_response_mask(batch) which should be response_len mask
+    response_mask = batch.batch.get("response_mask", None)
+    if response_mask is None:
+        response_mask = compute_response_mask(batch)
+        batch.batch["response_mask"] = response_mask
+
+    # Ensure response_mask is (bs, response_len)
+    if response_mask.dim() == 2 and response_mask.shape[-1] != response_len and response_mask.shape[-1] > response_len:
+        response_mask = response_mask[:, -response_len:]
+
+    # exp_mask is full seq; slice response part
+    exp_mask_full = batch.batch.get("exp_mask", None)
+    exp_mask = None
+    if exp_mask_full is not None and exp_mask_full.dim() == 2:
+        if exp_mask_full.shape[-1] == response_len:
+            exp_mask = exp_mask_full
+        else:
+            exp_mask = exp_mask_full[:, -response_len:]
+
+    teacher_mask = batch.batch.get("teacher_mask", None)
+    if teacher_mask is not None and teacher_mask.dim() == 2 and teacher_mask.shape[-1] != response_len:
+        teacher_mask = teacher_mask[:, -response_len:]
+
+    # token-level rewards (response_len)
+    token_level_rewards = batch.batch.get("token_level_rewards", None)
+    if token_level_rewards is None:
+        token_level_rewards = batch.batch.get("token_level_scores", None)
+    rewards_sum = None
+    if token_level_rewards is not None and token_level_rewards.dim() == 2:
+        rewards_sum = (token_level_rewards[:, :response_len] * response_mask).sum(dim=-1)  # (bs,)
+
+    # token-level advantages (response_len)
+    advantages = batch.batch.get("advantages", None)
+    adv_scalar = None
+    if advantages is not None and advantages.dim() == 2:
+        denom = response_mask.sum(dim=-1).clamp_min(1.0)
+        adv_scalar = (advantages[:, :response_len] * response_mask).sum(dim=-1) / denom
+
+    # derive per-token category masks
+    if exp_mask is None:
+        exp_mask = torch.zeros_like(response_mask)
+    if teacher_mask is None:
+        teacher_mask = torch.zeros_like(response_mask)
+
+    on_token = (1.0 - exp_mask) * response_mask
+    off_token = exp_mask * response_mask
+    teacher_token = exp_mask * teacher_mask * response_mask
+    self_off_token = exp_mask * (1.0 - teacher_mask) * response_mask
+
+    # ratios (token level)
+    total_tokens = response_mask.sum().clamp_min(1.0)
+    metrics["diag/exp_token_ratio"] = (off_token.sum() / total_tokens).detach().item()
+    metrics["diag/teacher_token_ratio"] = (teacher_token.sum() / total_tokens).detach().item()
+
+    # advantage means by type (token level + per-sample scalar)
+    if advantages is not None:
+        v = _safe_masked_mean(advantages[:, :response_len], teacher_token.bool())
+        if v is not None:
+            metrics["diag/adv_teacher_token_mean"] = v.detach().item()
+        v = _safe_masked_mean(advantages[:, :response_len], self_off_token.bool())
+        if v is not None:
+            metrics["diag/adv_self_off_token_mean"] = v.detach().item()
+        v = _safe_masked_mean(advantages[:, :response_len], on_token.bool())
+        if v is not None:
+            metrics["diag/adv_onpolicy_token_mean"] = v.detach().item()
+
+    if adv_scalar is not None:
+        # sample-level teacher/offpolicy flags
+        is_teacher_sample = (teacher_token.sum(dim=-1) > 0)
+        is_off_sample = (off_token.sum(dim=-1) > 0)
+        is_on_sample = ~is_off_sample
+        v = _safe_masked_mean(adv_scalar, is_teacher_sample)
+        if v is not None:
+            metrics["diag/adv_teacher_sample_mean"] = v.detach().item()
+        v = _safe_masked_mean(adv_scalar, is_on_sample)
+        if v is not None:
+            metrics["diag/adv_onpolicy_sample_mean"] = v.detach().item()
+
+        # sign ratios
+        if is_on_sample.any():
+            metrics["diag/onpolicy_adv_pos_ratio"] = (adv_scalar[is_on_sample] > 0).float().mean().detach().item()
+        if is_teacher_sample.any():
+            metrics["diag/teacher_adv_pos_ratio"] = (adv_scalar[is_teacher_sample] > 0).float().mean().detach().item()
+
+    # reward means by type (sample level)
+    if rewards_sum is not None:
+        is_teacher_sample = (teacher_token.sum(dim=-1) > 0)
+        is_off_sample = (off_token.sum(dim=-1) > 0)
+        is_on_sample = ~is_off_sample
+        v = _safe_masked_mean(rewards_sum, is_on_sample)
+        if v is not None:
+            metrics["diag/reward_onpolicy_mean"] = v.detach().item()
+        v = _safe_masked_mean(rewards_sum, is_teacher_sample)
+        if v is not None:
+            metrics["diag/reward_teacher_mean"] = v.detach().item()
+
+        # group gap: teacher reward - onpolicy reward within same uid group
+        uids = batch.non_tensor_batch.get("uid", None)
+        if uids is not None:
+            try:
+                # uids: np array of strings
+                uids_list = [str(u) for u in list(uids)]
+                rs = rewards_sum.detach().cpu().tolist()
+                is_t = is_teacher_sample.detach().cpu().tolist()
+                # group -> (teacher_rewards, on_rewards)
+                grp: dict[str, dict[str, list]] = {}
+                for i, gid in enumerate(uids_list):
+                    if gid not in grp:
+                        grp[gid] = {"t": [], "o": []}
+                    if is_t[i]:
+                        grp[gid]["t"].append(rs[i])
+                    else:
+                        grp[gid]["o"].append(rs[i])
+                gaps = []
+                for gid, d in grp.items():
+                    if d["t"] and d["o"]:
+                        gaps.append(float(np.mean(d["t"]) - np.mean(d["o"])))
+                if gaps:
+                    metrics["diag/group_teacher_minus_on_reward_mean"] = float(np.mean(gaps))
+                    metrics["diag/group_teacher_minus_on_reward_std"] = float(np.std(gaps))
+                    metrics["diag/group_gap_count"] = float(len(gaps))
+            except Exception:
+                pass
+
+    # entropy diagnostics by type (token level)
+    if entropys is not None and entropys.dim() == 2 and entropys.shape[-1] >= response_len:
+        ent = entropys[:, :response_len]
+        v = _safe_masked_mean(ent, teacher_token.bool())
+        if v is not None:
+            metrics["diag/entropy_teacher_token_mean"] = v.detach().item()
+        v = _safe_masked_mean(ent, on_token.bool())
+        if v is not None:
+            metrics["diag/entropy_onpolicy_token_mean"] = v.detach().item()
+        v = _safe_masked_mean(ent, off_token.bool())
+        if v is not None:
+            metrics["diag/entropy_offpolicy_token_mean"] = v.detach().item()
+        s = _safe_masked_std(ent, on_token.bool())
+        if s is not None:
+            metrics["diag/entropy_onpolicy_token_std"] = s.detach().item()
+
+    return metrics
+
+
 def parse_reward_from_dataproto(data: DataProto, return_dict=False) -> dict | torch.Tensor:
     """
     Compute reward for a batch of data.
@@ -1197,6 +1371,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         batch_messages: Optional[np.ndarray] = None,
         batch_group_ids: Optional[torch.Tensor] = None,
         batch_reward_scores: Optional[np.ndarray] = None,
+        # ⭐ New: batch-level tensors for deeper analysis
+        batch_advantages: Optional[torch.Tensor] = None,          # (bs, response_len)
+        batch_exp_mask: Optional[torch.Tensor] = None,            # (bs, full_len) or (bs, response_len)
+        batch_teacher_mask: Optional[torch.Tensor] = None,         # (bs, response_len)
+        batch_old_log_probs: Optional[torch.Tensor] = None,        # (bs, response_len)
+        batch_token_level_rewards: Optional[torch.Tensor] = None,  # (bs, response_len)
+        batch_uid: Optional[np.ndarray] = None,                   # (bs,)
+        batch_diag_metrics: Optional[Dict[str, Any]] = None,       # aggregated metrics for this step
     ):
         """
         保存 Trajectory 信息用于后续分析。
@@ -1294,6 +1476,26 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             # keep entries that correspond to on-policy trajectories we just rolled out.
             # NOTE: batch_group_ids is a tensor on device; bring to cpu once.
             batch_gids = batch_group_ids.detach().cpu().tolist()
+            # prepare optional tensors in CPU/numpy for cheap per-sample stats
+            resp_len = entropys.shape[1] if entropys is not None else None
+            adv_cpu = batch_advantages.detach().cpu() if (batch_advantages is not None and torch.is_tensor(batch_advantages)) else None
+            exp_mask_cpu = None
+            if batch_exp_mask is not None and torch.is_tensor(batch_exp_mask) and resp_len is not None:
+                if batch_exp_mask.dim() == 2 and batch_exp_mask.shape[-1] == resp_len:
+                    exp_mask_cpu = batch_exp_mask.detach().cpu()
+                elif batch_exp_mask.dim() == 2 and batch_exp_mask.shape[-1] > resp_len:
+                    exp_mask_cpu = batch_exp_mask[:, -resp_len:].detach().cpu()
+            teacher_mask_cpu = None
+            if batch_teacher_mask is not None and torch.is_tensor(batch_teacher_mask) and resp_len is not None:
+                if batch_teacher_mask.dim() == 2 and batch_teacher_mask.shape[-1] == resp_len:
+                    teacher_mask_cpu = batch_teacher_mask.detach().cpu()
+                elif batch_teacher_mask.dim() == 2 and batch_teacher_mask.shape[-1] > resp_len:
+                    teacher_mask_cpu = batch_teacher_mask[:, -resp_len:].detach().cpu()
+            oldlp_cpu = batch_old_log_probs.detach().cpu() if (batch_old_log_probs is not None and torch.is_tensor(batch_old_log_probs)) else None
+            tlr_cpu = batch_token_level_rewards.detach().cpu() if (batch_token_level_rewards is not None and torch.is_tensor(batch_token_level_rewards)) else None
+            rm_cpu = response_masks.detach().cpu() if (response_masks is not None and torch.is_tensor(response_masks)) else None
+            uid_list = [str(u) for u in list(batch_uid)] if batch_uid is not None else None
+
             for bidx in range(min(len(batch_gids), entropys.shape[0])):
                 gid = int(batch_gids[bidx])
                 rollout_id = str(batch_rollout_ids[bidx])
@@ -1364,6 +1566,35 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         "total_tokens": int(len(traj_entropy)),
                     }
 
+                # ---- extra per-rollout diagnostics (from batch tensors) ----
+                extra_diag: dict[str, Any] = {}
+                if rm_cpu is not None and bidx < rm_cpu.shape[0]:
+                    rm = rm_cpu[bidx].numpy().astype(bool)
+                    extra_diag["response_valid_tokens"] = int(rm.sum())
+                if exp_mask_cpu is not None and bidx < exp_mask_cpu.shape[0]:
+                    em = exp_mask_cpu[bidx].numpy().astype(bool)
+                    extra_diag["exp_tokens"] = int(em.sum())
+                    extra_diag["offpolicy_ratio"] = float(em.sum() / max(1, extra_diag.get("response_valid_tokens", int(em.size))))
+                if teacher_mask_cpu is not None and bidx < teacher_mask_cpu.shape[0]:
+                    tm = teacher_mask_cpu[bidx].numpy().astype(bool)
+                    extra_diag["teacher_tokens"] = int(tm.sum())
+                    extra_diag["is_teacher"] = bool(tm.any())
+                if adv_cpu is not None and rm_cpu is not None and bidx < adv_cpu.shape[0] and bidx < rm_cpu.shape[0]:
+                    a = adv_cpu[bidx].numpy()
+                    rm = rm_cpu[bidx].numpy().astype(bool)
+                    extra_diag["adv_mean"] = float(a[rm].mean()) if rm.any() else None
+                    extra_diag["adv_std"] = float(a[rm].std()) if rm.any() else None
+                if oldlp_cpu is not None and rm_cpu is not None and bidx < oldlp_cpu.shape[0] and bidx < rm_cpu.shape[0]:
+                    olp = oldlp_cpu[bidx].numpy()
+                    rm = rm_cpu[bidx].numpy().astype(bool)
+                    extra_diag["old_log_prob_mean"] = float(olp[rm].mean()) if rm.any() else None
+                if tlr_cpu is not None and rm_cpu is not None and bidx < tlr_cpu.shape[0] and bidx < rm_cpu.shape[0]:
+                    r = tlr_cpu[bidx].numpy()
+                    rm = rm_cpu[bidx].numpy().astype(bool)
+                    extra_diag["reward_sum"] = float(r[rm].sum()) if rm.any() else float(r.sum())
+                if uid_list is not None and bidx < len(uid_list):
+                    extra_diag["uid"] = uid_list[bidx]
+
                 traj_data = {
                     "data_id": data_id,
                     "rollout_id": rollout_id,
@@ -1373,6 +1604,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                     "messages": messages,
                     "reward": reward_info,
                     "entropy": entropy_info,
+                    "diag": extra_diag,
                     "is_terminated": traj.is_terminated,
                     "success": traj.success if hasattr(traj, "success") else (traj.reward is not None and traj.reward.outcome > 0),
                 }
@@ -1568,6 +1800,16 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 f.write(json.dumps(data, ensure_ascii=False) + "\n")
         
         logger.info(f"Saved {len(saved_data)} trajectories to {filename}")
+
+        # ⭐ 同步保存 batch 级诊断指标（便于后续整体解读）
+        if batch_diag_metrics:
+            summary_path = os.path.join(trajectory_dir, f"batch_diag_step_{global_steps}.json")
+            try:
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    json.dump(batch_diag_metrics, f, ensure_ascii=False, indent=2)
+                logger.info(f"Saved batch diagnostics to {summary_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save batch diagnostics: {e}")
 
 
     def _validate(self):
@@ -2237,45 +2479,6 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
                         
-                        # ⭐ 保存 Trajectory 信息用于后续分析
-                        # 在计算完 entropy 后保存，确保有完整的信息
-                        # 注意：只在 async_rollout_mode 时保存，因为 trajectories 和 tasks 只在此时定义
-                        if self.async_rollout_mode and trajectories:
-                            trajectory_save_dir = self.config.trainer.get("trajectory_save_dir", None)
-                            if trajectory_save_dir is None:
-                                # 如果没有指定，使用 default_local_dir
-                                trajectory_save_dir = self.config.trainer.get("default_local_dir", "checkpoints")
-                            
-                            if trajectory_save_dir:
-                                try:
-                                    # 只保存 on-policy trajectories（前 len(trajectories) 个）
-                                    # 因为 off-policy 的 entropy 可能不准确
-                                    num_on_policy = len(trajectories)
-                                    if num_on_policy > 0 and entropys is not None:
-                                        # 确保 entropys 和 trajectories 的长度匹配
-                                        if num_on_policy <= entropys.shape[0]:
-                                            on_policy_entropys = entropys[:num_on_policy]
-                                            on_policy_response_masks = response_masks[:num_on_policy] if response_masks is not None else None
-                                            
-                                            # tasks 在 async_rollout_mode 分支内定义，应该存在
-                                            self._save_trajectories_for_analysis(
-                                                trajectories=trajectories,
-                                                tasks=tasks,  # tasks 在 async_rollout_mode 分支内定义
-                                                # IMPORTANT: pass full batch-aligned tensors/ids to avoid
-                                                # mismatching when trainer.balance_batch=True reorders batch.
-                                                entropys=entropys,
-                                                response_masks=response_masks,
-                                                batch_task_ids=batch.non_tensor_batch.get("task_ids", None),
-                                                batch_rollout_ids=batch.non_tensor_batch.get("rollout_ids", None),
-                                                batch_messages=batch.non_tensor_batch.get("messages", None),
-                                                batch_group_ids=batch.batch.get("group_ids", None),
-                                                batch_reward_scores=batch.non_tensor_batch.get("reward_scores", None),
-                                                global_steps=self.global_steps,
-                                                output_dir=trajectory_save_dir,
-                                            )
-                                except Exception as e:
-                                    logger.warning(f"Failed to save trajectories for analysis: {e}")
-                        
                         # ⭐ Experience Replay: 保存成功轨迹到内存
                         if enable_exp_replay:
                             n_rollout = self.config.actor_rollout_ref.rollout.n
@@ -2614,6 +2817,47 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
+
+                        # ⭐ Teacher effect diagnostics: batch-level logging + save per-rollout analysis
+                        try:
+                            diag_metrics = compute_teacher_effect_metrics(batch=batch, entropys=entropys)
+                            # prefix already in keys
+                            metrics.update(diag_metrics)
+                        except Exception as _e:
+                            logger.warning(f"Failed to compute teacher effect metrics: {_e}")
+                            diag_metrics = None
+
+                        # ⭐ 保存 Trajectory 信息用于后续分析（放到 compute_advantage 后，包含 advantages）
+                        if self.async_rollout_mode and trajectories:
+                            trajectory_save_dir = self.config.trainer.get("trajectory_save_dir", None)
+                            if trajectory_save_dir is None:
+                                trajectory_save_dir = self.config.trainer.get("default_local_dir", "checkpoints")
+                            if trajectory_save_dir:
+                                try:
+                                    self._save_trajectories_for_analysis(
+                                        trajectories=trajectories,
+                                        tasks=tasks,
+                                        entropys=entropys,
+                                        response_masks=response_masks,
+                                        global_steps=self.global_steps,
+                                        output_dir=trajectory_save_dir,
+                                        # batch identifiers (aligned)
+                                        batch_task_ids=batch.non_tensor_batch.get("task_ids", None),
+                                        batch_rollout_ids=batch.non_tensor_batch.get("rollout_ids", None),
+                                        batch_messages=batch.non_tensor_batch.get("messages", None),
+                                        batch_group_ids=batch.batch.get("group_ids", None),
+                                        batch_reward_scores=batch.non_tensor_batch.get("reward_scores", None),
+                                        # batch tensors for deeper analysis
+                                        batch_advantages=batch.batch.get("advantages", None),
+                                        batch_exp_mask=batch.batch.get("exp_mask", None),
+                                        batch_teacher_mask=batch.batch.get("teacher_mask", None),
+                                        batch_old_log_probs=batch.batch.get("old_log_probs", None),
+                                        batch_token_level_rewards=batch.batch.get("token_level_rewards", None),
+                                        batch_uid=batch.non_tensor_batch.get("uid", None),
+                                        batch_diag_metrics=diag_metrics,
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Failed to save trajectories for analysis: {e}")
                         
                         # ============================================================================
                         # ⭐ DAPO Dynamic Sampling: Zero out advantages for filtered samples

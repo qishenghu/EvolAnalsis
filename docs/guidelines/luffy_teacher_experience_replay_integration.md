@@ -1,7 +1,7 @@
 # LUFFY Teacher Experience Replay 集成分析
 
 > **状态**: ✅ 实现完成  
-> **更新日期**: 2026-01-07
+> **更新日期**: 2026-01-08
 
 本文档分析如何在 AgentEvolver 中集成 LUFFY 风格的 Teacher Experience Replay 算法，在现有 ExGRPO（self-generated experience replay）基础上增加外部 Teacher 轨迹支持。
 
@@ -12,6 +12,11 @@
 > - `LUFFYTeacherRolloutMixer` 类已实现 Rollout 级别混合逻辑
 > - `ExperienceManager` 已支持 `n_teacher_rollouts_per_task` 配置
 > - Trainer 已支持 `mix_mode: rollout_level` 配置
+>
+> **Chat Template 对齐修复（2026-01-08）**：  
+> - 修复了同系列模型（如 Qwen-3B 学习 Qwen-72B）使用 `use_log_prob: true` 时的对齐问题
+> - 实现了基于 `token_ids` 的精确对齐策略
+> - 详见 [Log Prob 对齐问题与解决方案](#⭐-log-prob-对齐问题与解决方案重要) 章节
 
 ## ⭐ 快速开始
 
@@ -177,6 +182,79 @@ Teacher trajectory 的 log_prob 可用性取决于采集方式：
 **设计原则**：通过配置项 `teacher_experience.use_log_prob` 让用户决定：
 - `use_log_prob: true`：使用标准重要性采样（需要 log_prob）
 - `use_log_prob: false`：使用 LUFFY 简化形式（无需 log_prob）
+
+### ⭐ Log Prob 对齐问题与解决方案（重要）
+
+> **更新日期**: 2026-01-08
+
+当 `use_log_prob: true` 时，使用同系列模型（如 Qwen-3B 学习 Qwen-72B）会遇到一个对齐问题：
+
+#### 问题描述
+
+**采集时（vLLM）**：
+- vLLM 返回的 `log_probs` 只包含 **LLM 实际生成的 token**
+- **不包含** chat template 添加的特殊标记
+
+**训练时（tokenize_steps）**：
+- `response_loss_mask=1` 包含了整个 assistant 消息
+- 包括 chat template 的特殊标记（如 `<|im_start|>assistant\n`, `<|im_end|>`）
+
+**Qwen 的 chat template 格式**：
+```
+<|im_start|>assistant      ← 采集时不记录 log_prob（约 3-4 tokens）
+\n
+[实际生成的内容]            ← 只有这部分有 log_prob
+<|im_end|>                 ← 采集时不记录 log_prob（1 token）
+```
+
+**结果**：训练时的 LLM positions 比采集时的 log_probs 多（差值约为 4-5 tokens × 对话轮数）
+
+#### 解决方案
+
+`_align_teacher_log_probs` 函数实现了两种对齐策略：
+
+**模式 1：精确对齐（推荐）**
+- 使用采集时保存的 `token_ids` 进行匹配
+- 找到 teacher token 在 response 中的精确位置
+- 正确跳过 chat template 的特殊标记
+
+**模式 2：简单对齐（fallback）**
+- 从后往前填充（末尾对齐）
+- 开头的 chat template 标记位置自动填充 0
+- 适用于没有 `token_ids` 的旧数据
+
+#### 数据格式要求
+
+为支持精确对齐，采集脚本已保存 `log_probs_per_turn`：
+
+```json
+{
+  "log_probs": [-0.5, -0.3, -0.8, ...],
+  "log_probs_per_turn": [
+    {"turn_idx": 0, "log_probs": [-0.5, -0.3], "token_ids": [100, 200]},
+    {"turn_idx": 1, "log_probs": [-0.8, -0.2], "token_ids": [300, 400]},
+    ...
+  ]
+}
+```
+
+#### 日志说明
+
+训练时可能看到如下日志：
+```
+[Teacher Log Prob Alignment] Fewer teacher log_probs (159) than LLM positions (204). 
+45 leading positions (likely chat template tokens) will be 0.
+```
+
+这是**正常的**，表示：
+- 159：Teacher 实际生成的 token 数
+- 204：包含 chat template 标记的总 token 数
+- 45：chat template 添加的特殊标记数
+
+如果使用精确对齐（有 token_ids），会看到：
+```
+[Teacher Log Prob Alignment] Token-based alignment: 159/159 tokens matched (100.0%).
+```
 
 ---
 

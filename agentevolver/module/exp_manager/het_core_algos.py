@@ -309,6 +309,56 @@ def het_compute_teacher_aware_loss(
     teacher_exp_mask = exp_mask * teacher_mask_float
     teacher_off_pg_loss = verl_F.masked_mean(teacher_off_pg_losses, teacher_exp_mask * response_mask)
     teacher_off_pg_loss = torch.tensor(0.0, device=log_prob.device) if teacher_off_pg_loss.isnan().item() else teacher_off_pg_loss
+
+    # =============== 诊断指标：ratio / advantage 分布（用于分析 teacher 影响） ===============
+    # 说明：
+    # - 这些指标用于判断 teacher 对更新的“有效权重”是否过小/过大，以及是否导致训练不稳定。
+    # - 为避免在超长 response 上计算分位数过慢，这里对样本数做上限采样。
+    def _masked_stats(x: torch.Tensor, m: torch.Tensor, prefix: str) -> dict:
+        # x, m: (bs, response_len)
+        out = {}
+        mask = m.bool()
+        if mask.sum() == 0:
+            out[f"{prefix}/count"] = torch.tensor(0.0, device=x.device)
+            return out
+
+        vals = x[mask]
+        out[f"{prefix}/count"] = torch.tensor(float(vals.numel()), device=x.device)
+        out[f"{prefix}/mean"] = vals.mean()
+        out[f"{prefix}/std"] = vals.std() if vals.numel() > 1 else torch.tensor(0.0, device=x.device)
+        out[f"{prefix}/min"] = vals.min()
+        out[f"{prefix}/max"] = vals.max()
+
+        # quantiles (sample if too many)
+        max_q_samples = 4096
+        if vals.numel() > max_q_samples:
+            idx = torch.randperm(vals.numel(), device=vals.device)[:max_q_samples]
+            vals_q = vals[idx]
+        else:
+            vals_q = vals
+        try:
+            out[f"{prefix}/p50"] = torch.quantile(vals_q, 0.50)
+            out[f"{prefix}/p90"] = torch.quantile(vals_q, 0.90)
+            out[f"{prefix}/p99"] = torch.quantile(vals_q, 0.99)
+        except Exception:
+            # quantile may fail on some backends; keep mean/min/max only
+            pass
+        return out
+
+    # masks
+    teacher_token_mask = teacher_exp_mask * response_mask
+    self_token_mask = self_exp_mask * response_mask
+    on_token_mask = (1.0 - exp_mask) * response_mask
+
+    ratio_stats = {}
+    # teacher_ratio: after (optional) shaping, used for teacher loss
+    ratio_stats.update(_masked_stats(teacher_ratio, teacher_token_mask, "teacher_ratio"))
+    # self_off ratio: exp(log_prob - old_log_prob)
+    ratio_stats.update(_masked_stats(ratio, self_token_mask, "self_off_ratio"))
+    # on-policy ratio is always 1 in PPO surrogate, but we can still log on-policy advantage stats
+    ratio_stats.update(_masked_stats(advantages, teacher_token_mask, "adv/teacher"))
+    ratio_stats.update(_masked_stats(advantages, self_token_mask, "adv/self_off"))
+    ratio_stats.update(_masked_stats(advantages, on_token_mask, "adv/onpolicy"))
     
     # 总 off-policy loss
     off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)
@@ -329,6 +379,8 @@ def het_compute_teacher_aware_loss(
         # ⭐ 新增：分开统计 self-generated 和 teacher loss
         "self_off_pg_loss": self_off_pg_loss,
         "teacher_off_pg_loss": teacher_off_pg_loss,
+        # ⭐ 诊断指标：用于分析 teacher 影响（ratio / advantage 分布）
+        "teacher_diag_stats": ratio_stats,
         "on_pg_clipfrac": on_pg_clipfrac,
         "on_pg_clipfrac_lower": on_pg_clipfrac_lower,
         "ppo_kl": ppo_kl,

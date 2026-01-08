@@ -150,14 +150,49 @@ def load_teacher_trajectories(self, data_path: str) -> int:
   ],
   "reward": 1.0,
   "success": true,
-  "teacher_model": "gpt-4",
-  "log_probs": [-0.5, -0.3, -0.8, ...],  // 可选，如果有 log_prob
+  "teacher_model": "Qwen2.5-72B-Instruct",
+  "log_probs": [-0.5, -0.3, -0.8, ...],
+  "log_probs_per_turn": [
+    {
+      "turn_idx": 0,
+      "log_probs": [-0.5, -0.3, -0.1],
+      "token_ids": [100, 200, 300],
+      "tokens": ["I", " need", " to"]
+    },
+    {
+      "turn_idx": 1,
+      "log_probs": [-0.8, -0.2],
+      "token_ids": [400, 500],
+      "tokens": ["find", " tomato"]
+    }
+  ],
   "metadata": {
+    "is_teacher": true,
     "has_log_prob": true,
-    "log_probs_per_turn": [[-0.5, -0.3], [-0.8, -0.2], ...]  // 可选
+    "total_generated_tokens": 159,
+    "num_turns": 5
   }
 }
 ```
+
+**字段说明**：
+
+| 字段 | 必需 | 说明 |
+|------|------|------|
+| `task_id` | ✅ | 任务唯一标识 |
+| `rollout_id` | ✅ | 同一 task 的 rollout 序号 |
+| `messages` | ✅ | 对话历史 |
+| `reward` | ✅ | 奖励值 |
+| `success` | ✅ | 是否成功 |
+| `teacher_model` | ⚠️ | Teacher 模型名（便于追溯） |
+| `log_probs` | ⚠️ | 累积的 log_probs（当 `use_log_prob: true` 时需要） |
+| `log_probs_per_turn` | ⭐ | 分轮的详细信息（**推荐**，用于精确对齐） |
+| `log_probs_per_turn[].token_ids` | ⭐ | 生成的 token ids（**用于精确对齐 chat template 问题**） |
+| `metadata.has_log_prob` | ✅ | 标记是否有 log_prob |
+| `metadata.is_teacher` | ✅ | 标记为 teacher 轨迹 |
+
+> ⭐ **重要**：当使用 `use_log_prob: true` 时，强烈推荐包含 `log_probs_per_turn` 和 `token_ids`，
+> 以支持精确对齐，避免 chat template 导致的位置偏移问题。
 
 ---
 
@@ -477,7 +512,7 @@ if teacher_offpolicy_cmt_array:
 
 ### 4.1 数据准备
 
-**位置**: `agentevolver/module/env_manager/env_manager.py:796-863`
+**位置**: `agentevolver/module/env_manager/env_manager.py:882-920`
 
 ```python
 # ⭐ Experience Replay: 处理 recorded_old_log_probs
@@ -489,10 +524,13 @@ for sample in samples:
     if is_teacher and has_log_prob:
         # ⭐ Teacher Experience: 对齐 teacher_log_probs 到 response_loss_mask
         teacher_log_probs = sample.extras.get("teacher_log_probs")
+        teacher_token_ids = sample.extras.get("teacher_token_ids")  # 用于精确对齐
         aligned_log_probs = self._align_teacher_log_probs(
             teacher_log_probs=teacher_log_probs,
             response_loss_mask=sample.response_loss_mask,
             response_length=response_length,
+            response_ids=sample.response_ids,       # 用于精确对齐
+            teacher_token_ids=teacher_token_ids,    # 用于精确对齐
         )
         recorded_old_log_probs_list.append(aligned_log_probs)
         teacher_mask_list.append(torch.ones(response_length, dtype=torch.int))
@@ -513,6 +551,100 @@ for sample in samples:
 - `recorded_old_log_probs`: 历史策略的 log_prob（teacher 或 self-generated）
 - `teacher_mask`: 标记哪些样本是 teacher 轨迹（1=teacher, 0=非 teacher）
 - `exp_mask`: 标记哪些样本是 off-policy（1=off-policy, 0=on-policy）
+- `teacher_token_ids`: Teacher 生成的 token ids（用于精确对齐）
+
+### 4.1.1 ⭐ Log Prob 对齐问题（重要）
+
+当 `use_log_prob: true` 且使用同系列模型（如 Qwen-3B 学习 Qwen-72B）时，需要处理 **Chat Template 对齐问题**。
+
+#### 问题根源
+
+**采集时（vLLM）**：
+- `log_probs` 只包含 **LLM 实际生成的 token**
+- **不包含** chat template 添加的特殊标记
+
+**训练时（tokenize_steps）**：
+- `response_loss_mask=1` 包含了整个 assistant 消息
+- 包括 chat template 的特殊标记（如 `<|im_start|>assistant\n`, `<|im_end|>`）
+
+**Qwen 的 chat template**：
+```
+<|im_start|>assistant\n  ← 采集时不记录 log_prob（约 3-4 tokens）
+[实际生成的内容]          ← 只有这部分有 log_prob
+<|im_end|>               ← 采集时不记录 log_prob（1 token）
+```
+
+**结果**：训练时的 LLM positions 比采集时的 log_probs 多
+
+#### 解决方案
+
+`_align_teacher_log_probs` 实现了两种对齐策略：
+
+**模式 1：精确对齐（推荐）**
+
+**位置**: `agentevolver/module/env_manager/env_manager.py:469-493`
+
+使用采集时保存的 `token_ids` 进行匹配：
+
+```python
+# ⭐ 模式 1：精确对齐（使用 token_ids）
+if response_ids is not None and teacher_token_ids is not None:
+    filled_count = self._align_by_token_ids(
+        aligned_log_probs=aligned_log_probs,
+        teacher_log_probs=teacher_log_probs,
+        teacher_token_ids=teacher_token_ids,
+        response_ids=response_ids,
+        llm_positions=llm_positions,
+    )
+```
+
+**模式 2：简单对齐（fallback）**
+
+**位置**: `agentevolver/module/env_manager/env_manager.py:495-521`
+
+从后往前填充（末尾对齐），开头的 chat template 标记位置自动填充 0：
+
+```python
+# 从后往前填充（末尾对齐）
+for i in range(num_to_fill):
+    teacher_idx = len(teacher_log_probs) - 1 - i
+    llm_idx = len(llm_positions) - 1 - i
+    pos = llm_positions[llm_idx]
+    aligned_log_probs[pos] = teacher_log_probs[teacher_idx]
+```
+
+#### 日志说明
+
+训练时可能看到如下日志：
+
+**简单对齐模式**：
+```
+[Teacher Log Prob Alignment] Fewer teacher log_probs (159) than LLM positions (204). 
+45 leading positions (likely chat template tokens) will be 0.
+```
+
+**精确对齐模式**：
+```
+[Teacher Log Prob Alignment] Token-based alignment: 159/159 tokens matched (100.0%).
+```
+
+这些是正常的，表示对齐逻辑正在正确处理 chat template 标记。
+
+#### 确保精确对齐
+
+要启用精确对齐，确保 teacher 轨迹数据包含 `log_probs_per_turn`：
+
+```json
+{
+  "log_probs": [-0.5, -0.3, ...],
+  "log_probs_per_turn": [
+    {"turn_idx": 0, "log_probs": [-0.5, -0.3], "token_ids": [100, 200]},
+    {"turn_idx": 1, "log_probs": [-0.8, -0.2], "token_ids": [300, 400]}
+  ]
+}
+```
+
+使用 `scripts/collect_teacher_trajectories.py` 采集的数据会自动包含这些字段。
 
 ### 4.2 替换 Off-policy 的 old_log_prob
 
@@ -870,13 +1002,48 @@ exp_manager:
 1. 确认 `uid` 基于 `group_ids` 设置
 2. 确认同一 task 的 on-policy 和 teacher rollouts 共享相同的 `data_id`
 
-### 7.6 Log prob 对齐问题
+### 7.6 Log prob 对齐问题（Chat Template）
 
-**症状**: Multi-turn 场景下 loss 位置错误
+**症状**: 日志显示 `Fewer teacher log_probs (X) than LLM positions (Y)`
 
-**检查步骤**:
-1. 确认 `_align_teacher_log_probs` 正确处理 `response_loss_mask`
-2. 确认 `teacher_mask` 只在 LLM 响应位置（`loss_mask=1`）为 1
+**原因**: Chat template 在训练时的 tokenization 包含了特殊标记（如 `<|im_start|>assistant\n`, `<|im_end|>`），但采集时的 log_probs 只包含 LLM 实际生成的 token。
+
+**这是正常的！** 差值通常约为 `4-5 tokens × 对话轮数`。
+
+**解决方案**:
+
+1. **推荐**：确保 teacher 轨迹包含 `log_probs_per_turn` 和 `token_ids`，启用精确对齐：
+   ```json
+   {
+     "log_probs_per_turn": [
+       {"turn_idx": 0, "log_probs": [...], "token_ids": [100, 200, ...]},
+       ...
+     ]
+   }
+   ```
+
+2. **备选**：如果没有 `token_ids`，系统会使用简单对齐（从后往前填充）
+
+**验证对齐效果**:
+```
+# 精确对齐成功
+[Teacher Log Prob Alignment] Token-based alignment: 159/159 tokens matched (100.0%).
+
+# 简单对齐
+[Teacher Log Prob Alignment] Fewer teacher log_probs (159) than LLM positions (204). 
+45 leading positions (likely chat template tokens) will be 0.
+```
+
+### 7.7 Tokenizer 不匹配
+
+**症状**: `ratio` 值异常大或为 NaN
+
+**原因**: Teacher 模型和 Student 模型使用不同的 tokenizer
+
+**解决**:
+- 设置 `teacher_experience.use_log_prob: false`
+- 使用 LUFFY 简化形式（假设 π_old = 1）
+- 启用 policy shaping 提升信号：`teacher_policy_shaping_enable: true`
 
 ---
 
