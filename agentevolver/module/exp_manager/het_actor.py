@@ -245,6 +245,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     # ⭐ Teacher Experience: 提取 teacher-specific metrics（如果有）
                     self_off_pg_loss = ret_dict.get("self_off_pg_loss")
                     teacher_off_pg_loss = ret_dict.get("teacher_off_pg_loss")
+                    teacher_diag_stats = ret_dict.get("teacher_diag_stats")  # ratio/adv 分布统计
                     ##################
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate entropy loss
@@ -286,6 +287,17 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         data["actor/self_off_pg_loss"] = self_off_pg_loss.detach().item()
                     if teacher_off_pg_loss is not None:
                         data["actor/teacher_off_pg_loss"] = teacher_off_pg_loss.detach().item()
+                    # ⭐ Teacher Experience: 诊断指标（ratio / advantage 分布）
+                    if isinstance(teacher_diag_stats, dict) and teacher_diag_stats:
+                        for k, v in teacher_diag_stats.items():
+                            try:
+                                if torch.is_tensor(v):
+                                    data[f"teacher_diag/{k}"] = v.detach().float().item()
+                                else:
+                                    data[f"teacher_diag/{k}"] = float(v)
+                            except Exception:
+                                # skip non-numeric
+                                pass
                     ##################
                     append_to_dict(metrics, data)
 
