@@ -105,51 +105,51 @@
 
 ### 2.1 GRPO 的组内优势定义
 
-对同一 task 的一组 rollouts（大小 \(n\)），令每条 rollout 的回报为 \(R_i\)，组内平均为：
+对同一 task 的一组 rollouts（大小 $n$），令每条 rollout 的回报为 $R_i$，组内平均为：
 
-\[
+$$
 \bar{R} = \frac{1}{n}\sum_{j=1}^{n} R_j
-\]
+$$
 
 典型 GRPO 的相对优势可以抽象为：
 
-\[
+$$
 A_i = R_i - \bar{R}
-\]
+$$
 
 （实际实现可能还有标准化/截断/GAE 等，但 **组内去均值** 是关键结构。）
 
 ### 2.2 引入 teacher 混入后的 baseline 上移
 
-设每组里混入 \(k\) 条 teacher rollouts，剩余 \(n-k\) 条为 on-policy。令：
+设每组里混入 $k$ 条 teacher rollouts，剩余 $n-k$ 条为 on-policy。令：
 
-- teacher 平均回报：\(\mu_T\)
-- on-policy 平均回报：\(\mu_O\)
+- teacher 平均回报：$\mu_T$
+- on-policy 平均回报：$\mu_O$
 
 则组均值（baseline）为：
 
-\[
+$$
 \bar{R}
 = \frac{k\mu_T + (n-k)\mu_O}{n}
 = \mu_O + \frac{k}{n}(\mu_T-\mu_O)
-\]
+$$
 
-当 teacher 更强（\(\mu_T>\mu_O\)）时，baseline **相对 on-policy 的上移量**为：
+当 teacher 更强（$\mu_T>\mu_O$）时，baseline **相对 on-policy 的上移量**为：
 
-\[
+$$
 \Delta \triangleq \bar{R} - \mu_O = \frac{k}{n}(\mu_T-\mu_O) > 0
-\]
+$$
 
 这直接导致 on-policy 的组内优势期望：
 
-\[
+$$
 \mathbb{E}[A_O]
 = \mu_O - \bar{R}
 = -\Delta
 = -\frac{k}{n}(\mu_T-\mu_O) < 0
-\]
+$$
 
-**结论**：只要 teacher 平均回报高于 on-policy，且每组混入 \(k>0\)，那么 on-policy 在组内的期望优势就是负的（被系统性压低）。
+**结论**：只要 teacher 平均回报高于 on-policy，且每组混入 $k>0$，那么 on-policy 在组内的期望优势就是负的（被系统性压低）。
 
 > 这与本次 run 的观测完全一致：`diag/group_teacher_minus_on_reward_mean` 长期为正，且 `diag/adv_onpolicy_token_mean` 长期为负。
 
@@ -158,9 +158,9 @@ A_i = R_i - \bar{R}
 注意：teacher 的影响有两层：
 
 1) **直接梯度贡献**：teacher token 自身参与 policy gradient（teacher advantage 往往大且为正）  
-2) **间接 baseline 影响**：teacher 改变了 \(\bar{R}\)，从而改变了每条 on-policy rollout 的 \(A_i\)
+2) **间接 baseline 影响**：teacher 改变了 $\bar{R}$，从而改变了每条 on-policy rollout 的 $A_i$
 
-第二层是 "以小搏大" 的关键：即使 teacher token 比例小，只要它们对应的 rollout 回报显著更高，就会在组内把 \(\bar{R}\) 拉上去，影响所有 on-policy 的优势符号与幅度。
+第二层是 "以小搏大" 的关键：即使 teacher token 比例小，只要它们对应的 rollout 回报显著更高，就会在组内把 $\bar{R}$ 拉上去，影响所有 on-policy 的优势符号与幅度。
 
 ---
 
@@ -170,11 +170,11 @@ A_i = R_i - \bar{R}
 
 以 PPO/GRPO 的 policy gradient 形式（省略 clip/ratio 细节）为例：
 
-\[
+$$
 \nabla_\theta \mathcal{L}_{PG}
 \propto
 \mathbb{E}\left[\sum_t A_t \nabla_\theta \log \pi_\theta(a_t|s_t)\right]
-\]
+$$
 
 teacher rollout 往往有：
 
@@ -187,9 +187,9 @@ teacher rollout 往往有：
 
 上一节已经推出：
 
-\[
+$$
 \mathbb{E}[A_O] = -\frac{k}{n}(\mu_T-\mu_O)
-\]
+$$
 
 这意味着 **探索型的 on-policy 行为**（通常短期回报更不稳定）在组内更容易被判为负 advantage，从而在更新中被压制。
 
@@ -212,15 +212,33 @@ teacher rollout 往往有：
 
 #### 3.3.1 目标函数不是“最大化 teacher reward”，而是“最大化组内相对优势”
 
-对每个 task 的一组 rollouts（大小 n，其中 k 条 teacher，n-k 条 on-policy），简化写成：
+对每个 task 的一组 rollouts（大小 $n$，其中 $k$ 条 teacher，$n-k$ 条 on-policy），简化写成：
 
-- 组内 baseline：`R_bar = mean(R_1..R_n)`
-- 组内优势：`A_i = R_i - R_bar`
+- 组内 baseline（均值）：
 
-如果 teacher 更强：`mu_T > mu_O`，那你已经看到：
+$$
+\bar{R}=\frac{1}{n}\sum_{j=1}^{n}R_j
+$$
 
-- `E[A_on] = - (k/n) * (mu_T - mu_O) < 0`
-- `E[A_teacher] = + ((n-k)/n) * (mu_T - mu_O) > 0`
+- 组内优势：
+
+$$
+A_i = R_i - \bar{R}
+$$
+
+如果 teacher 更强（$\mu_T > \mu_O$），则可以推出：
+
+- on-policy 的期望优势：
+
+$$
+\mathbb{E}[A_O] = -\frac{k}{n}(\mu_T-\mu_O) < 0
+$$
+
+- teacher 的期望优势：
+
+$$
+\mathbb{E}[A_T] = +\frac{n-k}{n}(\mu_T-\mu_O) > 0
+$$
 
 重要点在于：**当 teacher 固定且强时，on-policy 的“期望优势”长期为负**。  
 这意味着训练在优化时会出现一个“结构性偏置”：大多数 on-policy token 会被当作“应该降低概率”的对象。
@@ -231,10 +249,14 @@ teacher rollout 往往有：
 
 把 token-level 的 policy gradient 写成（忽略 clip 等细节）：
 
-`grad ~ E[ w_t * A_t * ∇ log pi_theta(a_t | s_t) ]`
+$$
+\nabla_\theta \mathcal{L}_{PG}
+\propto
+\mathbb{E}\left[\sum_t w_t A_t \nabla_\theta \log \pi_\theta(a_t|s_t)\right]
+$$
 
-当大多数 on-policy token 的 `A_t < 0` 时，更新方向是 **降低这些 on-policy 动作的概率**。  
-但“降低自己做过的动作概率”并不保证“提高 teacher 动作概率”，因为 teacher 动作通常是一个很小子集，且在 early 阶段 `pi_theta(a_teacher|s)` 可能极低。
+当大多数 on-policy token 的 $A_t < 0$ 时，更新方向是 **降低这些 on-policy 动作的概率**。  
+但“降低自己做过的动作概率”并不保证“提高 teacher 动作概率”，因为 teacher 动作通常是一个很小子集，且在 early 阶段 $\pi_\theta(a_{teacher}|s)$ 可能极低。
 
 所以 early 很容易出现这种现象：
 
@@ -247,13 +269,13 @@ teacher rollout 往往有：
 
 #### 3.3.3 use_log_prob=false 时，teacher 梯度对“低概率 teacher token”天然很弱（学得慢）
 
-你这个 run 是 `use_log_prob=false`（LUFFY 形式）。在我们实现里，teacher 的 off-policy 权重本质上是 “用当前策略的概率做权重” 的某种变体（再可能叠加 policy shaping）。
+你这个 run 是 `use_log_prob=false`（LUFFY 形式）。在我们实现里，teacher 的 off-policy 权重本质上是“用当前策略的概率做权重”的某种变体（再可能叠加 policy shaping）。
 
 直观结论：
 
-- 当 `pi_theta(a_teacher|s)` 很小（early 阶段常见），teacher token 的权重也很小  
+- 当 $\pi_\theta(a_{teacher}|s)$ 很小（early 阶段常见），teacher token 的权重也很小  
   -> **teacher 的正 advantage 再大，也很难产生足够梯度把它学起来**
-- 等到中期 `pi_theta(a_teacher|s)` 被逐渐抬起来，teacher 梯度才会开始变“有效”  
+- 等到中期 $\pi_\theta(a_{teacher}|s)$ 被逐渐抬起来，teacher 梯度才会开始变“有效”  
   -> 这对应你看到的 **22 之后开始超过 GRPO**
 
 换句话说：**teacher 在 early 并不会像 BC 那样“强制你模仿”**；它更像一个“带权的 RL 信号”，权重还会在 early 被低概率显著削弱。
@@ -262,7 +284,7 @@ teacher rollout 往往有：
 
 当 on-policy 水平上升后，会出现两个自然后果：
 
-- (a) `mu_O` 上升使 `(mu_T - mu_O)` 变小，teacher 相对优势变小  
+- (a) $\mu_O$ 上升使 $(\mu_T - \mu_O)$ 变小，teacher 相对优势变小  
   -> teacher 的“拉动作用”边际变弱（你也观测到 group gap 从 early 的 0.63 降到 mid 的 0.44）
 - (b) baseline 仍然被 teacher 抬高，on-policy 优势仍偏负（虽然绝对值会变小）  
   -> 这会长期压制探索，导致策略更容易收缩到少数模式（熵下降/塌陷）
@@ -276,66 +298,134 @@ teacher rollout 往往有：
 
 > 一句话总结：**teacher replay 在这里不是“监督模仿”，而是“相对优势驱动的加权 RL 信号”**。强 teacher 会同时带来“中期加速”与“长期 baseline 抬高/探索压制”，从而自然产生 “先掉—后超—再落” 的非单调曲线。
 
-#### 3.3.5 更形式化：teacher 梯度强度为什么会随 `pi_theta(a_T|s)` 单调变强（解释“中期才开始贴近 teacher”）
+#### 3.3.5 更形式化：teacher 梯度强度为什么会随 $\pi_\theta(a_T|s)$ 单调变强（解释“中期才开始贴近 teacher”）
 
 把 teacher token 的更新抽象成一个“带权优势梯度”（忽略 clip/normalize，仅用于定性）：
 
-- teacher token 的梯度项：`g_T = E_{(s,a_T)~D_T}[ w_T(s,a_T) * A_T(s,a_T) * ∇ log pi_theta(a_T|s) ]`
+- teacher token 的梯度项：
 
-这里 `D_T` 是 teacher 轨迹诱导的状态-动作分布；`A_T` 是 teacher token 在当前 batch 里的优势（对这类 run 里通常为正且较大）；`w_T` 是 off-policy 权重。
+$$
+g_T = \mathbb{E}_{(s,a_T)\sim D_T}\left[ w_T(s,a_T)\,A_T(s,a_T)\,\nabla_\theta \log \pi_\theta(a_T|s) \right]
+$$
 
-在两个常见设定下，`w_T` 的量级行为不同：
+这里 $D_T$ 是 teacher 轨迹诱导的状态-动作分布；$A_T$ 是 teacher token 在当前 batch 里的优势（对这类 run 里通常为正且较大）；$w_T$ 是 off-policy 权重。
+
+在两个常见设定下，$w_T$ 的量级行为不同：
 
 - **use_log_prob=true（标准重要性比率）**
-  - 近似：`w_T ≈ exp( log pi_theta(a_T|s) - log pi_old(a_T|s) )`
-  - 对 teacher replay 来说 `pi_old` 常是 teacher：`pi_old = pi_teacher`
-  - 则：`w_T ≈ pi_theta(a_T|s) / pi_teacher(a_T|s)`
-  - 推论：如果 teacher 对该动作很自信（`pi_teacher` 大），但 student 还没学会（`pi_theta` 小），那么 `w_T` 会非常小。
+  - 近似：$w_T \approx \exp(\log \pi_\theta(a_T|s) - \log \pi_{old}(a_T|s))$
+  - 对 teacher replay 来说 $\pi_{old}$ 常是 teacher：$\pi_{old}=\pi_{teacher}$
+  - 则：$w_T \approx \pi_\theta(a_T|s) / \pi_{teacher}(a_T|s)$
+  - 推论：如果 teacher 对该动作很自信（$\pi_{teacher}$ 大），但 student 还没学会（$\pi_\theta$ 小），那么 $w_T$ 会非常小。
 
 - **use_log_prob=false（LUFFY 简化）**
-  - 近似：`w_T ≈ f( pi_theta(a_T|s) )`
-  - 不做 shaping 时可以近似成：`f(x)=x`
-  - 做 policy shaping（例如 `f(x)=x/(x+beta)`）时：
-    - 当 `x << beta`：`f(x) ≈ x/beta`（仍然与 `x` 成正比，依旧很小）
-    - 当 `x >> beta`：`f(x) ≈ 1`（权重饱和，teacher 梯度“完全显现”）
+  - 近似：$w_T \approx f(\pi_\theta(a_T|s))$
+  - 不做 shaping 时可以近似成：$f(x)=x$
+  - 做 policy shaping（例如 $f(x)=x/(x+\beta)$）时：
+    - 当 $x \ll \beta$：$f(x) \approx x/\beta$（仍然与 $x$ 成正比，依旧很小）
+    - 当 $x \gg \beta$：$f(x) \approx 1$（权重饱和，teacher 梯度“完全显现”）
 
 所以无论你是哪一种设定，都有一个共同结论：
 
-- 当 `pi_theta(a_T|s)` 很小（early 常见）时，teacher 梯度的有效系数 `w_T` 很小  
+- 当 $\pi_\theta(a_T|s)$ 很小（early 常见）时，teacher 梯度的有效系数 $w_T$ 很小  
   -> 即使 `A_T` 很大，也“推不动”策略去模仿 teacher（学得慢）
-- 当 `pi_theta(a_T|s)` 被逐步抬起来（中期开始）时，`w_T` 随之变大并可能饱和  
+- 当 $\pi_\theta(a_T|s)$ 被逐步抬起来（中期开始）时，$w_T$ 随之变大并可能饱和  
   -> teacher 梯度突然变得非常有效（你看到的“22 之后开始超过 GRPO”就符合这一点）
 
 这就是你问的“为什么不会一直按 teacher experience 学”的一个严格答案：  
 **teacher 的更新强度不是常数，它是随 student 当前对 teacher 动作的概率增长而自增强的。**
 
+#### 3.3.5.1 补全 late 阶段：为什么后期 LUFFY 会逐渐不如 GRPO（同一套符号下的解释）
+
+3.3.5 解释了“为什么中期 teacher 梯度突然变得有效”，但它同时也隐含了一个 late 阶段的副作用：当 $\pi_\theta(a_T|s)$ 变大、$w_T$ 变大（甚至饱和）之后，teacher 会更强地参与梯度与组内比较结构，进而 **抑制后期进一步提升所需要的探索与分布外修复**。这一段可以用两个互补机制来刻画。
+
+> 你可能会问：$D_T$ 是强 teacher 的分布，弱模型朝 $D_T$ 靠近不应该更好吗？为什么还要在 $D_\pi$ 上做“长尾修复”？
+>
+> 关键点是：我们最终想最大化的是当前策略的期望回报
+>
+> $$
+> J(\pi)=\mathbb{E}_{\tau\sim\pi}[R(\tau)]
+> $$
+>
+> 这个目标由 **策略自己诱导的状态占用分布** $d_\pi(s)$ 决定，而不是由 teacher 的 $d_T(s)$ 决定。哪怕 teacher 更强，**只要 student 还不是 teacher**，它在真实 rollout 里就会不可避免地产生小偏差；在多步/多轮环境中，小偏差会累积并把轨迹带到 teacher 轨迹很少覆盖的状态区域（失败态、恢复态、偏离后的“补救态”）。
+>
+> 换句话说：
+>
+> - $D_T$ 往往近似 “成功轨迹上的状态-动作分布”（更短、更少失败分支）
+> - $D_\pi$ 包含了 student 真实会遇到的状态（包括 teacher 很少遇到的错误分支）
+>
+> late 阶段要继续提升/保持 reward，常常取决于 **错误后的恢复能力**：即使主干策略已经很像 teacher，只要偶发一步走错，就需要在这些“teacher 不常到达”的状态上采取正确补救，否则整条轨迹 reward 仍会失败。这类修复只能通过在 $D_\pi$（或更接近 $D_\pi$）的分布上训练得到；如果更新过度偏向 $D_T$，就会出现“主干像 teacher，但鲁棒性不足”的现象，体现在 late 段 reward 难以维持高位。
+
+**机制 A：teacher 参与组内 baseline 会持续制造 on-policy 的负优势压力（探索被系统性惩罚）**
+
+对同一 task 的组内优势定义是：
+
+$$
+A_i = R_i - \bar{R}
+$$
+
+当 teacher 更强且每组固定混入 $k>0$ 条 teacher 时，on-policy 的期望优势仍是：
+
+$$
+\mathbb{E}[A_O] = -\frac{k}{n}(\mu_T-\mu_O) < 0
+$$
+
+注意这条式子在 late 阶段仍成立，唯一变化是 $(\mu_T-\mu_O)$ 可能变小，但只要它不为 0，on-policy 的期望优势就仍为负。  
+这意味着：**后期任何“为了探索/修复长尾失败模式而做出的偏离”更容易被判为负 advantage，更新会把它压回去**。因此相比纯 on-policy 的 GRPO，LUFFY 更容易走向“保守收缩”而非“继续探索爬坡”。
+
+**机制 B：当 $w_T$ 饱和后，teacher 更新强、但它只能把你拉向 teacher 覆盖的分布；late 阶段的提升更依赖分布外修复**
+
+在 3.3.5 中我们写了 teacher 梯度项：
+
+$$
+g_T = \mathbb{E}_{(s,a_T)\sim D_T}\left[ w_T(s,a_T)\,A_T(s,a_T)\,\nabla_\theta \log \pi_\theta(a_T|s) \right]
+$$
+
+当进入 late 阶段，常见情况是：
+
+- $\pi_\theta(a_T|s)$ 已经不小，导致 $w_T$ 变大甚至饱和（use\_log\_prob=false 时更明显）
+- 因而 teacher 梯度对参数更新的“牵引力”上升
+
+但是 $g_T$ 的期望是在 teacher 分布 $D_T$ 上取的。也就是说它更擅长做的是：
+
+- **让策略在 teacher 覆盖到的状态-动作子空间里更像 teacher**
+
+而 late 阶段要超过/追平 GRPO，往往依赖的是另一个东西：
+
+- **在 on-policy 真实遇到的失败状态分布 $D_\pi$ 上修复长尾错误**（teacher 轨迹可能没有覆盖到这些失败路径）
+
+如果 $D_T$ 与 $D_\pi$ 存在差异（尤其是 teacher 更强、路径更短、更少失败分支时差异会更大），那么当 $w_T$ 变大后，更新会更多沿着 $D_T$ 的方向“收缩”，而不是沿着 $D_\pi$ 的方向“修复”。  
+这会表现为：中期 reward 上升很快（快速进入 teacher 的子空间），但 late 阶段边际收益变小甚至回落，并被 GRPO 的持续 on-policy 修复反超。
+
+> 用一句话概括：**early/mid：$w_T$ 从小到大让 teacher 信号逐步“显性化”，带来加速；late：$w_T$ 大 + baseline 抬高让策略更保守，且更新更偏向 $D_T$，从而压制 $D_\pi$ 上的长尾修复，最终不如 GRPO。**
+
 #### 3.3.6 更形式化：给一个“熵塌陷”的（近似）充分条件
 
-我们只看一个状态 `s` 下的离散动作分布（把多 token 展开成多个动作也一样），令：
+我们只看一个状态 $s$ 下的离散动作分布（把多 token 展开成多个动作也一样），令：
 
-- `p_i = pi_theta(a_i|s)`
-- `H(p) = -sum_i p_i log p_i`
+- $p_i = \pi_\theta(a_i|s)$
+- $H(p) = -\sum_i p_i \log p_i$
 
 忽略 clip 和 baseline 细节时，PPO/GRPO 的更新会倾向于：
 
 - 对“高优势动作”提高概率
 - 对“负优势动作”降低概率
 
-如果在一个较长时间段内，存在一个动作子集 `G`（可以理解成 teacher 常走的一组动作/模板），满足：
+如果在一个较长时间段内，存在一个动作子集 $G$（可以理解成 teacher 常走的一组动作/模板），满足：
 
-- 对所有 `a in G`：`E[A(s,a)] >= +c_pos`
-- 对所有 `a notin G`：`E[A(s,a)] <= -c_neg`
-- 且 entropy 正则系数 `alpha` 相对较小（不足以抵消上述优势差）
+- 对所有 $a\in G$：$\mathbb{E}[A(s,a)] \ge +c_{pos}$
+- 对所有 $a\notin G$：$\mathbb{E}[A(s,a)] \le -c_{neg}$
+- 且 entropy 正则系数 $\alpha$ 相对较小（不足以抵消上述优势差）
 
 则迭代更新会把质量从 `a notin G` 不断转移到 `G`，导致：
 
-- `sum_{a in G} p(a)` 单调增加
+- $\sum_{a\in G} p(a)$ 单调增加
 - 概率质量集中到少数动作上
-- 熵 `H(p)` 下降（“塌陷”）
+- 熵 $H(p)$ 下降（“塌陷”）
 
 把它更直观地写成一句话：
 
-- 如果“同一批训练信号”长期给出 **稳定的正优势方向**（teacher）与 **广泛的负优势惩罚**（on-policy 探索），且 `alpha` 不够大，那么最稳定的解就是“收缩到少数高概率模式”，熵必然下降。
+- 如果“同一批训练信号”长期给出 **稳定的正优势方向**（teacher）与 **广泛的负优势惩罚**（on-policy 探索），且 $\alpha$ 不够大，那么最稳定的解就是“收缩到少数高概率模式”，熵必然下降。
 
 这与你的观测一致：
 
@@ -353,7 +443,9 @@ teacher rollout 往往有：
 
 常见 entropy 正则（最大化熵）写为：
 
-- `L = L_PG - alpha * E[ H(pi_theta(.|s)) ]`
+$$
+\mathcal{L} = \mathcal{L}_{PG} - \alpha \,\mathbb{E}[H(\pi_\theta(\cdot|s))]
+$$
 
 其中 `H(pi)` 越大越"探索"。当 policy gradient 部分对某些动作给出持续正 advantage 时，`pi_theta` 会对这些动作 **提高概率**，从而自然降低熵（更确定）。
 
@@ -365,7 +457,7 @@ teacher rollout 往往有：
 
 - on-policy 的回报 `mu_O` 上升
 - teacher 与 on-policy 的差距 `(mu_T - mu_O)` 可能阶段性缩小
-- 则 baseline 上移量 `Delta = (k/n)*(mu_T - mu_O)` 变小
+- 则 baseline 上移量 $\Delta = (k/n)(\mu_T-\mu_O)$ 变小
 
 在这种情况下，on-policy 的负 advantage 压力减轻，entropy 正则和训练噪声可能让策略出现一定“再扩散” → **中期熵回升**。
 
@@ -403,8 +495,8 @@ teacher rollout 贡献的“有效学习信号”来自两点：
 
 teacher 的负作用主要不是“teacher 本身坏”，而是 **teacher 太强 + GRPO 的组内相对基线** 共同作用：
 
-- teacher 强 → baseline 上移 `Delta > 0`
-- baseline 上移 → on-policy 期望优势变负 `E[A_on] < 0`
+- teacher 强 → baseline 上移 $\Delta > 0$
+- baseline 上移 → on-policy 期望优势变负 $\mathbb{E}[A_O] < 0$
 - on-policy 优势为负 → 探索轨迹被惩罚 → 熵下降 → 发现更优策略的概率下降
 
 这会导致后期被 GRPO 反超，或者在更极端情况下出现 reward 崩塌。
