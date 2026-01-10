@@ -35,14 +35,17 @@ kill_port() {
 
 # Run GRPO baseline (default)
 python launcher.py \
-  --conf config/alfworld_grpo_3b_teacher_only_no_logprob.yaml
+  --conf config/alfworld_grpo_3b_teacher_only_no_logprob__baseline_sep_plus_adaptive_gate.yaml
 
 
 python launcher.py \
-  --conf config/alfworld_grpo_3b_teacher_only_use_logprob.yaml
+  --conf config/alfworld_grpo_3b_teacher_only_no_logprob__grpo_teacher_baseline_sep.yaml
 
 python launcher.py \
-  --conf config/alfworld_grpo_3b_teacher_only_use_logprob_random.yaml
+  --conf config/alfworld_grpo_3b_teacher_only_no_logprob__teacher_adaptive_gate.yaml
+
+python launcher.py \
+  --conf config/alfworld_grpo_3b_teacher_only_no_logprob_random.yaml
 
 # Run GRPO with Experience Replay
 # python launcher.py \

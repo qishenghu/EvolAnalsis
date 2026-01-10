@@ -26,7 +26,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__grpo_teacher_baseline_sep_v1
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_confidence_analysis_v1
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -44,13 +44,6 @@ trainer:
 algorithm:
   adv_estimator: grpo
   use_kl_in_reward: false
-  # 2.1 (optional): teacher-separated GRPO baseline
-  grpo:
-    teacher_baseline_separation:
-      enable: true
-      teacher_baseline: "all_mean"
-      non_teacher_baseline: "non_teacher_mean"
-      std_source: "non_teacher"
   
   dapo:
     enable: false
@@ -344,10 +337,6 @@ exp_manager:
       enable: true
       mode: "p_div_p_beta"  # f(x) = x / (x + β)
       beta: 0.1             # β 值，控制梯度放大/抑制程度
-
-    # 2.2 (optional): adaptive teacher loss gating
-    adaptive_weight:
-      enable: false
 
 # ============================================================================
 # Attribution-Driven Credit Assignment (ADCA-GRPO) Configuration
