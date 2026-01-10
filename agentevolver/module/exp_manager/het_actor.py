@@ -79,6 +79,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         if multi_turn:
             select_keys.append("loss_mask")
             select_keys.append("exp_mask")
+        # ⭐ Teacher replay / gating extras (keep backward compatible)
+        if isinstance(data, DataProto):
+            if "teacher_mask" in data.batch:
+                select_keys.append("teacher_mask")
+            if "teacher_loss_scale" in data.batch:
+                select_keys.append("teacher_loss_scale")
         # if multi_turn:
         #     select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -167,6 +173,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         has_teacher_data = teacher_mask.sum() > 0
                     else:
                         has_teacher_data = False
+                    teacher_loss_scale = data.get("teacher_loss_scale", None)
+                    if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
+                        teacher_loss_scale = teacher_loss_scale[:, -response_length:]
                     
                     if use_dapo:
                         # Use DAPO's decoupled asymmetric clipping mechanism
@@ -215,6 +224,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_policy_shaping_mode=teacher_policy_shaping_mode,
                             teacher_policy_shaping_beta=teacher_policy_shaping_beta,
                             teacher_use_clip=teacher_use_clip,
+                            teacher_loss_scale=teacher_loss_scale,
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
                     else:
                         # Use original het_compute_token_on_off_policy_loss

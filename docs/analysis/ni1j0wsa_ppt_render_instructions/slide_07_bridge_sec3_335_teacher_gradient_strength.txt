@@ -1,0 +1,75 @@
+Create a single academic presentation slide (16:9) that introduces the key bridge
+result (Sec. 3.3.5): teacher-gradient strength increases monotonically with the policy
+probability on teacher actions, explaining the reward phase transitions.
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Minimal texture; keep strong contrast for math and the central schematic.
+
+Font:
+- Use DM Sans for all text.
+- Math formulas large and crisp.
+
+Layout:
+- Title at top (≈10% height).
+- Two-column body:
+  LEFT (≈58%): “Key formula + monotonicity statement”
+  RIGHT (≈42%): “Schematic: w_T vs πθ(a_T|s)” with a blank chart placeholder
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, bold):
+“Bridge (Sec. 3.3.5) — Teacher Gradient Self-Amplifies with πθ(a_T|s)”
+
+Subtitle (small):
+“When teacher actions are low-probability, teacher updates are weak; as π increases, updates become strong”
+
+------------------------------------------------------------
+LEFT: FORMULA + STATEMENT
+------------------------------------------------------------
+Section header (semibold):
+“Teacher Token Update (Abstract Form)”
+
+Show one central formula (large, centered):
+g_T = E_{(s,a_T)~D_T} [ w_T(s,a_T) · A_T(s,a_T) · ∇θ log πθ(a_T|s) ]
+
+Under it, add a bold monotonicity claim (one line):
+“Key point: w_T increases monotonically with πθ(a_T|s), often saturating for large πθ(a_T|s).”
+
+Add a small “intuition” box (rounded rectangle):
+Header (semibold):
+“Intuition”
+Bullets:
+- “Early: πθ(a_T|s) is tiny → w_T is tiny → teacher signal cannot ‘pull’ the policy much.”
+- “Mid: πθ(a_T|s) grows → w_T grows → teacher signal becomes effective → acceleration.”
+- “Late: w_T saturates + baseline shift persists → conservative concentration → underperformance risk.”
+
+Optional tiny note (one line):
+“This is not behavior cloning; update strength depends on current-policy probability.”
+
+------------------------------------------------------------
+RIGHT: SCHEMATIC PLACEHOLDER (BLANK CHART AREA)
+------------------------------------------------------------
+Section header (semibold):
+“Schematic: w_T(π)”
+
+Insert a blank mini-chart placeholder (rounded rectangle, white fill, light gray border),
+occupying most of the right column:
+Centered label (light text):
+“[Insert schematic: w_T vs πθ(a_T|s), monotone increasing, possibly saturating]”
+
+Add axis labels (outside the placeholder):
+- X-axis: “πθ(a_T|s)”
+- Y-axis: “w_T (effective teacher weight)”
+
+Add two small annotations near the placeholder:
+- Near left: “low-π regime: weak teacher gradient”
+- Near right: “high-π regime: strong / saturated teacher gradient”
+
+Bottom transition line (small text, right-aligned):
+“Next: use this bridge + baseline-shift to explain the three reward phases.”
+
+Style constraints:
+- Keep this slide conceptually focused (no reward plots here).
+- Formula must be the visual anchor on the left.

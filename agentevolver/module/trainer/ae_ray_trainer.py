@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import os
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from concurrent.futures.thread import ThreadPoolExecutor
 from copy import deepcopy
 from pprint import pprint
@@ -242,13 +243,23 @@ def compute_teacher_effect_metrics(batch: DataProto, entropys: Optional[torch.Te
                     else:
                         grp[gid]["o"].append(rs[i])
                 gaps = []
+                nt_means = []
+                all_means = []
                 for gid, d in grp.items():
                     if d["t"] and d["o"]:
                         gaps.append(float(np.mean(d["t"]) - np.mean(d["o"])))
+                        nt_means.append(float(np.mean(d["o"])))
+                        all_means.append(float(np.mean(d["t"] + d["o"])))
                 if gaps:
                     metrics["diag/group_teacher_minus_on_reward_mean"] = float(np.mean(gaps))
                     metrics["diag/group_teacher_minus_on_reward_std"] = float(np.std(gaps))
                     metrics["diag/group_gap_count"] = float(len(gaps))
+                if nt_means:
+                    # Useful for 2.1 teacher-baseline separation: this approximates the non-teacher baseline.
+                    metrics["diag/group_non_teacher_reward_mean"] = float(np.mean(nt_means))
+                if all_means:
+                    # Useful to compare against original GRPO mixed baseline proxy.
+                    metrics["diag/group_all_reward_mean"] = float(np.mean(all_means))
             except Exception:
                 pass
 
@@ -420,6 +431,100 @@ def compute_grpo_outcome_advantage(
 
 
 
+def compute_grpo_outcome_advantage_teacher_baseline_separated(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    teacher_mask: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    teacher_baseline: str = "all_mean",
+    non_teacher_baseline: str = "non_teacher_mean",
+    std_source: str = "non_teacher",
+):
+    """
+    GRPO outcome-advantage with teacher-separated baseline (2.1 improvement).
+
+    Goal:
+    - Do NOT let teacher rollouts (typically reward=1) lift the baseline used for non-teacher samples.
+    - Keep original behavior by default (feature is off unless enabled by config).
+
+    Notes:
+    - "teacher" is inferred by per-sample teacher_mask (any token marked -> teacher sample).
+    - "non-teacher" corresponds to the remaining samples in the same GRPO group.
+    - We only separate teacher vs non-teacher; we do NOT change self-generated experience replay semantics.
+    """
+    # Keep original score definition for comparability
+    scores = token_level_rewards.sum(dim=-1)  # (bs,)
+
+    # Align teacher_mask to response length and derive per-sample teacher flag
+    resp_len = response_mask.size(1)
+    if teacher_mask.dim() == 2 and teacher_mask.size(1) != resp_len and teacher_mask.size(1) > resp_len:
+        teacher_mask = teacher_mask[:, -resp_len:]
+    is_teacher = (teacher_mask * response_mask).sum(dim=-1) > 0  # (bs,)
+
+    id2idxs: dict[Any, list[int]] = defaultdict(list)
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2idxs[index[i]].append(i)
+
+        id2_mean_all: dict[Any, torch.Tensor] = {}
+        id2_mean_non_teacher: dict[Any, torch.Tensor] = {}
+        id2_std: dict[Any, torch.Tensor] = {}
+
+        for gid, idxs in id2idxs.items():
+            idxs_t = torch.tensor(idxs, device=scores.device, dtype=torch.long)
+            s_all = scores[idxs_t]
+            t_all = is_teacher[idxs_t]
+            s_nt = s_all[~t_all]
+
+            mean_all = s_all.mean() if s_all.numel() > 0 else torch.tensor(0.0, device=scores.device)
+            mean_nt = s_nt.mean() if s_nt.numel() > 0 else mean_all
+
+            id2_mean_all[gid] = mean_all
+            id2_mean_non_teacher[gid] = mean_nt
+
+            if std_source == "all":
+                s_for_std = s_all
+            else:  # "non_teacher"
+                s_for_std = s_nt if s_nt.numel() > 0 else s_all
+
+            if s_for_std.numel() <= 1:
+                std = torch.tensor(1.0, device=scores.device)
+            else:
+                std = s_for_std.std()
+                if torch.isnan(std).item() or std.item() == 0.0:
+                    std = torch.tensor(1.0, device=scores.device)
+            id2_std[gid] = std
+
+        adv = scores.clone()
+        for i in range(bsz):
+            gid = index[i]
+
+            if is_teacher[i]:
+                if teacher_baseline == "fixed_one":
+                    base = torch.tensor(1.0, device=scores.device)
+                elif teacher_baseline == "non_teacher_mean":
+                    base = id2_mean_non_teacher[gid]
+                else:  # "all_mean"
+                    base = id2_mean_all[gid]
+            else:
+                if non_teacher_baseline == "all_mean":
+                    base = id2_mean_all[gid]
+                else:  # "non_teacher_mean"
+                    base = id2_mean_non_teacher[gid]
+
+            adv_i = scores[i] - base
+            if norm_adv_by_std_in_grpo:
+                adv_i = adv_i / (id2_std[gid] + epsilon)
+            adv[i] = adv_i
+
+        adv = adv.unsqueeze(-1) * response_mask
+
+    return adv, adv
+
+
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, config=None):
     """
     Compute advantage estimates for policy optimization.
@@ -470,13 +575,46 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_length = grpo_calculation_mask.size(1)
             # This mask is the one intended for GRPO
             grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )  # ⭐ Compute advantages and returns for GRPO
+
+        # 2.1 improvement (optional): teacher-separated baseline for GRPO advantage.
+        # Default remains original GRPO behavior.
+        teacher_sep_cfg = None
+        try:
+            teacher_sep_cfg = (config.get("grpo", {}) or {}).get("teacher_baseline_separation", None) if config else None
+        except Exception:
+            teacher_sep_cfg = None
+
+        # NOTE: config may be OmegaConf DictConfig; treat Mapping as config-like
+        enable_teacher_sep = bool(teacher_sep_cfg.get("enable", False)) if isinstance(teacher_sep_cfg, Mapping) else False
+        teacher_mask = data.batch.get("teacher_mask", None)
+        has_teacher = (
+            teacher_mask is not None
+            and torch.is_tensor(teacher_mask)
+            and teacher_mask.numel() > 0
+            and teacher_mask.sum().item() > 0
+        )
+
+        if enable_teacher_sep and has_teacher:
+            resp_len = grpo_calculation_mask.size(1)
+            if teacher_mask.dim() == 2 and teacher_mask.size(1) != resp_len and teacher_mask.size(1) > resp_len:
+                teacher_mask = teacher_mask[:, -resp_len:]
+            advantages, returns = compute_grpo_outcome_advantage_teacher_baseline_separated(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                teacher_mask=teacher_mask,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                teacher_baseline=str(teacher_sep_cfg.get("teacher_baseline", "all_mean")),
+                non_teacher_baseline=str(teacher_sep_cfg.get("non_teacher_baseline", "non_teacher_mean")),
+                std_source=str(teacher_sep_cfg.get("std_source", "non_teacher")),
+            )
+        else:
+            advantages, returns = compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch["token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=data.non_tensor_batch["uid"],
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )  # ⭐ Compute advantages and returns for GRPO
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     else:
@@ -557,6 +695,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
+        # 2.2 adaptive teacher gating (EMA state for reward gap)
+        self._teacher_gap_ema: Optional[float] = None
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -2244,23 +2384,23 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         )
                                     elif enable_exp_replay:
                                         # 使用原有的 ExperienceMixCollateFn（向后兼容）
-                                        experience_mix_collate = ExperienceMixCollateFn(
-                                            exp_manager=self.exp_manager,
-                                            train_task_manager=self.train_task_manager,
-                                            exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
-                                            replay_start_ratio=replay_start_ratio,
-                                            offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
-                                            n_rollout=self.config.actor_rollout_ref.rollout.n,
-                                        )
-                                        
-                                        experience_tasks, on_policy_tasks = experience_mix_collate(
-                                            training_tasks=tasks,
-                                            training_progress=training_progress,
-                                            enable_replay=True,
-                                        )
+                                    experience_mix_collate = ExperienceMixCollateFn(
+                                        exp_manager=self.exp_manager,
+                                        train_task_manager=self.train_task_manager,
+                                        exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
+                                        replay_start_ratio=replay_start_ratio,
+                                        offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
+                                        n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                    )
+                                    
+                                    experience_tasks, on_policy_tasks = experience_mix_collate(
+                                        training_tasks=tasks,
+                                        training_progress=training_progress,
+                                        enable_replay=True,
+                                    )
                                         # 统一变量名，便于后续合并逻辑复用
                                         teacher_exp_tasks = []
-                                        
+                                    
                                     # 合并 tasks（experience_tasks + teacher_exp_tasks + on_policy_tasks）
                                     tasks = experience_tasks + teacher_exp_tasks + on_policy_tasks
                                     
@@ -2851,6 +2991,70 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         except Exception as _e:
                             logger.warning(f"Failed to compute teacher effect metrics: {_e}")
                             diag_metrics = None
+
+                        # ============================================================================
+                        # ⭐ 2.2 Improvement (optional): adaptive teacher loss gating/annealing
+                        # ============================================================================
+                        # This writes `teacher_loss_scale` into batch.batch so actor can scale teacher loss.
+                        # Safety:
+                        # - Only active if exp_manager.teacher_experience.adaptive_weight.enable=true
+                        # - Only applies when teacher_mask exists and has teacher tokens
+                        # - Does NOT affect ExGRPO self-generated experience replay (teacher_mask=0)
+                        try:
+                            te_cfg = getattr(getattr(self.config, "exp_manager", None), "teacher_experience", None)
+                            aw_cfg = getattr(te_cfg, "adaptive_weight", None) if te_cfg is not None else None
+                            aw_enable = bool(getattr(aw_cfg, "enable", False)) if aw_cfg is not None else False
+                        except Exception:
+                            aw_cfg, aw_enable = None, False
+
+                        if aw_enable and diag_metrics and isinstance(diag_metrics, dict):
+                            gap = diag_metrics.get("diag/group_teacher_minus_on_reward_mean", None)
+                            teacher_mask_full = batch.batch.get("teacher_mask", None)
+                            has_teacher = (
+                                teacher_mask_full is not None
+                                and torch.is_tensor(teacher_mask_full)
+                                and teacher_mask_full.numel() > 0
+                                and teacher_mask_full.sum().item() > 0
+                            )
+                            if gap is not None and has_teacher:
+                                mode = str(getattr(aw_cfg, "mode", "gap_linear"))
+                                eps = float(getattr(aw_cfg, "epsilon", 0.0))
+                                tau = float(getattr(aw_cfg, "tau", 1.0))
+                                a_min = float(getattr(aw_cfg, "min", 0.0))
+                                a_max = float(getattr(aw_cfg, "max", 1.0))
+
+                                # optional EMA on gap
+                                ema_cfg = getattr(aw_cfg, "ema", None)
+                                ema_enable = bool(getattr(ema_cfg, "enable", False)) if ema_cfg is not None else False
+                                ema_beta = float(getattr(ema_cfg, "beta", 0.9)) if ema_cfg is not None else 0.9
+                                g = float(gap)
+                                if ema_enable:
+                                    if getattr(self, "_teacher_gap_ema", None) is None:
+                                        self._teacher_gap_ema = g
+                                    else:
+                                        self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
+                                    g_eff = float(self._teacher_gap_ema)
+                                else:
+                                    g_eff = g
+
+                                denom = tau if tau > 0 else 1.0
+                                if mode == "gap_linear":
+                                    alpha = (g_eff - eps) / denom
+                                else:
+                                    alpha = (g_eff - eps) / denom
+                                alpha = max(a_min, min(a_max, alpha))
+
+                                # fill per-token scale aligned to actor's response_length
+                                resp_len = batch.batch["responses"].shape[-1]
+                                bs = batch.batch["responses"].shape[0]
+                                device = batch.batch["responses"].device
+                                batch.batch["teacher_loss_scale"] = torch.full(
+                                    (bs, resp_len), float(alpha), device=device, dtype=torch.float32
+                                )
+                                metrics["diag/teacher_loss_scale"] = float(alpha)
+                                metrics["diag/teacher_gap_used"] = float(g_eff)
+                                if ema_enable:
+                                    metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
 
                         # ⭐ 保存 Trajectory 信息用于后续分析（放到 compute_advantage 后，包含 advantages）
                         if self.async_rollout_mode and trajectories:

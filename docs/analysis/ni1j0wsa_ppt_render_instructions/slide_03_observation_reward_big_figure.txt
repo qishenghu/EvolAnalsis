@@ -1,0 +1,67 @@
+Create a single academic presentation slide (16:9) focused on Observation #1:
+the reward curve is non-monotonic (early drop → mid surpasses GRPO → late underperforms).
+This slide must reserve a large blank area for inserting an existing experiment figure.
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Minimal texture only.
+
+Font:
+- Use DM Sans for all text.
+- Keep annotation text concise and readable.
+
+Layout:
+- Title at top (≈10% height).
+- Main body split vertically:
+  TOP (≈70% height): LARGE FIGURE PLACEHOLDER (for reward plot).
+  BOTTOM (≈20% height): “Key time windows” + “Interpretation (1 sentence)”
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, bold):
+“Observation 1 — Reward Is Non-Monotonic Under LUFFY”
+
+Subtitle (small, below title):
+“Early drop, mid-stage acceleration, late-stage stagnation/decline vs GRPO”
+
+------------------------------------------------------------
+MAIN FIGURE PLACEHOLDER (LARGE BLANK AREA)
+------------------------------------------------------------
+Insert a large rounded rectangle placeholder (very light gray border, white fill)
+covering most of the slide width:
+Label centered inside (light text):
+“[Insert Figure: Reward comparison (LUFFY on-policy vs GRPO), MA w=10]”
+
+Add three translucent overlay bands on top of the placeholder (do NOT draw the plot;
+just overlays + labels on the placeholder):
+- Band A (left third, pale amber): label “Early (≈ step < 22)”
+- Band B (middle third, pale green): label “Mid (≈ 22–59)”
+- Band C (right third, pale lavender): label “Late (≈ step > 59)”
+
+Add 2–3 small callout tags (sticky-note style, subtle) anchored to the placeholder edges:
+- “First surpass ≈ step 22”
+- “Last above GRPO ≈ step 59”
+- “Peak earlier than GRPO (LUFFY ≈ step 37; GRPO ≈ step 91)”
+
+------------------------------------------------------------
+BOTTOM: KEY WINDOWS + ONE-LINE INTERPRETATION
+------------------------------------------------------------
+Left bottom box (rounded rectangle):
+Header (semibold):
+“Key windows”
+Bullets (short):
+- “Early: instability + apparent drop”
+- “Mid: sample-efficient improvement”
+- “Late: exploration deficit → underperforms GRPO”
+
+Right bottom box (rounded rectangle):
+Header (semibold):
+“Interpretation (preview)”
+Single sentence (no formulas here):
+“Teacher signals accelerate mid-stage learning but systematically bias relative advantages,
+which suppresses late-stage exploration and long-tail recovery.”
+
+Style constraints:
+- Keep bottom text ≤ 6 lines total.
+- Ensure the figure placeholder occupies ≥ 65% of slide area.

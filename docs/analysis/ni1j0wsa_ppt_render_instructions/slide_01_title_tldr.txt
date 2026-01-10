@@ -1,0 +1,77 @@
+Create a single academic presentation slide (16:9) that serves as the TITLE + TL;DR
+for an analysis of LUFFY teacher-only training (no logprob), with a clean research
+infographic style.
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Subtle paper texture only; no decorative illustrations.
+
+Font:
+- Use DM Sans for all text.
+- Title: bold, large. Subtitles/headers: semibold. Body: regular.
+- Mathematical symbols must render cleanly (use high-quality math typesetting).
+
+Layout:
+- Top title band (≈18% height).
+- Middle content area split into two columns (≈82% height):
+  LEFT (≈55% width): “What we observe (3 signals)”
+  RIGHT (≈45% width): “One-line mechanism summary”
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, large, bold):
+“LUFFY Teacher-Only (No LogProb): Why Reward Peaks Early and Collapses Late”
+
+Subtitle (below title, smaller):
+“From reproducible metrics to a causal mechanism: baseline shift → advantage bias → exploration suppression”
+
+Small context line (very small, right-aligned in title band):
+“Run: ni1j0wsa (LUFFY teacher-only, use_log_prob=false)  |  Baseline: GRPO (9ggix50f)”
+
+------------------------------------------------------------
+LEFT COLUMN: TL;DR OBSERVATIONS
+------------------------------------------------------------
+Section header (semibold):
+“TL;DR — What We Observe”
+
+Add three stacked rounded-rectangle cards (with soft pastel accent bars on the left):
+
+Card 1 (Reward):
+Title (bold):
+“Reward: early drop → mid outperforms GRPO → late underperforms”
+Bullets (2 lines max):
+- “Mid-stage sample efficiency improves, but late-stage improvement stalls or reverses.”
+
+Card 2 (Advantage):
+Title (bold):
+“Advantage: on-policy tokens stay negative; teacher tokens stay positive”
+Bullets:
+- “A persistent relative-advantage bias emerges within each task group.”
+
+Card 3 (Entropy):
+Title (bold):
+“Entropy: sharp decrease → partial rebound → collapse”
+Bullets:
+- “Exploration is gradually suppressed and policy mass concentrates.”
+
+------------------------------------------------------------
+RIGHT COLUMN: MECHANISM IN ONE SENTENCE
+------------------------------------------------------------
+Section header (semibold):
+“Mechanism (One Sentence)”
+
+Add a large quote-style callout box (rounded rectangle, subtle highlight):
+Bold lead-in:
+“Teacher rollouts raise the within-group baseline, which makes the expected on-policy
+advantage negative; combined with teacher-gradient strength increasing with
+πθ(a_T|s), training becomes non-monotonic: early instability, mid acceleration, late
+conservative collapse.”
+
+Below the callout, add a tiny “Roadmap” line (small text):
+“Next: (1) Reward curve  (2) Advantage bias  (3) Baseline-shift math  (4) Entropy curve
+ (5) Teacher-gradient self-amplification”
+
+Style constraints:
+- Keep whitespace generous; no charts on this slide.
+- Use only minimal arrows (→) inside text; no icons.

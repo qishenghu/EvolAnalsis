@@ -1,0 +1,66 @@
+Create a single academic presentation slide (16:9) focused on Observation #2:
+the advantage structure is systematically biased (on-policy tokens negative; teacher tokens positive).
+Reserve a large blank area for inserting an existing experiment figure (gap/adv plot).
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Subtle texture only.
+
+Font:
+- Use DM Sans for all text.
+- Use bold only for headers and key inequalities (e.g., “< 0”, “> 0”).
+
+Layout:
+- Title at top (≈10% height).
+- Main body: two columns
+  LEFT (≈68% width): LARGE FIGURE PLACEHOLDER
+  RIGHT (≈32% width): “What the figure shows” + “Why we care”
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, bold):
+“Observation 2 — Persistent Advantage Bias Within Groups”
+
+Subtitle (small):
+“On-policy token advantage stays negative while teacher token advantage stays positive”
+
+------------------------------------------------------------
+LEFT: LARGE FIGURE PLACEHOLDER
+------------------------------------------------------------
+Insert a large rounded rectangle placeholder (light gray border, white fill).
+Label centered inside (light text):
+“[Insert Figure: group gap & token-level advantage (MA w=10)]”
+
+Add two minimal annotation arrows on the placeholder margin (no plot drawing):
+- Arrow to the “on-policy advantage” region labeled:
+  “on-policy token advantage < 0 (persistent)”
+- Arrow to the “teacher advantage” region labeled:
+  “teacher token advantage > 0 (persistent)”
+
+Optional small tag (tiny text) in a corner:
+“Teacher token ratio is small (~1%), but impact is amplified via baseline shift.”
+
+------------------------------------------------------------
+RIGHT: INTERPRETATION BOXES (TEXT-ONLY)
+------------------------------------------------------------
+Box 1 (rounded rectangle):
+Header (semibold):
+“What this implies”
+Bullets (short, high-signal):
+- “Relative credit is captured by teacher rollouts.”
+- “Most on-policy behaviors receive negative updates.”
+
+Box 2 (rounded rectangle):
+Header (semibold):
+“Why it matters for reward & entropy”
+Bullets:
+- “Negative on-policy advantage suppresses exploration.”
+- “Policy mass concentrates → entropy decreases → late-stage underperformance risk.”
+
+Bottom mini-divider line (thin, subtle), then a single transition sentence (small text):
+“Next: a one-page derivation shows this bias is inevitable when teacher rewards exceed on-policy rewards.”
+
+Style constraints:
+- Keep right column ≤ 10 lines total.
+- Figure placeholder must occupy ≥ 60% of slide area.

@@ -1,0 +1,64 @@
+Create a single academic presentation slide (16:9) focused on Observation #3:
+entropy shows a three-phase pattern (decrease → rebound → collapse). Reserve a large
+blank area for inserting an existing experiment figure (entropy / entropy_loss / ratio).
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Minimal texture only.
+
+Font:
+- Use DM Sans for all text.
+- Keep annotations short; avoid dense paragraphs.
+
+Layout:
+- Title at top (≈10% height).
+- Main body split vertically:
+  TOP (≈70% height): LARGE FIGURE PLACEHOLDER
+  BOTTOM (≈20% height): “Three phases” + “Mechanism link” (short)
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, bold):
+“Observation 3 — Entropy: Decrease → Rebound → Collapse”
+
+Subtitle (small):
+“A direct signature of exploration suppression under persistent negative on-policy advantage”
+
+------------------------------------------------------------
+MAIN FIGURE PLACEHOLDER (LARGE BLANK AREA)
+------------------------------------------------------------
+Insert a large rounded rectangle placeholder (light gray border, white fill).
+Label centered inside (light text):
+“[Insert Figure: entropy / entropy_loss (MA w=10), optionally with teacher_token_ratio]”
+
+Overlay three translucent phase bands (do NOT draw the plot):
+- Band A (left, pale amber): label “Phase 1: rapid entropy decrease”
+- Band B (middle, pale green): label “Phase 2: partial rebound”
+- Band C (right, pale lavender): label “Phase 3: entropy collapse”
+
+Add two minimal margin callouts (tiny text):
+- “Rebound often coincides with temporary gap shrinkage (μ_T − μ_O decreases).”
+- “Late collapse correlates with conservative policy concentration.”
+
+------------------------------------------------------------
+BOTTOM: PHASE SUMMARY + LINK TO MECHANISM
+------------------------------------------------------------
+Left bottom box (rounded rectangle):
+Header (semibold):
+“Three-phase interpretation”
+Bullets (3 bullets, 1 line each):
+- “Phase 1: strong positive teacher signal concentrates policy mass.”
+- “Phase 2: weaker relative pressure allows limited re-diffusion.”
+- “Phase 3: exploration becomes persistently penalized → collapse.”
+
+Right bottom box (rounded rectangle):
+Header (semibold):
+“Link to Mechanism A”
+Single sentence:
+“If E[A_O] < 0 holds for long periods, exploration-like deviations are repeatedly down-weighted,
+driving entropy downward and hurting late-stage robustness.”
+
+Style constraints:
+- Figure placeholder must occupy ≥ 65% of slide area.
+- Keep bottom section ≤ 7 lines total.

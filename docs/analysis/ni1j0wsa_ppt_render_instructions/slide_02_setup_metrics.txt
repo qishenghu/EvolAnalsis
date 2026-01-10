@@ -1,0 +1,87 @@
+Create a single academic presentation slide (16:9) that defines the experimental
+setup and the exact metric names used, with a clean layout and large whitespace.
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Subtle texture only; no decorative illustrations.
+
+Font:
+- Use DM Sans for all text.
+- Section headers semibold; body regular; code-like metric names in monospace-style
+  pill labels (still DM Sans, but in a rounded chip).
+
+Layout:
+- Title at top (≈12% height).
+- Two-column body (≈88% height):
+  LEFT (≈55%): “Experiment Setup”
+  RIGHT (≈45%): “Metrics & Smoothing”
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, bold):
+“Setup: Runs, Signals, and Measurement”
+
+------------------------------------------------------------
+LEFT COLUMN: EXPERIMENT SETUP
+------------------------------------------------------------
+Section header:
+“Experiment Setup”
+
+Add a rounded rectangle “Run Cards” stack (2 cards):
+
+Card A (LUFFY run):
+Title (bold):
+“LUFFY (Teacher-Only, No LogProb)”
+Bullets:
+- “Run ID: ni1j0wsa”
+- “Teacher experiences injected; teacher reward ≈ 1.0”
+- “Off-policy weighting uses current-policy probability (no teacher logprob)”
+
+Card B (Baseline):
+Title (bold):
+“Baseline: GRPO”
+Bullets:
+- “Run ID: 9ggix50f”
+- “Pure on-policy rollouts; no teacher baseline shift”
+
+Add a small footnote line under the cards (tiny text):
+“All comparisons use consistent smoothing and aligned training steps.”
+
+------------------------------------------------------------
+RIGHT COLUMN: METRICS & SMOOTHING
+------------------------------------------------------------
+Section header:
+“Metrics (Exact Names)”
+
+Add three metric blocks with chip labels and a one-line description each.
+
+Metric Block 1 (Reward):
+Chip label:
+`critic/rewards_onpolicy/mean`  vs  `critic/rewards/mean`
+Description:
+“Primary performance signal (on-policy reward vs GRPO reward).”
+
+Metric Block 2 (Advantage diagnostics):
+Chip labels:
+`diag/adv_onpolicy_token_mean`
+`diag/adv_teacher_token_mean`
+Description:
+“Token-level relative advantage for on-policy vs teacher tokens.”
+
+Metric Block 3 (Entropy & mixing):
+Chip labels:
+`diag/entropy_onpolicy_token_mean`
+`diag/teacher_token_ratio`
+Description:
+“Exploration proxy (entropy) and teacher token mixing fraction.”
+
+Add a final small block titled (semibold):
+“Smoothing”
+Content:
+- “Moving average window: w = 10”
+- “Purpose: reduce point noise without changing trend ordering”
+
+Style constraints:
+- No plots on this slide.
+- Prioritize readability; keep each block ≤ 2 lines.

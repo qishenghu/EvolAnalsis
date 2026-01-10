@@ -1,0 +1,77 @@
+Create a single academic presentation slide (16:9) that gives the core Sec. 2
+mechanism as a minimal derivation: teacher rollouts raise the group baseline, making
+expected on-policy advantage negative. This slide must be formula-centric.
+
+Background:
+- Light watercolor wash, pastel tones, airy and bright.
+- Subtle texture only; keep high contrast for math.
+
+Font:
+- Use DM Sans for all text.
+- Math formulas must be large, centered, and highly readable.
+
+Layout:
+- Title at top (≈10% height).
+- Two-column body:
+  LEFT (≈60%): “Minimal derivation” (formulas)
+  RIGHT (≈40%): “Interpretation + amplification effect”
+
+------------------------------------------------------------
+TOP: TITLE
+------------------------------------------------------------
+Title (top center, bold):
+“Mechanism A (Sec. 2) — Baseline Shift Makes On-Policy Advantage Negative”
+
+Subtitle (small):
+“Within-group mean reward increases with teacher mixing, biasing relative advantages”
+
+------------------------------------------------------------
+LEFT: MINIMAL DERIVATION (FORMULA PANEL)
+------------------------------------------------------------
+Section header (semibold):
+“Minimal Derivation”
+
+Use a clean step-by-step layout with 3 large formula lines, each inside a faint
+rounded rectangle row (like a proof strip). Use consistent notation:
+- Group size: n
+- Teacher count: k
+- Mean teacher reward: μ_T
+- Mean on-policy reward: μ_O
+- Group baseline: \bar{R}
+
+Formula Row 1 (baseline / group mean):
+\bar{R} = (k μ_T + (n − k) μ_O) / n
+
+Formula Row 2 (baseline shift relative to on-policy mean):
+\bar{R} = μ_O + (k/n)(μ_T − μ_O)
+
+Formula Row 3 (expected on-policy advantage):
+E[A_O] = μ_O − \bar{R} = − (k/n)(μ_T − μ_O)  < 0   (if μ_T > μ_O and k > 0)
+
+Add a small one-line note under Row 3 (tiny text):
+“Core assumption: teacher rollouts are higher-reward on average (μ_T > μ_O).”
+
+------------------------------------------------------------
+RIGHT: INTERPRETATION + “WHY SMALL MIXING MATTERS”
+------------------------------------------------------------
+Box 1 (rounded rectangle):
+Header (semibold):
+“Immediate consequence”
+Bullets:
+- “On-policy samples are systematically ‘below baseline’ in expectation.”
+- “Training applies negative updates to broad on-policy behaviors.”
+
+Box 2 (rounded rectangle):
+Header (semibold):
+“Why a small teacher fraction can matter”
+Add two labeled bullets with bold labels:
+- **Direct gradient**: “teacher tokens contribute positive-advantage updates”
+- **Indirect baseline effect**: “teacher shifts \bar{R}, changing A_i for all on-policy rollouts”
+
+Bottom callout (thin border, subtle highlight):
+Bold sentence:
+“This is the bridge from Observation 2 to entropy collapse and late-stage reward reversal.”
+
+Style constraints:
+- No plots on this slide.
+- Math must dominate (~55–65% of visual weight).

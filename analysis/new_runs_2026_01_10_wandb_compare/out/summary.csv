@@ -1,0 +1,5 @@
+run_id,label,teacher_use_log_prob,teacher_sampling,steps_logged,reward_last,reward_best,reward_onpolicy_last,reward_teacher_last,teacher_token_ratio_last,teacher_rollouts_last,entropy_loss_last,kl_loss_last
+6iuti28h,LUFFY / logprob / sampling=random,True,random,98,0.4375,0.828125,0.3571428656578064,1.0,0.005816995166242123,8.0,0.05828145146369934,0.3292699158191681
+9ggix50f,Vanilla GRPO,,,98,0.65625,0.921875,,,,,0.10274004191160202,0.466971755027771
+nj1g3tzx,LUFFY / logprob / sampling=confidence,True,confidence,98,0.546875,0.8125,0.4821428656578064,1.0,0.006422711536288261,8.0,0.11827623099088669,0.45171019434928894
+uk74oszd,LUFFY / no_logprob / sampling=confidence,False,confidence,98,0.578125,0.875,0.5178571343421936,1.0,0.006900592241436243,8.0,0.10560240596532822,0.5080323219299316

@@ -178,6 +178,7 @@ def het_compute_teacher_aware_loss(
     teacher_policy_shaping_mode: str = "p_div_p_beta",  # Policy shaping 模式
     teacher_policy_shaping_beta: float = 0.1,  # Policy shaping 参数 β
     teacher_use_clip: bool = False,  # Teacher 轨迹是否使用 clipping
+    teacher_loss_scale: Optional[torch.Tensor] = None,  # ⭐ 2.2: scale teacher loss (0..1), broadcastable to (bs, resp_len)
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -279,6 +280,13 @@ def het_compute_teacher_aware_loss(
             mode=teacher_policy_shaping_mode,
             beta=teacher_policy_shaping_beta,
         )
+
+    # ⭐ 2.2: Optional adaptive scaling for teacher loss
+    if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
+        # Ensure broadcastable: (bs, resp_len) preferred; accept (bs, 1) or scalar-like
+        if teacher_loss_scale.dim() == 1:
+            teacher_loss_scale = teacher_loss_scale.unsqueeze(-1)
+        teacher_ratio = teacher_ratio * teacher_loss_scale
     
     # Teacher loss 计算
     teacher_off_pg_losses_raw = -advantages * teacher_ratio
