@@ -306,7 +306,7 @@ class ParallelEnvManager(object):
         if n_rollout_override is not None:
             base_rollout_n = n_rollout_override
         else:
-        base_rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
+            base_rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
         future_to_params: Dict[Future, Tuple[Task, TrajExpConfig, str, str, str, int, dict, list[bool]]] = {}
 
         # ⭐ Experience Replay: 计算每个 task 的实际 on-policy rollout 数量
@@ -929,25 +929,25 @@ class ParallelEnvManager(object):
                 teacher_mask_list.append(torch.ones(response_length, dtype=torch.int))
             else:
                 # ⭐ Self-generated Experience: 直接使用保存的 old_log_probs
-            old_log_probs = sample.extras.get("old_log_probs")
-            if old_log_probs is not None:
-                # 转换为 tensor 并对齐长度
-                if isinstance(old_log_probs, (list, np.ndarray)):
-                    old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32)
-                # 对齐到 response_length
-                if len(old_log_probs) > response_length:
-                    old_log_probs = old_log_probs[:response_length]
-                elif len(old_log_probs) < response_length:
-                    old_log_probs = torch.cat([
-                        old_log_probs,
-                        torch.zeros(response_length - len(old_log_probs), dtype=torch.float32)
-                    ])
-                recorded_old_log_probs_list.append(old_log_probs)
-            else:
-                # 如果没有记录，创建零向量（后续会重新计算）
-                recorded_old_log_probs_list.append(
+                old_log_probs = sample.extras.get("old_log_probs")
+                if old_log_probs is not None:
+                    # 转换为 tensor 并对齐长度
+                    if isinstance(old_log_probs, (list, np.ndarray)):
+                        old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32)
+                    # 对齐到 response_length
+                    if len(old_log_probs) > response_length:
+                        old_log_probs = old_log_probs[:response_length]
+                    elif len(old_log_probs) < response_length:
+                        old_log_probs = torch.cat([
+                            old_log_probs,
+                            torch.zeros(response_length - len(old_log_probs), dtype=torch.float32)
+                        ])
+                    recorded_old_log_probs_list.append(old_log_probs)
+                else:
+                    # 如果没有记录，创建零向量（后续会重新计算）
+                    recorded_old_log_probs_list.append(
                         torch.zeros(response_length, dtype=torch.float32)
-                )
+                    )
                 # 非 teacher
                 teacher_mask_list.append(torch.zeros(response_length, dtype=torch.int))
         
