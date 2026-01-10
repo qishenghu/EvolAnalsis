@@ -2384,20 +2384,20 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         )
                                     elif enable_exp_replay:
                                         # 使用原有的 ExperienceMixCollateFn（向后兼容）
-                                    experience_mix_collate = ExperienceMixCollateFn(
-                                        exp_manager=self.exp_manager,
-                                        train_task_manager=self.train_task_manager,
-                                        exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
-                                        replay_start_ratio=replay_start_ratio,
-                                        offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
-                                        n_rollout=self.config.actor_rollout_ref.rollout.n,
-                                    )
-                                    
-                                    experience_tasks, on_policy_tasks = experience_mix_collate(
-                                        training_tasks=tasks,
-                                        training_progress=training_progress,
-                                        enable_replay=True,
-                                    )
+                                        experience_mix_collate = ExperienceMixCollateFn(
+                                            exp_manager=self.exp_manager,
+                                            train_task_manager=self.train_task_manager,
+                                            exp_ratio=exp_replay_config.get("exp_ratio", 0.5),
+                                            replay_start_ratio=replay_start_ratio,
+                                            offpolicy_trajectories_per_task=exp_replay_config.get("offpolicy_trajectories_per_task", 1),
+                                            n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                        )
+                                        
+                                        experience_tasks, on_policy_tasks = experience_mix_collate(
+                                            training_tasks=tasks,
+                                            training_progress=training_progress,
+                                            enable_replay=True,
+                                        )
                                         # 统一变量名，便于后续合并逻辑复用
                                         teacher_exp_tasks = []
                                     
