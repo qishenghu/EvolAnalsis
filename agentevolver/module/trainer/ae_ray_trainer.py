@@ -159,6 +159,29 @@ def compute_teacher_effect_metrics(batch: DataProto, entropys: Optional[torch.Te
     metrics["diag/exp_token_ratio"] = (off_token.sum() / total_tokens).detach().item()
     metrics["diag/teacher_token_ratio"] = (teacher_token.sum() / total_tokens).detach().item()
 
+    # ⭐ Extra ratios to avoid confusion:
+    # - teacher_token_ratio above uses total response tokens as denominator (includes env/tool tokens in multi-turn)
+    # - the following metrics provide more intuitive denominators
+    loss_mask_full = batch.batch.get("loss_mask", None)
+    loss_mask = None
+    if loss_mask_full is not None and torch.is_tensor(loss_mask_full) and loss_mask_full.dim() == 2:
+        if loss_mask_full.shape[-1] == response_len:
+            loss_mask = loss_mask_full
+        elif loss_mask_full.shape[-1] > response_len:
+            loss_mask = loss_mask_full[:, -response_len:]
+    if loss_mask is not None:
+        llm_token = loss_mask * response_mask  # only LLM positions within response
+        llm_total = llm_token.sum().clamp_min(1.0)
+        metrics["diag/llm_token_ratio_in_response"] = (llm_total / total_tokens).detach().item()
+        metrics["diag/teacher_llm_token_ratio"] = (teacher_token.sum() / llm_total).detach().item()
+
+    # sample-level ratios (rollout-level intuition)
+    # Prefer teacher_mask to detect teacher samples (works even if exp_mask/loss_mask has edge cases)
+    is_teacher_sample = (teacher_mask.sum(dim=-1) > 0) if teacher_mask is not None else (teacher_token.sum(dim=-1) > 0)
+    metrics["diag/teacher_sample_ratio"] = is_teacher_sample.float().mean().detach().item()
+    is_off_sample = (off_token.sum(dim=-1) > 0)
+    metrics["diag/offpolicy_sample_ratio"] = is_off_sample.float().mean().detach().item()
+
     # advantage means by type (token level + per-sample scalar)
     if advantages is not None:
         v = _safe_masked_mean(advantages[:, :response_len], teacher_token.bool())
@@ -2235,7 +2258,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             training_progress=training_progress,
                                             enable_replay=True,
                                         )
-                                    
+                                        # 统一变量名，便于后续合并逻辑复用
+                                        teacher_exp_tasks = []
+                                        
                                     # 合并 tasks（experience_tasks + teacher_exp_tasks + on_policy_tasks）
                                     tasks = experience_tasks + teacher_exp_tasks + on_policy_tasks
                                     
