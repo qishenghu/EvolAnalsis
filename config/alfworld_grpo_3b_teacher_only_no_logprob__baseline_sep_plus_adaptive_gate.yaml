@@ -350,7 +350,10 @@ exp_manager:
       enable: true
       mode: "gap_linear"
       # alpha = clip((gap - epsilon)/tau, min, max)
-      epsilon: 0.05
+      # NOTE(2026-01-13): In our runs, diag/group_teacher_minus_on_reward_mean (gap) is typically ~0.37-0.67.
+      # The old setting (epsilon=0.05,tau=0.30) makes (gap-eps)/tau almost always >1, so alpha saturates at 1 (no annealing).
+      # New setting aims for: gap≈0.35 -> alpha≈0, gap≈0.65 -> alpha≈1, with linear annealing in between.
+      epsilon: 0.35
       tau: 0.30
       min: 0.0
       max: 1.0
