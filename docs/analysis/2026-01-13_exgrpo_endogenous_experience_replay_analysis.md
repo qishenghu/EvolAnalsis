@@ -91,21 +91,21 @@ $$w(\theta)=\exp(\log\pi_\theta(a|s)-\log\pi_{\text{old}}(a|s))=\frac{\pi_\theta
 把训练看成 **on-policy 数据** 与 **replay(off-policy) 数据** 的混合优化（省略 baseline/clip/正则等实现细节），其梯度可写成一个近似的“混合梯度”形式：
 
 $$
-\\nabla_\\theta J(\\theta)\\;\\approx\\;
-\\mathbb{E}_{(s,a)\\sim D_{\\text{on}}}\\big[\\nabla\\log\\pi_\\theta(a|s)\\,\\hat A\\big]
-\\;+
-\\lambda\\;\\mathbb{E}_{(s,a)\\sim D_{\\text{replay}}}\\big[\\nabla\\log\\pi_\\theta(a|s)\\,\\hat A\\cdot g(w)\\big]
+\nabla_\theta J(\theta)\;\approx\;
+\mathbb{E}_{(s,a)\sim D_{\text{on}}}\big[\nabla\log\pi_\theta(a|s)\,\hat A\big]
+\;+
+\lambda\;\mathbb{E}_{(s,a)\sim D_{\text{replay}}}\big[\nabla\log\pi_\theta(a|s)\,\hat A\cdot g(w)\big]
 $$
 
 其中：
-- \(\\lambda\\) 可理解为 replay 的“强度系数”，在实现上与 `exp_ratio`（以及实际 off-policy token 占比）同向。
-- \(w=\\exp(\\log\\pi_\\theta-\\log\\pi_{\\text{old}})\\) 是重要性比率，\(g(w)\\) 是有界的 shaping（例如 \(g(w)=\\frac{w}{w+\\beta}\\in(0,1)\\)）。
+- \(\lambda\) 可理解为 replay 的"强度系数"，在实现上与 `exp_ratio`（以及实际 off-policy token 占比）同向。
+- \(w=\exp(\log\pi_\theta-\log\pi_{\text{old}})\) 是重要性比率，\(g(w)\) 是有界的 shaping（例如 \(g(w)=\frac{w}{w+\beta}\in(0,1)\)）。
 
 **为什么会导致熵“上冲→回落”？**
 - **上冲（exploration phase）**：replay 提供的成功轨迹包含一些“当前策略下概率较低，但对成功重要”的 token/动作。混合梯度第二项会把这些低概率区域往上抬，从宏观上看就像把分布“摊开”→ 熵上升。
 - **回落（consolidation phase）**：当这些模式被当前策略学会后，on-policy 梯度第一项更倾向于把概率质量集中到更确定的模式上→ 熵下降。
 
-因此，熵的周期性波动可以被解释为：**replay 注入探索驱动 + on-policy 收敛驱动** 的交替主导；当 `exp_ratio` 更大时，\(\\lambda\\) 更大，上冲驱动更强，所以更容易出现“上冲更快、更高、波动更大”的现象。
+因此，熵的周期性波动可以被解释为：**replay 注入探索驱动 + on-policy 收敛驱动** 的交替主导；当 `exp_ratio` 更大时，\(\lambda\) 更大，上冲驱动更强，所以更容易出现"上冲更快、更高、波动更大"的现象。
 
 > 重要注：要把这个机制论证到论文级别，必须把“熵上冲发生在哪里”讲清楚——它可能主要发生在 off-policy token，也可能带动 on-policy token 一起上升。两者对“是否真正促进探索”的意义完全不同。
 

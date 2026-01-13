@@ -295,6 +295,7 @@ def main() -> None:
     ap.add_argument("--ma", type=int, default=10)
     ap.add_argument("--out_dir", default="analysis/luffy_no_logprob_improvement_compare/out")
     ap.add_argument("--report_path", default="docs/analysis/2026-01-13_luffy_no_logprob_improvements_report.md")
+    ap.add_argument("--include_v2", action="store_true", help="Include v2 annealing runs (pciujkve/t7doz8ru).")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -337,6 +338,28 @@ def main() -> None:
             ),
         ),
     ]
+
+    if args.include_v2:
+        runs.extend(
+            [
+                RunSpec(
+                    label="Exp-2 v2 (7.2 adaptive gate annealed)",
+                    run_id="pciujkve",
+                    traj_dir=Path(
+                        "/home/qisheng/agent/AgentEvolver/checkpoints/agentevolver/"
+                        "alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__teacher_adaptive_gate_v2/Trajectory"
+                    ),
+                ),
+                RunSpec(
+                    label="Exp-3 v2 (7.1 + 7.2 annealed)",
+                    run_id="t7doz8ru",
+                    traj_dir=Path(
+                        "/home/qisheng/agent/AgentEvolver/checkpoints/agentevolver/"
+                        "alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_adaptive_gate_v2/Trajectory"
+                    ),
+                ),
+            ]
+        )
 
     # W&B keys: keep tight, but include fallbacks.
     wandb_keys = [
@@ -502,7 +525,8 @@ def main() -> None:
     summary_df["reward_last_delta_vs_baseline"] = summary_df["reward_last"] - baseline_last
 
     md = []
-    md.append("# 2026-01-13：LUFFY no-logprob（baseline）vs 两项改进（7.1/7.2）综合分析报告\n")
+    title_suffix = "（含 v2 退火复跑）" if args.include_v2 else ""
+    md.append(f"# 2026-01-13：LUFFY no-logprob（baseline）vs 两项改进（7.1/7.2）综合分析报告{title_suffix}\n")
     md.append("## 0. 实验设置与对比对象\n")
     md.append("本报告对齐了 4 个 run（相同任务/训练步数/teacher 配置，差异仅来自 7.1/7.2 开关），并使用两类数据源交叉验证：\n")
     md.append("- **W&B history**：reward、actor loss、以及 `diag/teacher_loss_scale` 等（门控专用）\n")
