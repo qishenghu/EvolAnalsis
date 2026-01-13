@@ -687,6 +687,9 @@ class ParallelEnvManager(object):
             "is_experience_replay": cmt.metadata.get("is_experience_replay", False),  # ⭐ Experience Replay: 标记是否为 off-policy 数据
             "old_log_probs": cmt.metadata.get("old_log_probs"),  # ⭐ Experience Replay: 历史策略的 log_prob
             "recorded_response_mask": cmt.metadata.get("response_mask"),  # ⭐ Multi-turn: 历史轨迹的 response_mask，用于对齐
+            # ⭐ Experience Replay: 轨迹陈旧度与质量诊断（用于分析 endo replay 的有效性/风险）
+            "policy_version": cmt.metadata.get("policy_version"),
+            "entropy": cmt.metadata.get("entropy"),
             "task_id": cmt.task_id,  # ⭐ 保存 task_id 用于后续处理
             # ⭐ Teacher Experience: 传递 teacher 特有字段
             "is_teacher": cmt.metadata.get("is_teacher", False),

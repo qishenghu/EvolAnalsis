@@ -218,4 +218,34 @@ $$
 P(\tau)\propto \exp\Big(\frac{\text{conf}(\tau)}{T}\Big)
 $$
 
+### 7. ✅ 已实现的两项改进（2.1 / 2.2）与对应配置（可直接跑）
+
+基于本报告里观察到的 **“teacher 抬高 baseline → on-policy 负优势/探索受抑 → late 回落”**，我已经在代码里实现了两项可选改进；两者均为**可配置开关**，默认不影响原 LUFFY/ExGRPO 行为（不开启即走原逻辑）。
+
+#### 7.1 改进 ：GRPO advantage/baseline teacher-separation（on-policy baseline 不再包含 teacher reward）
+
+- **功能**：在 GRPO 的同组计算里，对 **non-teacher 样本** 使用 “non-teacher-only mean” 作为 baseline（避免 teacher 的高回报把 on-policy baseline 系统性抬高）。teacher 样本的 baseline 可单独配置（默认仍可用 all_mean 以保持兼容性）。
+- **开关位置**：`algorithm.grpo.teacher_baseline_separation.enable: true`
+- **关键诊断指标**（W&B / log）：
+  - `diag/group_non_teacher_reward_mean`（non-teacher 组内均值）
+  - `diag/group_all_reward_mean`（teacher+non-teacher 组内均值，作为对照）
+  - `diag/group_teacher_minus_on_reward_mean`（teacher 与 on-policy 的组内 gap）
+
+#### 7.2 改进 ：Teacher loss adaptive gating/annealing（teacher loss 自适应退火）
+
+- **功能**：根据当前 batch 的 reward gap（`diag/group_teacher_minus_on_reward_mean`）自动计算 teacher loss 的缩放系数 `teacher_loss_scale=α`，并写入 batch 供 actor loss 计算使用，从而实现“**gap 大（中期）teacher 强；gap 小（late）teacher 自动弱化**”。
+- **开关位置**：`exp_manager.teacher_experience.adaptive_weight.enable: true`
+- **关键诊断指标**：
+  - `diag/teacher_loss_scale`（当前 α）
+  - `diag/teacher_gap_used`（用于计算 α 的 gap，若启用 EMA 则为 EMA 后的值）
+  - `diag/teacher_gap_ema`（可选：gap 的 EMA）
+
+#### 7.3 三份完整 YAML（基于 `alfworld_grpo_3b_teacher_only_no_logprob.yaml` 补齐后生成）
+
+你可以直接用下面三份配置做消融（它们已经包含 `actor_rollout_ref / data / env_service / ...` 的完整段落）：
+
+- **仅启用 2.1（baseline 分离）**：`config/alfworld_grpo_3b_teacher_only_no_logprob__grpo_teacher_baseline_sep.yaml`
+- **仅启用 2.2（teacher 自适应门控）**：`config/alfworld_grpo_3b_teacher_only_no_logprob__teacher_adaptive_gate.yaml`
+- **同时启用 2.1 + 2.2**：`config/alfworld_grpo_3b_teacher_only_no_logprob__baseline_sep_plus_adaptive_gate.yaml`
+
 

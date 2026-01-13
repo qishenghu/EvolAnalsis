@@ -1,0 +1,5 @@
+_step,training/global_step,critic/rewards/mean,critic/advantages/mean,actor/entropy_loss,actor/kl_loss,actor/pg_loss,actor/ppo_kl,exp_replay/num_experience_tasks,exp_replay/num_offpolicy_trajectories,exp_replay/total_tasks_in_pool,exp_replay/skip_uid_set_size,exp_mask_ratio,label
+1,1,0.3125,-0.18163633346557617,0.4793244004249573,0.0018907141638919711,0.08016972802579403,0,0,0,3,0,0,"ER exp_ratio=0.5, start=0.05 (rep)"
+2,2,0.390625,-0.2775269150733948,0.5736864805221558,0.002230194164440036,0.0350093487650156,0,0,0,9,0,0,"ER exp_ratio=0.5, start=0.05 (rep)"
+3,3,0.1875,-0.15020187199115753,0.6346144676208496,0.005395800806581974,0.03706707805395126,0,0,0,11,0,0,"ER exp_ratio=0.5, start=0.05 (rep)"
+4,4,0.53125,-0.18727008998394012,0.45540496706962585,0.031062927097082138,0.15206667594611645,0,0,0,16,1,0,"ER exp_ratio=0.5, start=0.05 (rep)"

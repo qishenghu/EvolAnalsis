@@ -89,6 +89,52 @@ def het_compute_token_on_off_policy_loss(
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     ratio = torch.exp(negative_approx_kl)
 
+    # =========================
+    # Diagnostics (endogenous replay)
+    # =========================
+    def _masked_stats(x: torch.Tensor, mask: torch.Tensor, prefix: str) -> dict:
+        out: dict[str, torch.Tensor] = {}
+        if x is None or mask is None:
+            out[f"{prefix}/count"] = torch.tensor(0.0, device=log_prob.device)
+            return out
+        if not torch.is_tensor(mask):
+            out[f"{prefix}/count"] = torch.tensor(0.0, device=log_prob.device)
+            return out
+        mask_b = mask.bool()
+        if mask_b.sum().item() == 0:
+            out[f"{prefix}/count"] = torch.tensor(0.0, device=x.device)
+            return out
+
+        vals = x[mask_b]
+        out[f"{prefix}/count"] = torch.tensor(float(vals.numel()), device=x.device)
+        out[f"{prefix}/mean"] = vals.mean()
+        out[f"{prefix}/std"] = vals.std() if vals.numel() > 1 else torch.tensor(0.0, device=x.device)
+        out[f"{prefix}/min"] = vals.min()
+        out[f"{prefix}/max"] = vals.max()
+
+        # quantiles (sample if too many)
+        max_q_samples = 4096
+        if vals.numel() > max_q_samples:
+            idx = torch.randperm(vals.numel(), device=vals.device)[:max_q_samples]
+            vals_q = vals[idx]
+        else:
+            vals_q = vals
+        try:
+            out[f"{prefix}/p90"] = torch.quantile(vals_q, 0.90)
+            out[f"{prefix}/p99"] = torch.quantile(vals_q, 0.99)
+        except Exception:
+            pass
+        return out
+
+    off_token_mask = exp_mask * response_mask
+    on_token_mask = (1.0 - exp_mask) * response_mask
+    exp_replay_diag_stats: dict[str, torch.Tensor] = {}
+    # Importance ratio stats (off-policy tokens only)
+    exp_replay_diag_stats.update(_masked_stats(ratio, off_token_mask, "importance_ratio/off"))
+    # Advantage stats split by on/off tokens (helps detect baseline pollution / exploration suppression)
+    exp_replay_diag_stats.update(_masked_stats(advantages, off_token_mask, "adv/off"))
+    exp_replay_diag_stats.update(_masked_stats(advantages, on_token_mask, "adv/on"))
+
     def compute_pg_losses(cliprange_low, cliprange_high):
         pg_losses1 = -advantages * ratio
         pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
@@ -118,6 +164,8 @@ def het_compute_token_on_off_policy_loss(
         
         # Apply policy shaping: f(x) = x / (x + β)
         off_ratio_shaped = off_ratio / (off_ratio + off_policy_shaping_beta)
+        # shaped ratio stats (off-policy tokens only)
+        exp_replay_diag_stats.update(_masked_stats(off_ratio_shaped, off_token_mask, "importance_ratio_shaped/off"))
         
         # Replace CLIP term with shaped ratio: -advantages * f(w*(θ))
         off_pg_losses = -advantages * off_ratio_shaped
@@ -154,6 +202,8 @@ def het_compute_token_on_off_policy_loss(
         "on_pg_clipfrac": on_pg_clipfrac,
         "on_pg_clipfrac_lower": on_pg_clipfrac_lower,
         "ppo_kl": ppo_kl,
+        # ⭐ Endogenous replay diagnostics (logged by het_actor.py)
+        "exp_replay_diag_stats": exp_replay_diag_stats,
     }
 
 

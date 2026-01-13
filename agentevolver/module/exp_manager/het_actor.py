@@ -256,6 +256,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     self_off_pg_loss = ret_dict.get("self_off_pg_loss")
                     teacher_off_pg_loss = ret_dict.get("teacher_off_pg_loss")
                     teacher_diag_stats = ret_dict.get("teacher_diag_stats")  # ratio/adv 分布统计
+                    exp_replay_diag_stats = ret_dict.get("exp_replay_diag_stats")  # endo replay: ratio/adv/shaping 统计
                     ##################
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate entropy loss
@@ -307,6 +308,16 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     data[f"teacher_diag/{k}"] = float(v)
                             except Exception:
                                 # skip non-numeric
+                                pass
+                    # ⭐ Endogenous replay diagnostics (importance ratio / shaped ratio / adv split)
+                    if isinstance(exp_replay_diag_stats, dict) and exp_replay_diag_stats:
+                        for k, v in exp_replay_diag_stats.items():
+                            try:
+                                if torch.is_tensor(v):
+                                    data[f"exp_replay_diag/{k}"] = v.detach().float().item()
+                                else:
+                                    data[f"exp_replay_diag/{k}"] = float(v)
+                            except Exception:
                                 pass
                     ##################
                     append_to_dict(metrics, data)

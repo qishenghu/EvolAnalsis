@@ -2629,6 +2629,35 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         entropy_loss = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                         metrics.update(old_log_prob_metrics)
+
+                        # ⭐ Endogenous replay: split entropy by on/off-policy (LLM tokens only, in multi-turn)
+                        # This is critical to analyze entropy collapse / exploration suppression caused by replay.
+                        try:
+                            if "responses" in batch.batch and "exp_mask" in batch.batch and "loss_mask" in batch.batch:
+                                resp_len = batch.batch["responses"].shape[-1]
+                                exp_mask_full = batch.batch["exp_mask"]
+                                exp_mask = exp_mask_full if exp_mask_full.shape[-1] == resp_len else exp_mask_full[:, -resp_len:]
+                                loss_mask_full = batch.batch["loss_mask"]
+                                loss_mask = loss_mask_full if loss_mask_full.shape[-1] == resp_len else loss_mask_full[:, -resp_len:]
+                                llm_mask = loss_mask * response_masks
+                                denom_all = llm_mask.sum().clamp_min(1.0)
+                                denom_off = (exp_mask * llm_mask).sum().clamp_min(1.0)
+                                denom_on = ((1.0 - exp_mask) * llm_mask).sum().clamp_min(1.0)
+
+                                # entropys is (bs, resp_len)
+                                ent_all = (entropys * llm_mask).sum() / denom_all
+                                ent_off = (entropys * exp_mask * llm_mask).sum() / denom_off
+                                ent_on = (entropys * (1.0 - exp_mask) * llm_mask).sum() / denom_on
+
+                                metrics.update(
+                                    {
+                                        "exp_replay/entropy_llm_mean": ent_all.detach().float().item(),
+                                        "exp_replay/entropy_llm_onpolicy_mean": ent_on.detach().float().item(),
+                                        "exp_replay/entropy_llm_offpolicy_mean": ent_off.detach().float().item(),
+                                    }
+                                )
+                        except Exception:
+                            pass
                         
                         # ⭐ Experience Replay: 替换 off-policy 数据的 old_log_prob
                         if enable_exp_replay and "recorded_old_log_probs" in batch.batch:
@@ -2688,11 +2717,79 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 "exp_replay/total_tasks_in_pool": len(self.exp_manager.get_valid_replay_task_ids()),
                                 "exp_replay/num_experience_tasks": len(experience_tasks),
                                 "exp_replay/num_offpolicy_trajectories": len(offpolicy_cmt_array),
+                                # ⭐ 更直观的 replay 强度（rollout 级别）
+                                "exp_replay/offpolicy_rollout_ratio": (
+                                    float(len(offpolicy_cmt_array)) / float(self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n)
+                                    if (self.config.data.train_batch_size and self.config.actor_rollout_ref.rollout.n)
+                                    else 0.0
+                                ),
                                 # ⭐ 新增：Teacher Experience Metrics
                                 "teacher_exp/num_teacher_tasks": len(teacher_exp_tasks),
                                 "teacher_exp/num_teacher_trajectories": len(teacher_offpolicy_cmt_array),
                                 "teacher_exp/total_teacher_pool_size": len(self.exp_manager.get_valid_teacher_task_ids()) if self.exp_manager.teacher_enabled else 0,
                             })
+
+                            # ⭐ Endogenous replay：pool difficulty 分布（便于分析 replay 主要集中在哪些难度）
+                            try:
+                                n_rollout = int(self.config.actor_rollout_ref.rollout.n)
+                                diff_dict = getattr(self.exp_manager, "difficulty2task_dict", {}) or {}
+                                total_cnt = 0
+                                weighted_sum = 0
+                                for d in range(n_rollout + 1):
+                                    c = len(diff_dict.get(d, []) or [])
+                                    total_cnt += c
+                                    weighted_sum += d * c
+                                    metrics[f"exp_replay/pool_count/d{d}"] = c
+                                metrics["exp_replay/pool_count_total"] = total_cnt
+                                metrics["exp_replay/pool_difficulty_mean"] = (weighted_sum / total_cnt) if total_cnt > 0 else 0.0
+                            except Exception:
+                                pass
+
+                            # ⭐ Endogenous replay：token-level off-policy 占比（对齐 response_mask/loss_mask，避免 exp_mask_ratio 受 padding 干扰）
+                            try:
+                                if "responses" in batch.batch and "response_mask" in batch.batch and "exp_mask" in batch.batch:
+                                    resp_len = batch.batch["responses"].shape[-1]
+                                    response_mask = batch.batch["response_mask"]
+                                    exp_mask_full = batch.batch["exp_mask"]
+                                    exp_mask = exp_mask_full if exp_mask_full.shape[-1] == resp_len else exp_mask_full[:, -resp_len:]
+                                    resp_total = response_mask.sum().clamp_min(1.0)
+                                    off_resp = (exp_mask * response_mask).sum()
+                                    metrics["exp_replay/offpolicy_token_ratio_response"] = (off_resp / resp_total).detach().float().item()
+
+                                    loss_mask_full = batch.batch.get("loss_mask", None)
+                                    if loss_mask_full is not None and loss_mask_full.shape[-1] >= resp_len:
+                                        loss_mask = loss_mask_full[:, -resp_len:]
+                                        llm_mask = loss_mask * response_mask
+                                        llm_total = llm_mask.sum().clamp_min(1.0)
+                                        off_llm = (exp_mask * llm_mask).sum()
+                                        metrics["exp_replay/offpolicy_token_ratio_llm"] = (off_llm / llm_total).detach().float().item()
+                            except Exception:
+                                pass
+
+                            # ⭐ Endogenous replay：经验陈旧度（age = global_step - policy_version）
+                            try:
+                                extras = batch.non_tensor_batch.get("extras", None)
+                                if extras is not None:
+                                    ages = []
+                                    for ex in extras:
+                                        if not isinstance(ex, dict):
+                                            continue
+                                        if not ex.get("is_experience_replay", False):
+                                            continue
+                                        pv = ex.get("policy_version", None)
+                                        if pv is None:
+                                            continue
+                                        try:
+                                            ages.append(float(self.global_steps - int(pv)))
+                                        except Exception:
+                                            continue
+                                    if ages:
+                                        metrics["exp_replay/offpolicy_age_mean"] = float(np.mean(ages))
+                                        metrics["exp_replay/offpolicy_age_max"] = float(np.max(ages))
+                                        metrics["exp_replay/offpolicy_age_min"] = float(np.min(ages))
+                                        metrics["exp_replay/offpolicy_age_count"] = float(len(ages))
+                            except Exception:
+                                pass
 
                         if "rollout_log_probs" in batch.batch.keys():
                             # TODO: we may want to add diff of probs too.
