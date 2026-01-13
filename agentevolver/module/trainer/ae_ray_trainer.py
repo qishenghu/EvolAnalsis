@@ -3115,6 +3115,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             )
                             if gap is not None and has_teacher:
                                 mode = str(getattr(aw_cfg, "mode", "gap_linear"))
+                                gate_level = str(getattr(aw_cfg, "gate_level", "batch")).lower().strip()
                                 eps = float(getattr(aw_cfg, "epsilon", 0.0))
                                 tau = float(getattr(aw_cfg, "tau", 1.0))
                                 a_min = float(getattr(aw_cfg, "min", 0.0))
@@ -3124,34 +3125,140 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 ema_cfg = getattr(aw_cfg, "ema", None)
                                 ema_enable = bool(getattr(ema_cfg, "enable", False)) if ema_cfg is not None else False
                                 ema_beta = float(getattr(ema_cfg, "beta", 0.9)) if ema_cfg is not None else 0.9
-                                g = float(gap)
-                                if ema_enable:
-                                    if getattr(self, "_teacher_gap_ema", None) is None:
-                                        self._teacher_gap_ema = g
-                                    else:
-                                        self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
-                                    g_eff = float(self._teacher_gap_ema)
-                                else:
-                                    g_eff = g
-
                                 denom = tau if tau > 0 else 1.0
-                                if mode == "gap_linear":
-                                    alpha = (g_eff - eps) / denom
-                                else:
-                                    alpha = (g_eff - eps) / denom
-                                alpha = max(a_min, min(a_max, alpha))
 
                                 # fill per-token scale aligned to actor's response_length
                                 resp_len = batch.batch["responses"].shape[-1]
                                 bs = batch.batch["responses"].shape[0]
                                 device = batch.batch["responses"].device
-                                batch.batch["teacher_loss_scale"] = torch.full(
-                                    (bs, resp_len), float(alpha), device=device, dtype=torch.float32
-                                )
-                                metrics["diag/teacher_loss_scale"] = float(alpha)
-                                metrics["diag/teacher_gap_used"] = float(g_eff)
-                                if ema_enable:
-                                    metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
+
+                                # Use response mask aligned rewards for group-level gap if needed
+                                response_mask_local = batch.batch.get("response_mask", None)
+                                if response_mask_local is None:
+                                    response_mask_local = compute_response_mask(batch)
+                                    batch.batch["response_mask"] = response_mask_local
+                                if (
+                                    response_mask_local.dim() == 2
+                                    and response_mask_local.shape[-1] != resp_len
+                                    and response_mask_local.shape[-1] > resp_len
+                                ):
+                                    response_mask_local = response_mask_local[:, -resp_len:]
+
+                                token_level_rewards_local = batch.batch.get("token_level_rewards", None)
+                                if token_level_rewards_local is None:
+                                    token_level_rewards_local = batch.batch.get("token_level_scores", None)
+                                rewards_sum_local = None
+                                if token_level_rewards_local is not None and torch.is_tensor(token_level_rewards_local) and token_level_rewards_local.dim() == 2:
+                                    rewards_sum_local = (token_level_rewards_local[:, :resp_len] * response_mask_local).sum(dim=-1)  # (bs,)
+
+                                # Derive is_teacher_sample from teacher_mask within response span
+                                teacher_mask_local = teacher_mask_full
+                                if teacher_mask_local is not None and teacher_mask_local.dim() == 2 and teacher_mask_local.shape[-1] != resp_len and teacher_mask_local.shape[-1] > resp_len:
+                                    teacher_mask_local = teacher_mask_local[:, -resp_len:]
+                                is_teacher_sample_local = (teacher_mask_local.sum(dim=-1) > 0) if teacher_mask_local is not None else None
+
+                                def _alpha_from_gap(g_eff: float) -> float:
+                                    a = (g_eff - eps) / denom
+                                    a = max(a_min, min(a_max, a))
+                                    return float(a)
+
+                                if gate_level == "group" and rewards_sum_local is not None and is_teacher_sample_local is not None:
+                                    # v3: per-task(per-group) gate.
+                                    # Group by uid if present; fallback to task_ids.
+                                    group_ids = None
+                                    try:
+                                        group_ids = batch.non_tensor_batch.get("uid", None)
+                                    except Exception:
+                                        group_ids = None
+                                    if group_ids is None:
+                                        try:
+                                            group_ids = batch.non_tensor_batch.get("task_ids", None)
+                                        except Exception:
+                                            group_ids = None
+
+                                    if group_ids is None or len(group_ids) != bs:
+                                        # fallback to batch-level if grouping not available
+                                        gate_level = "batch"
+                                    else:
+                                        # build group -> indices mapping (string key for safety)
+                                        id2idx = defaultdict(list)
+                                        for i, gid in enumerate(group_ids):
+                                            id2idx[str(gid)].append(i)
+
+                                        # compute per-group gap and alpha
+                                        alpha_per_sample = torch.empty((bs,), device=device, dtype=torch.float32)
+                                        gap_used_list: List[float] = []
+                                        alpha_list: List[float] = []
+
+                                        # Optional per-group EMA (stateful), isolated to this trainer instance.
+                                        ema_by_group = getattr(self, "_teacher_gap_ema_by_group", None)
+                                        if ema_enable and ema_by_group is None:
+                                            ema_by_group = {}
+                                            setattr(self, "_teacher_gap_ema_by_group", ema_by_group)
+
+                                        for gid, idxs in id2idx.items():
+                                            idx_t = [i for i in idxs if bool(is_teacher_sample_local[i].item())]
+                                            idx_o = [i for i in idxs if not bool(is_teacher_sample_local[i].item())]
+                                            if len(idx_t) == 0 or len(idx_o) == 0:
+                                                # if missing teacher or on-policy samples in group, fall back to batch gap
+                                                g_raw = float(gap)
+                                            else:
+                                                rt = float(rewards_sum_local[idx_t].mean().item())
+                                                ro = float(rewards_sum_local[idx_o].mean().item())
+                                                g_raw = rt - ro
+
+                                            if ema_enable:
+                                                prev = ema_by_group.get(gid, None)
+                                                if prev is None:
+                                                    ema_by_group[gid] = g_raw
+                                                else:
+                                                    ema_by_group[gid] = ema_beta * float(prev) + (1.0 - ema_beta) * g_raw
+                                                g_eff = float(ema_by_group[gid])
+                                            else:
+                                                g_eff = float(g_raw)
+
+                                            a = _alpha_from_gap(g_eff)
+                                            for i in idxs:
+                                                alpha_per_sample[i] = a
+                                            gap_used_list.append(g_eff)
+                                            alpha_list.append(a)
+
+                                        batch.batch["teacher_loss_scale"] = alpha_per_sample.unsqueeze(-1).expand(bs, resp_len).contiguous()
+
+                                        # logging: keep original keys as MEAN to stay compatible with existing analysis scripts
+                                        if len(alpha_list) > 0:
+                                            metrics["diag/teacher_loss_scale"] = float(np.mean(alpha_list))
+                                            metrics["diag/teacher_loss_scale_min"] = float(np.min(alpha_list))
+                                            metrics["diag/teacher_loss_scale_max"] = float(np.max(alpha_list))
+                                        if len(gap_used_list) > 0:
+                                            metrics["diag/teacher_gap_used"] = float(np.mean(gap_used_list))
+                                            metrics["diag/teacher_gap_used_p90"] = float(np.quantile(np.array(gap_used_list), 0.90))
+                                            metrics["diag/teacher_gap_used_max"] = float(np.max(gap_used_list))
+                                        metrics["diag/teacher_gate_level"] = 1.0  # 1=group, 0=batch (for quick filtering)
+                                        # Done for group gate
+                                        gate_level = "group"
+
+                                if gate_level != "group":
+                                    # batch-level gate (backward compatible)
+                                    g = float(gap)
+                                    if ema_enable:
+                                        if getattr(self, "_teacher_gap_ema", None) is None:
+                                            self._teacher_gap_ema = g
+                                        else:
+                                            self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
+                                        g_eff = float(self._teacher_gap_ema)
+                                    else:
+                                        g_eff = g
+
+                                    alpha = _alpha_from_gap(g_eff)
+                                    batch.batch["teacher_loss_scale"] = torch.full(
+                                        (bs, resp_len), float(alpha), device=device, dtype=torch.float32
+                                    )
+                                    metrics["diag/teacher_loss_scale"] = float(alpha)
+                                    metrics["diag/teacher_gap_used"] = float(g_eff)
+                                    metrics["diag/teacher_gate_level"] = 0.0
+                                    if ema_enable:
+                                        metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
 
                         # ⭐ 保存 Trajectory 信息用于后续分析（放到 compute_advantage 后，包含 advantages）
                         if self.async_rollout_mode and trajectories:
