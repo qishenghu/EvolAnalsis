@@ -202,6 +202,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_policy_shaping_mode = self.config.get("teacher_policy_shaping_mode", "p_div_p_beta")
                         teacher_policy_shaping_beta = self.config.get("teacher_policy_shaping_beta", 0.1)
                         teacher_use_clip = self.config.get("teacher_use_clip", False)
+                        # ⭐ 7.3: token-level teacher gate (optional; default disabled)
+                        teacher_token_gate_enable = self.config.get("teacher_token_gate_enable", False)
+                        teacher_token_gate_mode = self.config.get("teacher_token_gate_mode", "logprob_sigmoid")
+                        teacher_token_gate_threshold_logprob = self.config.get("teacher_token_gate_threshold_logprob", -2.0)
+                        teacher_token_gate_temperature = self.config.get("teacher_token_gate_temperature", 1.0)
+                        teacher_token_gate_min = self.config.get("teacher_token_gate_min", 0.0)
+                        teacher_token_gate_max = self.config.get("teacher_token_gate_max", 1.0)
+                        teacher_token_gate_stop_grad = self.config.get("teacher_token_gate_stop_grad", True)
                         
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
@@ -225,6 +233,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_policy_shaping_beta=teacher_policy_shaping_beta,
                             teacher_use_clip=teacher_use_clip,
                             teacher_loss_scale=teacher_loss_scale,
+                            # 7.3 token gate (optional)
+                            teacher_token_gate_enable=teacher_token_gate_enable,
+                            teacher_token_gate_mode=teacher_token_gate_mode,
+                            teacher_token_gate_threshold_logprob=teacher_token_gate_threshold_logprob,
+                            teacher_token_gate_temperature=teacher_token_gate_temperature,
+                            teacher_token_gate_min=teacher_token_gate_min,
+                            teacher_token_gate_max=teacher_token_gate_max,
+                            teacher_token_gate_stop_grad=teacher_token_gate_stop_grad,
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
                     else:
                         # Use original het_compute_token_on_off_policy_loss

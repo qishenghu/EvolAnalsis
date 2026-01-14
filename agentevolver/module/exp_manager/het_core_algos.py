@@ -229,6 +229,14 @@ def het_compute_teacher_aware_loss(
     teacher_policy_shaping_beta: float = 0.1,  # Policy shaping 参数 β
     teacher_use_clip: bool = False,  # Teacher 轨迹是否使用 clipping
     teacher_loss_scale: Optional[torch.Tensor] = None,  # ⭐ 2.2: scale teacher loss (0..1), broadcastable to (bs, resp_len)
+    # ⭐ 7.3 (optional): token-level teacher gating by policy confidence on teacher actions
+    teacher_token_gate_enable: bool = False,
+    teacher_token_gate_mode: str = "logprob_sigmoid",
+    teacher_token_gate_threshold_logprob: float = -2.0,
+    teacher_token_gate_temperature: float = 1.0,
+    teacher_token_gate_min: float = 0.0,
+    teacher_token_gate_max: float = 1.0,
+    teacher_token_gate_stop_grad: bool = True,
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -331,6 +339,33 @@ def het_compute_teacher_aware_loss(
             beta=teacher_policy_shaping_beta,
         )
 
+    # ⭐ 7.3: token-level teacher gating (confidence-weighted teacher update)
+    # Gate teacher gradients primarily on low-confidence teacher tokens, based on current policy logprob on teacher actions.
+    # w_t = sigmoid((thr - log_pi(a_T|s))/T) in [0,1], optionally clamped to [min,max] and detached (stop-grad).
+    teacher_gate_w = None
+    if teacher_token_gate_enable:
+        _mode = str(teacher_token_gate_mode or "logprob_sigmoid").lower().strip()
+        _temp = float(teacher_token_gate_temperature) if float(teacher_token_gate_temperature) > 0 else 1.0
+        _thr = float(teacher_token_gate_threshold_logprob)
+        _w_min = float(teacher_token_gate_min)
+        _w_max = float(teacher_token_gate_max)
+        # safety: avoid runtime issues if misconfigured
+        if _w_min > _w_max:
+            _w_min, _w_max = _w_max, _w_min
+
+        if _mode == "logprob_sigmoid":
+            teacher_gate_w = torch.sigmoid((_thr - log_prob) / _temp)
+        elif _mode == "logprob_hard":
+            teacher_gate_w = (log_prob < _thr).float()
+        else:
+            teacher_gate_w = None
+
+        if teacher_gate_w is not None:
+            teacher_gate_w = torch.clamp(teacher_gate_w, min=_w_min, max=_w_max)
+            if teacher_token_gate_stop_grad:
+                teacher_gate_w = teacher_gate_w.detach()
+            teacher_ratio = teacher_ratio * teacher_gate_w
+
     # ⭐ 2.2: Optional adaptive scaling for teacher loss
     if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
         # Ensure broadcastable: (bs, resp_len) preferred; accept (bs, 1) or scalar-like
@@ -411,6 +446,8 @@ def het_compute_teacher_aware_loss(
     ratio_stats = {}
     # teacher_ratio: after (optional) shaping, used for teacher loss
     ratio_stats.update(_masked_stats(teacher_ratio, teacher_token_mask, "teacher_ratio"))
+    if teacher_gate_w is not None and torch.is_tensor(teacher_gate_w):
+        ratio_stats.update(_masked_stats(teacher_gate_w, teacher_token_mask, "teacher_gate_w"))
     # self_off ratio: exp(log_prob - old_log_prob)
     ratio_stats.update(_masked_stats(ratio, self_token_mask, "self_off_ratio"))
     # on-policy ratio is always 1 in PPO surrogate, but we can still log on-policy advantage stats

@@ -157,16 +157,6 @@ def pick_reward_column(df: pd.DataFrame) -> str:
     raise KeyError(f"No reward column found. Available columns sample: {list(df.columns)[:30]}")
 
 
-def clip_max_step(df: pd.DataFrame, max_step: Optional[int]) -> pd.DataFrame:
-    """Keep rows with _step <= max_step (if provided)."""
-    if max_step is None:
-        return df
-    if "_step" not in df.columns:
-        return df
-    s = pd.to_numeric(df["_step"], errors="coerce")
-    return df[s <= int(max_step)].copy()
-
-
 def merge_sources(wandb_df: pd.DataFrame, local_df: pd.DataFrame) -> pd.DataFrame:
     # Outer-join then prefer W&B where present for overlapping keys.
     merged = pd.merge(local_df, wandb_df, on="_step", how="outer", suffixes=("_local", "_wandb"))
@@ -306,10 +296,7 @@ def main() -> None:
     ap.add_argument("--out_dir", default="analysis/luffy_no_logprob_improvement_compare/out")
     ap.add_argument("--report_path", default="docs/analysis/2026-01-13_luffy_no_logprob_improvements_report.md")
     ap.add_argument("--include_v2", action="store_true", help="Include v2 annealing runs (pciujkve/t7doz8ru).")
-    ap.add_argument("--max_step", type=int, default=None, help="Only analyze steps <= max_step (useful for partial runs).")
-    ap.add_argument("--extra_run_id", type=str, default=None, help="Optional extra W&B run id to include.")
-    ap.add_argument("--extra_label", type=str, default=None, help="Label for extra run.")
-    ap.add_argument("--extra_traj_dir", type=str, default=None, help="Trajectory directory for extra run.")
+    ap.add_argument("--include_v3", action="store_true", help="Include v3 per-group gate run (btxf74s2).")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -375,13 +362,18 @@ def main() -> None:
             ]
         )
 
-    if args.extra_run_id and args.extra_traj_dir:
-        runs.append(
-            RunSpec(
-                label=args.extra_label or f"Extra run ({args.extra_run_id})",
-                run_id=args.extra_run_id,
-                traj_dir=Path(args.extra_traj_dir),
-            )
+    if args.include_v3:
+        runs.extend(
+            [
+                RunSpec(
+                    label="Exp-3 v3 (7.1 + 7.2 per-group gate)",
+                    run_id="btxf74s2",
+                    traj_dir=Path(
+                        "/home/qisheng/agent/AgentEvolver/checkpoints/agentevolver/"
+                        "alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_adaptive_gate_v3/Trajectory"
+                    ),
+                ),
+            ]
         )
 
     # W&B keys: keep tight, but include fallbacks.
@@ -396,10 +388,11 @@ def main() -> None:
         "actor/pg_loss",
         # diag that may only exist in wandb (adaptive gate)
         "diag/teacher_loss_scale",
-        "diag/teacher_loss_scale_min",
-        "diag/teacher_loss_scale_max",
         "diag/teacher_gap_used",
         "diag/teacher_gap_ema",
+        # v3 group-gate diagnostics (may not exist in v1/v2)
+        "diag/teacher_loss_scale_min",
+        "diag/teacher_loss_scale_max",
         "diag/teacher_gap_used_p90",
         "diag/teacher_gap_used_max",
         "diag/teacher_gate_level",
@@ -424,11 +417,8 @@ def main() -> None:
     for rs in runs:
         local_df = load_local_batch_diag(rs.traj_dir)
         wandb_df = load_wandb_history(rs.run_id, wandb_keys, entity=args.entity, project=args.project)
-        local_df = clip_max_step(local_df, args.max_step)
-        wandb_df = clip_max_step(wandb_df, args.max_step)
         df = merge_sources(wandb_df, local_df)
         df = df.sort_values("_step").reset_index(drop=True)
-        df = clip_max_step(df, args.max_step)
         df["label"] = rs.label
         merged_by_label[rs.label] = df
 
@@ -557,8 +547,6 @@ def main() -> None:
 
     md = []
     title_suffix = "（含 v2 退火复跑）" if args.include_v2 else ""
-    if args.max_step is not None:
-        title_suffix += f"（仅统计 step<= {int(args.max_step)}）"
     md.append(f"# 2026-01-13：LUFFY no-logprob（baseline）vs 两项改进（7.1/7.2）综合分析报告{title_suffix}\n")
     md.append("## 0. 实验设置与对比对象\n")
     md.append("本报告对齐了 4 个 run（相同任务/训练步数/teacher 配置，差异仅来自 7.1/7.2 开关），并使用两类数据源交叉验证：\n")
