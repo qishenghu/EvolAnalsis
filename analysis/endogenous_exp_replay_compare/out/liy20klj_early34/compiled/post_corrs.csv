@@ -1,0 +1,8 @@
+a,b,corr
+diag/exp_token_ratio,diag/entropy_onpolicy_token_mean,0.5706253977621961
+diag/exp_token_ratio,diag/entropy_offpolicy_token_mean,0.444045096428441
+exp_replay/offpolicy_token_ratio_llm,exp_replay/entropy_llm_onpolicy_mean,0.36887011068435466
+exp_replay/offpolicy_token_ratio_llm,exp_replay/entropy_llm_offpolicy_mean,0.4956824874556638
+exp_replay/offpolicy_age_mean,exp_replay_diag/importance_ratio/off/p99,-0.10317412234601094
+exp_replay/offpolicy_age_mean,exp_replay_diag/importance_ratio/off/max,-0.1892830916414438
+exp_replay/entropy_llm_offpolicy_mean,exp_replay_diag/importance_ratio/off/p99,-0.02986218592470603

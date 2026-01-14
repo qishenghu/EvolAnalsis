@@ -1,0 +1,3 @@
+split,n_rollouts,success_rate,reward_outcome_mean,response_valid_tokens_mean,offpolicy_ratio_mean,exp_tokens_mean
+onpolicy,1500.0,0.4673333333333333,0.4673333333333333,5132.388666666667,0.0,0.0
+offpolicy,100.0,1.0,1.0,2555.98,0.1737513109323361,418.69
