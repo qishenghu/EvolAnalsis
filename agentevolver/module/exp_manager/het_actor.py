@@ -210,6 +210,11 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_token_gate_min = self.config.get("teacher_token_gate_min", 0.0)
                         teacher_token_gate_max = self.config.get("teacher_token_gate_max", 1.0)
                         teacher_token_gate_stop_grad = self.config.get("teacher_token_gate_stop_grad", True)
+                        # ⭐ 7.3 conditional gate: enable token gate only when per-group gap <= threshold
+                        teacher_token_gate_conditional_gap_enable = self.config.get("teacher_token_gate_conditional_gap_enable", False)
+                        teacher_token_gate_conditional_gap_threshold = self.config.get("teacher_token_gate_conditional_gap_threshold", 0.3)
+                        # Get per-sample gap from batch (computed in trainer)
+                        teacher_token_gate_conditional_gap_per_sample = data.get("teacher_gap_per_sample", None)
                         
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
@@ -241,6 +246,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_token_gate_min=teacher_token_gate_min,
                             teacher_token_gate_max=teacher_token_gate_max,
                             teacher_token_gate_stop_grad=teacher_token_gate_stop_grad,
+                            # 7.3 conditional gate
+                            teacher_token_gate_conditional_gap_enable=teacher_token_gate_conditional_gap_enable,
+                            teacher_token_gate_conditional_gap_threshold=teacher_token_gate_conditional_gap_threshold,
+                            teacher_token_gate_conditional_gap_per_sample=teacher_token_gate_conditional_gap_per_sample,
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
                     else:
                         # Use original het_compute_token_on_off_policy_loss

@@ -3196,6 +3196,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             ema_by_group = {}
                                             setattr(self, "_teacher_gap_ema_by_group", ema_by_group)
 
+                                        # ⭐ Also compute per-sample gap for 7.3 conditional gate
+                                        gap_per_sample = torch.empty((bs,), device=device, dtype=torch.float32)
+                                        
                                         for gid, idxs in id2idx.items():
                                             idx_t = [i for i in idxs if bool(is_teacher_sample_local[i].item())]
                                             idx_o = [i for i in idxs if not bool(is_teacher_sample_local[i].item())]
@@ -3220,8 +3223,12 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             a = _alpha_from_gap(g_eff)
                                             for i in idxs:
                                                 alpha_per_sample[i] = a
+                                                gap_per_sample[i] = g_eff  # ⭐ Store per-sample gap for 7.3 conditional gate
                                             gap_used_list.append(g_eff)
                                             alpha_list.append(a)
+                                        
+                                        # ⭐ Store per-sample gap in batch for 7.3 conditional gate
+                                        batch.batch["teacher_gap_per_sample"] = gap_per_sample
 
                                         batch.batch["teacher_loss_scale"] = alpha_per_sample.unsqueeze(-1).expand(bs, resp_len).contiguous()
 
@@ -3250,15 +3257,19 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     else:
                                         g_eff = g
 
-                                        alpha = _alpha_from_gap(g_eff)
+                                    alpha = _alpha_from_gap(g_eff)
                                     batch.batch["teacher_loss_scale"] = torch.full(
                                         (bs, resp_len), float(alpha), device=device, dtype=torch.float32
+                                    )
+                                    # ⭐ For batch-level gate, use same gap for all samples (for 7.3 conditional gate)
+                                    batch.batch["teacher_gap_per_sample"] = torch.full(
+                                        (bs,), float(g_eff), device=device, dtype=torch.float32
                                     )
                                     metrics["diag/teacher_loss_scale"] = float(alpha)
                                     metrics["diag/teacher_gap_used"] = float(g_eff)
                                     metrics["diag/teacher_gate_level"] = 0.0
-                                if ema_enable:
-                                    metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
+                                    if ema_enable:
+                                        metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
 
                         # ⭐ 保存 Trajectory 信息用于后续分析（放到 compute_advantage 后，包含 advantages）
                         if self.async_rollout_mode and trajectories:

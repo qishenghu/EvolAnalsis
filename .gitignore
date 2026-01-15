@@ -144,6 +144,9 @@ local_vector_store/
 
 ExGRPO/
 
+analysis/
+docs/
+
 AgentGym/agentenv-searchqa/retrieve_data/
 AgentGym/agentenv-searchqa/agentenv_searchqa/queries/
 

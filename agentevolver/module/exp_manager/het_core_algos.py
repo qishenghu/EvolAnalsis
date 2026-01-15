@@ -237,6 +237,10 @@ def het_compute_teacher_aware_loss(
     teacher_token_gate_min: float = 0.0,
     teacher_token_gate_max: float = 1.0,
     teacher_token_gate_stop_grad: bool = True,
+    # ⭐ 7.3 conditional gate: enable token gate only when per-group gap <= threshold
+    teacher_token_gate_conditional_gap_enable: bool = False,
+    teacher_token_gate_conditional_gap_threshold: float = 0.3,
+    teacher_token_gate_conditional_gap_per_sample: Optional[torch.Tensor] = None,  # (bs,) per-sample gap values
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -342,29 +346,58 @@ def het_compute_teacher_aware_loss(
     # ⭐ 7.3: token-level teacher gating (confidence-weighted teacher update)
     # Gate teacher gradients primarily on low-confidence teacher tokens, based on current policy logprob on teacher actions.
     # w_t = sigmoid((thr - log_pi(a_T|s))/T) in [0,1], optionally clamped to [min,max] and detached (stop-grad).
+    # ⭐ Conditional gate: only enable token gate when per-group gap <= threshold (gap small = task learned well)
     teacher_gate_w = None
     if teacher_token_gate_enable:
-        _mode = str(teacher_token_gate_mode or "logprob_sigmoid").lower().strip()
-        _temp = float(teacher_token_gate_temperature) if float(teacher_token_gate_temperature) > 0 else 1.0
-        _thr = float(teacher_token_gate_threshold_logprob)
-        _w_min = float(teacher_token_gate_min)
-        _w_max = float(teacher_token_gate_max)
-        # safety: avoid runtime issues if misconfigured
-        if _w_min > _w_max:
-            _w_min, _w_max = _w_max, _w_min
-
-        if _mode == "logprob_sigmoid":
-            teacher_gate_w = torch.sigmoid((_thr - log_prob) / _temp)
-        elif _mode == "logprob_hard":
-            teacher_gate_w = (log_prob < _thr).float()
+        # Check conditional gap: if enabled, only apply gate when gap <= threshold
+        should_apply_gate = True
+        if teacher_token_gate_conditional_gap_enable:
+            gap_per_sample = teacher_token_gate_conditional_gap_per_sample
+            gap_threshold = float(teacher_token_gate_conditional_gap_threshold)
+            if gap_per_sample is not None and torch.is_tensor(gap_per_sample):
+                # gap_per_sample: (bs,), broadcast to (bs, resp_len)
+                bs, resp_len = log_prob.shape
+                if gap_per_sample.dim() == 1 and gap_per_sample.shape[0] == bs:
+                    # Create per-sample gate mask: 1 if gap <= threshold (apply gate), 0 otherwise
+                    gap_mask = (gap_per_sample <= gap_threshold).float()  # (bs,)
+                    gap_mask = gap_mask.unsqueeze(-1).expand(bs, resp_len)  # (bs, resp_len)
+                    # If all samples have gap > threshold, disable gate entirely
+                    if gap_mask.sum() == 0:
+                        should_apply_gate = False
+                else:
+                    # Invalid shape, fallback to unconditional gate
+                    gap_mask = None
+            else:
+                # gap_per_sample not provided, fallback to unconditional gate
+                gap_mask = None
         else:
-            teacher_gate_w = None
+            gap_mask = None
 
-        if teacher_gate_w is not None:
-            teacher_gate_w = torch.clamp(teacher_gate_w, min=_w_min, max=_w_max)
-            if teacher_token_gate_stop_grad:
-                teacher_gate_w = teacher_gate_w.detach()
-            teacher_ratio = teacher_ratio * teacher_gate_w
+        if should_apply_gate:
+            _mode = str(teacher_token_gate_mode or "logprob_sigmoid").lower().strip()
+            _temp = float(teacher_token_gate_temperature) if float(teacher_token_gate_temperature) > 0 else 1.0
+            _thr = float(teacher_token_gate_threshold_logprob)
+            _w_min = float(teacher_token_gate_min)
+            _w_max = float(teacher_token_gate_max)
+            # safety: avoid runtime issues if misconfigured
+            if _w_min > _w_max:
+                _w_min, _w_max = _w_max, _w_min
+
+            if _mode == "logprob_sigmoid":
+                teacher_gate_w = torch.sigmoid((_thr - log_prob) / _temp)
+            elif _mode == "logprob_hard":
+                teacher_gate_w = (log_prob < _thr).float()
+            else:
+                teacher_gate_w = None
+
+            if teacher_gate_w is not None:
+                teacher_gate_w = torch.clamp(teacher_gate_w, min=_w_min, max=_w_max)
+                # Apply conditional gap mask if enabled
+                if gap_mask is not None:
+                    teacher_gate_w = teacher_gate_w * gap_mask + (1.0 - gap_mask)  # gap > threshold: gate_w = 1 (no gating)
+                if teacher_token_gate_stop_grad:
+                    teacher_gate_w = teacher_gate_w.detach()
+                teacher_ratio = teacher_ratio * teacher_gate_w
 
     # ⭐ 2.2: Optional adaptive scaling for teacher loss
     if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
