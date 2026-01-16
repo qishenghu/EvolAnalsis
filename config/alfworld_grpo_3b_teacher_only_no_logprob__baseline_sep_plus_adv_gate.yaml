@@ -10,17 +10,20 @@ defaults:
 
 # ============================================================================
 # AlfWorld GRPO Training Configuration with Teacher Experience Replay (LUFFY)
-# 7.1 + 7.3 ablation:
+# 7.1 + 7.4-A ablation:
 # - 7.1: GRPO baseline/adv teacher-separation
-# - 7.3: token-level teacher gate (confidence-weighted teacher update)
+# - 7.4-A: advantage-aware teacher token gate (gate by advantage instead of logprob)
 #
-# Safety:
-# - 7.3 is implemented as OPTIONAL args in het_compute_teacher_aware_loss and is default-disabled.
-# - This YAML only enables it for this experiment, without touching other configs.
+# Rationale: 7.3 (logprob-based gate) didn't improve over 7.1 because:
+#   1. logprob is not a reliable proxy for "task learned"
+#   2. 7.1 turns teacher into positive anchor; 7.3 weakens it unnecessarily
+#
+# 7.4-A directly aligns with gradient value: keep high-advantage teacher tokens,
+# reduce low/negative-advantage ones. This should be more precise.
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_token_gate_v1
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_adv_gate_v1
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -88,18 +91,21 @@ actor_rollout_ref:
     teacher_policy_shaping_beta: ${exp_manager.teacher_experience.policy_shaping.beta}
     teacher_use_clip: false
 
-    # ⭐ 7.3 token-level teacher gate (enabled for this ablation)
-    # Gate teacher gradients by current policy confidence on teacher actions.
-    # w_t = sigmoid((thr - log_pi(a_T|s))/T) clamped to [min,max]; (optionally stop-grad).
-    teacher_token_gate_enable: ${exp_manager.teacher_experience.token_gate.enable}
-    teacher_token_gate_mode: ${exp_manager.teacher_experience.token_gate.mode}
-    teacher_token_gate_threshold_logprob: ${exp_manager.teacher_experience.token_gate.threshold_logprob}
-    teacher_token_gate_temperature: ${exp_manager.teacher_experience.token_gate.temperature}
-    teacher_token_gate_min: ${exp_manager.teacher_experience.token_gate.min}
-    teacher_token_gate_max: ${exp_manager.teacher_experience.token_gate.max}
-    teacher_token_gate_stop_grad: ${exp_manager.teacher_experience.token_gate.stop_grad}
-    teacher_token_gate_conditional_gap_enable: ${exp_manager.teacher_experience.token_gate.conditional_gap.enable}
-    teacher_token_gate_conditional_gap_threshold: ${exp_manager.teacher_experience.token_gate.conditional_gap.threshold}
+    # ⭐ 7.3 token gate (DISABLED for this 7.4-A ablation)
+    teacher_token_gate_enable: false
+
+    # ⭐ 7.4-A: advantage-aware teacher token gate (ENABLED)
+    # Gate teacher gradients based on advantage value:
+    # - High advantage → keep teacher signal (valuable gradient)
+    # - Low/negative advantage → reduce teacher signal (harmful/noisy gradient)
+    # w_t = sigmoid((adv - thr) / T) clamped to [min, max]
+    teacher_adv_gate_enable: ${exp_manager.teacher_experience.adv_gate.enable}
+    teacher_adv_gate_mode: ${exp_manager.teacher_experience.adv_gate.mode}
+    teacher_adv_gate_threshold_adv: ${exp_manager.teacher_experience.adv_gate.threshold_adv}
+    teacher_adv_gate_temperature: ${exp_manager.teacher_experience.adv_gate.temperature}
+    teacher_adv_gate_min: ${exp_manager.teacher_experience.adv_gate.min}
+    teacher_adv_gate_max: ${exp_manager.teacher_experience.adv_gate.max}
+    teacher_adv_gate_stop_grad: ${exp_manager.teacher_experience.adv_gate.stop_grad}
 
     use_dapo: false
     fsdp_config:
@@ -244,31 +250,43 @@ exp_manager:
     adaptive_weight:
       enable: false
 
-    # 7.3 (enabled): token-level teacher gate
-    # ⭐ Adjusted parameters to reduce over-gating (based on analysis showing gate_mean=0.18 was too low)
+    # 7.3 (disabled in this ablation - using 7.4-A instead)
     token_gate:
+      enable: false
+
+    # ⭐ 7.4-A: advantage-aware teacher token gate (ENABLED)
+    # Key insight: instead of using logprob (which is an indirect proxy for "task learned"),
+    # directly use advantage value to gate teacher tokens.
+    # This is more aligned with what we actually want: keep high-value teacher updates,
+    # reduce low/harmful teacher updates.
+    #
+    # Data analysis (7.1 baseline):
+    # - Teacher adv distribution: early=1.12, mid=0.75, late=0.67
+    # - Teacher adv min: early=0.83, mid=0.50, late=0.40
+    # - ALL teacher advantages are POSITIVE (because teacher reward=1, on-policy<1)
+    #
+    # ⚠️ CRITICAL LESSON from 7.3 failure:
+    # - 7.3 failed with gate_w/mean ≈ 0.345 (too aggressive)
+    # - Any config leading to gate_w/mean < 0.5 is risky!
+    #
+    # CONSERVATIVE CONFIG (chosen to avoid over-suppression):
+    # - threshold_adv=0.4: only gate tokens with adv below late-stage min
+    # - temperature=0.2: sharp transition, most tokens unaffected
+    # - min=0.5: guarantee at least 50% teacher signal retained
+    #
+    # Expected gate_w distribution:
+    # - Early (adv~1.12): gate_w ≈ 0.94 (almost full teacher signal)
+    # - Mid (adv~0.75): gate_w ≈ 0.74 (strong teacher signal)
+    # - Late (adv~0.67): gate_w ≈ 0.65 (moderate reduction, not aggressive)
+    # - Overall gate_w/mean ≈ 0.77 (much safer than 7.3's 0.345)
+    adv_gate:
       enable: true
-      mode: "logprob_sigmoid"      # "logprob_sigmoid" | "logprob_hard"
-      threshold_logprob: -1.5      # ⭐ Increased from -2.0 to -1.5 (p≈0.223) to keep more teacher signals
-      temperature: 0.5             # ⭐ Decreased from 1.0 to 0.5 for smoother transition
-      min: 0.3                     # ⭐ Increased from 0.0 to 0.3 to ensure at least 30% teacher signals retained
-      max: 1.0                     # clamp upper bound
-      stop_grad: true              # recommended: treat gate as schedule, not a learnable path
-      # ⭐ Conditional gate: only enable token gate when per-group gap <= threshold
-      # Rationale: gap small = task learned well, so we can reduce teacher influence via token gate
-      # gap large = task still needs strong teacher signal, so disable token gate
-      # 
-      # Threshold selection rationale (based on 7.1 baseline data analysis):
-      # - Late stage median gap: 0.3661 (most tasks learned well)
-      # - Overall median gap: 0.4286
-      # - 0.3 threshold: only covers 9% of samples (too strict, gate rarely activates)
-      # - 0.4 threshold: covers ~43% of samples (balanced, late stage mostly activates)
-      # - 0.45 threshold: covers ~57% of samples (more aggressive)
-      conditional_gap:
-        enable: true               # Enable conditional gate based on per-group gap
-        threshold: 0.4            # ⭐ Adjusted from 0.3 to 0.4 based on data analysis
-                                  # Late stage median gap ≈ 0.37, so 0.4 covers most late-stage tasks
-                                  # while preserving strong teacher signal for early/mid stages
+      mode: "sigmoid"              # "sigmoid" | "hard"
+      threshold_adv: 0.4           # ⭐ Only gate very low advantage tokens (below late min)
+      temperature: 0.2             # ⭐ Sharp transition around threshold
+      min: 0.5                     # ⭐ CRITICAL: guarantee 50% teacher signal even for lowest adv
+      max: 1.0                     # keep full gradient for high adv
+      stop_grad: true              # treat gate as schedule, not learnable
 
 # ============================================================================
 # Attribution-Driven Credit Assignment (ADCA-GRPO) Configuration
@@ -280,5 +298,7 @@ attribution_driven_credit_assignment:
 # Thread Pool Configuration
 # ============================================================================
 thread_pool:
-  max_workers: 8
-
+  max_workers: 64
+  enable_memory_protection: true
+  memory_threshold: 0.9
+  cool_down_time: 30

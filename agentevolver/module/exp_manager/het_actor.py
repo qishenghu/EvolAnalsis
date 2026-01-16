@@ -215,6 +215,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_token_gate_conditional_gap_threshold = self.config.get("teacher_token_gate_conditional_gap_threshold", 0.3)
                         # Get per-sample gap from batch (computed in trainer)
                         teacher_token_gate_conditional_gap_per_sample = data.get("teacher_gap_per_sample", None)
+                        # ⭐ 7.4-A: advantage-aware teacher token gate (optional; default disabled)
+                        # Conservative defaults to avoid over-suppressing teacher signals
+                        teacher_adv_gate_enable = self.config.get("teacher_adv_gate_enable", False)
+                        teacher_adv_gate_mode = self.config.get("teacher_adv_gate_mode", "sigmoid")
+                        teacher_adv_gate_threshold_adv = self.config.get("teacher_adv_gate_threshold_adv", 0.4)
+                        teacher_adv_gate_temperature = self.config.get("teacher_adv_gate_temperature", 0.2)
+                        teacher_adv_gate_min = self.config.get("teacher_adv_gate_min", 0.5)
+                        teacher_adv_gate_max = self.config.get("teacher_adv_gate_max", 1.0)
+                        teacher_adv_gate_stop_grad = self.config.get("teacher_adv_gate_stop_grad", True)
                         
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
@@ -250,6 +259,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_token_gate_conditional_gap_enable=teacher_token_gate_conditional_gap_enable,
                             teacher_token_gate_conditional_gap_threshold=teacher_token_gate_conditional_gap_threshold,
                             teacher_token_gate_conditional_gap_per_sample=teacher_token_gate_conditional_gap_per_sample,
+                            # 7.4-A advantage gate (optional)
+                            teacher_adv_gate_enable=teacher_adv_gate_enable,
+                            teacher_adv_gate_mode=teacher_adv_gate_mode,
+                            teacher_adv_gate_threshold_adv=teacher_adv_gate_threshold_adv,
+                            teacher_adv_gate_temperature=teacher_adv_gate_temperature,
+                            teacher_adv_gate_min=teacher_adv_gate_min,
+                            teacher_adv_gate_max=teacher_adv_gate_max,
+                            teacher_adv_gate_stop_grad=teacher_adv_gate_stop_grad,
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
                     else:
                         # Use original het_compute_token_on_off_policy_loss

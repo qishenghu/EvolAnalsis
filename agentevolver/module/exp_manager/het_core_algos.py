@@ -241,6 +241,14 @@ def het_compute_teacher_aware_loss(
     teacher_token_gate_conditional_gap_enable: bool = False,
     teacher_token_gate_conditional_gap_threshold: float = 0.3,
     teacher_token_gate_conditional_gap_per_sample: Optional[torch.Tensor] = None,  # (bs,) per-sample gap values
+    # ⭐ 7.4-A: advantage-aware teacher token gate (gate by advantage value instead of logprob)
+    teacher_adv_gate_enable: bool = False,
+    teacher_adv_gate_mode: str = "sigmoid",  # "sigmoid" or "hard"
+    teacher_adv_gate_threshold_adv: float = 0.0,  # advantage threshold
+    teacher_adv_gate_temperature: float = 1.0,
+    teacher_adv_gate_min: float = 0.1,  # min gate weight (retain some gradient even for negative adv)
+    teacher_adv_gate_max: float = 1.0,
+    teacher_adv_gate_stop_grad: bool = True,
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -399,6 +407,32 @@ def het_compute_teacher_aware_loss(
                     teacher_gate_w = teacher_gate_w.detach()
                 teacher_ratio = teacher_ratio * teacher_gate_w
 
+    # ⭐ 7.4-A: advantage-aware teacher token gate
+    # Gate teacher gradients based on advantage value: keep high-advantage tokens, reduce low/negative-advantage tokens
+    teacher_adv_gate_w = None
+    if teacher_adv_gate_enable:
+        _adv_mode = str(teacher_adv_gate_mode or "sigmoid").lower().strip()
+        _adv_temp = float(teacher_adv_gate_temperature) if float(teacher_adv_gate_temperature) > 0 else 1.0
+        _adv_thr = float(teacher_adv_gate_threshold_adv)
+        _adv_w_min = float(teacher_adv_gate_min)
+        _adv_w_max = float(teacher_adv_gate_max)
+        if _adv_w_min > _adv_w_max:
+            _adv_w_min, _adv_w_max = _adv_w_max, _adv_w_min
+
+        if _adv_mode == "sigmoid":
+            # w = sigmoid((adv - thr) / T), high adv -> high weight, low/neg adv -> low weight
+            teacher_adv_gate_w = torch.sigmoid((advantages - _adv_thr) / _adv_temp)
+        elif _adv_mode == "hard":
+            teacher_adv_gate_w = (advantages > _adv_thr).float()
+        else:
+            teacher_adv_gate_w = None
+
+        if teacher_adv_gate_w is not None:
+            teacher_adv_gate_w = torch.clamp(teacher_adv_gate_w, min=_adv_w_min, max=_adv_w_max)
+            if teacher_adv_gate_stop_grad:
+                teacher_adv_gate_w = teacher_adv_gate_w.detach()
+            teacher_ratio = teacher_ratio * teacher_adv_gate_w
+
     # ⭐ 2.2: Optional adaptive scaling for teacher loss
     if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
         # Ensure broadcastable: (bs, resp_len) preferred; accept (bs, 1) or scalar-like
@@ -481,6 +515,9 @@ def het_compute_teacher_aware_loss(
     ratio_stats.update(_masked_stats(teacher_ratio, teacher_token_mask, "teacher_ratio"))
     if teacher_gate_w is not None and torch.is_tensor(teacher_gate_w):
         ratio_stats.update(_masked_stats(teacher_gate_w, teacher_token_mask, "teacher_gate_w"))
+    # 7.4-A: advantage-aware gate weight
+    if teacher_adv_gate_w is not None and torch.is_tensor(teacher_adv_gate_w):
+        ratio_stats.update(_masked_stats(teacher_adv_gate_w, teacher_token_mask, "teacher_adv_gate_w"))
     # self_off ratio: exp(log_prob - old_log_prob)
     ratio_stats.update(_masked_stats(ratio, self_token_mask, "self_off_ratio"))
     # on-policy ratio is always 1 in PPO surrogate, but we can still log on-policy advantage stats
