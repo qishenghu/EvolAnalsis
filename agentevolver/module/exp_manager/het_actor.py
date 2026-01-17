@@ -147,12 +147,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
-                    # Calculate entropy if: (1) entropy_coeff != 0, or (2) 7.5 entropy gate is enabled
                     calculate_entropy = False
                     if entropy_coeff != 0:
-                        calculate_entropy = True
-                    # ⭐ 7.5: also need entropy if entropy gate is enabled
-                    if self.config.get("teacher_entropy_gate_enable", False):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)  # ⭐ Forward pass to get entropy and log probabilities
 
@@ -206,37 +202,18 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_policy_shaping_mode = self.config.get("teacher_policy_shaping_mode", "p_div_p_beta")
                         teacher_policy_shaping_beta = self.config.get("teacher_policy_shaping_beta", 0.1)
                         teacher_use_clip = self.config.get("teacher_use_clip", False)
-                        # ⭐ 7.3: token-level teacher gate (optional; default disabled)
-                        teacher_token_gate_enable = self.config.get("teacher_token_gate_enable", False)
-                        teacher_token_gate_mode = self.config.get("teacher_token_gate_mode", "logprob_sigmoid")
-                        teacher_token_gate_threshold_logprob = self.config.get("teacher_token_gate_threshold_logprob", -2.0)
-                        teacher_token_gate_temperature = self.config.get("teacher_token_gate_temperature", 1.0)
-                        teacher_token_gate_min = self.config.get("teacher_token_gate_min", 0.0)
-                        teacher_token_gate_max = self.config.get("teacher_token_gate_max", 1.0)
-                        teacher_token_gate_stop_grad = self.config.get("teacher_token_gate_stop_grad", True)
-                        # ⭐ 7.3 conditional gate: enable token gate only when per-group gap <= threshold
-                        teacher_token_gate_conditional_gap_enable = self.config.get("teacher_token_gate_conditional_gap_enable", False)
-                        teacher_token_gate_conditional_gap_threshold = self.config.get("teacher_token_gate_conditional_gap_threshold", 0.3)
-                        # Get per-sample gap from batch (computed in trainer)
-                        teacher_token_gate_conditional_gap_per_sample = data.get("teacher_gap_per_sample", None)
-                        # ⭐ 7.4-A: advantage-aware teacher token gate (optional; default disabled)
-                        # Conservative defaults to avoid over-suppressing teacher signals
-                        teacher_adv_gate_enable = self.config.get("teacher_adv_gate_enable", False)
-                        teacher_adv_gate_mode = self.config.get("teacher_adv_gate_mode", "sigmoid")
-                        teacher_adv_gate_threshold_adv = self.config.get("teacher_adv_gate_threshold_adv", 0.4)
-                        teacher_adv_gate_temperature = self.config.get("teacher_adv_gate_temperature", 0.2)
-                        teacher_adv_gate_min = self.config.get("teacher_adv_gate_min", 0.5)
-                        teacher_adv_gate_max = self.config.get("teacher_adv_gate_max", 1.0)
-                        teacher_adv_gate_stop_grad = self.config.get("teacher_adv_gate_stop_grad", True)
-                        # ⭐ 7.5: entropy-weighted teacher token gate (optional; default disabled)
-                        # Gate by policy entropy: high entropy (uncertain) → keep teacher, low entropy → reduce
-                        teacher_entropy_gate_enable = self.config.get("teacher_entropy_gate_enable", False)
-                        teacher_entropy_gate_mode = self.config.get("teacher_entropy_gate_mode", "sigmoid")
-                        teacher_entropy_gate_threshold = self.config.get("teacher_entropy_gate_threshold", 0.15)
-                        teacher_entropy_gate_temperature = self.config.get("teacher_entropy_gate_temperature", 0.1)
-                        teacher_entropy_gate_min = self.config.get("teacher_entropy_gate_min", 0.5)
-                        teacher_entropy_gate_max = self.config.get("teacher_entropy_gate_max", 1.0)
-                        teacher_entropy_gate_stop_grad = self.config.get("teacher_entropy_gate_stop_grad", True)
+                        # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin (optional; default disabled)
+                        # 双门控机制：只向"好老师"学习，但只学到"懂了为止"
+                        teacher_ag_pm_enable = self.config.get("teacher_ag_pm_enable", False)
+                        teacher_ag_pm_adv_threshold = self.config.get("teacher_ag_pm_adv_threshold", 0.4)
+                        teacher_ag_pm_adv_temperature = self.config.get("teacher_ag_pm_adv_temperature", 0.2)
+                        teacher_ag_pm_adv_min = self.config.get("teacher_ag_pm_adv_min", 0.5)
+                        teacher_ag_pm_adv_max = self.config.get("teacher_ag_pm_adv_max", 1.0)
+                        teacher_ag_pm_prob_max = self.config.get("teacher_ag_pm_prob_max", 0.9)
+                        teacher_ag_pm_prob_temperature = self.config.get("teacher_ag_pm_prob_temperature", 0.02)
+                        teacher_ag_pm_prob_min = self.config.get("teacher_ag_pm_prob_min", 0.0)
+                        teacher_ag_pm_prob_max_gate = self.config.get("teacher_ag_pm_prob_max_gate", 1.0)
+                        teacher_ag_pm_stop_grad = self.config.get("teacher_ag_pm_stop_grad", True)
                         
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
@@ -260,36 +237,18 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_policy_shaping_beta=teacher_policy_shaping_beta,
                             teacher_use_clip=teacher_use_clip,
                             teacher_loss_scale=teacher_loss_scale,
-                            # 7.3 token gate (optional)
-                            teacher_token_gate_enable=teacher_token_gate_enable,
-                            teacher_token_gate_mode=teacher_token_gate_mode,
-                            teacher_token_gate_threshold_logprob=teacher_token_gate_threshold_logprob,
-                            teacher_token_gate_temperature=teacher_token_gate_temperature,
-                            teacher_token_gate_min=teacher_token_gate_min,
-                            teacher_token_gate_max=teacher_token_gate_max,
-                            teacher_token_gate_stop_grad=teacher_token_gate_stop_grad,
-                            # 7.3 conditional gate
-                            teacher_token_gate_conditional_gap_enable=teacher_token_gate_conditional_gap_enable,
-                            teacher_token_gate_conditional_gap_threshold=teacher_token_gate_conditional_gap_threshold,
-                            teacher_token_gate_conditional_gap_per_sample=teacher_token_gate_conditional_gap_per_sample,
-                            # 7.4-A advantage gate (optional)
-                            teacher_adv_gate_enable=teacher_adv_gate_enable,
-                            teacher_adv_gate_mode=teacher_adv_gate_mode,
-                            teacher_adv_gate_threshold_adv=teacher_adv_gate_threshold_adv,
-                            teacher_adv_gate_temperature=teacher_adv_gate_temperature,
-                            teacher_adv_gate_min=teacher_adv_gate_min,
-                            teacher_adv_gate_max=teacher_adv_gate_max,
-                            teacher_adv_gate_stop_grad=teacher_adv_gate_stop_grad,
-                            # 7.5 entropy gate (optional)
-                            teacher_entropy_gate_enable=teacher_entropy_gate_enable,
-                            teacher_entropy_gate_mode=teacher_entropy_gate_mode,
-                            teacher_entropy_gate_threshold=teacher_entropy_gate_threshold,
-                            teacher_entropy_gate_temperature=teacher_entropy_gate_temperature,
-                            teacher_entropy_gate_min=teacher_entropy_gate_min,
-                            teacher_entropy_gate_max=teacher_entropy_gate_max,
-                            teacher_entropy_gate_stop_grad=teacher_entropy_gate_stop_grad,
-                            entropy=entropy,  # Pass entropy tensor for 7.5
-                        )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
+                            # 7.6 AG-PM: Advantage-Gated Probability Margin
+                            teacher_ag_pm_enable=teacher_ag_pm_enable,
+                            teacher_ag_pm_adv_threshold=teacher_ag_pm_adv_threshold,
+                            teacher_ag_pm_adv_temperature=teacher_ag_pm_adv_temperature,
+                            teacher_ag_pm_adv_min=teacher_ag_pm_adv_min,
+                            teacher_ag_pm_adv_max=teacher_ag_pm_adv_max,
+                            teacher_ag_pm_prob_max=teacher_ag_pm_prob_max,
+                            teacher_ag_pm_prob_temperature=teacher_ag_pm_prob_temperature,
+                            teacher_ag_pm_prob_min=teacher_ag_pm_prob_min,
+                            teacher_ag_pm_prob_max_gate=teacher_ag_pm_prob_max_gate,
+                            teacher_ag_pm_stop_grad=teacher_ag_pm_stop_grad,
+                        )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO + 7.6 AG-PM)
                     else:
                         # Use original het_compute_token_on_off_policy_loss
                         ret_dict = het_compute_token_on_off_policy_loss(

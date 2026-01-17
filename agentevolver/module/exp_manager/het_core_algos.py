@@ -229,36 +229,20 @@ def het_compute_teacher_aware_loss(
     teacher_policy_shaping_beta: float = 0.1,  # Policy shaping 参数 β
     teacher_use_clip: bool = False,  # Teacher 轨迹是否使用 clipping
     teacher_loss_scale: Optional[torch.Tensor] = None,  # ⭐ 2.2: scale teacher loss (0..1), broadcastable to (bs, resp_len)
-    # ⭐ 7.3 (optional): token-level teacher gating by policy confidence on teacher actions
-    teacher_token_gate_enable: bool = False,
-    teacher_token_gate_mode: str = "logprob_sigmoid",
-    teacher_token_gate_threshold_logprob: float = -2.0,
-    teacher_token_gate_temperature: float = 1.0,
-    teacher_token_gate_min: float = 0.0,
-    teacher_token_gate_max: float = 1.0,
-    teacher_token_gate_stop_grad: bool = True,
-    # ⭐ 7.3 conditional gate: enable token gate only when per-group gap <= threshold
-    teacher_token_gate_conditional_gap_enable: bool = False,
-    teacher_token_gate_conditional_gap_threshold: float = 0.3,
-    teacher_token_gate_conditional_gap_per_sample: Optional[torch.Tensor] = None,  # (bs,) per-sample gap values
-    # ⭐ 7.4-A: advantage-aware teacher token gate (gate by advantage value instead of logprob)
-    teacher_adv_gate_enable: bool = False,
-    teacher_adv_gate_mode: str = "sigmoid",  # "sigmoid" or "hard"
-    teacher_adv_gate_threshold_adv: float = 0.0,  # advantage threshold
-    teacher_adv_gate_temperature: float = 1.0,
-    teacher_adv_gate_min: float = 0.1,  # min gate weight (retain some gradient even for negative adv)
-    teacher_adv_gate_max: float = 1.0,
-    teacher_adv_gate_stop_grad: bool = True,
-    # ⭐ 7.5: entropy-weighted teacher token gate (gate by policy entropy)
-    # Motivation: high entropy = model uncertain → keep teacher signal; low entropy = model confident → reduce
-    teacher_entropy_gate_enable: bool = False,
-    teacher_entropy_gate_mode: str = "sigmoid",  # "sigmoid" or "hard"
-    teacher_entropy_gate_threshold: float = 0.2,  # entropy threshold
-    teacher_entropy_gate_temperature: float = 0.1,
-    teacher_entropy_gate_min: float = 0.5,  # min gate weight (guarantee 50% teacher signal)
-    teacher_entropy_gate_max: float = 1.0,
-    teacher_entropy_gate_stop_grad: bool = True,
-    entropy: Optional[torch.Tensor] = None,  # (bs, seq_len) policy entropy at each token
+    # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin
+    # 双门控机制：(1) Advantage Gate + (2) Probability Margin Gate
+    teacher_ag_pm_enable: bool = False,
+    # Advantage Gate 参数（继承 7.4 思想）
+    teacher_ag_pm_adv_threshold: float = 0.4,
+    teacher_ag_pm_adv_temperature: float = 0.2,
+    teacher_ag_pm_adv_min: float = 0.5,
+    teacher_ag_pm_adv_max: float = 1.0,
+    # Probability Margin Gate 参数（新机制）
+    teacher_ag_pm_prob_max: float = 0.9,  # 概率上界，达到后停止学习
+    teacher_ag_pm_prob_temperature: float = 0.02,  # 非常陡峭，近似硬截断
+    teacher_ag_pm_prob_min: float = 0.0,
+    teacher_ag_pm_prob_max_gate: float = 1.0,
+    teacher_ag_pm_stop_grad: bool = True,
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -361,114 +345,48 @@ def het_compute_teacher_aware_loss(
             beta=teacher_policy_shaping_beta,
         )
 
-    # ⭐ 7.3: token-level teacher gating (confidence-weighted teacher update)
-    # Gate teacher gradients primarily on low-confidence teacher tokens, based on current policy logprob on teacher actions.
-    # w_t = sigmoid((thr - log_pi(a_T|s))/T) in [0,1], optionally clamped to [min,max] and detached (stop-grad).
-    # ⭐ Conditional gate: only enable token gate when per-group gap <= threshold (gap small = task learned well)
-    teacher_gate_w = None
-    if teacher_token_gate_enable:
-        # Check conditional gap: if enabled, only apply gate when gap <= threshold
-        should_apply_gate = True
-        if teacher_token_gate_conditional_gap_enable:
-            gap_per_sample = teacher_token_gate_conditional_gap_per_sample
-            gap_threshold = float(teacher_token_gate_conditional_gap_threshold)
-            if gap_per_sample is not None and torch.is_tensor(gap_per_sample):
-                # gap_per_sample: (bs,), broadcast to (bs, resp_len)
-                bs, resp_len = log_prob.shape
-                if gap_per_sample.dim() == 1 and gap_per_sample.shape[0] == bs:
-                    # Create per-sample gate mask: 1 if gap <= threshold (apply gate), 0 otherwise
-                    gap_mask = (gap_per_sample <= gap_threshold).float()  # (bs,)
-                    gap_mask = gap_mask.unsqueeze(-1).expand(bs, resp_len)  # (bs, resp_len)
-                    # If all samples have gap > threshold, disable gate entirely
-                    if gap_mask.sum() == 0:
-                        should_apply_gate = False
-                else:
-                    # Invalid shape, fallback to unconditional gate
-                    gap_mask = None
-            else:
-                # gap_per_sample not provided, fallback to unconditional gate
-                gap_mask = None
-        else:
-            gap_mask = None
-
-        if should_apply_gate:
-            _mode = str(teacher_token_gate_mode or "logprob_sigmoid").lower().strip()
-            _temp = float(teacher_token_gate_temperature) if float(teacher_token_gate_temperature) > 0 else 1.0
-            _thr = float(teacher_token_gate_threshold_logprob)
-            _w_min = float(teacher_token_gate_min)
-            _w_max = float(teacher_token_gate_max)
-            # safety: avoid runtime issues if misconfigured
-            if _w_min > _w_max:
-                _w_min, _w_max = _w_max, _w_min
-
-            if _mode == "logprob_sigmoid":
-                teacher_gate_w = torch.sigmoid((_thr - log_prob) / _temp)
-            elif _mode == "logprob_hard":
-                teacher_gate_w = (log_prob < _thr).float()
-            else:
-                teacher_gate_w = None
-
-            if teacher_gate_w is not None:
-                teacher_gate_w = torch.clamp(teacher_gate_w, min=_w_min, max=_w_max)
-                # Apply conditional gap mask if enabled
-                if gap_mask is not None:
-                    teacher_gate_w = teacher_gate_w * gap_mask + (1.0 - gap_mask)  # gap > threshold: gate_w = 1 (no gating)
-                if teacher_token_gate_stop_grad:
-                    teacher_gate_w = teacher_gate_w.detach()
-                teacher_ratio = teacher_ratio * teacher_gate_w
-
-    # ⭐ 7.4-A: advantage-aware teacher token gate
-    # Gate teacher gradients based on advantage value: keep high-advantage tokens, reduce low/negative-advantage tokens
-    teacher_adv_gate_w = None
-    if teacher_adv_gate_enable:
-        _adv_mode = str(teacher_adv_gate_mode or "sigmoid").lower().strip()
-        _adv_temp = float(teacher_adv_gate_temperature) if float(teacher_adv_gate_temperature) > 0 else 1.0
-        _adv_thr = float(teacher_adv_gate_threshold_adv)
-        _adv_w_min = float(teacher_adv_gate_min)
-        _adv_w_max = float(teacher_adv_gate_max)
-        if _adv_w_min > _adv_w_max:
-            _adv_w_min, _adv_w_max = _adv_w_max, _adv_w_min
-
-        if _adv_mode == "sigmoid":
-            # w = sigmoid((adv - thr) / T), high adv -> high weight, low/neg adv -> low weight
-            teacher_adv_gate_w = torch.sigmoid((advantages - _adv_thr) / _adv_temp)
-        elif _adv_mode == "hard":
-            teacher_adv_gate_w = (advantages > _adv_thr).float()
-        else:
-            teacher_adv_gate_w = None
-
-        if teacher_adv_gate_w is not None:
-            teacher_adv_gate_w = torch.clamp(teacher_adv_gate_w, min=_adv_w_min, max=_adv_w_max)
-            if teacher_adv_gate_stop_grad:
-                teacher_adv_gate_w = teacher_adv_gate_w.detach()
-            teacher_ratio = teacher_ratio * teacher_adv_gate_w
-
-    # ⭐ 7.5: entropy-weighted teacher token gate
-    # Gate teacher gradients based on policy entropy: high entropy → keep signal, low entropy → reduce
-    # Motivation: teacher is most valuable when model is uncertain (high entropy)
-    teacher_entropy_gate_w = None
-    if teacher_entropy_gate_enable and entropy is not None:
-        _ent_mode = str(teacher_entropy_gate_mode or "sigmoid").lower().strip()
-        _ent_temp = float(teacher_entropy_gate_temperature) if float(teacher_entropy_gate_temperature) > 0 else 0.1
-        _ent_thr = float(teacher_entropy_gate_threshold)
-        _ent_w_min = float(teacher_entropy_gate_min)
-        _ent_w_max = float(teacher_entropy_gate_max)
-        if _ent_w_min > _ent_w_max:
-            _ent_w_min, _ent_w_max = _ent_w_max, _ent_w_min
-
-        if _ent_mode == "sigmoid":
-            # w = sigmoid((entropy - thr) / T), high entropy -> high weight, low entropy -> low weight
-            teacher_entropy_gate_w = torch.sigmoid((entropy - _ent_thr) / _ent_temp)
-        elif _ent_mode == "hard":
-            teacher_entropy_gate_w = (entropy > _ent_thr).float()
-        else:
-            teacher_entropy_gate_w = None
-
-        if teacher_entropy_gate_w is not None:
-            teacher_entropy_gate_w = torch.clamp(teacher_entropy_gate_w, min=_ent_w_min, max=_ent_w_max)
-            if teacher_entropy_gate_stop_grad:
-                teacher_entropy_gate_w = teacher_entropy_gate_w.detach()
-            teacher_ratio = teacher_ratio * teacher_entropy_gate_w
+    # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin
+    # 双门控机制：只向"好老师"学习，但只学到"懂了为止"
+    teacher_ag_pm_adv_gate_w = None
+    teacher_ag_pm_prob_gate_w = None
+    teacher_prob = None  # 用于统计
+    if teacher_ag_pm_enable:
+        # === 第一道门：Advantage Gate (继承 7.4 思想) ===
+        # 只学习高 advantage 的 teacher token
+        _adv_thr = float(teacher_ag_pm_adv_threshold)
+        _adv_temp = float(teacher_ag_pm_adv_temperature) if float(teacher_ag_pm_adv_temperature) > 0 else 0.2
+        _adv_min = float(teacher_ag_pm_adv_min)
+        _adv_max = float(teacher_ag_pm_adv_max)
+        if _adv_min > _adv_max:
+            _adv_min, _adv_max = _adv_max, _adv_min
+        
+        teacher_ag_pm_adv_gate_w = torch.sigmoid((advantages - _adv_thr) / _adv_temp)
+        teacher_ag_pm_adv_gate_w = torch.clamp(teacher_ag_pm_adv_gate_w, min=_adv_min, max=_adv_max)
+        
+        # === 第二道门：Probability Margin Gate (新机制) ===
+        # 当 π(a_T|s) >= prob_max 时，停止学习（防止熵坍塌）
+        _prob_max = float(teacher_ag_pm_prob_max)
+        _prob_temp = float(teacher_ag_pm_prob_temperature) if float(teacher_ag_pm_prob_temperature) > 0 else 0.02
+        _prob_min = float(teacher_ag_pm_prob_min)
+        _prob_max_gate = float(teacher_ag_pm_prob_max_gate)
+        if _prob_min > _prob_max_gate:
+            _prob_min, _prob_max_gate = _prob_max_gate, _prob_min
+        
+        # 计算 π(a_T|s) = exp(log_prob)，clamp 避免数值问题
+        teacher_prob = torch.exp(log_prob.clamp(max=0))  # log_prob <= 0, 所以 prob <= 1
+        
+        # Bang-Bang Control: 用陡峭 sigmoid 近似硬截断 I(π < prob_max)
+        # 当 prob < prob_max 时 gate ≈ 1，当 prob >= prob_max 时 gate ≈ 0
+        teacher_ag_pm_prob_gate_w = torch.sigmoid((_prob_max - teacher_prob) / _prob_temp)
+        teacher_ag_pm_prob_gate_w = torch.clamp(teacher_ag_pm_prob_gate_w, min=_prob_min, max=_prob_max_gate)
+        
+        # Stop gradient（将 gate 视为调度器，不反传梯度）
+        if teacher_ag_pm_stop_grad:
+            teacher_ag_pm_adv_gate_w = teacher_ag_pm_adv_gate_w.detach()
+            teacher_ag_pm_prob_gate_w = teacher_ag_pm_prob_gate_w.detach()
+        
+        # 组合双门控
+        teacher_ratio = teacher_ratio * teacher_ag_pm_adv_gate_w * teacher_ag_pm_prob_gate_w
 
     # ⭐ 2.2: Optional adaptive scaling for teacher loss
     if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
@@ -550,17 +468,13 @@ def het_compute_teacher_aware_loss(
     ratio_stats = {}
     # teacher_ratio: after (optional) shaping, used for teacher loss
     ratio_stats.update(_masked_stats(teacher_ratio, teacher_token_mask, "teacher_ratio"))
-    if teacher_gate_w is not None and torch.is_tensor(teacher_gate_w):
-        ratio_stats.update(_masked_stats(teacher_gate_w, teacher_token_mask, "teacher_gate_w"))
-    # 7.4-A: advantage-aware gate weight
-    if teacher_adv_gate_w is not None and torch.is_tensor(teacher_adv_gate_w):
-        ratio_stats.update(_masked_stats(teacher_adv_gate_w, teacher_token_mask, "teacher_adv_gate_w"))
-    # 7.5: entropy-weighted gate weight
-    if teacher_entropy_gate_w is not None and torch.is_tensor(teacher_entropy_gate_w):
-        ratio_stats.update(_masked_stats(teacher_entropy_gate_w, teacher_token_mask, "teacher_entropy_gate_w"))
-    # Also log the entropy itself for debugging
-    if entropy is not None and torch.is_tensor(entropy):
-        ratio_stats.update(_masked_stats(entropy, teacher_token_mask, "teacher_entropy"))
+    # 7.6 AG-PM: gate weights and probability
+    if teacher_ag_pm_adv_gate_w is not None and torch.is_tensor(teacher_ag_pm_adv_gate_w):
+        ratio_stats.update(_masked_stats(teacher_ag_pm_adv_gate_w, teacher_token_mask, "ag_pm_adv_gate_w"))
+    if teacher_ag_pm_prob_gate_w is not None and torch.is_tensor(teacher_ag_pm_prob_gate_w):
+        ratio_stats.update(_masked_stats(teacher_ag_pm_prob_gate_w, teacher_token_mask, "ag_pm_prob_gate_w"))
+    if teacher_prob is not None and torch.is_tensor(teacher_prob):
+        ratio_stats.update(_masked_stats(teacher_prob, teacher_token_mask, "teacher_prob"))
     # self_off ratio: exp(log_prob - old_log_prob)
     ratio_stats.update(_masked_stats(ratio, self_token_mask, "self_off_ratio"))
     # on-policy ratio is always 1 in PPO surrogate, but we can still log on-policy advantage stats

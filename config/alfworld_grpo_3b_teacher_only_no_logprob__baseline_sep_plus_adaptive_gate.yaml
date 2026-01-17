@@ -1,0 +1,380 @@
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+# ============================================================================
+# AlfWorld GRPO Training Configuration with Teacher Experience Replay (LUFFY)
+# ============================================================================
+# This configuration is for training Qwen/Qwen2.5-3B-Instruct on AlfWorld
+# using GRPO with Teacher Experience Replay mechanism (LUFFY-style).
+# 
+# Key differences from self-generated experience replay:
+# - Uses pre-collected teacher trajectories (from stronger models like GPT-4, Qwen-72B)
+# - No self-generated experience accumulation during training
+# - Can use log_prob from teacher (if same tokenizer) or LUFFY-style importance ratio
+#
+# Key settings:
+# - batch_size: 8
+# - rollout: 8 (n_rollout)
+# - teacher_exp_ratio: 0.25 (25% teacher experience tasks, 75% on-policy tasks)
+# ============================================================================
+
+trainer:
+  # v3: per-task (per-group) gate support is implemented in code; configure via adaptive_weight.gate_level below.
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_adaptive_gate_v3
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  save_freq: 100
+  test_freq: 25
+  val_before_train: false
+  validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
+  rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
+  logger: ["console", "wandb"]
+
+# ============================================================================
+# Algorithm Configuration
+# ============================================================================
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  # 2.1 (optional): teacher-separated GRPO baseline
+  grpo:
+    teacher_baseline_separation:
+      enable: true
+      teacher_baseline: "all_mean"
+      non_teacher_baseline: "non_teacher_mean"
+      std_source: "non_teacher"
+  
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: "strict"
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: "additive"
+
+# ============================================================================
+# Model Configuration - Qwen/Qwen2.5-3B-Instruct
+# ============================================================================
+actor_rollout_ref:
+  model:
+    path: /data/code/exp/models/Qwen/Qwen2.5-3B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1e-6
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    # ⭐ Off-policy Policy Shaping Configuration (Self-generated Experience)
+    # For self-generated experience, recommend using "exgrpo_policy_shaping"
+    off_policy_shaping_mode: "exgrpo_policy_shaping"
+    off_policy_shaping_beta: 0.1
+    
+    # ⭐ Teacher Experience Loss Configuration (LUFFY)
+    # 这些配置只在 teacher_experience.enable=true 时生效
+    # 注意：teacher_use_log_prob 应与 exp_manager.teacher_experience.use_log_prob 保持一致
+    # ⚠️ 此处的值会被 exp_manager.teacher_experience.use_log_prob 覆盖（如果设置了的话）
+    # 建议：只在 exp_manager.teacher_experience 中配置 use_log_prob
+    teacher_use_log_prob: ${exp_manager.teacher_experience.use_log_prob}  # ← 引用 exp_manager 的配置
+    
+    # teacher_policy_shaping_enable: 是否启用 LUFFY 的 policy shaping
+    # Policy shaping f(x) = x/(x+β) 可以放大低概率动作的梯度信号
+    teacher_policy_shaping_enable: ${exp_manager.teacher_experience.policy_shaping.enable}
+    teacher_policy_shaping_mode: ${exp_manager.teacher_experience.policy_shaping.mode}
+    teacher_policy_shaping_beta: ${exp_manager.teacher_experience.policy_shaping.beta}
+    
+    # teacher_use_clip: Teacher 轨迹是否使用 clipping
+    # LUFFY 论文建议不使用 clipping，以充分利用 teacher 信号
+    teacher_use_clip: false
+    
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: false
+    enable_request_id: false
+    prompt_length: 20480
+    response_length: 2048
+    max_model_len: 25580
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: vllm
+    mode: async
+    gpu_memory_utilization: 0.5
+    n: 8
+    log_prob_max_token_len_per_gpu: 25580
+    val_kwargs:
+      n: 1
+    max_env_worker: 32
+    context_template: "linear"
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ""
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
+
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  train_batch_size: 8
+  max_prompt_length: 4000
+  max_response_length: 21580
+  filter_overlong_prompts: true
+  truncation: "error"
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  val_type: "val"
+  max_train_tasks: 800
+  shuffle: true
+
+# ============================================================================
+# Environment Service Configuration - AlfWorld
+# ============================================================================
+env_service:
+  env_type: "alfworld"
+  env_url: "http://127.0.0.1:8081"
+
+# ============================================================================
+# Task Manager Configuration
+# ============================================================================
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/alfworld.json
+
+# ============================================================================
+# Experience Manager Configuration
+# ============================================================================
+# ⭐ 本配置只使用 Teacher Experience Replay 机制（LUFFY 风格）
+#    - 使用预采集的 Teacher 轨迹（来自更强的模型如 GPT-4 或 Qwen-72B）
+#    - 不使用 Self-generated Experience Replay（ExGRPO 风格）
+#    - 不使用 Experience-guided rollout
+#    - 不使用 Experience summarization
+# ============================================================================
+exp_manager:
+  # ============================================================================
+  # Experience-Guided Rollout Configuration (DISABLED)
+  # ============================================================================
+  train_rollout_mode: "woexp"
+  val_rollout_mode: "woexp"
+  rollout_ratio: 0
+  train_sample_mode: "alldiscard"
+  train_sample_keepratio: 0.0
+  experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
+  
+  # ============================================================================
+  # Experience Summarization Configuration (DISABLED)
+  # ============================================================================
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: "http://127.0.0.1:8124"
+    workspace_id: "alfworld_3b_grpo_teacher_only"
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  
+  # ============================================================================
+  # Self-Generated Experience Replay Configuration (DISABLED)
+  # ============================================================================
+  # ⭐ 禁用 Self-Generated Experience Replay
+  # 本配置只使用 Teacher Experience，不累积 self-generated 经验
+  # ============================================================================
+  experience_replay:
+    enable: false  # ⭐ 禁用 Self-Generated Experience Replay
+    
+    # 以下参数在 enable=false 时不生效，但保留以供参考
+    replay_start_ratio: 0.1
+    exp_ratio: 0.0  # ⭐ 0% self-generated（全部由 teacher 提供）
+    offpolicy_trajectories_per_task: 1
+    experience_lbound: 2
+    experience_rbound: 8
+    exp_select_mode: "argmin"
+    use_current_policy_entropy: true
+    exp_is_correct: true
+    max_trajectories_per_task: 5
+  
+  # ============================================================================
+  # Teacher Experience Replay Configuration (ENABLED - LUFFY Style)
+  # ============================================================================
+  # ⭐ LUFFY 风格：Rollout 级别混合（每个 task 内部混合 on-policy 和 teacher rollouts）
+  #
+  # 与 ExGRPO Task 级别混合的区别：
+  # - ExGRPO: batch 中某些 task 完全是 replay，某些完全是 on-policy
+  # - LUFFY:  每个 task 的 n 个 rollouts 中，部分是 on-policy，部分是 teacher
+  #
+  # 例如：batch_size=8, n_rollout=8, n_teacher_rollouts_per_task=1
+  #   Task 1: 7 on-policy + 1 teacher    ← 同一 task 内混合
+  #   Task 2: 7 on-policy + 1 teacher
+  #   ...
+  #   Task 8: 7 on-policy + 1 teacher
+  #   → GRPO 在同一 task 内计算 advantage，teacher 的 reward 影响 on-policy 的 baseline
+  #
+  # 数据格式（JSONL，每行一个轨迹）：
+  # {
+  #   "task_id": "task_123",
+  #   "messages": [{"role": "user", "content": "..."}, ...],
+  #   "reward": 1.0,
+  #   "success": true,
+  #   "metadata": {"is_teacher": true, "has_log_prob": true},
+  #   "log_probs": [...]  // 可选，如果 use_log_prob=true 则需要
+  # }
+  #
+  # 采集 Teacher 轨迹：
+  #   python scripts/collect_teacher_trajectories.py \
+  #     --env_type alfworld \
+  #     --task_file data/alfworld/train_task_ids.txt \
+  #     --backend openai \
+  #     --model gpt-4 \
+  #     --output_path data/teacher_trajectories/alfworld_gpt4.jsonl
+  # ============================================================================
+  teacher_experience:
+    # ⭐ 主开关：启用 Teacher Experience Replay
+    enable: true
+    
+    # ⭐ 混合模式：
+    # - "rollout_level": LUFFY 风格，每个 task 内混合 on-policy 和 teacher rollouts（推荐）
+    # - "task_level": ExGRPO 风格，batch 中某些 task 完全是 teacher experience（兼容旧版）
+    mix_mode: "rollout_level"
+    
+    # ⭐ Teacher 轨迹数据路径（JSONL 格式）
+    # 需要预先使用 scripts/collect_teacher_trajectories.py 采集
+    data_path: "data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered.pkl"
+    
+    # ⭐⭐⭐ LUFFY 风格核心配置（mix_mode: rollout_level）⭐⭐⭐
+    # 每个 task 混入的 teacher rollout 数量
+    # 例如：n_rollout=8, n_teacher_rollouts_per_task=1
+    #   → 每个 task 有 7 个 on-policy + 1 个 teacher rollout
+    # 注意：n_teacher_rollouts_per_task < n_rollout
+    n_teacher_rollouts_per_task: 1
+    
+    # ⭐ Task 级别配置（mix_mode: task_level，兼容旧版 ExGRPO 风格）
+    # 当 mix_mode=task_level 时使用此参数
+    # exp_ratio: 0.25  # batch 中 25% 的 task 使用 teacher experience
+    
+    # ⭐ 每个 task 最多存储的 Teacher 轨迹数量（用于提供选择多样性）
+    # 与 n_teacher_rollouts_per_task 的区别：
+    #   - max_trajectories_per_task: 存储多少条（从 JSONL 加载时的上限）
+    #   - n_teacher_rollouts_per_task: 每个 batch 使用多少条
+    # 例如：max=3, n=1, select_mode=entropy
+    #   → 每个 task 存储 3 条，每次从中选 entropy 最低的 1 条使用
+    # 如果 select_mode=random 且 n=1，可以简单设置 max=1
+    max_trajectories_per_task: 6  # 简化：存储数=使用数，random 选择时不需要存更多
+    
+    # ⭐ 轨迹选择模式
+    # - "random": 随机选择（默认，简单高效）
+    # - "first": 选择前 N 个
+    # - "all": 返回所有轨迹
+    # - "entropy": 按 entropy 从低到高排序选择
+    #   * 对于有 log_prob 的轨迹：直接计算 entropy
+    #   * 对于没有 log_prob 的轨迹：使用当前 policy 计算 entropy
+    # - "confidence": 按 Teacher 的平均 log_prob 从高到低排序（适用于 OpenAI API）
+    #   * 需要轨迹包含 log_prob
+    #   * 越高的 log_prob 表示 Teacher 越确信
+    select_mode: "random"
+    
+    # ⭐ 是否使用 Teacher 轨迹的 log_prob 计算 importance ratio
+    # - true: 使用标准重要性采样 ratio = π_current / π_teacher
+    #         适用于：Teacher 与 Policy 使用相同 tokenizer（如 Qwen-3B ← Qwen-72B）
+    #         要求：轨迹必须包含 log_prob，且 tokenizer 可对齐
+    # - false: 使用 LUFFY 简化形式 ratio = π_current（假设 π_old = 1）
+    #          适用于：Teacher 与 Policy tokenizer 不同（如 Qwen-3B ← GPT-4）
+    #          或 Teacher 未提供 log_prob
+    use_log_prob: false  # GPT-4 与 Qwen 的 tokenizer 不同，使用 LUFFY 形式
+    
+    # ⭐ Policy Shaping 配置（可选，用于调节 off-policy 梯度）
+    # 当 use_log_prob=false 时，policy shaping 可以帮助稳定训练
+    policy_shaping:
+      enable: true
+      mode: "p_div_p_beta"  # f(x) = x / (x + β)
+      beta: 0.1             # β 值，控制梯度放大/抑制程度
+
+    # 2.2 (optional): adaptive teacher loss gating
+    adaptive_weight:
+      enable: true
+      mode: "gap_linear"
+      # v3 ablation: gate granularity
+      # - "batch": use batch-mean gap to compute a single alpha (backward compatible)
+      # - "group": compute alpha per task-group (by uid/task_id) to avoid mis-killing hard-tail tasks
+      gate_level: "group"
+      # alpha = clip((gap - epsilon)/tau, min, max)
+      # NOTE(2026-01-13): In our runs, diag/group_teacher_minus_on_reward_mean (gap) is typically ~0.37-0.67.
+      # The old setting (epsilon=0.05,tau=0.30) makes (gap-eps)/tau almost always >1, so alpha saturates at 1 (no annealing).
+      # New setting aims for: gap≈0.35 -> alpha≈0, gap≈0.65 -> alpha≈1, with linear annealing in between.
+      epsilon: 0.35
+      tau: 0.30
+      min: 0.0
+      max: 1.0
+      ema:
+        enable: true
+        beta: 0.90
+
+# ============================================================================
+# Attribution-Driven Credit Assignment (ADCA-GRPO) Configuration
+# ============================================================================
+attribution_driven_credit_assignment:
+  enable: false
+
+# ============================================================================
+# Thread Pool Configuration
+# ============================================================================
+thread_pool:
+  max_workers: 8
+
