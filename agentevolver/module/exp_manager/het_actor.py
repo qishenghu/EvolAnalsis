@@ -147,8 +147,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
+                    # Calculate entropy if: (1) entropy_coeff != 0, or (2) 7.5 entropy gate is enabled
                     calculate_entropy = False
                     if entropy_coeff != 0:
+                        calculate_entropy = True
+                    # ⭐ 7.5: also need entropy if entropy gate is enabled
+                    if self.config.get("teacher_entropy_gate_enable", False):
                         calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)  # ⭐ Forward pass to get entropy and log probabilities
 
@@ -224,6 +228,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_adv_gate_min = self.config.get("teacher_adv_gate_min", 0.5)
                         teacher_adv_gate_max = self.config.get("teacher_adv_gate_max", 1.0)
                         teacher_adv_gate_stop_grad = self.config.get("teacher_adv_gate_stop_grad", True)
+                        # ⭐ 7.5: entropy-weighted teacher token gate (optional; default disabled)
+                        # Gate by policy entropy: high entropy (uncertain) → keep teacher, low entropy → reduce
+                        teacher_entropy_gate_enable = self.config.get("teacher_entropy_gate_enable", False)
+                        teacher_entropy_gate_mode = self.config.get("teacher_entropy_gate_mode", "sigmoid")
+                        teacher_entropy_gate_threshold = self.config.get("teacher_entropy_gate_threshold", 0.15)
+                        teacher_entropy_gate_temperature = self.config.get("teacher_entropy_gate_temperature", 0.1)
+                        teacher_entropy_gate_min = self.config.get("teacher_entropy_gate_min", 0.5)
+                        teacher_entropy_gate_max = self.config.get("teacher_entropy_gate_max", 1.0)
+                        teacher_entropy_gate_stop_grad = self.config.get("teacher_entropy_gate_stop_grad", True)
                         
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
@@ -267,6 +280,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_adv_gate_min=teacher_adv_gate_min,
                             teacher_adv_gate_max=teacher_adv_gate_max,
                             teacher_adv_gate_stop_grad=teacher_adv_gate_stop_grad,
+                            # 7.5 entropy gate (optional)
+                            teacher_entropy_gate_enable=teacher_entropy_gate_enable,
+                            teacher_entropy_gate_mode=teacher_entropy_gate_mode,
+                            teacher_entropy_gate_threshold=teacher_entropy_gate_threshold,
+                            teacher_entropy_gate_temperature=teacher_entropy_gate_temperature,
+                            teacher_entropy_gate_min=teacher_entropy_gate_min,
+                            teacher_entropy_gate_max=teacher_entropy_gate_max,
+                            teacher_entropy_gate_stop_grad=teacher_entropy_gate_stop_grad,
+                            entropy=entropy,  # Pass entropy tensor for 7.5
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO)
                     else:
                         # Use original het_compute_token_on_off_policy_loss

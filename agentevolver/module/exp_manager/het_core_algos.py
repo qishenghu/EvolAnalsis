@@ -249,6 +249,16 @@ def het_compute_teacher_aware_loss(
     teacher_adv_gate_min: float = 0.1,  # min gate weight (retain some gradient even for negative adv)
     teacher_adv_gate_max: float = 1.0,
     teacher_adv_gate_stop_grad: bool = True,
+    # ⭐ 7.5: entropy-weighted teacher token gate (gate by policy entropy)
+    # Motivation: high entropy = model uncertain → keep teacher signal; low entropy = model confident → reduce
+    teacher_entropy_gate_enable: bool = False,
+    teacher_entropy_gate_mode: str = "sigmoid",  # "sigmoid" or "hard"
+    teacher_entropy_gate_threshold: float = 0.2,  # entropy threshold
+    teacher_entropy_gate_temperature: float = 0.1,
+    teacher_entropy_gate_min: float = 0.5,  # min gate weight (guarantee 50% teacher signal)
+    teacher_entropy_gate_max: float = 1.0,
+    teacher_entropy_gate_stop_grad: bool = True,
+    entropy: Optional[torch.Tensor] = None,  # (bs, seq_len) policy entropy at each token
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -433,6 +443,33 @@ def het_compute_teacher_aware_loss(
                 teacher_adv_gate_w = teacher_adv_gate_w.detach()
             teacher_ratio = teacher_ratio * teacher_adv_gate_w
 
+    # ⭐ 7.5: entropy-weighted teacher token gate
+    # Gate teacher gradients based on policy entropy: high entropy → keep signal, low entropy → reduce
+    # Motivation: teacher is most valuable when model is uncertain (high entropy)
+    teacher_entropy_gate_w = None
+    if teacher_entropy_gate_enable and entropy is not None:
+        _ent_mode = str(teacher_entropy_gate_mode or "sigmoid").lower().strip()
+        _ent_temp = float(teacher_entropy_gate_temperature) if float(teacher_entropy_gate_temperature) > 0 else 0.1
+        _ent_thr = float(teacher_entropy_gate_threshold)
+        _ent_w_min = float(teacher_entropy_gate_min)
+        _ent_w_max = float(teacher_entropy_gate_max)
+        if _ent_w_min > _ent_w_max:
+            _ent_w_min, _ent_w_max = _ent_w_max, _ent_w_min
+
+        if _ent_mode == "sigmoid":
+            # w = sigmoid((entropy - thr) / T), high entropy -> high weight, low entropy -> low weight
+            teacher_entropy_gate_w = torch.sigmoid((entropy - _ent_thr) / _ent_temp)
+        elif _ent_mode == "hard":
+            teacher_entropy_gate_w = (entropy > _ent_thr).float()
+        else:
+            teacher_entropy_gate_w = None
+
+        if teacher_entropy_gate_w is not None:
+            teacher_entropy_gate_w = torch.clamp(teacher_entropy_gate_w, min=_ent_w_min, max=_ent_w_max)
+            if teacher_entropy_gate_stop_grad:
+                teacher_entropy_gate_w = teacher_entropy_gate_w.detach()
+            teacher_ratio = teacher_ratio * teacher_entropy_gate_w
+
     # ⭐ 2.2: Optional adaptive scaling for teacher loss
     if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
         # Ensure broadcastable: (bs, resp_len) preferred; accept (bs, 1) or scalar-like
@@ -518,6 +555,12 @@ def het_compute_teacher_aware_loss(
     # 7.4-A: advantage-aware gate weight
     if teacher_adv_gate_w is not None and torch.is_tensor(teacher_adv_gate_w):
         ratio_stats.update(_masked_stats(teacher_adv_gate_w, teacher_token_mask, "teacher_adv_gate_w"))
+    # 7.5: entropy-weighted gate weight
+    if teacher_entropy_gate_w is not None and torch.is_tensor(teacher_entropy_gate_w):
+        ratio_stats.update(_masked_stats(teacher_entropy_gate_w, teacher_token_mask, "teacher_entropy_gate_w"))
+    # Also log the entropy itself for debugging
+    if entropy is not None and torch.is_tensor(entropy):
+        ratio_stats.update(_masked_stats(entropy, teacher_token_mask, "teacher_entropy"))
     # self_off ratio: exp(log_prob - old_log_prob)
     ratio_stats.update(_masked_stats(ratio, self_token_mask, "self_off_ratio"))
     # on-policy ratio is always 1 in PPO surrogate, but we can still log on-policy advantage stats
