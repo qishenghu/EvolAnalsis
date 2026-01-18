@@ -229,6 +229,16 @@ def het_compute_teacher_aware_loss(
     teacher_policy_shaping_beta: float = 0.1,  # Policy shaping 参数 β
     teacher_use_clip: bool = False,  # Teacher 轨迹是否使用 clipping
     teacher_loss_scale: Optional[torch.Tensor] = None,  # ⭐ 2.2: scale teacher loss (0..1), broadcastable to (bs, resp_len)
+    # ⭐ 7.7: TER sequence-level β schedule (soft-min teacher confidence)
+    # 仅用于 teacher_use_log_prob=False 且 policy_shaping_mode == "p_div_p_beta"
+    teacher_seq_beta_enable: bool = False,
+    teacher_seq_beta_alpha: float = -5.0,          # α < 0; more negative => more tail/min sensitive
+    teacher_seq_beta_c0: float = 0.25,             # center of sigmoid in confidence space
+    teacher_seq_beta_temperature: float = 0.05,    # transition smoothness; smaller => sharper
+    teacher_seq_beta_beta_min: float = 0.05,       # >=0; stronger teacher (since r=p/(p+β))
+    teacher_seq_beta_beta_max: float = 0.30,       # >= beta_min; weaker teacher
+    teacher_seq_beta_p_min: float = 1e-4,          # clamp prob to avoid overflow for alpha<0
+    teacher_seq_beta_stop_grad: bool = True,
     # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin
     # 双门控机制：(1) Advantage Gate + (2) Probability Margin Gate
     teacher_ag_pm_enable: bool = False,
@@ -337,12 +347,64 @@ def het_compute_teacher_aware_loss(
         # 假设 π_old = 1，ratio = π_current / 1 = π_current
         teacher_ratio = torch.exp(log_prob)
     
+    # ⭐ 7.7: TER sequence-level β schedule (soft-min / tail-aware)
+    # 目的：避免 token-level gate 的误伤；在“仍有短板 token”时不削弱 teacher，在“整体已学会”时逐步减弱 teacher。
+    # 说明：这里只改变 β（shaping 强度），不改变 7.1 的 baseline separation 或其他 7.3/7.6 功能。
+    teacher_seq_beta_C = None
+    teacher_seq_beta_beta = None  # shape: (bs, 1)
+    if (
+        teacher_seq_beta_enable
+        and (not teacher_use_log_prob)
+        and teacher_policy_shaping_enable
+        and str(teacher_policy_shaping_mode).lower().strip() == "p_div_p_beta"
+    ):
+        # mask teacher tokens inside response
+        _tm = (teacher_mask_float * response_mask).float()  # (bs, resp_len)
+        _cnt = _tm.sum(dim=-1, keepdim=True)  # (bs, 1)
+        if torch.any(_cnt > 0):
+            # teacher token probability p_t = exp(log_prob) ∈ (0,1]
+            # clamp max=0 ensures p<=1; clamp min avoids overflow when alpha<0
+            p_min = float(teacher_seq_beta_p_min) if float(teacher_seq_beta_p_min) > 0 else 1e-4
+            p = torch.exp(log_prob.clamp(max=0)).clamp(min=p_min)  # (bs, resp_len)
+
+            alpha = float(teacher_seq_beta_alpha)
+            if alpha >= 0:
+                # enforce alpha<0; fallback to -5.0
+                alpha = -5.0
+
+            # generalized mean for alpha<0:
+            # C_alpha = (mean(p^alpha))^(1/alpha)
+            # compute p^alpha in log-space for stability: exp(alpha * log p)
+            logp = torch.log(p)
+            pa = torch.exp((alpha * logp).clamp(min=-80.0, max=80.0))  # (bs, resp_len)
+            mean_pa = (pa * _tm).sum(dim=-1, keepdim=True) / (_cnt + 1e-8)  # (bs,1)
+            mean_pa = mean_pa.clamp(min=1e-20)
+            teacher_seq_beta_C = torch.exp((1.0 / alpha) * torch.log(mean_pa))  # (bs,1), in (0,1]
+
+            # beta schedule: beta in [beta_min, beta_max]
+            beta_min = float(teacher_seq_beta_beta_min) if float(teacher_seq_beta_beta_min) >= 0 else 0.0
+            beta_max = float(teacher_seq_beta_beta_max) if float(teacher_seq_beta_beta_max) >= 0 else beta_min
+            if beta_min > beta_max:
+                beta_min, beta_max = beta_max, beta_min
+
+            c0 = float(teacher_seq_beta_c0)
+            temp = float(teacher_seq_beta_temperature) if float(teacher_seq_beta_temperature) > 0 else 0.05
+            gate = torch.sigmoid((teacher_seq_beta_C - c0) / temp)  # (bs,1)
+            teacher_seq_beta_beta = beta_min + (beta_max - beta_min) * gate  # (bs,1)
+
+            if teacher_seq_beta_stop_grad:
+                teacher_seq_beta_C = teacher_seq_beta_C.detach()
+                teacher_seq_beta_beta = teacher_seq_beta_beta.detach()
+
     # Policy shaping（LUFFY 推荐使用）
     if teacher_policy_shaping_enable:
+        beta_for_shaping = teacher_policy_shaping_beta
+        if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
+            beta_for_shaping = teacher_seq_beta_beta  # (bs,1), broadcastable
         teacher_ratio = _apply_policy_shaping(
             teacher_ratio,
             mode=teacher_policy_shaping_mode,
-            beta=teacher_policy_shaping_beta,
+            beta=beta_for_shaping,
         )
 
     # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin
@@ -468,6 +530,16 @@ def het_compute_teacher_aware_loss(
     ratio_stats = {}
     # teacher_ratio: after (optional) shaping, used for teacher loss
     ratio_stats.update(_masked_stats(teacher_ratio, teacher_token_mask, "teacher_ratio"))
+    # 7.7: sequence-level beta schedule diagnostics
+    if teacher_seq_beta_C is not None and torch.is_tensor(teacher_seq_beta_C):
+        # broadcast to token shape for masked stats
+        ratio_stats.update(
+            _masked_stats(teacher_seq_beta_C.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/C_alpha")
+        )
+    if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
+        ratio_stats.update(
+            _masked_stats(teacher_seq_beta_beta.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/beta")
+        )
     # 7.6 AG-PM: gate weights and probability
     if teacher_ag_pm_adv_gate_w is not None and torch.is_tensor(teacher_ag_pm_adv_gate_w):
         ratio_stats.update(_masked_stats(teacher_ag_pm_adv_gate_w, teacher_token_mask, "ag_pm_adv_gate_w"))
@@ -509,7 +581,7 @@ def het_compute_teacher_aware_loss(
     }
 
 
-def _apply_policy_shaping(ratio: torch.Tensor, mode: str, beta: float = 0.1) -> torch.Tensor:
+def _apply_policy_shaping(ratio: torch.Tensor, mode: str, beta=0.1) -> torch.Tensor:
     """
     应用 Policy Shaping。
     
@@ -519,7 +591,7 @@ def _apply_policy_shaping(ratio: torch.Tensor, mode: str, beta: float = 0.1) -> 
             - "p_div_p_beta": LUFFY 的 f(x) = x / (x + β)，放大低概率信号
             - "sqrt": f(x) = sqrt(x)
             - "no_shaping": 不使用 shaping
-        beta: β 参数
+        beta: β 参数（float 或 broadcastable tensor，例如 shape=(bs,1)）
     
     Returns:
         shaped_ratio: 处理后的 ratio

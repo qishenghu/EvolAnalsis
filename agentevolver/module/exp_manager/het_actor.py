@@ -202,6 +202,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_policy_shaping_mode = self.config.get("teacher_policy_shaping_mode", "p_div_p_beta")
                         teacher_policy_shaping_beta = self.config.get("teacher_policy_shaping_beta", 0.1)
                         teacher_use_clip = self.config.get("teacher_use_clip", False)
+                        # ⭐ 7.7: TER sequence-level β schedule (soft-min teacher confidence)
+                        teacher_seq_beta_enable = self.config.get("teacher_seq_beta_enable", False)
+                        teacher_seq_beta_alpha = self.config.get("teacher_seq_beta_alpha", -5.0)
+                        teacher_seq_beta_c0 = self.config.get("teacher_seq_beta_c0", 0.25)
+                        teacher_seq_beta_temperature = self.config.get("teacher_seq_beta_temperature", 0.05)
+                        teacher_seq_beta_beta_min = self.config.get("teacher_seq_beta_beta_min", 0.05)
+                        teacher_seq_beta_beta_max = self.config.get("teacher_seq_beta_beta_max", 0.30)
+                        teacher_seq_beta_p_min = self.config.get("teacher_seq_beta_p_min", 1e-4)
+                        teacher_seq_beta_stop_grad = self.config.get("teacher_seq_beta_stop_grad", True)
                         # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin (optional; default disabled)
                         # 双门控机制：只向"好老师"学习，但只学到"懂了为止"
                         teacher_ag_pm_enable = self.config.get("teacher_ag_pm_enable", False)
@@ -237,6 +246,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_policy_shaping_beta=teacher_policy_shaping_beta,
                             teacher_use_clip=teacher_use_clip,
                             teacher_loss_scale=teacher_loss_scale,
+                            # 7.7: sequence-level beta schedule
+                            teacher_seq_beta_enable=teacher_seq_beta_enable,
+                            teacher_seq_beta_alpha=teacher_seq_beta_alpha,
+                            teacher_seq_beta_c0=teacher_seq_beta_c0,
+                            teacher_seq_beta_temperature=teacher_seq_beta_temperature,
+                            teacher_seq_beta_beta_min=teacher_seq_beta_beta_min,
+                            teacher_seq_beta_beta_max=teacher_seq_beta_beta_max,
+                            teacher_seq_beta_p_min=teacher_seq_beta_p_min,
+                            teacher_seq_beta_stop_grad=teacher_seq_beta_stop_grad,
                             # 7.6 AG-PM: Advantage-Gated Probability Margin
                             teacher_ag_pm_enable=teacher_ag_pm_enable,
                             teacher_ag_pm_adv_threshold=teacher_ag_pm_adv_threshold,
