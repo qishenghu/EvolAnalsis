@@ -1751,6 +1751,89 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                     olp = oldlp_cpu[bidx].numpy()
                     rm = rm_cpu[bidx].numpy().astype(bool)
                     extra_diag["old_log_prob_mean"] = float(olp[rm].mean()) if rm.any() else None
+                    # --- teacher-token-only logp distribution (critical for TER gating debugging) ---
+                    if teacher_mask_cpu is not None and bidx < teacher_mask_cpu.shape[0]:
+                        tm = teacher_mask_cpu[bidx].numpy().astype(bool)
+                        m = rm & tm
+                        if m.any():
+                            v = olp[m].astype(float)
+                            extra_diag["teacher_old_logp_mean"] = float(v.mean())
+                            extra_diag["teacher_old_logp_min"] = float(v.min())
+                            # percentiles are robust summaries for tail behavior
+                            try:
+                                extra_diag["teacher_old_logp_p10"] = float(np.quantile(v, 0.10))
+                                extra_diag["teacher_old_logp_p50"] = float(np.quantile(v, 0.50))
+                            except Exception:
+                                pass
+
+                            # --- seq_beta(7.7) replay diagnostics (approx): compute using old_log_probs ---
+                            # This enables case-level postmortem even if wandb only has aggregated teacher_diag.
+                            try:
+                                seq_cfg = getattr(self.config.exp_manager.teacher_experience, "seq_beta_77", None)
+                            except Exception:
+                                seq_cfg = None
+                            if seq_cfg is not None and getattr(seq_cfg, "enable", False):
+                                conf_mode = str(getattr(seq_cfg, "conf_mode", "gen_mean_prob")).lower().strip()
+                                q = float(getattr(seq_cfg, "logp_q", 0.10))
+                                if not (0.0 < q < 1.0):
+                                    q = 0.10
+                                max_tok = int(getattr(seq_cfg, "max_tokens_per_traj", 2048))
+                                if max_tok <= 0:
+                                    max_tok = 2048
+                                vv = v
+                                if vv.size > max_tok:
+                                    idx = np.random.permutation(vv.size)[:max_tok]
+                                    vv = vv[idx]
+                                vv_sorted = np.sort(vv)
+                                k = max(1, int(round(q * vv_sorted.size)))
+                                if conf_mode == "quantile_logp":
+                                    logC = float(vv_sorted[k - 1])
+                                elif conf_mode == "cvar_logp":
+                                    logC = float(vv_sorted[:k].mean())
+                                else:
+                                    # legacy: generalized mean on prob space using alpha<0
+                                    alpha = float(getattr(seq_cfg, "alpha", -5.0))
+                                    if alpha >= 0:
+                                        alpha = -5.0
+                                    p_min = float(getattr(seq_cfg, "p_min", 1e-8))
+                                    if p_min <= 0:
+                                        p_min = 1e-8
+                                    # logC = (1/alpha) * log(mean(exp(alpha*logp))) ; logp<=0
+                                    x = np.clip(alpha * np.log(np.clip(np.exp(vv), p_min, 1.0)), -80.0, 80.0)
+                                    mean_pa = float(np.mean(np.exp(x)))
+                                    mean_pa = max(mean_pa, 1e-20)
+                                    logC = float((1.0 / alpha) * np.log(mean_pa))
+
+                                extra_diag["seq_beta_logC_old"] = float(logC)
+                                # gate & beta (logprob space preferred)
+                                gate_space = str(getattr(seq_cfg, "gate_space", "logprob")).lower().strip()
+                                beta_min = float(getattr(seq_cfg, "beta_min", 0.05))
+                                beta_max = float(getattr(seq_cfg, "beta_max", 0.35))
+                                if beta_min > beta_max:
+                                    beta_min, beta_max = beta_max, beta_min
+                                if gate_space == "logprob":
+                                    logc0 = getattr(seq_cfg, "logc0", None)
+                                    if logc0 is None:
+                                        # fallback to log(c0) if provided
+                                        c0 = float(getattr(seq_cfg, "c0", 0.25))
+                                        logc0 = float(np.log(c0)) if (0.0 < c0 < 1.0) else -6.0
+                                    Tlog = float(getattr(seq_cfg, "log_temperature", 1.0))
+                                    if Tlog <= 0:
+                                        Tlog = 1.0
+                                    gate = 1.0 / (1.0 + np.exp(-(logC - float(logc0)) / Tlog))
+                                else:
+                                    # prob-space (legacy)
+                                    c0 = float(getattr(seq_cfg, "c0", 0.25))
+                                    T = float(getattr(seq_cfg, "temperature", 0.05))
+                                    if T <= 0:
+                                        T = 0.05
+                                    C = float(np.exp(logC))
+                                    gate = 1.0 / (1.0 + np.exp(-(C - c0) / T))
+                                beta = beta_min + (beta_max - beta_min) * float(gate)
+                                extra_diag["seq_beta_beta_old"] = float(beta)
+                                extra_diag["seq_beta_gate_old"] = float(gate)
+                        else:
+                            extra_diag["teacher_old_logp_mean"] = None
                 if tlr_cpu is not None and rm_cpu is not None and bidx < tlr_cpu.shape[0] and bidx < rm_cpu.shape[0]:
                     r = tlr_cpu[bidx].numpy()
                     rm = rm_cpu[bidx].numpy().astype(bool)

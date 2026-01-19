@@ -210,6 +210,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_seq_beta_gate_space = self.config.get("teacher_seq_beta_gate_space", "prob")
                         teacher_seq_beta_logc0 = self.config.get("teacher_seq_beta_logc0", None)
                         teacher_seq_beta_log_temperature = self.config.get("teacher_seq_beta_log_temperature", 0.5)
+                        teacher_seq_beta_conf_mode = self.config.get("teacher_seq_beta_conf_mode", "gen_mean_prob")
+                        teacher_seq_beta_logp_q = self.config.get("teacher_seq_beta_logp_q", 0.10)
+                        teacher_seq_beta_max_tokens_per_traj = self.config.get("teacher_seq_beta_max_tokens_per_traj", 4096)
                         teacher_seq_beta_beta_min = self.config.get("teacher_seq_beta_beta_min", 0.05)
                         teacher_seq_beta_beta_max = self.config.get("teacher_seq_beta_beta_max", 0.30)
                         teacher_seq_beta_p_min = self.config.get("teacher_seq_beta_p_min", 1e-4)
@@ -257,6 +260,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_seq_beta_gate_space=teacher_seq_beta_gate_space,
                             teacher_seq_beta_logc0=teacher_seq_beta_logc0,
                             teacher_seq_beta_log_temperature=teacher_seq_beta_log_temperature,
+                            teacher_seq_beta_conf_mode=teacher_seq_beta_conf_mode,
+                            teacher_seq_beta_logp_q=teacher_seq_beta_logp_q,
+                            teacher_seq_beta_max_tokens_per_traj=teacher_seq_beta_max_tokens_per_traj,
                             teacher_seq_beta_beta_min=teacher_seq_beta_beta_min,
                             teacher_seq_beta_beta_max=teacher_seq_beta_beta_max,
                             teacher_seq_beta_p_min=teacher_seq_beta_p_min,

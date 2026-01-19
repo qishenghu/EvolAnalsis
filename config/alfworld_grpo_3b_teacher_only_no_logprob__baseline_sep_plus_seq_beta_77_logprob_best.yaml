@@ -27,7 +27,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_seq_beta_77_logprob_best_v1
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_seq_beta_77_logprob_best_v2
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -96,6 +96,9 @@ actor_rollout_ref:
     teacher_seq_beta_gate_space: ${exp_manager.teacher_experience.seq_beta_77.gate_space}
     teacher_seq_beta_logc0: ${exp_manager.teacher_experience.seq_beta_77.logc0}
     teacher_seq_beta_log_temperature: ${exp_manager.teacher_experience.seq_beta_77.log_temperature}
+    teacher_seq_beta_conf_mode: ${exp_manager.teacher_experience.seq_beta_77.conf_mode}
+    teacher_seq_beta_logp_q: ${exp_manager.teacher_experience.seq_beta_77.logp_q}
+    teacher_seq_beta_max_tokens_per_traj: ${exp_manager.teacher_experience.seq_beta_77.max_tokens_per_traj}
     teacher_seq_beta_beta_min: ${exp_manager.teacher_experience.seq_beta_77.beta_min}
     teacher_seq_beta_beta_max: ${exp_manager.teacher_experience.seq_beta_77.beta_max}
     teacher_seq_beta_p_min: ${exp_manager.teacher_experience.seq_beta_77.p_min}
@@ -220,9 +223,15 @@ exp_manager:
     seq_beta_77:
       enable: true
       alpha: -2.0
+      # v3: robust confidence to avoid extreme-tail pinning
+      conf_mode: "cvar_logp"     # "gen_mean_prob" | "quantile_logp" | "cvar_logp"
+      logp_q: 0.15               # bottom-10% logp CVaR
+      max_tokens_per_traj: 2048  # cap for speed; bs small so fine
       gate_space: "logprob"
-      logc0: -6.4
-      log_temperature: 0.25
+      # IMPORTANT: your run ukbj0veq shows logC_alpha ~ [-15,-14] early.
+      # So we set threshold in that regime to *allow β to move* once logC improves.
+      logc0: -13.0
+      log_temperature: 1.0
       # legacy (ignored in logprob mode, kept for clarity/compat)
       c0: 0.25
       temperature: 0.05

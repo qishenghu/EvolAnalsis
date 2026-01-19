@@ -240,6 +240,13 @@ def het_compute_teacher_aware_loss(
     teacher_seq_beta_gate_space: str = "prob",     # "prob" | "logprob"
     teacher_seq_beta_logc0: Optional[float] = None,# if None and gate_space=="logprob", fall back to log(c0) when 0<c0<1
     teacher_seq_beta_log_temperature: float = 0.5, # temperature in log-space
+    # ⭐ 7.7-v3: robust confidence mode to avoid extreme tail token pinning logC to very negative values
+    # - "gen_mean_prob": original generalized-mean on prob space (alpha<0)
+    # - "quantile_logp": per-trajectory quantile of teacher-token logp (e.g., q=0.1)
+    # - "cvar_logp": mean of the lowest-q fraction of teacher-token logp (CVaR; more stable than min)
+    teacher_seq_beta_conf_mode: str = "gen_mean_prob",
+    teacher_seq_beta_logp_q: float = 0.10,        # used by quantile_logp / cvar_logp
+    teacher_seq_beta_max_tokens_per_traj: int = 4096,  # sampling cap for robust stats
     teacher_seq_beta_beta_min: float = 0.05,       # >=0; stronger teacher (since r=p/(p+β))
     teacher_seq_beta_beta_max: float = 0.30,       # >= beta_min; weaker teacher
     teacher_seq_beta_p_min: float = 1e-4,          # clamp prob to avoid overflow for alpha<0
@@ -357,6 +364,7 @@ def het_compute_teacher_aware_loss(
     # 说明：这里只改变 β（shaping 强度），不改变 7.1 的 baseline separation 或其他 7.3/7.6 功能。
     teacher_seq_beta_C = None
     teacher_seq_beta_logC = None  # shape: (bs, 1)
+    teacher_seq_beta_logC_robust = None  # shape: (bs, 1), for quantile/cvar modes
     teacher_seq_beta_beta = None  # shape: (bs, 1)
     if (
         teacher_seq_beta_enable
@@ -368,26 +376,62 @@ def het_compute_teacher_aware_loss(
         _tm = (teacher_mask_float * response_mask).float()  # (bs, resp_len)
         _cnt = _tm.sum(dim=-1, keepdim=True)  # (bs, 1)
         if torch.any(_cnt > 0):
-            # teacher token probability p_t = exp(log_prob) ∈ (0,1]
-            # clamp max=0 ensures p<=1; clamp min avoids overflow when alpha<0
-            p_min = float(teacher_seq_beta_p_min) if float(teacher_seq_beta_p_min) > 0 else 1e-4
-            p = torch.exp(log_prob.clamp(max=0)).clamp(min=p_min)  # (bs, resp_len)
+            conf_mode = str(teacher_seq_beta_conf_mode).lower().strip()
+            max_tok = int(teacher_seq_beta_max_tokens_per_traj) if int(teacher_seq_beta_max_tokens_per_traj) > 0 else 4096
+            # teacher token logp (<=0) for robust modes
+            token_logp = log_prob.clamp(max=0)  # (bs, resp_len)
 
-            alpha = float(teacher_seq_beta_alpha)
-            if alpha >= 0:
-                # enforce alpha<0; fallback to -5.0
-                alpha = -5.0
+            if conf_mode in ("quantile_logp", "cvar_logp"):
+                # per-trajectory robust log-confidence based on teacher-token logp distribution
+                q = float(teacher_seq_beta_logp_q)
+                if not (0.0 < q < 1.0):
+                    q = 0.10
+                vals = []
+                bs = token_logp.shape[0]
+                for i in range(bs):
+                    mi = _tm[i].bool()
+                    if mi.sum().item() == 0:
+                        vals.append(torch.tensor([-1e9], device=token_logp.device, dtype=token_logp.dtype))
+                        continue
+                    vi = token_logp[i][mi]
+                    # cap for speed
+                    if vi.numel() > max_tok:
+                        idx = torch.randperm(vi.numel(), device=vi.device)[:max_tok]
+                        vi = vi[idx]
+                    vi_sorted, _ = torch.sort(vi)
+                    k = int(max(1, round(q * vi_sorted.numel())))
+                    if conf_mode == "quantile_logp":
+                        # quantile at q (e.g., p10 of logp)
+                        vals.append(vi_sorted[k - 1].view(1))
+                    else:
+                        # CVaR (mean of worst-q fraction)
+                        vals.append(vi_sorted[:k].mean().view(1))
+                teacher_seq_beta_logC_robust = torch.stack(vals, dim=0).view(-1, 1)  # (bs,1)
+                # define C for logging parity (not used for gating unless gate_space=="prob")
+                teacher_seq_beta_logC = teacher_seq_beta_logC_robust
+                teacher_seq_beta_C = torch.exp(teacher_seq_beta_logC_robust)
+            else:
+                # legacy: generalized-mean on prob space
+                # teacher token probability p_t = exp(log_prob) ∈ (0,1]
+                # clamp max=0 ensures p<=1; clamp min avoids overflow when alpha<0
+                p_min = float(teacher_seq_beta_p_min) if float(teacher_seq_beta_p_min) > 0 else 1e-4
+                p = torch.exp(token_logp).clamp(min=p_min)  # (bs, resp_len)
 
-            # generalized mean for alpha<0:
-            # C_alpha = (mean(p^alpha))^(1/alpha)
-            # compute p^alpha in log-space for stability: exp(alpha * log p)
-            logp = torch.log(p)
-            pa = torch.exp((alpha * logp).clamp(min=-80.0, max=80.0))  # (bs, resp_len)
-            mean_pa = (pa * _tm).sum(dim=-1, keepdim=True) / (_cnt + 1e-8)  # (bs,1)
-            mean_pa = mean_pa.clamp(min=1e-20)
-            # logC_alpha = (1/alpha) * log(mean(p^alpha))
-            teacher_seq_beta_logC = (1.0 / alpha) * torch.log(mean_pa)  # (bs,1), typically negative
-            teacher_seq_beta_C = torch.exp(teacher_seq_beta_logC)  # (bs,1), in (0,1]
+                alpha = float(teacher_seq_beta_alpha)
+                if alpha >= 0:
+                    # enforce alpha<0; fallback to -5.0
+                    alpha = -5.0
+
+                # generalized mean for alpha<0:
+                # C_alpha = (mean(p^alpha))^(1/alpha)
+                # compute p^alpha in log-space for stability: exp(alpha * log p)
+                logp_prob = torch.log(p)
+                pa = torch.exp((alpha * logp_prob).clamp(min=-80.0, max=80.0))  # (bs, resp_len)
+                mean_pa = (pa * _tm).sum(dim=-1, keepdim=True) / (_cnt + 1e-8)  # (bs,1)
+                mean_pa = mean_pa.clamp(min=1e-20)
+                # logC_alpha = (1/alpha) * log(mean(p^alpha))
+                teacher_seq_beta_logC = (1.0 / alpha) * torch.log(mean_pa)  # (bs,1), typically negative
+                teacher_seq_beta_C = torch.exp(teacher_seq_beta_logC)  # (bs,1), in (0,1]
 
             # beta schedule: beta in [beta_min, beta_max]
             beta_min = float(teacher_seq_beta_beta_min) if float(teacher_seq_beta_beta_min) >= 0 else 0.0
@@ -418,6 +462,7 @@ def het_compute_teacher_aware_loss(
             if teacher_seq_beta_stop_grad:
                 teacher_seq_beta_C = teacher_seq_beta_C.detach()
                 teacher_seq_beta_logC = teacher_seq_beta_logC.detach() if teacher_seq_beta_logC is not None else None
+                teacher_seq_beta_logC_robust = teacher_seq_beta_logC_robust.detach() if teacher_seq_beta_logC_robust is not None else None
                 teacher_seq_beta_beta = teacher_seq_beta_beta.detach()
     
     # Policy shaping（LUFFY 推荐使用）
@@ -563,6 +608,10 @@ def het_compute_teacher_aware_loss(
     if teacher_seq_beta_logC is not None and torch.is_tensor(teacher_seq_beta_logC):
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_logC.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_alpha")
+        )
+    if teacher_seq_beta_logC_robust is not None and torch.is_tensor(teacher_seq_beta_logC_robust):
+        ratio_stats.update(
+            _masked_stats(teacher_seq_beta_logC_robust.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_robust")
         )
     if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
         ratio_stats.update(
