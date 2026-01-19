@@ -1,0 +1,55 @@
+exp_manager:
+  teacher_experience:
+    enable: true
+    mix_mode: "rollout_level"
+    data_path: "data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered.pkl"
+    n_teacher_rollouts_per_task: 1
+    max_trajectories_per_task: 6
+    select_mode: "random"
+    use_log_prob: false
+
+    policy_shaping:
+      enable: true
+      mode: "p_div_p_beta"
+      beta: 0.1
+
+    adaptive_weight:
+      enable: false
+    token_gate:
+      enable: false
+    adv_gate:
+      enable: false
+    entropy_gate:
+      enable: false
+    ag_pm_gate:
+      enable: false
+
+    # ⭐ 7.7-v2 (aggressive): keep strong teacher early (beta_min=0.05)
+    # Hypothesis test:
+    # - early gets the known boost from small beta
+    # - mid/late should automatically weaken teacher if logC_alpha increases
+    # To make it *actually* move, we gate in logprob space with a reachable threshold.
+    seq_beta_77:
+      enable: true
+      alpha: -2.0
+      gate_space: "logprob"
+
+      # logC_alpha is typically negative; in v1 we observed logC_alpha ~= log(2e-4) ~ -8.5
+      # Set threshold closer to that regime so the gate can transition during training.
+      logc0: -7.2
+      log_temperature: 0.8
+
+      # legacy fields (ignored when gate_space=logprob)
+      c0: 0.25
+      temperature: 0.05
+
+      beta_min: 0.05
+      beta_max: 0.35
+      p_min: 1e-8
+      stop_grad: true
+
+algorithm:
+  grpo:
+    teacher_baseline_separation:
+      enable: true
+

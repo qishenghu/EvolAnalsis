@@ -233,8 +233,13 @@ def het_compute_teacher_aware_loss(
     # 仅用于 teacher_use_log_prob=False 且 policy_shaping_mode == "p_div_p_beta"
     teacher_seq_beta_enable: bool = False,
     teacher_seq_beta_alpha: float = -5.0,          # α < 0; more negative => more tail/min sensitive
-    teacher_seq_beta_c0: float = 0.25,             # center of sigmoid in confidence space
+    teacher_seq_beta_c0: float = 0.25,             # center of sigmoid in confidence space (prob-space by default)
     teacher_seq_beta_temperature: float = 0.05,    # transition smoothness; smaller => sharper
+    # ⭐ 7.7-v2: gate in log-prob space to fix scale mismatch for LLM token probabilities
+    # If enabled, use logC_alpha and logc0 (typically negative, e.g., -6) for gating.
+    teacher_seq_beta_gate_space: str = "prob",     # "prob" | "logprob"
+    teacher_seq_beta_logc0: Optional[float] = None,# if None and gate_space=="logprob", fall back to log(c0) when 0<c0<1
+    teacher_seq_beta_log_temperature: float = 0.5, # temperature in log-space
     teacher_seq_beta_beta_min: float = 0.05,       # >=0; stronger teacher (since r=p/(p+β))
     teacher_seq_beta_beta_max: float = 0.30,       # >= beta_min; weaker teacher
     teacher_seq_beta_p_min: float = 1e-4,          # clamp prob to avoid overflow for alpha<0
@@ -351,6 +356,7 @@ def het_compute_teacher_aware_loss(
     # 目的：避免 token-level gate 的误伤；在“仍有短板 token”时不削弱 teacher，在“整体已学会”时逐步减弱 teacher。
     # 说明：这里只改变 β（shaping 强度），不改变 7.1 的 baseline separation 或其他 7.3/7.6 功能。
     teacher_seq_beta_C = None
+    teacher_seq_beta_logC = None  # shape: (bs, 1)
     teacher_seq_beta_beta = None  # shape: (bs, 1)
     if (
         teacher_seq_beta_enable
@@ -379,7 +385,9 @@ def het_compute_teacher_aware_loss(
             pa = torch.exp((alpha * logp).clamp(min=-80.0, max=80.0))  # (bs, resp_len)
             mean_pa = (pa * _tm).sum(dim=-1, keepdim=True) / (_cnt + 1e-8)  # (bs,1)
             mean_pa = mean_pa.clamp(min=1e-20)
-            teacher_seq_beta_C = torch.exp((1.0 / alpha) * torch.log(mean_pa))  # (bs,1), in (0,1]
+            # logC_alpha = (1/alpha) * log(mean(p^alpha))
+            teacher_seq_beta_logC = (1.0 / alpha) * torch.log(mean_pa)  # (bs,1), typically negative
+            teacher_seq_beta_C = torch.exp(teacher_seq_beta_logC)  # (bs,1), in (0,1]
 
             # beta schedule: beta in [beta_min, beta_max]
             beta_min = float(teacher_seq_beta_beta_min) if float(teacher_seq_beta_beta_min) >= 0 else 0.0
@@ -387,15 +395,31 @@ def het_compute_teacher_aware_loss(
             if beta_min > beta_max:
                 beta_min, beta_max = beta_max, beta_min
 
-            c0 = float(teacher_seq_beta_c0)
-            temp = float(teacher_seq_beta_temperature) if float(teacher_seq_beta_temperature) > 0 else 0.05
-            gate = torch.sigmoid((teacher_seq_beta_C - c0) / temp)  # (bs,1)
+            gate_space = str(teacher_seq_beta_gate_space).lower().strip()
+            if gate_space == "logprob":
+                # log-space gating: gate = sigmoid((logC - logc0) / Tlog)
+                Tlog = float(teacher_seq_beta_log_temperature) if float(teacher_seq_beta_log_temperature) > 0 else 0.5
+                logc0 = teacher_seq_beta_logc0
+                if logc0 is None:
+                    # fallback: if 0<c0<1, use log(c0); else use a conservative default
+                    c0 = float(teacher_seq_beta_c0)
+                    if 0.0 < c0 < 1.0:
+                        logc0 = float(torch.log(torch.tensor(c0)).item())
+                    else:
+                        logc0 = -6.0
+                gate = torch.sigmoid((teacher_seq_beta_logC - float(logc0)) / Tlog)  # (bs,1)
+            else:
+                # prob-space gating (legacy): gate = sigmoid((C - c0) / T)
+                c0 = float(teacher_seq_beta_c0)
+                temp = float(teacher_seq_beta_temperature) if float(teacher_seq_beta_temperature) > 0 else 0.05
+                gate = torch.sigmoid((teacher_seq_beta_C - c0) / temp)  # (bs,1)
             teacher_seq_beta_beta = beta_min + (beta_max - beta_min) * gate  # (bs,1)
 
             if teacher_seq_beta_stop_grad:
                 teacher_seq_beta_C = teacher_seq_beta_C.detach()
+                teacher_seq_beta_logC = teacher_seq_beta_logC.detach() if teacher_seq_beta_logC is not None else None
                 teacher_seq_beta_beta = teacher_seq_beta_beta.detach()
-
+    
     # Policy shaping（LUFFY 推荐使用）
     if teacher_policy_shaping_enable:
         beta_for_shaping = teacher_policy_shaping_beta
@@ -535,6 +559,10 @@ def het_compute_teacher_aware_loss(
         # broadcast to token shape for masked stats
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_C.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/C_alpha")
+        )
+    if teacher_seq_beta_logC is not None and torch.is_tensor(teacher_seq_beta_logC):
+        ratio_stats.update(
+            _masked_stats(teacher_seq_beta_logC.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_alpha")
         )
     if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
         ratio_stats.update(

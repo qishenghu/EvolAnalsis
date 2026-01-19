@@ -1,0 +1,51 @@
+exp_manager:
+  teacher_experience:
+    enable: true
+    mix_mode: "rollout_level"
+    data_path: "data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered.pkl"
+    n_teacher_rollouts_per_task: 1
+    max_trajectories_per_task: 6
+    select_mode: "random"
+    use_log_prob: false
+
+    # Policy shaping (β will be overridden by 7.7 if enabled)
+    policy_shaping:
+      enable: true
+      mode: "p_div_p_beta"
+      beta: 0.1
+
+    # disable other gates
+    adaptive_weight:
+      enable: false
+    token_gate:
+      enable: false
+    adv_gate:
+      enable: false
+    entropy_gate:
+      enable: false
+    ag_pm_gate:
+      enable: false
+
+    # ⭐ 7.7-v2: sequence-level beta schedule in LOGPROB space
+    # Key fix vs v1:
+    # - gate on logC_alpha rather than C_alpha to avoid probability scale mismatch
+    # - reduce tail over-sensitivity and remove p_min floor effect as much as possible
+    seq_beta_77:
+      enable: true
+      alpha: -2.0                 # less extreme tail sensitivity than -5
+      gate_space: "logprob"       # NEW: "prob"|"logprob"
+      logc0: -6.0                 # NEW: threshold in log-space (~p=0.0025)
+      log_temperature: 0.6        # NEW: smoother transition in log-space
+      c0: 0.25                    # legacy field (ignored when gate_space=logprob)
+      temperature: 0.05           # legacy field (ignored when gate_space=logprob)
+      beta_min: 0.10              # back to baseline strength (avoid over-strong teacher early/mid)
+      beta_max: 0.35              # allow real weakening when learned
+      p_min: 1e-8                 # avoid clamping C_alpha to ~1e-4
+      stop_grad: true
+
+algorithm:
+  grpo:
+    # ⭐ 7.1: teacher baseline separation
+    teacher_baseline_separation:
+      enable: true
+
