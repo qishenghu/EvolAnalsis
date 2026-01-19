@@ -126,6 +126,28 @@ actor_rollout_ref:
     n: 8
     log_prob_max_token_len_per_gpu: 25580
 
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+
+data:
+  train_batch_size: 8
+  max_prompt_length: 4000
+  max_response_length: 21580
+  filter_overlong_prompts: true
+  truncation: "error"
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  val_type: "val"
+  max_train_tasks: 800
+  shuffle: true
+
+env_service:
+  env_type: "alfworld"
+  env_url: "http://127.0.0.1:8081"
+
 task_manager:
   n: 0
   mixture:
@@ -208,6 +230,9 @@ exp_manager:
       beta_max: 0.35
       p_min: 1e-8
       stop_grad: true
+
+attribution_driven_credit_assignment:
+  enable: false
 
 thread_pool:
   max_workers: 64
