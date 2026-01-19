@@ -591,10 +591,35 @@ def het_compute_teacher_aware_loss(
             pass
         return out
 
+    def _vector_stats(v: torch.Tensor, prefix: str) -> dict:
+        """
+        v: 1D tensor of per-trajectory values (teacher-only).
+        This avoids token-weighting artifacts when a scalar (e.g., beta) is broadcast to tokens.
+        """
+        out: dict[str, torch.Tensor] = {}
+        if v is None or (not torch.is_tensor(v)) or v.numel() == 0:
+            out[f"{prefix}/count"] = torch.tensor(0.0, device=log_prob.device)
+            return out
+        vv = v.flatten()
+        out[f"{prefix}/count"] = torch.tensor(float(vv.numel()), device=vv.device)
+        out[f"{prefix}/mean"] = vv.mean()
+        out[f"{prefix}/std"] = vv.std() if vv.numel() > 1 else torch.tensor(0.0, device=vv.device)
+        out[f"{prefix}/min"] = vv.min()
+        out[f"{prefix}/max"] = vv.max()
+        try:
+            out[f"{prefix}/p50"] = torch.quantile(vv, 0.50)
+            out[f"{prefix}/p90"] = torch.quantile(vv, 0.90)
+            out[f"{prefix}/p99"] = torch.quantile(vv, 0.99)
+        except Exception:
+            pass
+        return out
+
     # masks
     teacher_token_mask = teacher_exp_mask * response_mask
     self_token_mask = self_exp_mask * response_mask
     on_token_mask = (1.0 - exp_mask) * response_mask
+    # per-trajectory teacher presence mask (bool): does this sequence contain any teacher tokens?
+    teacher_traj_mask = (teacher_token_mask.sum(dim=-1) > 0)  # (bs,)
 
     ratio_stats = {}
     # teacher_ratio: after (optional) shaping, used for teacher loss
@@ -609,13 +634,23 @@ def het_compute_teacher_aware_loss(
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_logC.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_alpha")
         )
+        # trajectory-level stats (one value per teacher rollout)
+        ratio_stats.update(
+            _vector_stats(teacher_seq_beta_logC.squeeze(-1)[teacher_traj_mask], "seq_beta/logC_alpha_traj")
+        )
     if teacher_seq_beta_logC_robust is not None and torch.is_tensor(teacher_seq_beta_logC_robust):
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_logC_robust.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_robust")
         )
+        ratio_stats.update(
+            _vector_stats(teacher_seq_beta_logC_robust.squeeze(-1)[teacher_traj_mask], "seq_beta/logC_robust_traj")
+        )
     if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_beta.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/beta")
+        )
+        ratio_stats.update(
+            _vector_stats(teacher_seq_beta_beta.squeeze(-1)[teacher_traj_mask], "seq_beta/beta_traj")
         )
     # 7.6 AG-PM: gate weights and probability
     if teacher_ag_pm_adv_gate_w is not None and torch.is_tensor(teacher_ag_pm_adv_gate_w):

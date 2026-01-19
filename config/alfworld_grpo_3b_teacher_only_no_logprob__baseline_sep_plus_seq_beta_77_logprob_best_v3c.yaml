@@ -221,8 +221,11 @@ exp_manager:
       max_tokens_per_traj: 2048
       gate_space: "logprob"
       # Retuned threshold (avoid gate saturation to 1 at step1)
-      logc0: -3.5
-      log_temperature: 0.7
+      # Further retune based on early steps (logC often in [-8,-4]):
+      # - lower logc0: make gate more sensitive around mid-phase (-4ish), so β can rise earlier
+      # - increase log_temperature: smooth gate to avoid abrupt per-step saturation
+      logc0: -4.2
+      log_temperature: 1.0
       # legacy (ignored in logprob mode)
       c0: 0.25
       temperature: 0.05
