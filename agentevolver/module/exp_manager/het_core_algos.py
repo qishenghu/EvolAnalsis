@@ -624,7 +624,7 @@ def het_compute_teacher_aware_loss(
     ratio_stats = {}
     # teacher_ratio: after (optional) shaping, used for teacher loss
     ratio_stats.update(_masked_stats(teacher_ratio, teacher_token_mask, "teacher_ratio"))
-    # 7.7: sequence-level beta schedule diagnostics
+    # 7.7: sequence-level beta schedule diagnostics (token-level)
     if teacher_seq_beta_C is not None and torch.is_tensor(teacher_seq_beta_C):
         # broadcast to token shape for masked stats
         ratio_stats.update(
@@ -634,24 +634,26 @@ def het_compute_teacher_aware_loss(
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_logC.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_alpha")
         )
-        # trajectory-level stats (one value per teacher rollout)
-        ratio_stats.update(
-            _vector_stats(teacher_seq_beta_logC.squeeze(-1)[teacher_traj_mask], "seq_beta/logC_alpha_traj")
-        )
     if teacher_seq_beta_logC_robust is not None and torch.is_tensor(teacher_seq_beta_logC_robust):
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_logC_robust.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/logC_robust")
-        )
-        ratio_stats.update(
-            _vector_stats(teacher_seq_beta_logC_robust.squeeze(-1)[teacher_traj_mask], "seq_beta/logC_robust_traj")
         )
     if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
         ratio_stats.update(
             _masked_stats(teacher_seq_beta_beta.expand_as(teacher_ratio), teacher_token_mask, "seq_beta/beta")
         )
-        ratio_stats.update(
-            _vector_stats(teacher_seq_beta_beta.squeeze(-1)[teacher_traj_mask], "seq_beta/beta_traj")
-        )
+
+    # NOTE:
+    # - We intentionally do NOT log traj-level stats here.
+    # - Actor update uses micro-batches (often bsz=1), which makes traj-level stats degenerate (count=1).
+    # - We instead return raw per-traj values for step-level aggregation in het_actor.
+    teacher_diag_traj_values = {}
+    if teacher_seq_beta_beta is not None and torch.is_tensor(teacher_seq_beta_beta):
+        teacher_diag_traj_values["seq_beta/beta"] = teacher_seq_beta_beta.squeeze(-1)[teacher_traj_mask]  # (n_teacher_traj,)
+    if teacher_seq_beta_logC is not None and torch.is_tensor(teacher_seq_beta_logC):
+        teacher_diag_traj_values["seq_beta/logC_alpha"] = teacher_seq_beta_logC.squeeze(-1)[teacher_traj_mask]
+    if teacher_seq_beta_logC_robust is not None and torch.is_tensor(teacher_seq_beta_logC_robust):
+        teacher_diag_traj_values["seq_beta/logC_robust"] = teacher_seq_beta_logC_robust.squeeze(-1)[teacher_traj_mask]
     # 7.6 AG-PM: gate weights and probability
     if teacher_ag_pm_adv_gate_w is not None and torch.is_tensor(teacher_ag_pm_adv_gate_w):
         ratio_stats.update(_masked_stats(teacher_ag_pm_adv_gate_w, teacher_token_mask, "ag_pm_adv_gate_w"))
@@ -687,6 +689,8 @@ def het_compute_teacher_aware_loss(
         "teacher_off_pg_loss": teacher_off_pg_loss,
         # ⭐ 诊断指标：用于分析 teacher 影响（ratio / advantage 分布）
         "teacher_diag_stats": ratio_stats,
+        # ⭐ raw per-trajectory values for correct step-level aggregation (across micro-batches)
+        "teacher_diag_traj_values": teacher_diag_traj_values,
         "on_pg_clipfrac": on_pg_clipfrac,
         "on_pg_clipfrac_lower": on_pg_clipfrac_lower,
         "ppo_kl": ppo_kl,

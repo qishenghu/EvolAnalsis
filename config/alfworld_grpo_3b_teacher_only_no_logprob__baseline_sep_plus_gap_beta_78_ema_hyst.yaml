@@ -9,26 +9,15 @@ defaults:
   - _self_
 
 # ============================================================================
-# 7.1 + 7.7-v3c (CVaR-logp robust confidence + LOGPROB gate) — retuned threshold
-#
-# What happened in run 4snkb9jg:
-# - teacher_diag/seq_beta/logC_alpha(mean) jumped to ~ -5.7 -> -3.6 in first 2 steps
-# - with logc0=-13, gate = sigmoid((logC - logc0)/T) ≈ sigmoid(7~10) ≈ 1
-#   -> beta saturated to beta_max (~0.35) from step1 (teacher already weakened)
-#
-# Fix:
-# - move logc0 into the observed logC regime (around -3~-4), so β is NOT saturated.
-# - keep beta_min=0.05 to preserve early teacher boost.
-# - use CVaR (bottom-q logp mean) as robust tail-aware confidence.
-#
-# Monitor (wandb):
-# - teacher_diag/seq_beta/logC_robust/mean (should be ~ -6..-2 early, move upward)
-# - teacher_diag/seq_beta/beta/mean       (should start near ~0.05-0.12 then rise)
-# - teacher_diag/teacher_ratio/mean       (should not stay overly high in mid/late)
+# 7.1 + 7.8 (adv-gap -> beta) : EMA + Hysteresis
+# - Keep everything else OFF (7.7/7.6/7.4/7.5...) to isolate 7.8 effect.
+# - 7.1: teacher baseline separation enabled.
+# - 7.8: use adv_gap = mean(adv_teacher_sample) - mean(adv_onpolicy_sample) proxy
+#        (implemented as token-mean per-sample advantage in actor).
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_seq_beta_77_logprob_best_v3c
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_gap_beta_78_ema_hyst
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -49,7 +38,6 @@ algorithm:
       teacher_baseline: "all_mean"
       non_teacher_baseline: "non_teacher_mean"
       std_source: "non_teacher"
-
   dapo:
     enable: false
     dynamic_sampling:
@@ -86,29 +74,25 @@ actor_rollout_ref:
     teacher_use_log_prob: ${exp_manager.teacher_experience.use_log_prob}
     teacher_policy_shaping_enable: ${exp_manager.teacher_experience.policy_shaping.enable}
     teacher_policy_shaping_mode: ${exp_manager.teacher_experience.policy_shaping.mode}
-    teacher_policy_shaping_beta: ${exp_manager.teacher_experience.policy_shaping.beta}
+    teacher_policy_shaping_beta: ${exp_manager.teacher_experience.policy_shaping.beta}  # will be overridden by 7.8 when enabled
     teacher_use_clip: false
 
-    # ⭐ 7.7: robust seq-beta schedule
-    teacher_seq_beta_enable: ${exp_manager.teacher_experience.seq_beta_77.enable}
-    teacher_seq_beta_alpha: ${exp_manager.teacher_experience.seq_beta_77.alpha}
-    teacher_seq_beta_c0: ${exp_manager.teacher_experience.seq_beta_77.c0}
-    teacher_seq_beta_temperature: ${exp_manager.teacher_experience.seq_beta_77.temperature}
-    teacher_seq_beta_gate_space: ${exp_manager.teacher_experience.seq_beta_77.gate_space}
-    teacher_seq_beta_logc0: ${exp_manager.teacher_experience.seq_beta_77.logc0}
-    teacher_seq_beta_log_temperature: ${exp_manager.teacher_experience.seq_beta_77.log_temperature}
-    teacher_seq_beta_conf_mode: ${exp_manager.teacher_experience.seq_beta_77.conf_mode}
-    teacher_seq_beta_logp_q: ${exp_manager.teacher_experience.seq_beta_77.logp_q}
-    teacher_seq_beta_max_tokens_per_traj: ${exp_manager.teacher_experience.seq_beta_77.max_tokens_per_traj}
-    teacher_seq_beta_beta_min: ${exp_manager.teacher_experience.seq_beta_77.beta_min}
-    teacher_seq_beta_beta_max: ${exp_manager.teacher_experience.seq_beta_77.beta_max}
-    teacher_seq_beta_p_min: ${exp_manager.teacher_experience.seq_beta_77.p_min}
-    teacher_seq_beta_stop_grad: ${exp_manager.teacher_experience.seq_beta_77.stop_grad}
+    # ⭐ 7.8: adv-gap -> beta (EMA + Hysteresis)
+    teacher_gap_beta_enable: true
+    teacher_gap_beta_use_ema: true
+    teacher_gap_beta_ema_decay: 0.9
+    teacher_gap_beta_use_hysteresis: true
+    teacher_gap_beta_hysteresis_hi: 0.55
+    teacher_gap_beta_hysteresis_lo: 0.45
+    # two-level beta
+    teacher_gap_beta_beta_strong: 0.05
+    teacher_gap_beta_beta_weak: 0.10
 
-    # Disable other gates (keep experiment clean)
-    teacher_ag_pm_enable: false
-    teacher_adv_gate_enable: false
-    teacher_token_gate_enable: false
+    # Keep other mechanisms OFF (isolation)
+    teacher_seq_beta_enable: false   # 7.7 OFF
+    teacher_ag_pm_enable: false      # 7.6 OFF
+    teacher_adv_gate_enable: false   # 7.4 OFF
+    teacher_token_gate_enable: false # 7.5 OFF
     teacher_entropy_gate_enable: false
 
     use_dapo: false
@@ -128,6 +112,13 @@ actor_rollout_ref:
     mode: async
     gpu_memory_utilization: 0.5
     n: 8
+    log_prob_max_token_len_per_gpu: 25580
+    val_kwargs:
+      n: 1
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
     log_prob_max_token_len_per_gpu: 25580
 
 critic:
@@ -183,23 +174,11 @@ exp_manager:
   train_sample_mode: "alldiscard"
   train_sample_keepratio: 0.0
   experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
-
   init_exp_before_training: false
   init_exp_only: false
   summary_batch_size: 8
-
   experience_replay:
     enable: false
-    replay_start_ratio: 0.1
-    exp_ratio: 0.0
-    offpolicy_trajectories_per_task: 1
-    experience_lbound: 2
-    experience_rbound: 8
-    exp_select_mode: "argmin"
-    use_current_policy_entropy: true
-    exp_is_correct: true
-    max_trajectories_per_task: 5
-
   teacher_experience:
     enable: true
     mix_mode: "rollout_level"
@@ -211,28 +190,7 @@ exp_manager:
     policy_shaping:
       enable: true
       mode: "p_div_p_beta"
-      beta: 0.1
-
-    seq_beta_77:
-      enable: true
-      alpha: -2.0
-      conf_mode: "cvar_logp"
-      logp_q: 0.10
-      max_tokens_per_traj: 2048
-      gate_space: "logprob"
-      # Retuned threshold (avoid gate saturation to 1 at step1)
-      # Further retune based on early steps (logC often in [-8,-4]):
-      # - lower logc0: make gate more sensitive around mid-phase (-4ish), so β can rise earlier
-      # - increase log_temperature: smooth gate to avoid abrupt per-step saturation
-      logc0: -2.6
-      log_temperature: 0.7
-      # legacy (ignored in logprob mode)
-      c0: 0.25
-      temperature: 0.05
-      beta_min: 0.05
-      beta_max: 0.35
-      p_min: 1e-8
-      stop_grad: true
+      beta: 0.1  # base; 7.8 overrides per step
 
 attribution_driven_credit_assignment:
   enable: false

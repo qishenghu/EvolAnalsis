@@ -58,6 +58,129 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
             **kwargs: Keyword arguments passed to the superclass constructor.
         """
         super().__init__(**kwargs)
+        # 7.8: gap->beta scheduler state (kept inside actor; default disabled)
+        self._gap_beta_ema: float | None = None
+        self._gap_beta_state: float | None = None  # hysteresis state: current beta value
+        self._gap_beta_updates: int = 0
+
+    def _gap_beta_scheduler(
+        self,
+        *,
+        advantages: torch.Tensor,
+        response_mask: torch.Tensor,
+        exp_mask: torch.Tensor,
+        teacher_mask: torch.Tensor,
+        update_state: bool,
+    ) -> tuple[float | None, dict[str, float]]:
+        """
+        7.8: Adjust teacher policy shaping beta based on advantage gap.
+
+        We define per-sample scalar advantage as the mean over response tokens:
+          adv_scalar[i] = mean_t advantages[i,t] over response_mask.
+
+        Then advantage gap (scalar) is:
+          gap = mean(adv_scalar[teacher_samples]) - mean(adv_scalar[onpolicy_samples])
+
+        NOTE:
+        - This is a scheduler (no grad), intended to be stable even when tasks differ each step.
+        - The result is a *scalar* beta override applied to teacher shaping only.
+        """
+        diag: dict[str, float] = {}
+        if not self.config.get("teacher_gap_beta_enable", False):
+            return None, diag
+
+        if advantages is None or (not torch.is_tensor(advantages)):
+            return None, diag
+        if teacher_mask is None or (not torch.is_tensor(teacher_mask)):
+            return None, diag
+        if exp_mask is None or (not torch.is_tensor(exp_mask)):
+            return None, diag
+
+        # per-sample scalar advantage (token-mean on response tokens)
+        rm = response_mask.float()
+        denom = rm.sum(dim=-1).clamp(min=1.0)
+        adv_scalar = (advantages * rm).sum(dim=-1) / denom  # (bs,)
+
+        is_teacher = (teacher_mask.sum(dim=-1) > 0)
+        is_off = (exp_mask.sum(dim=-1) > 0)
+        is_on = ~is_off
+
+        if (not is_teacher.any()) or (not is_on.any()):
+            return None, diag
+
+        teacher_mean = adv_scalar[is_teacher].mean()
+        on_mean = adv_scalar[is_on].mean()
+        gap = (teacher_mean - on_mean).detach().float().item()
+        diag["adv_gap"] = float(gap)
+
+        use_ema = bool(self.config.get("teacher_gap_beta_use_ema", True))
+        use_hyst = bool(self.config.get("teacher_gap_beta_use_hysteresis", True))
+
+        # EMA update
+        gap_used = gap
+        if use_ema:
+            decay = float(self.config.get("teacher_gap_beta_ema_decay", 0.9))
+            decay = min(max(decay, 0.0), 0.9999)
+            if self._gap_beta_ema is None:
+                ema = gap
+            else:
+                ema = decay * float(self._gap_beta_ema) + (1.0 - decay) * gap
+            diag["adv_gap_ema"] = float(ema)
+            gap_used = float(ema)
+            if update_state:
+                self._gap_beta_ema = float(ema)
+
+        beta_strong = float(self.config.get("teacher_gap_beta_beta_strong", 0.05))  # stronger teacher
+        beta_weak = float(self.config.get("teacher_gap_beta_beta_weak", 0.10))      # weaker teacher
+        # normalize ordering
+        beta_low = min(beta_strong, beta_weak)
+        beta_high = max(beta_strong, beta_weak)
+
+        beta_out: float
+        switched = 0.0
+
+        if use_hyst:
+            hi = float(self.config.get("teacher_gap_beta_hysteresis_hi", 0.55))
+            lo = float(self.config.get("teacher_gap_beta_hysteresis_lo", 0.45))
+            if lo > hi:
+                lo, hi = hi, lo
+
+            # state init
+            cur = self._gap_beta_state
+            if cur is None:
+                # choose initial state by comparing to mid threshold
+                mid = 0.5 * (hi + lo)
+                cur = beta_low if gap_used > mid else beta_high
+                if update_state:
+                    self._gap_beta_state = float(cur)
+
+            # hysteresis transitions:
+            # - if gap is high (teacher much better), strengthen teacher => smaller beta
+            # - if gap is low, weaken teacher => larger beta
+            if float(cur) == beta_high and gap_used > hi:
+                beta_out = beta_low
+                switched = 1.0
+            elif float(cur) == beta_low and gap_used < lo:
+                beta_out = beta_high
+                switched = 1.0
+            else:
+                beta_out = float(cur)
+
+            if update_state:
+                self._gap_beta_state = float(beta_out)
+        else:
+            thr = float(self.config.get("teacher_gap_beta_threshold", 0.5))
+            beta_out = beta_low if gap_used > thr else beta_high
+
+        if update_state:
+            self._gap_beta_updates += 1
+
+        diag["beta"] = float(beta_out)
+        diag["switched"] = float(switched)
+        diag["use_ema"] = 1.0 if use_ema else 0.0
+        diag["use_hysteresis"] = 1.0 if use_hyst else 0.0
+        diag["updates"] = float(self._gap_beta_updates)
+        return float(beta_out), diag
 
     def update_policy(self, data: DataProto):
         """
@@ -120,6 +243,39 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()  # ⭐ Zero the gradients before computing the new ones
+                # Accumulate per-trajectory teacher diagnostics across micro-batches (for correct step-level stats)
+                teacher_traj_value_acc: dict[str, list[torch.Tensor]] = {}
+
+                # ------------------------------------------------------------------
+                # 7.8: gap->beta (compute once per mini-batch; apply to all micro-batches)
+                # ------------------------------------------------------------------
+                gap_beta_override: float | None = None
+                gap_beta_diag: dict[str, float] = {}
+                try:
+                    # Build masks on (likely) CPU tensors to avoid GPU sync.
+                    mb = mini_batch.batch if isinstance(mini_batch, DataProto) else mini_batch
+                    mb_responses = mb["responses"]
+                    mb_response_length = mb_responses.size(1)
+                    mb_attention_mask = mb["attention_mask"]
+                    if multi_turn:
+                        mb_response_mask = mb["loss_mask"][:, -mb_response_length:]
+                    else:
+                        mb_response_mask = mb_attention_mask[:, -mb_response_length:]
+                    mb_adv = mb["advantages"][:, -mb_response_length:]
+                    mb_exp = mb["exp_mask"][:, -mb_response_length:]
+                    mb_teacher = mb.get("teacher_mask", None)
+                    if mb_teacher is not None:
+                        mb_teacher = mb_teacher[:, -mb_response_length:]
+                    # only update EMA/state on the first PPO epoch for this batch
+                    gap_beta_override, gap_beta_diag = self._gap_beta_scheduler(
+                        advantages=mb_adv,
+                        response_mask=mb_response_mask,
+                        exp_mask=mb_exp,
+                        teacher_mask=mb_teacher,
+                        update_state=(epoch == 0),
+                    )
+                except Exception:
+                    gap_beta_override, gap_beta_diag = None, {}
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -230,6 +386,16 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         teacher_ag_pm_prob_max_gate = self.config.get("teacher_ag_pm_prob_max_gate", 1.0)
                         teacher_ag_pm_stop_grad = self.config.get("teacher_ag_pm_stop_grad", True)
                         
+                        # ⭐ 7.8: advantage-gap scheduled beta override (only for LUFFY + p_div_p_beta)
+                        if (
+                            gap_beta_override is not None
+                            and (not teacher_use_log_prob)
+                            and teacher_policy_shaping_enable
+                            and str(teacher_policy_shaping_mode).lower().strip() == "p_div_p_beta"
+                            and (not self.config.get("teacher_seq_beta_enable", False))  # 7.7 has higher priority
+                        ):
+                            teacher_policy_shaping_beta = float(gap_beta_override)
+
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -279,6 +445,13 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_ag_pm_prob_max_gate=teacher_ag_pm_prob_max_gate,
                             teacher_ag_pm_stop_grad=teacher_ag_pm_stop_grad,
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO + 7.6 AG-PM)
+                        # Collect raw per-trajectory values for correct step-level aggregation
+                        traj_vals = ret_dict.get("teacher_diag_traj_values")
+                        if isinstance(traj_vals, dict) and traj_vals:
+                            for k, v in traj_vals.items():
+                                if v is None or (not torch.is_tensor(v)) or v.numel() == 0:
+                                    continue
+                                teacher_traj_value_acc.setdefault(str(k), []).append(v.detach())
                     else:
                         # Use original het_compute_token_on_off_policy_loss
                         ret_dict = het_compute_token_on_off_policy_loss(
@@ -362,6 +535,13 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             except Exception:
                                 # skip non-numeric
                                 pass
+                    # ⭐ 7.8: log scheduler diagnostics (step-level; duplicated across micro-batches is OK)
+                    if gap_beta_diag:
+                        for k, v in gap_beta_diag.items():
+                            try:
+                                data[f"teacher_diag/gap_beta/{k}"] = float(v)
+                            except Exception:
+                                pass
                     # ⭐ Endogenous replay diagnostics (importance ratio / shaped ratio / adv split)
                     if isinstance(exp_replay_diag_stats, dict) and exp_replay_diag_stats:
                         for k, v in exp_replay_diag_stats.items():
@@ -374,6 +554,44 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 pass
                     ##################
                     append_to_dict(metrics, data)
+
+                # ------------------------------------------------------------------
+                # Step-level traj statistics (aggregated across micro-batches)
+                # ------------------------------------------------------------------
+                def _stats_from_vals(v: torch.Tensor) -> dict[str, float]:
+                    v = v.flatten()
+                    out: dict[str, float] = {}
+                    if v.numel() == 0:
+                        out["count"] = 0.0
+                        return out
+                    out["count"] = float(v.numel())
+                    out["mean"] = float(v.mean().item())
+                    out["std"] = float(v.std().item()) if v.numel() > 1 else 0.0
+                    out["min"] = float(v.min().item())
+                    out["max"] = float(v.max().item())
+                    try:
+                        out["p50"] = float(torch.quantile(v, 0.50).item())
+                        out["p90"] = float(torch.quantile(v, 0.90).item())
+                        out["p99"] = float(torch.quantile(v, 0.99).item())
+                    except Exception:
+                        pass
+                    return out
+
+                if teacher_traj_value_acc:
+                    step_traj_metrics = {}
+                    for k, chunks in teacher_traj_value_acc.items():
+                        try:
+                            vv = torch.cat([c.flatten() for c in chunks if torch.is_tensor(c) and c.numel() > 0], dim=0)
+                        except Exception:
+                            continue
+                        # Log as teacher_diag/seq_beta/*_traj/*
+                        if k.startswith("seq_beta/"):
+                            base = k.split("/", 1)[1]  # e.g. "beta" or "logC_alpha"
+                            stats = _stats_from_vals(vv.float())
+                            for sk, sv in stats.items():
+                                step_traj_metrics[f"teacher_diag/seq_beta/{base}_traj/{sk}"] = sv
+                    if step_traj_metrics:
+                        append_to_dict(metrics, step_traj_metrics)
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}

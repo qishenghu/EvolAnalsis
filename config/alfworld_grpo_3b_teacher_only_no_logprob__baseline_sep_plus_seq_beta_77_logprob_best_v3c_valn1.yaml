@@ -9,26 +9,13 @@ defaults:
   - _self_
 
 # ============================================================================
-# 7.1 + 7.7-v3c (CVaR-logp robust confidence + LOGPROB gate) — retuned threshold
-#
-# What happened in run 4snkb9jg:
-# - teacher_diag/seq_beta/logC_alpha(mean) jumped to ~ -5.7 -> -3.6 in first 2 steps
-# - with logc0=-13, gate = sigmoid((logC - logc0)/T) ≈ sigmoid(7~10) ≈ 1
-#   -> beta saturated to beta_max (~0.35) from step1 (teacher already weakened)
-#
-# Fix:
-# - move logc0 into the observed logC regime (around -3~-4), so β is NOT saturated.
-# - keep beta_min=0.05 to preserve early teacher boost.
-# - use CVaR (bottom-q logp mean) as robust tail-aware confidence.
-#
-# Monitor (wandb):
-# - teacher_diag/seq_beta/logC_robust/mean (should be ~ -6..-2 early, move upward)
-# - teacher_diag/seq_beta/beta/mean       (should start near ~0.05-0.12 then rise)
-# - teacher_diag/teacher_ratio/mean       (should not stay overly high in mid/late)
+# 7.1 + 7.7-v3c — same as `..._best_v3c.yaml` but force fast validation:
+# - override `actor_rollout_ref.rollout.val_kwargs.n: 1`
+#   (avoid inheriting `config/agentevolver.yaml` default `val_kwargs.n: 8`)
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_seq_beta_77_logprob_best_v3c
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_seq_beta_77_logprob_best_v3c_valn1
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -129,6 +116,14 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.5
     n: 8
     log_prob_max_token_len_per_gpu: 25580
+    # ⭐关键：让验证只采样 1 次（否则会继承 agentevolver.yaml 的 n=8，测试会显著变慢）
+    val_kwargs:
+      n: 1
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
 
 critic:
   ppo_max_token_len_per_gpu: 25580
@@ -220,10 +215,6 @@ exp_manager:
       logp_q: 0.10
       max_tokens_per_traj: 2048
       gate_space: "logprob"
-      # Retuned threshold (avoid gate saturation to 1 at step1)
-      # Further retune based on early steps (logC often in [-8,-4]):
-      # - lower logc0: make gate more sensitive around mid-phase (-4ish), so β can rise earlier
-      # - increase log_temperature: smooth gate to avoid abrupt per-step saturation
       logc0: -2.6
       log_temperature: 0.7
       # legacy (ignored in logprob mode)
