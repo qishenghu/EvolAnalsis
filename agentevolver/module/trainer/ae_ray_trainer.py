@@ -3323,25 +3323,25 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                                 if gate_level != "group":
                                     # batch-level gate (backward compatible)
-                                g = float(gap)
-                                if ema_enable:
-                                    if getattr(self, "_teacher_gap_ema", None) is None:
-                                        self._teacher_gap_ema = g
+                                    g = float(gap)
+                                    if ema_enable:
+                                        if getattr(self, "_teacher_gap_ema", None) is None:
+                                            self._teacher_gap_ema = g
+                                        else:
+                                            self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
+                                        g_eff = float(self._teacher_gap_ema)
                                     else:
-                                        self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
-                                    g_eff = float(self._teacher_gap_ema)
-                                else:
-                                    g_eff = g
+                                        g_eff = g
 
                                     alpha = _alpha_from_gap(g_eff)
-                                batch.batch["teacher_loss_scale"] = torch.full(
-                                    (bs, resp_len), float(alpha), device=device, dtype=torch.float32
-                                )
-                                metrics["diag/teacher_loss_scale"] = float(alpha)
-                                metrics["diag/teacher_gap_used"] = float(g_eff)
-                                    metrics["diag/teacher_gate_level"] = 0.0
-                                if ema_enable:
-                                    metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
+                                    batch.batch["teacher_loss_scale"] = torch.full(
+                                        (bs, resp_len), float(alpha), device=device, dtype=torch.float32
+                                    )
+                                    metrics["diag/teacher_loss_scale"] = float(alpha)
+                                    metrics["diag/teacher_gap_used"] = float(g_eff)
+                                    metrics["diag/teacher_gate_level"] = 0.0  # 1=group, 0=batch
+                                    if ema_enable:
+                                        metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
 
                         # ⭐ 保存 Trajectory 信息用于后续分析（放到 compute_advantage 后，包含 advantages）
                         if self.async_rollout_mode and trajectories:
