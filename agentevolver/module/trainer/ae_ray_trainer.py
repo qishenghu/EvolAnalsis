@@ -2603,6 +2603,16 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         "luffy79/threshold": luffy_stats.get("difficulty_gate_79_threshold", 0.0),
                                         "luffy79/min_onpolicy_rollouts": luffy_stats.get("difficulty_gate_79_min_onpolicy_rollouts", 1),
                                         "luffy79/tasks_skipped_teacher": luffy_stats.get("difficulty_gate_79_tasks_skipped_teacher", 0),
+                                        # robustness / availability
+                                        "luffy79/tasks_need_teacher": luffy_stats.get("difficulty_gate_79_tasks_need_teacher", 0),
+                                        "luffy79/tasks_no_teacher_available": luffy_stats.get("difficulty_gate_79_tasks_no_teacher_available", 0),
+                                        # per-task on-policy avg reward distribution (computed on tasks with valid rewards)
+                                        "luffy79/onpolicy_avg_reward_count": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_count", 0),
+                                        "luffy79/onpolicy_avg_reward_mean": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_mean", float("nan")),
+                                        "luffy79/onpolicy_avg_reward_p50": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_p50", float("nan")),
+                                        "luffy79/onpolicy_avg_reward_p90": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_p90", float("nan")),
+                                        "luffy79/onpolicy_avg_reward_min": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_min", float("nan")),
+                                        "luffy79/onpolicy_avg_reward_max": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_max", float("nan")),
                                     })
                                 
                             elif enable_exp_replay or enable_teacher_exp:

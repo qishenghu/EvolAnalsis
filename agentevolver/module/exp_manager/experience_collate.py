@@ -532,6 +532,33 @@ class LUFFYTeacherRolloutMixer:
             tasks=tasks_for_teacher,
             n_teacher_rollouts_per_task=self.n_teacher_rollouts_per_task,
         )
+
+        # ⭐ 7.9 diagnostics: tasks that "need teacher" (not skipped) but have no teacher available
+        tasks_need_teacher = [t for t in tasks if (not gate79_enable) or (t.task_id not in tasks_skip_teacher)]
+        tasks_no_teacher_available: set[str] = set()
+        if gate79_enable:
+            for t in tasks_need_teacher:
+                tid = t.task_id
+                if tid not in teacher_rollouts_map or (not teacher_rollouts_map.get(tid)):
+                    tasks_no_teacher_available.add(tid)
+
+        # ⭐ 7.9 diagnostics: summarize per-task on-policy avg reward distribution (only for tasks with enough valid rollouts)
+        avg_vals = list(task_id_to_onpolicy_avg_reward.values()) if gate79_enable else []
+        avg_vals_sorted = sorted(avg_vals)
+        def _q(vals_sorted: list[float], q: float) -> float | None:
+            if not vals_sorted:
+                return None
+            q = float(q)
+            q = 0.0 if q < 0.0 else (1.0 if q > 1.0 else q)
+            # nearest-rank style index over [0, n-1]
+            idx = int(round(q * (len(vals_sorted) - 1)))
+            idx = max(0, min(len(vals_sorted) - 1, idx))
+            return float(vals_sorted[idx])
+        avg_mean = (sum(avg_vals) / len(avg_vals)) if avg_vals else None
+        avg_p50 = _q(avg_vals_sorted, 0.50)
+        avg_p90 = _q(avg_vals_sorted, 0.90)
+        avg_min = _q(avg_vals_sorted, 0.00)
+        avg_max = _q(avg_vals_sorted, 1.00)
         
         # 收集所有 teacher trajectories 并构建 task_id_to_data_id 映射
         all_teacher_trajs = []
@@ -593,6 +620,14 @@ class LUFFYTeacherRolloutMixer:
             "difficulty_gate_79_metric": gate79_metric,
             "difficulty_gate_79_min_onpolicy_rollouts": gate79_min_n,
             "difficulty_gate_79_tasks_skipped_teacher": len(tasks_skip_teacher),
+            "difficulty_gate_79_tasks_need_teacher": len(tasks_need_teacher) if gate79_enable else 0,
+            "difficulty_gate_79_tasks_no_teacher_available": len(tasks_no_teacher_available) if gate79_enable else 0,
+            "difficulty_gate_79_onpolicy_avg_reward_count": len(avg_vals_sorted) if gate79_enable else 0,
+            "difficulty_gate_79_onpolicy_avg_reward_mean": float(avg_mean) if avg_mean is not None else float("nan"),
+            "difficulty_gate_79_onpolicy_avg_reward_p50": float(avg_p50) if avg_p50 is not None else float("nan"),
+            "difficulty_gate_79_onpolicy_avg_reward_p90": float(avg_p90) if avg_p90 is not None else float("nan"),
+            "difficulty_gate_79_onpolicy_avg_reward_min": float(avg_min) if avg_min is not None else float("nan"),
+            "difficulty_gate_79_onpolicy_avg_reward_max": float(avg_max) if avg_max is not None else float("nan"),
         }
         
         for task in tasks:
