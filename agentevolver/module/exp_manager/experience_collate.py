@@ -439,6 +439,7 @@ class LUFFYTeacherRolloutMixer:
             - 统计信息字典
         """
         from collections import defaultdict
+        from typing import Optional
         
         # ⭐ 按 task_id 分组 on-policy CMT
         # 注意：CMT 对象的 task_id 属性存储的是真正的 task_id（如 "pick_cool_then_place..."）
@@ -463,13 +464,72 @@ class LUFFYTeacherRolloutMixer:
             # 记录 data_id -> task_id 映射
             if hasattr(cmt, 'data_id'):
                 data_id_to_task_id[str(cmt.data_id)] = task_id
+
+        # ⭐ 7.9: difficulty-aware teacher mixing (skip teacher if on-policy avg reward is high enough)
+        # Design goal: keep LUFFY shaping unchanged, but stop injecting teacher rollouts for "easy" tasks.
+        teacher_exp_cfg = {}
+        try:
+            teacher_exp_cfg = config.exp_manager.get("teacher_experience", {})
+        except Exception:
+            teacher_exp_cfg = {}
+        gate79 = teacher_exp_cfg.get("difficulty_gate_79", {}) if isinstance(teacher_exp_cfg, dict) else {}
+        gate79_enable = bool(gate79.get("enable", False))
+        gate79_thr = float(gate79.get("onpolicy_avg_reward_threshold", 0.6))
+        gate79_metric = str(gate79.get("metric", "outcome")).strip()
+        gate79_min_n = int(gate79.get("min_onpolicy_rollouts", 1))
+
+        def _get_reward_scalar(cmt_obj, metric: str) -> Optional[float]:
+            # primary: cmt.reward is a Reward(BaseModel) or dict
+            r = None
+            if hasattr(cmt_obj, "reward") and cmt_obj.reward is not None:
+                rw = cmt_obj.reward
+                if hasattr(rw, metric):
+                    r = getattr(rw, metric)
+                elif isinstance(rw, dict):
+                    r = rw.get(metric, None)
+                elif hasattr(rw, "metadata") and isinstance(getattr(rw, "metadata", None), dict):
+                    r = rw.metadata.get(metric, None)
+            # fallback: some pipelines may store scalar in metadata
+            if r is None and hasattr(cmt_obj, "metadata") and isinstance(cmt_obj.metadata, dict):
+                r = cmt_obj.metadata.get(metric, None)
+                if r is None and metric != "reward":
+                    r = cmt_obj.metadata.get("reward", None)
+            try:
+                return float(r) if r is not None else None
+            except Exception:
+                return None
+
+        task_id_to_onpolicy_avg_reward: dict[str, float] = {}
+        tasks_skip_teacher: set[str] = set()
+        if gate79_enable:
+            for task in tasks:
+                tid = task.task_id
+                cmts = task_id_to_onpolicy.get(tid, [])
+                vals = []
+                for c in cmts:
+                    # ignore discarded samples if present
+                    if hasattr(c, "discarded") and bool(getattr(c, "discarded")):
+                        continue
+                    v = _get_reward_scalar(c, gate79_metric)
+                    if v is not None:
+                        vals.append(v)
+                if len(vals) >= max(gate79_min_n, 1):
+                    avg = float(sum(vals) / len(vals))
+                    task_id_to_onpolicy_avg_reward[tid] = avg
+                    if avg >= gate79_thr:
+                        tasks_skip_teacher.add(tid)
+                # if not enough valid rollouts, don't gate this task (keep teacher allowed)
         
         logger.debug(f"[LUFFYMixer] on-policy CMT grouped by task_id: {list(task_id_to_onpolicy.keys())[:5]}...")
         logger.debug(f"[LUFFYMixer] on-policy counts per task: {[len(v) for v in list(task_id_to_onpolicy.values())[:5]]}...")
         
         # 获取每个 task 的 teacher rollouts（Trajectory 对象）
+        # ⭐ 7.9: if enabled, only request teacher for tasks that are not "easy" by on-policy avg reward
+        tasks_for_teacher = tasks
+        if gate79_enable and tasks_skip_teacher:
+            tasks_for_teacher = [t for t in tasks if t.task_id not in tasks_skip_teacher]
         teacher_rollouts_map = self.exp_manager.get_teacher_rollouts_for_luffy_mixing(
-            tasks=tasks,
+            tasks=tasks_for_teacher,
             n_teacher_rollouts_per_task=self.n_teacher_rollouts_per_task,
         )
         
@@ -527,6 +587,12 @@ class LUFFYTeacherRolloutMixer:
             "total_onpolicy_replaced": 0,
             "total_teacher": 0,
             "expected_teacher_per_task": self.n_teacher_rollouts_per_task,
+            # 7.9 diagnostics
+            "difficulty_gate_79_enable": 1 if gate79_enable else 0,
+            "difficulty_gate_79_threshold": gate79_thr,
+            "difficulty_gate_79_metric": gate79_metric,
+            "difficulty_gate_79_min_onpolicy_rollouts": gate79_min_n,
+            "difficulty_gate_79_tasks_skipped_teacher": len(tasks_skip_teacher),
         }
         
         for task in tasks:
@@ -538,6 +604,11 @@ class LUFFYTeacherRolloutMixer:
             # 获取该 task 的 teacher CMT
             teacher_cmts = task_id_to_teacher.get(task_id, [])
             actual_teacher_count = len(teacher_cmts)
+
+            # ⭐ 7.9: force skip teacher for "easy" tasks (even if teacher trajectories exist)
+            if gate79_enable and task_id in tasks_skip_teacher:
+                teacher_cmts = []
+                actual_teacher_count = 0
             
             # 计算需要保留的 on-policy 数量
             n_onpolicy_to_keep = self.n_rollout - actual_teacher_count
@@ -574,6 +645,13 @@ class LUFFYTeacherRolloutMixer:
             f"{stats['tasks_with_partial_teacher']} partial, "
             f"{stats['tasks_without_teacher']} no teacher."
         )
+
+        if gate79_enable:
+            logger.info(
+                f"[LUFFYMixer][7.9] difficulty gate enabled: "
+                f"metric={gate79_metric}, thr={gate79_thr}, "
+                f"skipped_teacher_tasks={len(tasks_skip_teacher)}/{len(tasks)}"
+            )
         
         if actual_total != expected_total:
             logger.warning(

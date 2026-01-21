@@ -82,8 +82,8 @@ actor_rollout_ref:
     teacher_gap_beta_use_ema: true
     teacher_gap_beta_ema_decay: 0.9
     teacher_gap_beta_use_hysteresis: true
-    teacher_gap_beta_hysteresis_hi: 0.55
-    teacher_gap_beta_hysteresis_lo: 0.45
+    teacher_gap_beta_hysteresis_hi: 1.10
+    teacher_gap_beta_hysteresis_lo: 0.90
     # two-level beta
     teacher_gap_beta_beta_strong: 0.05
     teacher_gap_beta_beta_weak: 0.10

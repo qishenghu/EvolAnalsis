@@ -2597,6 +2597,13 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     "luffy/total_onpolicy_kept": luffy_stats.get("total_onpolicy_kept", 0),
                                     "luffy/onpolicy_replaced_by_teacher": luffy_stats.get("total_onpolicy_replaced", 0),
                                 })
+                                # ⭐ 7.9: difficulty-aware teacher mixing diagnostics (optional)
+                                if isinstance(luffy_stats, dict) and luffy_stats.get("difficulty_gate_79_enable", 0):
+                                    metrics.update({
+                                        "luffy79/threshold": luffy_stats.get("difficulty_gate_79_threshold", 0.0),
+                                        "luffy79/min_onpolicy_rollouts": luffy_stats.get("difficulty_gate_79_min_onpolicy_rollouts", 1),
+                                        "luffy79/tasks_skipped_teacher": luffy_stats.get("difficulty_gate_79_tasks_skipped_teacher", 0),
+                                    })
                                 
                             elif enable_exp_replay or enable_teacher_exp:
                                 # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐
@@ -3323,25 +3330,25 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                                 if gate_level != "group":
                                     # batch-level gate (backward compatible)
-                                    g = float(gap)
-                                    if ema_enable:
-                                        if getattr(self, "_teacher_gap_ema", None) is None:
-                                            self._teacher_gap_ema = g
-                                        else:
-                                            self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
-                                        g_eff = float(self._teacher_gap_ema)
+                                g = float(gap)
+                                if ema_enable:
+                                    if getattr(self, "_teacher_gap_ema", None) is None:
+                                        self._teacher_gap_ema = g
                                     else:
-                                        g_eff = g
+                                        self._teacher_gap_ema = ema_beta * float(self._teacher_gap_ema) + (1.0 - ema_beta) * g
+                                    g_eff = float(self._teacher_gap_ema)
+                                else:
+                                    g_eff = g
 
                                     alpha = _alpha_from_gap(g_eff)
-                                    batch.batch["teacher_loss_scale"] = torch.full(
-                                        (bs, resp_len), float(alpha), device=device, dtype=torch.float32
-                                    )
-                                    metrics["diag/teacher_loss_scale"] = float(alpha)
-                                    metrics["diag/teacher_gap_used"] = float(g_eff)
+                                batch.batch["teacher_loss_scale"] = torch.full(
+                                    (bs, resp_len), float(alpha), device=device, dtype=torch.float32
+                                )
+                                metrics["diag/teacher_loss_scale"] = float(alpha)
+                                metrics["diag/teacher_gap_used"] = float(g_eff)
                                     metrics["diag/teacher_gate_level"] = 0.0  # 1=group, 0=batch
-                                    if ema_enable:
-                                        metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
+                                if ema_enable:
+                                    metrics["diag/teacher_gap_ema"] = float(self._teacher_gap_ema) if self._teacher_gap_ema is not None else float("nan")
 
                         # ⭐ 保存 Trajectory 信息用于后续分析（放到 compute_advantage 后，包含 advantages）
                         if self.async_rollout_mode and trajectories:

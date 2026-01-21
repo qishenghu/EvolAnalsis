@@ -395,7 +395,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             and (not self.config.get("teacher_seq_beta_enable", False))  # 7.7 has higher priority
                         ):
                             teacher_policy_shaping_beta = float(gap_beta_override)
-
+                        
                         ret_dict = het_compute_teacher_aware_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,

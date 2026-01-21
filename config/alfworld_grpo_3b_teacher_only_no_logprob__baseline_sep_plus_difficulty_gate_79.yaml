@@ -1,0 +1,40 @@
+## 7.9 (Difficulty-aware teacher rollout mixing)
+## Goal: keep LUFFY policy shaping unchanged, but skip injecting teacher rollouts for "easy" tasks
+## Definition of "easy": on-policy avg reward across n_rollout rollouts for that task >= threshold
+##
+## Notes:
+## - This works only when teacher_experience.enable=true AND mix_mode=rollout_level
+## - Default reward metric is Reward.outcome (typically 0/1 in AlfWorld), so threshold=0.6 means >=60% success in the 8 rollouts
+## - This config is built on top of 7.1 baseline separation; other teacher gates are disabled.
+
+defaults:
+  - alfworld_grpo_3b_teacher_only_no_logprob__grpo_teacher_baseline_sep
+
+exp_manager:
+  teacher_experience:
+    enable: true
+    mix_mode: "rollout_level"
+    n_teacher_rollouts_per_task: 1
+
+    # ⭐ 7.9: difficulty gate
+    difficulty_gate_79:
+      enable: true
+      metric: "outcome"                  # Reward.outcome (0/1)
+      onpolicy_avg_reward_threshold: 0.5 # if avg >= thr => skip teacher for this task
+      min_onpolicy_rollouts: 1           # require at least N valid rollouts to compute avg
+
+  # make sure other experience replay components are off (if you want a clean comparison)
+  experience_replay:
+    enable: false
+
+# Disable other teacher gates/schedules (keep LUFFY shaping as-is, but no extra gates)
+seq_beta_77:
+  enable: false
+
+teacher_gap_beta_enable: false
+
+teacher_token_gate_enable: false
+teacher_adv_gate_enable: false
+teacher_entropy_gate_enable: false
+teacher_ag_pm_enable: false
+
