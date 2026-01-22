@@ -2613,7 +2613,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         "luffy79/onpolicy_avg_reward_p90": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_p90", float("nan")),
                                         "luffy79/onpolicy_avg_reward_min": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_min", float("nan")),
                                         "luffy79/onpolicy_avg_reward_max": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_max", float("nan")),
-                                    })
+                                })
                                 
                             elif enable_exp_replay or enable_teacher_exp:
                                 # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐

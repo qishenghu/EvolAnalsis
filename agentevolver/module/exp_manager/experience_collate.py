@@ -382,6 +382,8 @@ class LUFFYTeacherRolloutMixer:
         self.exp_manager = exp_manager
         self.n_teacher_rollouts_per_task = n_teacher_rollouts_per_task
         self.n_rollout = n_rollout
+        # one-time log guard for 7.9 config printing (terminal visibility)
+        self._difficulty_gate_79_logged = False
         
         # 验证配置
         if n_teacher_rollouts_per_task >= n_rollout:
@@ -472,11 +474,31 @@ class LUFFYTeacherRolloutMixer:
             teacher_exp_cfg = config.exp_manager.get("teacher_experience", {})
         except Exception:
             teacher_exp_cfg = {}
-        gate79 = teacher_exp_cfg.get("difficulty_gate_79", {}) if isinstance(teacher_exp_cfg, dict) else {}
+        # NOTE: config is often an OmegaConf DictConfig, not a plain dict.
+        # Avoid isinstance(..., dict) checks here; just best-effort .get().
+        gate79 = {}
+        try:
+            gate79 = teacher_exp_cfg.get("difficulty_gate_79", {}) if teacher_exp_cfg is not None else {}
+        except Exception:
+            gate79 = {}
         gate79_enable = bool(gate79.get("enable", False))
         gate79_thr = float(gate79.get("onpolicy_avg_reward_threshold", 0.6))
         gate79_metric = str(gate79.get("metric", "outcome")).strip()
         gate79_min_n = int(gate79.get("min_onpolicy_rollouts", 1))
+        if (not self._difficulty_gate_79_logged) and gate79_enable:
+            self._difficulty_gate_79_logged = True
+            logger.info(
+                "[LUFFYMixer][7.9] difficulty gate ENABLED: "
+                f"metric={gate79_metric}, thr={gate79_thr}, min_onpolicy_rollouts={gate79_min_n}, "
+                f"n_teacher_rollouts_per_task={self.n_teacher_rollouts_per_task}, n_rollout={self.n_rollout}"
+            )
+        elif (not self._difficulty_gate_79_logged) and (not gate79_enable):
+            # print once so it's obvious in terminal if config wasn't picked up
+            self._difficulty_gate_79_logged = True
+            logger.info(
+                "[LUFFYMixer][7.9] difficulty gate DISABLED (config not enabled or not found). "
+                f"(n_teacher_rollouts_per_task={self.n_teacher_rollouts_per_task}, n_rollout={self.n_rollout})"
+            )
 
         def _get_reward_scalar(cmt_obj, metric: str) -> Optional[float]:
             # primary: cmt.reward is a Reward(BaseModel) or dict
@@ -686,7 +708,7 @@ class LUFFYTeacherRolloutMixer:
                 f"[LUFFYMixer][7.9] difficulty gate enabled: "
                 f"metric={gate79_metric}, thr={gate79_thr}, "
                 f"skipped_teacher_tasks={len(tasks_skip_teacher)}/{len(tasks)}"
-            )
+        )
         
         if actual_total != expected_total:
             logger.warning(
