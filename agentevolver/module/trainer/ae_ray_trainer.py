@@ -2614,6 +2614,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         "luffy79/onpolicy_avg_reward_min": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_min", float("nan")),
                                         "luffy79/onpolicy_avg_reward_max": luffy_stats.get("difficulty_gate_79_onpolicy_avg_reward_max", float("nan")),
                                 })
+
+                                # ⭐ 7.10: step-based hard disable teacher rollouts after a given step (optional)
+                                if isinstance(luffy_stats, dict) and luffy_stats.get("disable_teacher_710_enable", 0):
+                                    metrics.update({
+                                        "luffy710/after_step": luffy_stats.get("disable_teacher_710_after_step", 50),
+                                        "luffy710/cur_step": luffy_stats.get("disable_teacher_710_cur_step", -1),
+                                        "luffy710/disabled": luffy_stats.get("disable_teacher_710_disabled", 0),
+                                    })
                                 
                             elif enable_exp_replay or enable_teacher_exp:
                                 # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐

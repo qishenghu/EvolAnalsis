@@ -384,6 +384,8 @@ class LUFFYTeacherRolloutMixer:
         self.n_rollout = n_rollout
         # one-time log guard for 7.9 config printing (terminal visibility)
         self._difficulty_gate_79_logged = False
+        # one-time log guard for 7.10 config printing (terminal visibility)
+        self._disable_teacher_710_logged = False
         
         # 验证配置
         if n_teacher_rollouts_per_task >= n_rollout:
@@ -442,6 +444,26 @@ class LUFFYTeacherRolloutMixer:
         """
         from collections import defaultdict
         from typing import Optional
+
+        def _get_global_step_from_cmts(cmts: List) -> Optional[int]:
+            # Prefer a consistent "step" value stored in CMT (common in our trajectory jsonl).
+            vals = []
+            for c in cmts:
+                v = None
+                if hasattr(c, "step") and getattr(c, "step") is not None:
+                    v = getattr(c, "step")
+                elif hasattr(c, "metadata") and isinstance(getattr(c, "metadata", None), dict):
+                    v = c.metadata.get("step", None)
+                if v is None:
+                    continue
+                try:
+                    vals.append(int(v))
+                except Exception:
+                    continue
+            if not vals:
+                return None
+            # Most of the time all cmts share the same step; take max to be safe.
+            return int(max(vals))
         
         # ⭐ 按 task_id 分组 on-policy CMT
         # 注意：CMT 对象的 task_id 属性存储的是真正的 task_id（如 "pick_cool_then_place..."）
@@ -467,13 +489,34 @@ class LUFFYTeacherRolloutMixer:
             if hasattr(cmt, 'data_id'):
                 data_id_to_task_id[str(cmt.data_id)] = task_id
 
-        # ⭐ 7.9: difficulty-aware teacher mixing (skip teacher if on-policy avg reward is high enough)
-        # Design goal: keep LUFFY shaping unchanged, but stop injecting teacher rollouts for "easy" tasks.
+        # ⭐ 7.10: simple step-based hard disable teacher rollouts after given step
         teacher_exp_cfg = {}
         try:
             teacher_exp_cfg = config.exp_manager.get("teacher_experience", {})
         except Exception:
             teacher_exp_cfg = {}
+        gate710 = {}
+        try:
+            gate710 = teacher_exp_cfg.get("disable_teacher_710", {}) if teacher_exp_cfg is not None else {}
+        except Exception:
+            gate710 = {}
+        gate710_enable = bool(gate710.get("enable", False))
+        gate710_after_step = int(gate710.get("after_step", 50))
+        cur_step = _get_global_step_from_cmts(on_policy_cmt_array)
+        teacher_disabled_710 = bool(gate710_enable and (cur_step is not None) and (cur_step >= gate710_after_step))
+        if not self._disable_teacher_710_logged:
+            self._disable_teacher_710_logged = True
+            if gate710_enable:
+                logger.info(
+                    "[LUFFYMixer][7.10] step-based teacher disable ENABLED: "
+                    f"after_step={gate710_after_step}, cur_step={cur_step}"
+                )
+            else:
+                logger.info("[LUFFYMixer][7.10] step-based teacher disable DISABLED (not enabled or not found).")
+
+        # ⭐ 7.9: difficulty-aware teacher mixing (skip teacher if on-policy avg reward is high enough)
+        # Design goal: keep LUFFY shaping unchanged, but stop injecting teacher rollouts for "easy" tasks.
+        # teacher_exp_cfg already loaded above (for 7.10); keep backward-compatible fallback
         # NOTE: config is often an OmegaConf DictConfig, not a plain dict.
         # Avoid isinstance(..., dict) checks here; just best-effort .get().
         gate79 = {}
@@ -546,8 +589,11 @@ class LUFFYTeacherRolloutMixer:
         logger.debug(f"[LUFFYMixer] on-policy counts per task: {[len(v) for v in list(task_id_to_onpolicy.values())[:5]]}...")
         
         # 获取每个 task 的 teacher rollouts（Trajectory 对象）
+        # ⭐ 7.10: if teacher disabled, request none
         # ⭐ 7.9: if enabled, only request teacher for tasks that are not "easy" by on-policy avg reward
         tasks_for_teacher = tasks
+        if teacher_disabled_710:
+            tasks_for_teacher = []
         if gate79_enable and tasks_skip_teacher:
             tasks_for_teacher = [t for t in tasks if t.task_id not in tasks_skip_teacher]
         teacher_rollouts_map = self.exp_manager.get_teacher_rollouts_for_luffy_mixing(
@@ -636,6 +682,11 @@ class LUFFYTeacherRolloutMixer:
             "total_onpolicy_replaced": 0,
             "total_teacher": 0,
             "expected_teacher_per_task": self.n_teacher_rollouts_per_task,
+            # 7.10 diagnostics
+            "disable_teacher_710_enable": 1 if gate710_enable else 0,
+            "disable_teacher_710_after_step": gate710_after_step,
+            "disable_teacher_710_cur_step": cur_step if cur_step is not None else -1,
+            "disable_teacher_710_disabled": 1 if teacher_disabled_710 else 0,
             # 7.9 diagnostics
             "difficulty_gate_79_enable": 1 if gate79_enable else 0,
             "difficulty_gate_79_threshold": gate79_thr,

@@ -1110,9 +1110,6 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         # Finalize per-step aggregated grad_dir metrics (log once per update_policy call)
         # ------------------------------------------------------------------
         try:
-            # Always emit the full grad_dir schema every step so that distributed metric reduction
-            # (which may keep only intersecting keys) won't drop ln/proj fields when some ranks
-            # have no teacher samples.
             grad_dir_default = {
                 # IMPORTANT: keep defaults finite. Some distributed reducers drop NaN keys entirely.
                 # Use `valid` flags to indicate whether the values are meaningful.
@@ -1148,7 +1145,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 "grad_dir/flat/layer_max": 0.0,
                 "grad_dir/flat/layer_count": 0.0,
             }
-            append_to_dict(metrics, grad_dir_default)
+            # NOTE: Do NOT append defaults separately: `append_to_dict` accumulates multiple values
+            # per key within a step and the downstream reducer takes means, which would dilute
+            # (e.g., valid=0.5, vec_dim halved). Instead, build a single output dict and append once.
+            grad_dir_out = dict(grad_dir_default)
 
             # Compute global sample counts first (avoid per-rank dilution in distributed metric reduction).
             # These are used to decide whether cosine is meaningful at the *global step* level.
@@ -1176,31 +1176,24 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     on_samples_global = float(os_.detach().cpu().item())
             except Exception:
                 pass
-            append_to_dict(
-                metrics,
-                {
-                    "grad_dir/teacher_samples_global": float(teacher_samples_global),
-                    "grad_dir/on_samples_global": float(on_samples_global),
-                },
-            )
+            grad_dir_out["grad_dir/teacher_samples_global"] = float(teacher_samples_global)
+            grad_dir_out["grad_dir/on_samples_global"] = float(on_samples_global)
 
             if not grad_dir_enable:
-                append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": 4.0})  # disabled
+                grad_dir_out["grad_dir/recorded"] = 0.0
+                grad_dir_out["grad_dir/missing_reason"] = 4.0  # disabled
             elif not grad_dir_should_run:
-                append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": 3.0})  # interval skip
+                grad_dir_out["grad_dir/recorded"] = 0.0
+                grad_dir_out["grad_dir/missing_reason"] = 3.0  # interval skip
             elif not grad_dir_step.get("run", False):
                 # selection/accumulation failed
                 mr = float(grad_dir_step.get("missing_reason", 5.0))
-                append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": mr})
+                grad_dir_out["grad_dir/recorded"] = 0.0
+                grad_dir_out["grad_dir/missing_reason"] = mr
             elif teacher_samples_global <= 0.0:
-                append_to_dict(
-                    metrics,
-                    {
-                        "grad_dir/recorded": 0.0,
-                        "grad_dir/missing_reason": 2.0,  # no teacher in this step
-                        "grad_dir/aggregate_micro_batches": 1.0,
-                    },
-                )
+                grad_dir_out["grad_dir/recorded"] = 0.0
+                grad_dir_out["grad_dir/missing_reason"] = 2.0  # no teacher in this step
+                grad_dir_out["grad_dir/aggregate_micro_batches"] = 1.0
             else:
                 def _finalize_probe(prefix: str, acc, params):
                     if acc is None or params is None or len(params) == 0:
@@ -1289,11 +1282,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 out["grad_dir/flat/layer_max"] = float(grad_dir_step.get("flat_layer_max", 0.0))
                 out["grad_dir/flat/layer_count"] = float(grad_dir_step.get("flat_layer_count", 0.0))
 
-                # Attach already-computed global sample counts (so panels stay simple)
-                out["grad_dir/teacher_samples_global"] = float(teacher_samples_global)
-                out["grad_dir/on_samples_global"] = float(on_samples_global)
+                grad_dir_out.update(out)
 
-                append_to_dict(metrics, out)
+            append_to_dict(metrics, grad_dir_out)
         except Exception:
             # never break training
             pass
