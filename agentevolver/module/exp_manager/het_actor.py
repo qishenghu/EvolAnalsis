@@ -471,6 +471,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         grad_dir_union_params = None
         grad_dir_union_idx_ln = None
         grad_dir_union_idx_proj = None
+        grad_dir_union_idx_flat = None
         grad_dir_union_acc = None  # {"on":[...], "te":[...]}
 
         if grad_dir_step["run"]:
@@ -574,6 +575,20 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 grad_dir_union_params = union
                 grad_dir_union_idx_ln = idx_ln
                 grad_dir_union_idx_proj = idx_proj
+                grad_dir_union_idx_flat = []
+
+                # Fallback for FSDP use_orig_params=False:
+                # named_parameters may only expose flat_param(s), making ln/proj substring matching impossible.
+                # In that case, use last-K flat_param tensors as a "flat" probe.
+                if (not grad_dir_union_params) and bool(self.config.get("teacher_grad_dir_diag_allow_flat_param", True)):
+                    flat = [(n, p) for (n, p) in named_params if ("flat_param" in str(n)) and p is not None and p.requires_grad]
+                    if flat:
+                        k = int(self.config.get("teacher_grad_dir_diag_flat_last_k", 2))
+                        k = max(1, k)
+                        flat_sel = flat[-k:]
+                        for (_n, p) in flat_sel:
+                            _add([p], grad_dir_union_idx_flat)
+                        grad_dir_union_params = union
 
                 if grad_dir_union_params:
                     grad_dir_union_acc = {
@@ -1032,6 +1047,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 "grad_dir/proj/norm_teacher": 0.0,
                 "grad_dir/proj/param_count": 0.0,
                 "grad_dir/proj/vec_dim": 0.0,
+                # FSDP flat-param probe (works even when use_orig_params=False)
+                "grad_dir/flat/valid": 0.0,
+                "grad_dir/flat/cos": 0.0,
+                "grad_dir/flat/dot": 0.0,
+                "grad_dir/flat/norm_on": 0.0,
+                "grad_dir/flat/norm_teacher": 0.0,
+                "grad_dir/flat/param_count": 0.0,
+                "grad_dir/flat/vec_dim": 0.0,
             }
             append_to_dict(metrics, grad_dir_default)
 
@@ -1082,22 +1105,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     "grad_dir/missing_reason": 0.0,
                     "grad_dir/aggregate_micro_batches": 1.0,
                 }
-                # IMPORTANT (multi-GPU correctness):
-                # We want cosine of the GLOBAL per-step gradients in the probe subspace:
-                #   cos( sum_r g_on^r , sum_r g_te^r )
-                # This requires all-reducing the probe gradient *vectors* (not only dot/norm scalars),
-                # otherwise cross-rank cross-terms are missed.
-                try:
-                    import torch.distributed as dist
-                    if dist.is_available() and dist.is_initialized() and grad_dir_union_acc is not None:
-                        for t in grad_dir_union_acc.get("on", []):
-                            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                        for t in grad_dir_union_acc.get("te", []):
-                            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-                except Exception:
-                    pass
-
-                # Finalize from union accumulators using index maps
+                # Finalize from union accumulators using index maps.
+                # Under FSDP, parameters are sharded; the correct global dot/norm is obtained by
+                # summing per-rank shard contributions (scalar all_reduce), NOT by all-reducing vectors.
                 def _finalize_from_union(prefix: str, idxs: list[int]):
                     if grad_dir_union_acc is None or grad_dir_union_params is None or (not idxs):
                         return {}
@@ -1112,6 +1122,16 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         n_on2 = n_on2 + (go * go).sum()
                         n_te2 = n_te2 + (gt * gt).sum()
                         vec_dim += int(go.numel())
+
+                    # Global reduction across ranks (sum shard contributions)
+                    try:
+                        import torch.distributed as dist
+                        if dist.is_available() and dist.is_initialized():
+                            dist.all_reduce(dot, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(n_on2, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(n_te2, op=dist.ReduceOp.SUM)
+                    except Exception:
+                        pass
 
                     n_on = torch.sqrt(n_on2 + 1e-12)
                     n_te = torch.sqrt(n_te2 + 1e-12)
@@ -1128,6 +1148,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
                 out.update(_finalize_from_union("ln", list(grad_dir_union_idx_ln or [])))
                 out.update(_finalize_from_union("proj", list(grad_dir_union_idx_proj or [])))
+                out.update(_finalize_from_union("flat", list(grad_dir_union_idx_flat or [])))
 
                 # Global sample counts (avoid confusion with per-rank counts).
                 try:
