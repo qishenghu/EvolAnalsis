@@ -1012,6 +1012,29 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         # Finalize per-step aggregated grad_dir metrics (log once per update_policy call)
         # ------------------------------------------------------------------
         try:
+            # Always emit the full grad_dir schema every step so that distributed metric reduction
+            # (which may keep only intersecting keys) won't drop ln/proj fields when some ranks
+            # have no teacher samples.
+            grad_dir_default = {
+                # IMPORTANT: keep defaults finite. Some distributed reducers drop NaN keys entirely.
+                # Use `valid` flags to indicate whether the values are meaningful.
+                "grad_dir/ln/valid": 0.0,
+                "grad_dir/ln/cos": 0.0,
+                "grad_dir/ln/dot": 0.0,
+                "grad_dir/ln/norm_on": 0.0,
+                "grad_dir/ln/norm_teacher": 0.0,
+                "grad_dir/ln/param_count": 0.0,
+                "grad_dir/ln/vec_dim": 0.0,
+                "grad_dir/proj/valid": 0.0,
+                "grad_dir/proj/cos": 0.0,
+                "grad_dir/proj/dot": 0.0,
+                "grad_dir/proj/norm_on": 0.0,
+                "grad_dir/proj/norm_teacher": 0.0,
+                "grad_dir/proj/param_count": 0.0,
+                "grad_dir/proj/vec_dim": 0.0,
+            }
+            append_to_dict(metrics, grad_dir_default)
+
             if not grad_dir_enable:
                 append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": 4.0})  # disabled
             elif not grad_dir_should_run:
@@ -1078,10 +1101,26 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         n_on2 = n_on2 + (go * go).sum()
                         n_te2 = n_te2 + (gt * gt).sum()
                         vec_dim += int(go.numel())
+
+                    # IMPORTANT (multi-GPU correctness):
+                    # We want cosine of the GLOBAL per-step gradients, i.e.,
+                    #   cos( sum_r g_on^r , sum_r g_te^r )
+                    # not mean_r cos(g_on^r, g_te^r).
+                    # So we all-reduce dot and norms across ranks before computing cosine.
+                    try:
+                        import torch.distributed as dist
+                        if dist.is_available() and dist.is_initialized():
+                            dist.all_reduce(dot, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(n_on2, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(n_te2, op=dist.ReduceOp.SUM)
+                    except Exception:
+                        pass
+
                     n_on = torch.sqrt(n_on2 + 1e-12)
                     n_te = torch.sqrt(n_te2 + 1e-12)
                     cos = dot / (n_on * n_te + 1e-12)
                     return {
+                        f"grad_dir/{prefix}/valid": 1.0,
                         f"grad_dir/{prefix}/cos": float(cos.detach().cpu().item()),
                         f"grad_dir/{prefix}/dot": float(dot.detach().cpu().item()),
                         f"grad_dir/{prefix}/norm_on": float(n_on.detach().cpu().item()),
@@ -1092,6 +1131,27 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
                 out.update(_finalize_from_union("ln", list(grad_dir_union_idx_ln or [])))
                 out.update(_finalize_from_union("proj", list(grad_dir_union_idx_proj or [])))
+
+                # Make sample counts global-consistent too (helpful sanity checks).
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        _dev = None
+                        try:
+                            _dev = grad_dir_union_acc["on"][0].device if (grad_dir_union_acc is not None and len(grad_dir_union_acc.get("on", [])) > 0) else None
+                        except Exception:
+                            _dev = None
+                        if _dev is None:
+                            _dev = torch.device("cpu")
+                        ts = torch.tensor(float(grad_dir_step.get("teacher_samples", 0)), device=_dev)
+                        os_ = torch.tensor(float(grad_dir_step.get("on_samples", 0)), device=_dev)
+                        dist.all_reduce(ts, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(os_, op=dist.ReduceOp.SUM)
+                        out["grad_dir/teacher_samples_global"] = float(ts.detach().cpu().item())
+                        out["grad_dir/on_samples_global"] = float(os_.detach().cpu().item())
+                except Exception:
+                    pass
+
                 append_to_dict(metrics, out)
         except Exception:
             # never break training
