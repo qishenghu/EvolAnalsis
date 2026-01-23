@@ -1101,21 +1101,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         n_on2 = n_on2 + (go * go).sum()
                         n_te2 = n_te2 + (gt * gt).sum()
                         vec_dim += int(go.numel())
-
-                    # IMPORTANT (multi-GPU correctness):
-                    # We want cosine of the GLOBAL per-step gradients, i.e.,
-                    #   cos( sum_r g_on^r , sum_r g_te^r )
-                    # not mean_r cos(g_on^r, g_te^r).
-                    # So we all-reduce dot and norms across ranks before computing cosine.
-                    try:
-                        import torch.distributed as dist
-                        if dist.is_available() and dist.is_initialized():
-                            dist.all_reduce(dot, op=dist.ReduceOp.SUM)
-                            dist.all_reduce(n_on2, op=dist.ReduceOp.SUM)
-                            dist.all_reduce(n_te2, op=dist.ReduceOp.SUM)
-                    except Exception:
-                        pass
-
+                    # NOTE: no all_reduce here! We will all_reduce globally outside in a rank-synchronized way
+                    # to avoid deadlocks when some ranks have 0 teacher samples.
                     n_on = torch.sqrt(n_on2 + 1e-12)
                     n_te = torch.sqrt(n_te2 + 1e-12)
                     cos = dot / (n_on * n_te + 1e-12)
@@ -1129,8 +1116,70 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         f"grad_dir/{prefix}/vec_dim": float(vec_dim),
                     }
 
-                out.update(_finalize_from_union("ln", list(grad_dir_union_idx_ln or [])))
-                out.update(_finalize_from_union("proj", list(grad_dir_union_idx_proj or [])))
+                # ---------------------------
+                # Multi-GPU correctness fix:
+                # Compute global cosine by all-reducing dot/norm^2 across ranks.
+                # IMPORTANT: all ranks must execute these collectives in the same order,
+                # otherwise deadlocks may occur.
+                # ---------------------------
+                try:
+                    import torch.distributed as dist
+                    dist_ok = bool(dist.is_available() and dist.is_initialized())
+                except Exception:
+                    dist_ok = False
+
+                # pick a device for reduction
+                _dev = None
+                try:
+                    _dev = grad_dir_union_acc["on"][0].device if (grad_dir_union_acc is not None and len(grad_dir_union_acc.get("on", [])) > 0) else None
+                except Exception:
+                    _dev = None
+                if _dev is None:
+                    _dev = torch.device("cpu")
+
+                def _local_dot_norm2(idxs: list[int]):
+                    dot = torch.tensor(0.0, device=_dev, dtype=torch.float32)
+                    n_on2 = torch.tensor(0.0, device=_dev, dtype=torch.float32)
+                    n_te2 = torch.tensor(0.0, device=_dev, dtype=torch.float32)
+                    vec_dim = 0
+                    if grad_dir_union_acc is None or (not idxs):
+                        return dot, n_on2, n_te2, vec_dim
+                    for j in idxs:
+                        go = grad_dir_union_acc["on"][j]
+                        gt = grad_dir_union_acc["te"][j]
+                        dot = dot + (go * gt).sum()
+                        n_on2 = n_on2 + (go * go).sum()
+                        n_te2 = n_te2 + (gt * gt).sum()
+                        vec_dim += int(go.numel())
+                    return dot, n_on2, n_te2, vec_dim
+
+                idx_ln = list(grad_dir_union_idx_ln or [])
+                idx_proj = list(grad_dir_union_idx_proj or [])
+                dot_ln, n_on2_ln, n_te2_ln, vec_ln = _local_dot_norm2(idx_ln)
+                dot_pr, n_on2_pr, n_te2_pr, vec_pr = _local_dot_norm2(idx_proj)
+
+                # Always all-reduce in fixed order when dist is initialized
+                if dist_ok:
+                    for t in (dot_ln, n_on2_ln, n_te2_ln, dot_pr, n_on2_pr, n_te2_pr):
+                        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
+                # compute global cosines
+                def _pack(prefix: str, dot, n_on2, n_te2, vec_dim: int, param_count: int):
+                    n_on = torch.sqrt(n_on2 + 1e-12)
+                    n_te = torch.sqrt(n_te2 + 1e-12)
+                    cos = dot / (n_on * n_te + 1e-12)
+                    return {
+                        f"grad_dir/{prefix}/valid": 1.0 if param_count > 0 else 0.0,
+                        f"grad_dir/{prefix}/cos": float(cos.detach().cpu().item()) if param_count > 0 else 0.0,
+                        f"grad_dir/{prefix}/dot": float(dot.detach().cpu().item()) if param_count > 0 else 0.0,
+                        f"grad_dir/{prefix}/norm_on": float(n_on.detach().cpu().item()) if param_count > 0 else 0.0,
+                        f"grad_dir/{prefix}/norm_teacher": float(n_te.detach().cpu().item()) if param_count > 0 else 0.0,
+                        f"grad_dir/{prefix}/param_count": float(param_count),
+                        f"grad_dir/{prefix}/vec_dim": float(vec_dim),
+                    }
+
+                out.update(_pack("ln", dot_ln, n_on2_ln, n_te2_ln, vec_ln, len(idx_ln)))
+                out.update(_pack("proj", dot_pr, n_on2_pr, n_te2_pr, vec_pr, len(idx_proj)))
 
                 # Make sample counts global-consistent too (helpful sanity checks).
                 try:
