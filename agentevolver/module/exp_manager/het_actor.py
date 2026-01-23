@@ -468,6 +468,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         grad_dir_acc_proj = None
         grad_dir_params_ln = None
         grad_dir_params_proj = None
+        grad_dir_union_params = None
+        grad_dir_union_idx_ln = None
+        grad_dir_union_idx_proj = None
+        grad_dir_union_acc = None  # {"on":[...], "te":[...]}
 
         if grad_dir_step["run"]:
             try:
@@ -547,13 +551,35 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 grad_dir_params_ln = [p for (_n, p) in sel_ln]
                 grad_dir_params_proj = [p for (_n, p) in sel_proj]
 
-                def _init_acc(params: list[torch.Tensor]):
-                    on = [torch.zeros_like(p, dtype=torch.float32) for p in params]
-                    te = [torch.zeros_like(p, dtype=torch.float32) for p in params]
-                    return {"on": on, "te": te}
+                # Build union param list to avoid repeated autograd.grad calls per probe.
+                # Keep stable order: ln params then proj params, de-duplicated by id().
+                union: list[torch.Tensor] = []
+                idx_ln: list[int] = []
+                idx_proj: list[int] = []
+                seen: dict[int, int] = {}
 
-                grad_dir_acc_ln = _init_acc(grad_dir_params_ln) if grad_dir_params_ln else None
-                grad_dir_acc_proj = _init_acc(grad_dir_params_proj) if grad_dir_params_proj else None
+                def _add(ps: list[torch.Tensor], out_idx: list[int]):
+                    for p in ps:
+                        pid = id(p)
+                        if pid in seen:
+                            out_idx.append(seen[pid])
+                            continue
+                        seen[pid] = len(union)
+                        out_idx.append(len(union))
+                        union.append(p)
+
+                _add(list(grad_dir_params_ln or []), idx_ln)
+                _add(list(grad_dir_params_proj or []), idx_proj)
+
+                grad_dir_union_params = union
+                grad_dir_union_idx_ln = idx_ln
+                grad_dir_union_idx_proj = idx_proj
+
+                if grad_dir_union_params:
+                    grad_dir_union_acc = {
+                        "on": [torch.zeros_like(p, dtype=torch.float32) for p in grad_dir_union_params],
+                        "te": [torch.zeros_like(p, dtype=torch.float32) for p in grad_dir_union_params],
+                    }
             except Exception:
                 grad_dir_step["run"] = False
                 grad_dir_step["missing_reason"] = 5.0
@@ -851,27 +877,34 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             # count samples (sanity check)
                             em = exp_mask
                             if em is not None and torch.is_tensor(em):
-                                is_off = (em.sum(dim=-1) > 0)
-                                grad_dir_step["on_samples"] += int((~is_off).sum().item())
+                                is_off = (em.sum(dim=-1) > 0)  # (bs,)
+                                is_on = ~is_off
+                                grad_dir_step["on_samples"] += int(is_on.sum().item())
                             if has_teacher_data and (teacher_mask is not None) and torch.is_tensor(teacher_mask):
                                 grad_dir_step["teacher_samples"] += int((teacher_mask.sum(dim=-1) > 0).sum().item())
 
-                            def _accumulate(acc, params, loss_on, loss_te, has_te: bool):
-                                if acc is None or params is None or len(params) == 0:
-                                    return
-                                g_on = torch.autograd.grad(loss_on, params, retain_graph=True, allow_unused=True)
-                                if has_te and (loss_te is not None) and torch.is_tensor(loss_te):
-                                    g_te = torch.autograd.grad(loss_te, params, retain_graph=True, allow_unused=True)
-                                else:
-                                    g_te = [None] * len(params)
-                                for i, (go, gt) in enumerate(zip(g_on, g_te)):
-                                    if go is not None:
-                                        acc["on"][i].add_(go.detach().float())
-                                    if gt is not None:
-                                        acc["te"][i].add_(gt.detach().float())
+                            # Accumulate per-step gradients on a small union parameter subset:
+                            # - Only accumulate g_on on ON-policy samples (avoid undefined on_pg_loss on teacher-only micro-batches).
+                            # - Only accumulate g_teacher on TEACHER samples.
+                            if grad_dir_union_acc is not None and grad_dir_union_params is not None and len(grad_dir_union_params) > 0:
+                                has_on = False
+                                try:
+                                    has_on = bool((is_on.sum().item() > 0))
+                                except Exception:
+                                    has_on = False
+                                has_te = bool(has_teacher_data and (teacher_off_pg_loss is not None) and torch.is_tensor(teacher_off_pg_loss))
 
-                            _accumulate(grad_dir_acc_ln, grad_dir_params_ln, on_pg_loss, teacher_off_pg_loss, bool(has_teacher_data))
-                            _accumulate(grad_dir_acc_proj, grad_dir_params_proj, on_pg_loss, teacher_off_pg_loss, bool(has_teacher_data))
+                                if has_on and (on_pg_loss is not None) and torch.is_tensor(on_pg_loss):
+                                    g_on = torch.autograd.grad(on_pg_loss, grad_dir_union_params, retain_graph=True, allow_unused=True)
+                                    for i, go in enumerate(g_on):
+                                        if go is not None:
+                                            grad_dir_union_acc["on"][i].add_(go.detach().float())
+
+                                if has_te:
+                                    g_te = torch.autograd.grad(teacher_off_pg_loss, grad_dir_union_params, retain_graph=True, allow_unused=True)
+                                    for i, gt in enumerate(g_te):
+                                        if gt is not None:
+                                            grad_dir_union_acc["te"][i].add_(gt.detach().float())
                         except Exception:
                             # don't break training; mark as failed
                             grad_dir_step["run"] = False
@@ -1030,8 +1063,35 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     "grad_dir/teacher_samples": float(grad_dir_step.get("teacher_samples", 0)),
                     "grad_dir/on_samples": float(grad_dir_step.get("on_samples", 0)),
                 }
-                out.update(_finalize_probe("ln", grad_dir_acc_ln, grad_dir_params_ln))
-                out.update(_finalize_probe("proj", grad_dir_acc_proj, grad_dir_params_proj))
+                # Finalize from union accumulators using index maps
+                def _finalize_from_union(prefix: str, idxs: list[int]):
+                    if grad_dir_union_acc is None or grad_dir_union_params is None or (not idxs):
+                        return {}
+                    dot = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
+                    n_on2 = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
+                    n_te2 = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
+                    vec_dim = 0
+                    for j in idxs:
+                        go = grad_dir_union_acc["on"][j]
+                        gt = grad_dir_union_acc["te"][j]
+                        dot = dot + (go * gt).sum()
+                        n_on2 = n_on2 + (go * go).sum()
+                        n_te2 = n_te2 + (gt * gt).sum()
+                        vec_dim += int(go.numel())
+                    n_on = torch.sqrt(n_on2 + 1e-12)
+                    n_te = torch.sqrt(n_te2 + 1e-12)
+                    cos = dot / (n_on * n_te + 1e-12)
+                    return {
+                        f"grad_dir/{prefix}/cos": float(cos.detach().cpu().item()),
+                        f"grad_dir/{prefix}/dot": float(dot.detach().cpu().item()),
+                        f"grad_dir/{prefix}/norm_on": float(n_on.detach().cpu().item()),
+                        f"grad_dir/{prefix}/norm_teacher": float(n_te.detach().cpu().item()),
+                        f"grad_dir/{prefix}/param_count": float(len(idxs)),
+                        f"grad_dir/{prefix}/vec_dim": float(vec_dim),
+                    }
+
+                out.update(_finalize_from_union("ln", list(grad_dir_union_idx_ln or [])))
+                out.update(_finalize_from_union("proj", list(grad_dir_union_idx_proj or [])))
                 append_to_dict(metrics, out)
         except Exception:
             # never break training
