@@ -77,6 +77,9 @@ actor_rollout_ref:
     off_policy_shaping_mode: "exgrpo_policy_shaping"
     off_policy_shaping_beta: 0.1
 
+    # ⭐ Gradient direction analysis (disabled - not supported under FSDP multi-GPU)
+    teacher_grad_dir_diag_enable: false
+
     # ⭐ Teacher Experience Loss Configuration (LUFFY)
     teacher_use_log_prob: ${exp_manager.teacher_experience.use_log_prob}
     teacher_policy_shaping_enable: ${exp_manager.teacher_experience.policy_shaping.enable}

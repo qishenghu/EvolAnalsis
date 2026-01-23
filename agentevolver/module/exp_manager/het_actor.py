@@ -82,8 +82,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         (e.g., lm_head) to keep overhead manageable under FSDP/large models.
         """
         try:
-            # Default ON: this is an analysis-oriented repo; allow users to disable if needed.
-            if not bool(self.config.get("teacher_grad_dir_diag_enable", True)):
+            # Default OFF: gradient direction analysis is expensive and not supported under FSDP multi-GPU.
+            # Set teacher_grad_dir_diag_enable: true in config to enable.
+            if not bool(self.config.get("teacher_grad_dir_diag_enable", False)):
                 return
             if (not has_teacher_data) or (teacher_off_pg_loss is None) or (on_pg_loss is None):
                 return
@@ -443,7 +444,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         # - Stable and matches "per-step" semantics; independent of micro-batch ordering.
         # - Avoids the earlier pitfall where teacher might not be in micro-batch 0.
         # ------------------------------------------------------------------
-        grad_dir_enable = bool(self.config.get("teacher_grad_dir_diag_enable", True))
+        grad_dir_enable = bool(self.config.get("teacher_grad_dir_diag_enable", False))
         grad_dir_interval = int(self.config.get("teacher_grad_dir_diag_interval", 1))
         grad_dir_interval = max(1, grad_dir_interval)
         grad_dir_should_run = False
