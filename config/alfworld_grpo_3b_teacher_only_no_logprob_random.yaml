@@ -121,6 +121,8 @@ actor_rollout_ref:
     fsdp_config:
       param_offload: true
       optimizer_offload: true
+      # ⭐ Needed for grad_dir probes: keep original parameter structure/names (avoid flat_param-only)
+      use_orig_params: true
   rollout:
     use_qwen3: false
     enable_request_id: false

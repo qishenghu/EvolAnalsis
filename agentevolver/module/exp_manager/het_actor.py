@@ -1049,8 +1049,6 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     {
                         "grad_dir/recorded": 0.0,
                         "grad_dir/missing_reason": 2.0,  # no teacher in this step
-                        "grad_dir/teacher_samples": float(grad_dir_step.get("teacher_samples", 0)),
-                        "grad_dir/on_samples": float(grad_dir_step.get("on_samples", 0)),
                         "grad_dir/aggregate_micro_batches": 1.0,
                     },
                 )
@@ -1083,9 +1081,22 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     "grad_dir/recorded": 1.0,
                     "grad_dir/missing_reason": 0.0,
                     "grad_dir/aggregate_micro_batches": 1.0,
-                    "grad_dir/teacher_samples": float(grad_dir_step.get("teacher_samples", 0)),
-                    "grad_dir/on_samples": float(grad_dir_step.get("on_samples", 0)),
                 }
+                # IMPORTANT (multi-GPU correctness):
+                # We want cosine of the GLOBAL per-step gradients in the probe subspace:
+                #   cos( sum_r g_on^r , sum_r g_te^r )
+                # This requires all-reducing the probe gradient *vectors* (not only dot/norm scalars),
+                # otherwise cross-rank cross-terms are missed.
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized() and grad_dir_union_acc is not None:
+                        for t in grad_dir_union_acc.get("on", []):
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                        for t in grad_dir_union_acc.get("te", []):
+                            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+                except Exception:
+                    pass
+
                 # Finalize from union accumulators using index maps
                 def _finalize_from_union(prefix: str, idxs: list[int]):
                     if grad_dir_union_acc is None or grad_dir_union_params is None or (not idxs):
@@ -1101,8 +1112,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         n_on2 = n_on2 + (go * go).sum()
                         n_te2 = n_te2 + (gt * gt).sum()
                         vec_dim += int(go.numel())
-                    # NOTE: no all_reduce here! We will all_reduce globally outside in a rank-synchronized way
-                    # to avoid deadlocks when some ranks have 0 teacher samples.
+
                     n_on = torch.sqrt(n_on2 + 1e-12)
                     n_te = torch.sqrt(n_te2 + 1e-12)
                     cos = dot / (n_on * n_te + 1e-12)
@@ -1116,72 +1126,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         f"grad_dir/{prefix}/vec_dim": float(vec_dim),
                     }
 
-                # ---------------------------
-                # Multi-GPU correctness fix:
-                # Compute global cosine by all-reducing dot/norm^2 across ranks.
-                # IMPORTANT: all ranks must execute these collectives in the same order,
-                # otherwise deadlocks may occur.
-                # ---------------------------
-                try:
-                    import torch.distributed as dist
-                    dist_ok = bool(dist.is_available() and dist.is_initialized())
-                except Exception:
-                    dist_ok = False
+                out.update(_finalize_from_union("ln", list(grad_dir_union_idx_ln or [])))
+                out.update(_finalize_from_union("proj", list(grad_dir_union_idx_proj or [])))
 
-                # pick a device for reduction
-                _dev = None
-                try:
-                    _dev = grad_dir_union_acc["on"][0].device if (grad_dir_union_acc is not None and len(grad_dir_union_acc.get("on", [])) > 0) else None
-                except Exception:
-                    _dev = None
-                if _dev is None:
-                    _dev = torch.device("cpu")
-
-                def _local_dot_norm2(idxs: list[int]):
-                    dot = torch.tensor(0.0, device=_dev, dtype=torch.float32)
-                    n_on2 = torch.tensor(0.0, device=_dev, dtype=torch.float32)
-                    n_te2 = torch.tensor(0.0, device=_dev, dtype=torch.float32)
-                    vec_dim = 0
-                    if grad_dir_union_acc is None or (not idxs):
-                        return dot, n_on2, n_te2, vec_dim
-                    for j in idxs:
-                        go = grad_dir_union_acc["on"][j]
-                        gt = grad_dir_union_acc["te"][j]
-                        dot = dot + (go * gt).sum()
-                        n_on2 = n_on2 + (go * go).sum()
-                        n_te2 = n_te2 + (gt * gt).sum()
-                        vec_dim += int(go.numel())
-                    return dot, n_on2, n_te2, vec_dim
-
-                idx_ln = list(grad_dir_union_idx_ln or [])
-                idx_proj = list(grad_dir_union_idx_proj or [])
-                dot_ln, n_on2_ln, n_te2_ln, vec_ln = _local_dot_norm2(idx_ln)
-                dot_pr, n_on2_pr, n_te2_pr, vec_pr = _local_dot_norm2(idx_proj)
-
-                # Always all-reduce in fixed order when dist is initialized
-                if dist_ok:
-                    for t in (dot_ln, n_on2_ln, n_te2_ln, dot_pr, n_on2_pr, n_te2_pr):
-                        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-
-                # compute global cosines
-                def _pack(prefix: str, dot, n_on2, n_te2, vec_dim: int, param_count: int):
-                    n_on = torch.sqrt(n_on2 + 1e-12)
-                    n_te = torch.sqrt(n_te2 + 1e-12)
-                    cos = dot / (n_on * n_te + 1e-12)
-                    return {
-                        f"grad_dir/{prefix}/valid": 1.0 if param_count > 0 else 0.0,
-                        f"grad_dir/{prefix}/cos": float(cos.detach().cpu().item()) if param_count > 0 else 0.0,
-                        f"grad_dir/{prefix}/dot": float(dot.detach().cpu().item()) if param_count > 0 else 0.0,
-                        f"grad_dir/{prefix}/norm_on": float(n_on.detach().cpu().item()) if param_count > 0 else 0.0,
-                        f"grad_dir/{prefix}/norm_teacher": float(n_te.detach().cpu().item()) if param_count > 0 else 0.0,
-                        f"grad_dir/{prefix}/param_count": float(param_count),
-                        f"grad_dir/{prefix}/vec_dim": float(vec_dim),
-                    }
-
-                out.update(_pack("ln", dot_ln, n_on2_ln, n_te2_ln, vec_ln, len(idx_ln)))
-                out.update(_pack("proj", dot_pr, n_on2_pr, n_te2_pr, vec_pr, len(idx_proj)))
-
-                # Make sample counts global-consistent too (helpful sanity checks).
+                # Global sample counts (avoid confusion with per-rank counts).
                 try:
                     import torch.distributed as dist
                     if dist.is_available() and dist.is_initialized():
@@ -1198,8 +1146,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         dist.all_reduce(os_, op=dist.ReduceOp.SUM)
                         out["grad_dir/teacher_samples_global"] = float(ts.detach().cpu().item())
                         out["grad_dir/on_samples_global"] = float(os_.detach().cpu().item())
+                    else:
+                        out["grad_dir/teacher_samples_global"] = float(grad_dir_step.get("teacher_samples", 0))
+                        out["grad_dir/on_samples_global"] = float(grad_dir_step.get("on_samples", 0))
                 except Exception:
-                    pass
+                    out["grad_dir/teacher_samples_global"] = float(grad_dir_step.get("teacher_samples", 0))
+                    out["grad_dir/on_samples_global"] = float(grad_dir_step.get("on_samples", 0))
 
                 append_to_dict(metrics, out)
         except Exception:

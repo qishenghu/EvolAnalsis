@@ -347,11 +347,23 @@ class HETActorRolloutRefWorker(Worker):
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
+            # Allow enabling `use_orig_params` for analysis/debugging (keeps original parameter names instead of flat_param).
+            # Default remains False to preserve current memory/perf behavior.
+            use_orig_params = False
+            try:
+                # prefer nested config: actor.fsdp_config.use_orig_params
+                use_orig_params = bool(getattr(self.config.actor.fsdp_config, "use_orig_params", False))
+            except Exception:
+                try:
+                    # backward-compatible: fsdp_config dict may contain the key
+                    use_orig_params = bool(fsdp_config.get("use_orig_params", False))
+                except Exception:
+                    use_orig_params = False
             actor_module_fsdp = FSDP(
                 actor_module,
                 cpu_offload=cpu_offload,
                 param_init_fn=init_fn,
-                use_orig_params=False,
+                use_orig_params=use_orig_params,
                 auto_wrap_policy=auto_wrap_policy,
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
