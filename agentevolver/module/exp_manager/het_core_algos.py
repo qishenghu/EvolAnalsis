@@ -142,9 +142,27 @@ def het_compute_token_on_off_policy_loss(
         pg_losses3 = -advantages * clip_ratio_c
         clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
         pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-        clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-        clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
+        # NOTE:
+        # - clipfrac (upper): where the clipped surrogate is chosen over unclipped (PPO-style max)
+        # - clipfrac_lower: where the "extreme" safety clipping is active for negative advantages
+        upper_hit = torch.gt(pg_losses2, pg_losses1)
+        lower_hit = torch.gt(clip_pg_losses1, pg_losses3) & (advantages < 0)
+        clipfrac = verl_F.masked_mean(upper_hit.float(), response_mask)
+        clipfrac_lower = verl_F.masked_mean(lower_hit.float(), response_mask)
         return pg_losses, clipfrac, clipfrac_lower
+
+    def compute_cliphit_rate(cliprange_low, cliprange_high, token_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Combined clip hit rate = P(upper clip hit OR lower/extreme clip hit) over tokens in token_mask.
+        """
+        pg_losses1 = -advantages * ratio
+        pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+        clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+        pg_losses3 = -advantages * clip_ratio_c
+        upper_hit = torch.gt(pg_losses2, pg_losses1)
+        lower_hit = torch.gt(clip_pg_losses1, pg_losses3) & (advantages < 0)
+        cliphit = upper_hit | lower_hit
+        return verl_F.masked_mean(cliphit.float(), token_mask)
 
     # On-policy calculations
     if cliprange_low is None:
@@ -153,6 +171,9 @@ def het_compute_token_on_off_policy_loss(
         cliprange_high = cliprange
     on_pg_losses, on_pg_clipfrac, on_pg_clipfrac_lower = compute_pg_losses(cliprange_low, cliprange_high)
     on_pg_loss = verl_F.masked_mean(on_pg_losses, (1.0 - exp_mask) * response_mask)  # ⭐ Compute the on-policy loss
+    # Cliphit rate for ON-policy tokens only (avoid off-policy dilution)
+    on_policy_mask = (1.0 - exp_mask) * response_mask
+    on_pg_cliphit_rate = compute_cliphit_rate(cliprange_low, cliprange_high, on_policy_mask)
 
     # Off-policy calculations
     if off_policy_shaping_mode == "exgrpo_policy_shaping":
@@ -173,6 +194,7 @@ def het_compute_token_on_off_policy_loss(
         # No clipping for off-policy when using policy shaping
         off_pg_clipfrac = torch.tensor(0.0)
         off_pg_clipfrac_lower = torch.tensor(0.0)
+        off_pg_cliphit_rate = torch.tensor(0.0)
         
         # Compute off-policy loss (only on LLM response tokens in multi-turn)
         off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)
@@ -184,6 +206,8 @@ def het_compute_token_on_off_policy_loss(
         off_pg_losses, off_pg_clipfrac, off_pg_clipfrac_lower = compute_pg_losses(off_cliprange_low, off_cliprange_high)
         off_pg_loss = verl_F.masked_mean(off_pg_losses, exp_mask * response_mask)  # ⭐ Compute the off-policy loss
         off_pg_loss = torch.tensor(0.0) if off_pg_loss.isnan().item() else off_pg_loss
+        off_policy_mask = exp_mask * response_mask
+        off_pg_cliphit_rate = compute_cliphit_rate(off_cliprange_low, off_cliprange_high, off_policy_mask)
     else:
         raise ValueError(f"Invalid off_policy_shaping_mode: {off_policy_shaping_mode}. Must be 'exgrpo_policy_shaping' or 'higher_clip_bound'")
 
@@ -201,6 +225,9 @@ def het_compute_token_on_off_policy_loss(
         "off_pg_loss": off_pg_loss,
         "on_pg_clipfrac": on_pg_clipfrac,
         "on_pg_clipfrac_lower": on_pg_clipfrac_lower,
+        # ⭐ New: combined clip-hit rate (upper OR lower) on on/off tokens
+        "on_pg_cliphit_rate": on_pg_cliphit_rate,
+        "off_pg_cliphit_rate": off_pg_cliphit_rate,
         "ppo_kl": ppo_kl,
         # ⭐ Endogenous replay diagnostics (logged by het_actor.py)
         "exp_replay_diag_stats": exp_replay_diag_stats,
@@ -327,12 +354,16 @@ def het_compute_teacher_aware_loss(
     on_clip_pg_losses2 = torch.min(on_pg_losses3, on_clip_pg_losses1)
     on_pg_losses = torch.where(advantages < 0, on_clip_pg_losses2, on_clip_pg_losses1)
     
-    on_pg_clipfrac = verl_F.masked_mean(torch.gt(on_pg_losses2, on_pg_losses1).float(), response_mask)
-    on_pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(on_clip_pg_losses1, on_pg_losses3) * (advantages < 0).float(), response_mask
-    )
+    on_upper_hit = torch.gt(on_pg_losses2, on_pg_losses1)
+    on_lower_hit = torch.gt(on_clip_pg_losses1, on_pg_losses3) & (advantages < 0)
+    on_pg_clipfrac = verl_F.masked_mean(on_upper_hit.float(), response_mask)
+    on_pg_clipfrac_lower = verl_F.masked_mean(on_lower_hit.float(), response_mask)
+    # combined (upper OR lower) clip-hit rate
+    on_pg_cliphit_rate_all = on_upper_hit | on_lower_hit
     
     on_pg_loss = verl_F.masked_mean(on_pg_losses, (1.0 - exp_mask) * response_mask)
+    on_policy_mask = (1.0 - exp_mask) * response_mask
+    on_pg_cliphit_rate = verl_F.masked_mean(on_pg_cliphit_rate_all.float(), on_policy_mask)
     
     # =============== Self-generated off-policy loss ===============
     # 使用现有的 off_policy_shaping_mode
@@ -340,10 +371,14 @@ def het_compute_teacher_aware_loss(
         self_off_ratio = ratio
         self_off_ratio_shaped = self_off_ratio / (self_off_ratio + off_policy_shaping_beta)
         self_off_pg_losses = -advantages * self_off_ratio_shaped
+        self_off_pg_cliphit_rate = torch.tensor(0.0, device=log_prob.device)
     else:  # higher_clip_bound
         self_off_pg_losses1 = -advantages * ratio
         self_off_pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + off_cliprange_high)
         self_off_pg_losses = torch.maximum(self_off_pg_losses1, self_off_pg_losses2)
+        self_upper_hit = torch.gt(self_off_pg_losses2, self_off_pg_losses1)
+        self_exp_mask_local = exp_mask * (1.0 - teacher_mask_float)
+        self_off_pg_cliphit_rate = verl_F.masked_mean(self_upper_hit.float(), self_exp_mask_local * response_mask)
     
     # =============== Teacher off-policy loss（LUFFY） ===============
     teacher_mask_float = teacher_mask.float()
@@ -532,8 +567,11 @@ def het_compute_teacher_aware_loss(
     if teacher_use_clip:
         teacher_off_pg_losses2 = -advantages * torch.clamp(teacher_ratio, 1 - cliprange_low, 1 + off_cliprange_high)
         teacher_off_pg_losses = torch.maximum(teacher_off_pg_losses_raw, teacher_off_pg_losses2)
+        teacher_upper_hit = torch.gt(teacher_off_pg_losses2, teacher_off_pg_losses_raw)
+        teacher_off_pg_cliphit_mask = teacher_upper_hit
     else:
         teacher_off_pg_losses = teacher_off_pg_losses_raw  # 不 clip
+        teacher_off_pg_cliphit_mask = torch.zeros_like(response_mask, dtype=torch.bool)
     
     # =============== 混合 off-policy loss ===============
     # 根据 teacher_mask 选择使用哪种 off-policy loss
@@ -555,6 +593,10 @@ def het_compute_teacher_aware_loss(
     teacher_exp_mask = exp_mask * teacher_mask_float
     teacher_off_pg_loss = verl_F.masked_mean(teacher_off_pg_losses, teacher_exp_mask * response_mask)
     teacher_off_pg_loss = torch.tensor(0.0, device=log_prob.device) if teacher_off_pg_loss.isnan().item() else teacher_off_pg_loss
+    teacher_off_pg_cliphit_rate = verl_F.masked_mean(
+        teacher_off_pg_cliphit_mask.float(),
+        teacher_exp_mask * response_mask,
+    )
 
     # =============== 诊断指标：ratio / advantage 分布（用于分析 teacher 影响） ===============
     # 说明：
@@ -693,6 +735,10 @@ def het_compute_teacher_aware_loss(
         "teacher_diag_traj_values": teacher_diag_traj_values,
         "on_pg_clipfrac": on_pg_clipfrac,
         "on_pg_clipfrac_lower": on_pg_clipfrac_lower,
+        # ⭐ New: combined clip-hit rates
+        "on_pg_cliphit_rate": on_pg_cliphit_rate,
+        "self_off_pg_cliphit_rate": self_off_pg_cliphit_rate,
+        "teacher_off_pg_cliphit_rate": teacher_off_pg_cliphit_rate,
         "ppo_kl": ppo_kl,
     }
 
@@ -1047,6 +1093,11 @@ def dapo_compute_policy_loss(
         on_policy_mask
     )
     clipfrac_lower = torch.tensor(0.0) if clipfrac_lower.isnan().item() else clipfrac_lower
+    cliphit = torch.tensor(0.0, device=log_prob.device)
+    try:
+        cliphit = torch.clamp(clipfrac_upper + clipfrac_lower, 0.0, 1.0)
+    except Exception:
+        cliphit = torch.tensor(0.0, device=log_prob.device)
     
     # Count tokens where DAPO relaxed clipping (A < 0, allowing more freedom)
     entropy_bonus_tokens = verl_F.masked_mean((advantages < 0).float(), response_mask)
@@ -1056,6 +1107,7 @@ def dapo_compute_policy_loss(
         "pg_losses": pg_losses,
         "pg_clipfrac": clipfrac_upper,
         "pg_clipfrac_lower": clipfrac_lower,
+        "pg_cliphit_rate": cliphit,
         "ppo_kl": ppo_kl,
         "entropy_bonus_tokens": entropy_bonus_tokens,
         # Separate on/off-policy losses for monitoring

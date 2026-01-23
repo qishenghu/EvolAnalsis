@@ -96,6 +96,26 @@ actor_rollout_ref:
     # teacher_use_clip: Teacher 轨迹是否使用 clipping
     # LUFFY 论文建议不使用 clipping，以充分利用 teacher 信号
     teacher_use_clip: false
+
+    # ⭐ Gradient-direction diagnostics (teacher vs on-policy)
+    # Default is ON in codebase; keep explicit here to guarantee visibility in WandB & local logs.
+    teacher_grad_dir_diag_enable: true
+    # Try stage: record every step
+    teacher_grad_dir_diag_interval: 1
+    # Prefer small parameters; avoid vocab-tied / embedding / lm_head.
+    teacher_grad_dir_diag_max_param_numel: 200000
+    teacher_grad_dir_diag_max_params: 4
+    teacher_grad_dir_diag_param_name_excludes: ["lm_head", "embed", "wte", "word_embeddings", "tok_embeddings", "token_embeddings", "shared"]
+    # Two-probe default: LN probe + behavior-related projection probe
+    teacher_grad_dir_diag_param_name_contains_ln: ["norm", "ln", "layernorm"]
+    # NOTE: Qwen2.5-3B 的 o_proj/down_proj 权重矩阵很大（会被 max_param_numel 过滤掉），
+    # 试验阶段用 attention 的 bias 作为轻量“行为探针”。
+    teacher_grad_dir_diag_param_name_contains_proj: ["q_proj.bias", "k_proj.bias", "v_proj.bias"]
+    # ⭐ Layer filtering: behavior probe only uses the last K layers (more behavior-related, cheaper)
+    teacher_grad_dir_diag_layer_filter_mode_proj: "last_k"
+    teacher_grad_dir_diag_last_k_proj: 2
+    # LN probe keeps all layers by default (can switch to last_k if you want)
+    teacher_grad_dir_diag_layer_filter_mode_ln: "all"
     
     use_dapo: false
     fsdp_config:

@@ -62,6 +62,211 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         self._gap_beta_ema: float | None = None
         self._gap_beta_state: float | None = None  # hysteresis state: current beta value
         self._gap_beta_updates: int = 0
+        # Teacher-vs-onpolicy gradient direction diagnostics (default disabled)
+        self._teacher_grad_dir_diag_updates: int = 0
+
+    def _maybe_log_teacher_onpolicy_grad_dir(
+        self,
+        *,
+        on_pg_loss: torch.Tensor,
+        teacher_off_pg_loss: torch.Tensor,
+        has_teacher_data: bool,
+        append_fn,
+    ) -> None:
+        """
+        Optional diagnostics: compare gradient directions induced by
+        - on-policy policy gradient loss (on_pg_loss)
+        - teacher policy gradient loss (teacher_off_pg_loss)
+
+        We approximate the full gradient vector by selecting a small subset of parameters
+        (e.g., lm_head) to keep overhead manageable under FSDP/large models.
+        """
+        try:
+            # Default ON: this is an analysis-oriented repo; allow users to disable if needed.
+            if not bool(self.config.get("teacher_grad_dir_diag_enable", True)):
+                return
+            if (not has_teacher_data) or (teacher_off_pg_loss is None) or (on_pg_loss is None):
+                return
+            if (not torch.is_tensor(on_pg_loss)) or (not torch.is_tensor(teacher_off_pg_loss)):
+                return
+
+            # Computing autograd.grad twice can be expensive; default to a moderate interval.
+            # (Metrics can still be logged every step by reusing the most recent computed values if desired.)
+            interval = int(self.config.get("teacher_grad_dir_diag_interval", 20))
+            interval = max(1, interval)
+            if (self._teacher_grad_dir_diag_updates % interval) != 0:
+                self._teacher_grad_dir_diag_updates += 1
+                return
+            self._teacher_grad_dir_diag_updates += 1
+
+            # Avoid vocab-tied / embedding / lm_head parameters by default:
+            # they are huge and can be dominated by token-frequency effects, and are expensive under FSDP.
+            name_excludes = self.config.get(
+                "teacher_grad_dir_diag_param_name_excludes",
+                [
+                    "lm_head",
+                    "embed",
+                    "wte",
+                    "word_embeddings",
+                    "tok_embeddings",
+                    "token_embeddings",
+                    "shared",
+                    "output_embedding",
+                ],
+            )
+            if isinstance(name_excludes, str):
+                name_excludes = [name_excludes]
+            name_excludes = [str(s) for s in name_excludes if str(s)]
+
+            max_param_numel = int(self.config.get("teacher_grad_dir_diag_max_param_numel", 200_000))
+            max_param_numel = max(1, max_param_numel)
+            max_params = int(self.config.get("teacher_grad_dir_diag_max_params", 4))
+            max_params = max(1, min(32, max_params))
+
+            named_params = [(n, p) for n, p in self.actor_module.named_parameters() if p is not None and p.requires_grad]
+
+            # Parse layer index from common LLM naming patterns:
+            # - model.layers.{i}.*
+            # - layers.{i}.*
+            def _extract_layer_idx(name: str) -> int | None:
+                try:
+                    import re
+                    m = re.search(r"(?:^|\\.)model\\.layers\\.(\\d+)\\.", name)
+                    if m:
+                        return int(m.group(1))
+                    m = re.search(r"(?:^|\\.)layers\\.(\\d+)\\.", name)
+                    if m:
+                        return int(m.group(1))
+                except Exception:
+                    return None
+                return None
+
+            # Determine last layer index present in this model (best-effort).
+            layer_idxs = []
+            for n, _p in named_params:
+                li = _extract_layer_idx(str(n))
+                if li is not None:
+                    layer_idxs.append(li)
+            max_layer_idx = max(layer_idxs) if layer_idxs else None
+
+            def _select_params(
+                include_substr: list[str],
+                probe_max_params: int,
+                *,
+                layer_filter_mode: str = "all",
+                last_k: int = 2,
+            ) -> list[tuple[str, torch.Tensor]]:
+                include_substr = [str(s) for s in include_substr if str(s)]
+                # size + exclude filters
+                cand = []
+                for n, p in named_params:
+                    try:
+                        if int(p.numel()) > max_param_numel:
+                            continue
+                    except Exception:
+                        continue
+                    if name_excludes and any(x in n for x in name_excludes):
+                        continue
+                    # optional layer filtering
+                    lf = str(layer_filter_mode).lower().strip()
+                    if lf in ("last_k", "last", "tail") and max_layer_idx is not None:
+                        k = int(last_k) if int(last_k) > 0 else 2
+                        li = _extract_layer_idx(str(n))
+                        if li is not None:
+                            if li < (int(max_layer_idx) - k + 1):
+                                continue
+                        else:
+                            # keep non-layer params (e.g., final norms) by default
+                            pass
+                    cand.append((n, p))
+                # include filter
+                if include_substr:
+                    cand2 = [(n, p) for (n, p) in cand if any(s in n for s in include_substr)]
+                else:
+                    cand2 = cand
+                if not cand2:
+                    cand2 = cand
+                # pick smallest
+                cand2 = sorted(cand2, key=lambda x: int(x[1].numel()))[:probe_max_params]
+                return cand2
+
+            def _compute_probe(probe_name: str, include_substr: list[str]) -> dict[str, float] | None:
+                # Per-probe layer filtering
+                if probe_name == "proj":
+                    lf = self.config.get("teacher_grad_dir_diag_layer_filter_mode_proj", "last_k")
+                    lk = int(self.config.get("teacher_grad_dir_diag_last_k_proj", 2))
+                else:
+                    lf = self.config.get("teacher_grad_dir_diag_layer_filter_mode_ln", "all")
+                    lk = int(self.config.get("teacher_grad_dir_diag_last_k_ln", 2))
+                sel = _select_params(
+                    include_substr=include_substr,
+                    probe_max_params=max_params,
+                    layer_filter_mode=lf,
+                    last_k=lk,
+                )
+                params = [p for (_, p) in sel]
+                if not params:
+                    return None
+                g_on = torch.autograd.grad(on_pg_loss, params, retain_graph=True, allow_unused=True)
+                g_te = torch.autograd.grad(teacher_off_pg_loss, params, retain_graph=True, allow_unused=True)
+
+                def _pack(gs):
+                    chunks = []
+                    for g in gs:
+                        if g is None:
+                            continue
+                        chunks.append(g.detach().reshape(-1).float())
+                    if not chunks:
+                        return None
+                    return torch.cat(chunks, dim=0)
+
+                v_on = _pack(g_on)
+                v_te = _pack(g_te)
+                if v_on is None or v_te is None:
+                    return None
+                eps = 1e-12
+                dot = (v_on * v_te).sum()
+                n_on = torch.linalg.vector_norm(v_on)
+                n_te = torch.linalg.vector_norm(v_te)
+                cos = dot / (n_on * n_te + eps)
+                out = {
+                    f"grad_dir/{probe_name}/cos": float(cos.item()),
+                    f"grad_dir/{probe_name}/dot": float(dot.item()),
+                    f"grad_dir/{probe_name}/norm_on": float(n_on.item()),
+                    f"grad_dir/{probe_name}/norm_teacher": float(n_te.item()),
+                    f"grad_dir/{probe_name}/param_count": float(len(params)),
+                    f"grad_dir/{probe_name}/vec_dim": float(v_on.numel()),
+                }
+                return out
+
+            # Two-probe default:
+            # - ln: cheap stability probe
+            # - proj: more behavior-related small matrices (still filtered by max_param_numel)
+            ln_contains = self.config.get("teacher_grad_dir_diag_param_name_contains_ln", ["norm", "ln", "layernorm"])
+            # Behavior-related lightweight probe:
+            # - For many LLMs (incl. Qwen2.5-3B), projection weights (o_proj/down_proj) are huge and may be filtered by
+            #   max_param_numel. Biases are much smaller and still reflect behavior-related updates.
+            proj_contains = self.config.get("teacher_grad_dir_diag_param_name_contains_proj", ["q_proj.bias", "k_proj.bias", "v_proj.bias", "o_proj.bias", "down_proj.bias"])
+            if isinstance(ln_contains, str):
+                ln_contains = [ln_contains]
+            if isinstance(proj_contains, str):
+                proj_contains = [proj_contains]
+
+            out_all: dict[str, float] = {
+                "grad_dir/interval": float(interval),
+                "grad_dir/max_param_numel": float(max_param_numel),
+            }
+            o1 = _compute_probe("ln", list(ln_contains))
+            if o1:
+                out_all.update(o1)
+            o2 = _compute_probe("proj", list(proj_contains))
+            if o2:
+                out_all.update(o2)
+            if len(out_all) > 2:
+                append_fn(out_all)
+        except Exception:
+            # diagnostics must never break training
+            return
 
     def _gap_beta_scheduler(
         self,
@@ -277,7 +482,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 except Exception:
                     gap_beta_override, gap_beta_diag = None, {}
 
-                for data in micro_batches:
+                for micro_idx, data in enumerate(micro_batches):
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
@@ -477,6 +682,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     off_pg_loss = ret_dict["off_pg_loss"]
                     on_pg_clipfrac = ret_dict["on_pg_clipfrac"]
                     on_pg_clipfrac_lower = ret_dict["on_pg_clipfrac_lower"]
+                    on_pg_cliphit_rate = ret_dict.get("on_pg_cliphit_rate", None)
+                    off_pg_cliphit_rate = ret_dict.get("off_pg_cliphit_rate", None)
+                    self_off_pg_cliphit_rate = ret_dict.get("self_off_pg_cliphit_rate", None)
+                    teacher_off_pg_cliphit_rate = ret_dict.get("teacher_off_pg_cliphit_rate", None)
                     ppo_kl = ret_dict["ppo_kl"]
                     # ⭐ Teacher Experience: 提取 teacher-specific metrics（如果有）
                     self_off_pg_loss = ret_dict.get("self_off_pg_loss")
@@ -507,6 +716,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
+
+                    # Optional: teacher vs on-policy gradient direction diagnostics (run once per mini-batch)
+                    if micro_idx == 0:
+                        self._maybe_log_teacher_onpolicy_grad_dir(
+                            on_pg_loss=on_pg_loss,
+                            teacher_off_pg_loss=teacher_off_pg_loss,
+                            has_teacher_data=has_teacher_data,
+                            append_fn=lambda d: append_to_dict(metrics, {f"{k}": v for k, v in d.items()}),
+                        )
                     loss.backward()  # ⭐ Backpropagate the loss
 
                     ##################
@@ -519,6 +737,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         "actor/on_pg_loss": on_pg_loss.detach().item(),
                         "actor/off_pg_loss": off_pg_loss.detach().item(),
                     }
+                    # ⭐ Surrogate clipping diagnostics (clip hit rate / distortion strength proxy)
+                    if on_pg_cliphit_rate is not None and torch.is_tensor(on_pg_cliphit_rate):
+                        data["actor/on_pg_cliphit_rate"] = on_pg_cliphit_rate.detach().float().item()
+                    if off_pg_cliphit_rate is not None and torch.is_tensor(off_pg_cliphit_rate):
+                        data["actor/off_pg_cliphit_rate"] = off_pg_cliphit_rate.detach().float().item()
+                    if self_off_pg_cliphit_rate is not None and torch.is_tensor(self_off_pg_cliphit_rate):
+                        data["actor/self_off_pg_cliphit_rate"] = self_off_pg_cliphit_rate.detach().float().item()
+                    if teacher_off_pg_cliphit_rate is not None and torch.is_tensor(teacher_off_pg_cliphit_rate):
+                        data["actor/teacher_off_pg_cliphit_rate"] = teacher_off_pg_cliphit_rate.detach().float().item()
                     # ⭐ Teacher Experience: 添加 teacher 专属 metrics
                     if self_off_pg_loss is not None:
                         data["actor/self_off_pg_loss"] = self_off_pg_loss.detach().item()

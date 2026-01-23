@@ -3445,6 +3445,69 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)  # ⭐ Update the actor with the new batch
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        # ------------------------------------------------------------------
+                        # ⭐ Gradient-direction diagnostics (teacher vs on-policy)
+                        # Ensure it is visible both in WandB (via metrics) and in local analysis logs.
+                        # - WandB: already handled by tracker.log(data=metrics)
+                        # - Local: write/merge into Trajectory/batch_diag_step_{step}.json
+                        #          and also dump a small grad_dir_{step}.json under rollout_log.
+                        # ------------------------------------------------------------------
+                        try:
+                            grad_dir_metrics = {k: v for k, v in metrics.items() if isinstance(k, str) and k.startswith("grad_dir/")}
+                            # Surrogate distortion diagnostics (clip hit / clipfrac)
+                            clip_metrics = {
+                                k: v
+                                for k, v in metrics.items()
+                                if isinstance(k, str)
+                                and (
+                                    k.startswith("actor/on_pg_clip")
+                                    or k.startswith("actor/off_pg_clip")
+                                    or k.startswith("actor/self_off_pg_clip")
+                                    or k.startswith("actor/teacher_off_pg_clip")
+                                )
+                            }
+                            local_metrics = {}
+                            local_metrics.update(grad_dir_metrics)
+                            local_metrics.update(clip_metrics)
+
+                            if local_metrics:
+                                # 1) trajectory analysis summary (overwrite/merge)
+                                trajectory_save_dir = self.config.trainer.get("trajectory_save_dir", None)
+                                if trajectory_save_dir is None:
+                                    trajectory_save_dir = self.config.trainer.get("default_local_dir", "checkpoints")
+                                if trajectory_save_dir:
+                                    trajectory_dir = os.path.join(str(trajectory_save_dir), "Trajectory")
+                                    os.makedirs(trajectory_dir, exist_ok=True)
+                                    summary_path = os.path.join(trajectory_dir, f"batch_diag_step_{self.global_steps}.json")
+                                    merged = {}
+                                    if os.path.exists(summary_path):
+                                        try:
+                                            with open(summary_path, "r", encoding="utf-8") as f:
+                                                merged = json.load(f) or {}
+                                        except Exception:
+                                            merged = {}
+                                    if not isinstance(merged, dict):
+                                        merged = {}
+                                    merged.update(local_metrics)
+                                    with open(summary_path, "w", encoding="utf-8") as f:
+                                        json.dump(merged, f, ensure_ascii=False, indent=2)
+
+                                # 2) rollout_log dumps (easy to find alongside traj_{step}.jsonl)
+                                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                                if rollout_data_dir:
+                                    os.makedirs(rollout_data_dir, exist_ok=True)
+                                    if grad_dir_metrics:
+                                        gd_path = os.path.join(str(rollout_data_dir), f"grad_dir_{self.global_steps}.json")
+                                        with open(gd_path, "w", encoding="utf-8") as f:
+                                            json.dump(grad_dir_metrics, f, ensure_ascii=False, indent=2)
+                                    if clip_metrics:
+                                        cm_path = os.path.join(str(rollout_data_dir), f"clip_metrics_{self.global_steps}.json")
+                                        with open(cm_path, "w", encoding="utf-8") as f:
+                                            json.dump(clip_metrics, f, ensure_ascii=False, indent=2)
+                        except Exception:
+                            # must never break training
+                            pass
                     
                     # collect summary tasks
                     if summary_task is not None:
