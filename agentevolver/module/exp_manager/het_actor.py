@@ -477,6 +477,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         if grad_dir_step["run"]:
             try:
                 import re
+                from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
 
                 def _extract_layer_idx(name: str) -> int | None:
                     m = re.search(r"(?:^|\\.)model\\.layers\\.(\\d+)\\.", name)
@@ -577,6 +578,44 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 grad_dir_union_idx_proj = idx_proj
                 grad_dir_union_idx_flat = []
 
+                # Best-effort mapping for FSDP flat_param -> which original param FQNs / layer indices it contains.
+                # Works even with use_orig_params=False, but relies on internal FSDP handle attrs (may vary by torch version).
+                flat_meta: dict[int, dict[str, float]] = {}
+                try:
+                    fsdp_mods = [m for m in self.actor_module.modules() if isinstance(m, _FSDP)]
+                    for m in fsdp_mods:
+                        h = getattr(m, "_handle", None)
+                        fp = None
+                        if h is not None:
+                            fp = getattr(h, "flat_param", None)
+                        if fp is None:
+                            # some versions attach flat_param directly
+                            fp = getattr(m, "flat_param", None)
+                        if fp is None:
+                            continue
+                        fqns = None
+                        if h is not None:
+                            fqns = getattr(h, "_fqns", None) or getattr(h, "fqns", None)
+                        if fqns is None:
+                            fqns = getattr(fp, "_fqns", None)
+                        li_list: list[int] = []
+                        if fqns is not None:
+                            try:
+                                for q in list(fqns):
+                                    li = _extract_layer_idx(str(q))
+                                    if li is not None:
+                                        li_list.append(int(li))
+                            except Exception:
+                                li_list = []
+                        if li_list:
+                            flat_meta[id(fp)] = {
+                                "layer_min": float(min(li_list)),
+                                "layer_max": float(max(li_list)),
+                                "layer_count": float(len(set(li_list))),
+                            }
+                except Exception:
+                    flat_meta = {}
+
                 # Fallback for FSDP use_orig_params=False:
                 # named_parameters may only expose flat_param(s), making ln/proj substring matching impossible.
                 # In that case, use last-K flat_param tensors as a "flat" probe.
@@ -585,10 +624,54 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     if flat:
                         k = int(self.config.get("teacher_grad_dir_diag_flat_last_k", 2))
                         k = max(1, k)
-                        flat_sel = flat[-k:]
+                        pick_mode = str(self.config.get("teacher_grad_dir_diag_flat_pick_mode", "last_k")).lower().strip()
+                        if pick_mode in ("smallest_k", "min_k"):
+                            flat_sel = sorted(flat, key=lambda x: int(x[1].numel()))[:k]
+                        elif pick_mode in ("layer_last_k", "layer_tail_k"):
+                            # Prefer flat_params that contain the last-K transformer layers, if we can infer layer indices.
+                            last_layers_k = int(self.config.get("teacher_grad_dir_diag_flat_last_k_layers", 2))
+                            last_layers_k = max(1, last_layers_k)
+                            # estimate model max layer idx from whatever names we have
+                            max_li = max_layer_idx
+                            if max_li is None and flat_meta:
+                                max_li = int(max(v.get("layer_max", 0.0) for v in flat_meta.values()))
+                            if max_li is not None and flat_meta:
+                                keep_min = int(max_li) - int(last_layers_k) + 1
+                                cand = []
+                                for n, p in flat:
+                                    meta = flat_meta.get(id(p), None)
+                                    if meta is None:
+                                        continue
+                                    if int(meta.get("layer_max", -1.0)) >= keep_min:
+                                        cand.append((n, p))
+                                flat_sel = cand[-k:] if cand else flat[-k:]
+                            else:
+                                flat_sel = flat[-k:]
+                        else:
+                            # default: last_k
+                            flat_sel = flat[-k:]
                         for (_n, p) in flat_sel:
                             _add([p], grad_dir_union_idx_flat)
                         grad_dir_union_params = union
+
+                        # store a compact summary for logging (layer min/max/count across selected flat params)
+                        try:
+                            mins = []
+                            maxs = []
+                            cnts = []
+                            for (_n, p) in flat_sel:
+                                meta = flat_meta.get(id(p), None)
+                                if meta is None:
+                                    continue
+                                mins.append(int(meta.get("layer_min", 0.0)))
+                                maxs.append(int(meta.get("layer_max", 0.0)))
+                                cnts.append(int(meta.get("layer_count", 0.0)))
+                            if mins and maxs:
+                                grad_dir_step["flat_layer_min"] = float(min(mins))
+                                grad_dir_step["flat_layer_max"] = float(max(maxs))
+                                grad_dir_step["flat_layer_count"] = float(sum(cnts))
+                        except Exception:
+                            pass
 
                 if grad_dir_union_params:
                     grad_dir_union_acc = {
@@ -1040,6 +1123,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 "grad_dir/ln/norm_teacher": 0.0,
                 "grad_dir/ln/param_count": 0.0,
                 "grad_dir/ln/vec_dim": 0.0,
+                "grad_dir/ln/abs_mean_on": 0.0,
+                "grad_dir/ln/abs_mean_teacher": 0.0,
                 "grad_dir/proj/valid": 0.0,
                 "grad_dir/proj/cos": 0.0,
                 "grad_dir/proj/dot": 0.0,
@@ -1047,6 +1132,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 "grad_dir/proj/norm_teacher": 0.0,
                 "grad_dir/proj/param_count": 0.0,
                 "grad_dir/proj/vec_dim": 0.0,
+                "grad_dir/proj/abs_mean_on": 0.0,
+                "grad_dir/proj/abs_mean_teacher": 0.0,
                 # FSDP flat-param probe (works even when use_orig_params=False)
                 "grad_dir/flat/valid": 0.0,
                 "grad_dir/flat/cos": 0.0,
@@ -1055,8 +1142,47 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 "grad_dir/flat/norm_teacher": 0.0,
                 "grad_dir/flat/param_count": 0.0,
                 "grad_dir/flat/vec_dim": 0.0,
+                "grad_dir/flat/abs_mean_on": 0.0,
+                "grad_dir/flat/abs_mean_teacher": 0.0,
+                "grad_dir/flat/layer_min": 0.0,
+                "grad_dir/flat/layer_max": 0.0,
+                "grad_dir/flat/layer_count": 0.0,
             }
             append_to_dict(metrics, grad_dir_default)
+
+            # Compute global sample counts first (avoid per-rank dilution in distributed metric reduction).
+            # These are used to decide whether cosine is meaningful at the *global step* level.
+            teacher_samples_global = float(grad_dir_step.get("teacher_samples", 0))
+            on_samples_global = float(grad_dir_step.get("on_samples", 0))
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    _dev = None
+                    try:
+                        _dev = (
+                            grad_dir_union_acc["on"][0].device
+                            if (grad_dir_union_acc is not None and len(grad_dir_union_acc.get("on", [])) > 0)
+                            else None
+                        )
+                    except Exception:
+                        _dev = None
+                    if _dev is None:
+                        _dev = torch.device("cpu")
+                    ts = torch.tensor(float(grad_dir_step.get("teacher_samples", 0)), device=_dev)
+                    os_ = torch.tensor(float(grad_dir_step.get("on_samples", 0)), device=_dev)
+                    dist.all_reduce(ts, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(os_, op=dist.ReduceOp.SUM)
+                    teacher_samples_global = float(ts.detach().cpu().item())
+                    on_samples_global = float(os_.detach().cpu().item())
+            except Exception:
+                pass
+            append_to_dict(
+                metrics,
+                {
+                    "grad_dir/teacher_samples_global": float(teacher_samples_global),
+                    "grad_dir/on_samples_global": float(on_samples_global),
+                },
+            )
 
             if not grad_dir_enable:
                 append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": 4.0})  # disabled
@@ -1066,7 +1192,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 # selection/accumulation failed
                 mr = float(grad_dir_step.get("missing_reason", 5.0))
                 append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": mr})
-            elif int(grad_dir_step.get("teacher_samples", 0)) <= 0:
+            elif teacher_samples_global <= 0.0:
                 append_to_dict(
                     metrics,
                     {
@@ -1107,13 +1233,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 }
                 # Finalize from union accumulators using index maps.
                 # Under FSDP, parameters are sharded; the correct global dot/norm is obtained by
-                # summing per-rank shard contributions (scalar all_reduce), NOT by all-reducing vectors.
+                # summing per-rank shard contributions (scalar all_reduce).
                 def _finalize_from_union(prefix: str, idxs: list[int]):
                     if grad_dir_union_acc is None or grad_dir_union_params is None or (not idxs):
                         return {}
                     dot = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
                     n_on2 = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
                     n_te2 = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
+                    abs_on = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
+                    abs_te = torch.tensor(0.0, device=grad_dir_union_acc["on"][0].device, dtype=torch.float32)
                     vec_dim = 0
                     for j in idxs:
                         go = grad_dir_union_acc["on"][j]
@@ -1121,6 +1249,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         dot = dot + (go * gt).sum()
                         n_on2 = n_on2 + (go * go).sum()
                         n_te2 = n_te2 + (gt * gt).sum()
+                        abs_on = abs_on + go.abs().sum()
+                        abs_te = abs_te + gt.abs().sum()
                         vec_dim += int(go.numel())
 
                     # Global reduction across ranks (sum shard contributions)
@@ -1130,6 +1260,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             dist.all_reduce(dot, op=dist.ReduceOp.SUM)
                             dist.all_reduce(n_on2, op=dist.ReduceOp.SUM)
                             dist.all_reduce(n_te2, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(abs_on, op=dist.ReduceOp.SUM)
+                            dist.all_reduce(abs_te, op=dist.ReduceOp.SUM)
                     except Exception:
                         pass
 
@@ -1144,35 +1276,22 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         f"grad_dir/{prefix}/norm_teacher": float(n_te.detach().cpu().item()),
                         f"grad_dir/{prefix}/param_count": float(len(idxs)),
                         f"grad_dir/{prefix}/vec_dim": float(vec_dim),
+                        # extra sanity: mean absolute grad magnitude in probe subspace
+                        f"grad_dir/{prefix}/abs_mean_on": float((abs_on / max(1, vec_dim)).detach().cpu().item()),
+                        f"grad_dir/{prefix}/abs_mean_teacher": float((abs_te / max(1, vec_dim)).detach().cpu().item()),
                     }
 
                 out.update(_finalize_from_union("ln", list(grad_dir_union_idx_ln or [])))
                 out.update(_finalize_from_union("proj", list(grad_dir_union_idx_proj or [])))
                 out.update(_finalize_from_union("flat", list(grad_dir_union_idx_flat or [])))
+                # Attach best-effort flat probe layer summary (helps interpret flat_param probe)
+                out["grad_dir/flat/layer_min"] = float(grad_dir_step.get("flat_layer_min", 0.0))
+                out["grad_dir/flat/layer_max"] = float(grad_dir_step.get("flat_layer_max", 0.0))
+                out["grad_dir/flat/layer_count"] = float(grad_dir_step.get("flat_layer_count", 0.0))
 
-                # Global sample counts (avoid confusion with per-rank counts).
-                try:
-                    import torch.distributed as dist
-                    if dist.is_available() and dist.is_initialized():
-                        _dev = None
-                        try:
-                            _dev = grad_dir_union_acc["on"][0].device if (grad_dir_union_acc is not None and len(grad_dir_union_acc.get("on", [])) > 0) else None
-                        except Exception:
-                            _dev = None
-                        if _dev is None:
-                            _dev = torch.device("cpu")
-                        ts = torch.tensor(float(grad_dir_step.get("teacher_samples", 0)), device=_dev)
-                        os_ = torch.tensor(float(grad_dir_step.get("on_samples", 0)), device=_dev)
-                        dist.all_reduce(ts, op=dist.ReduceOp.SUM)
-                        dist.all_reduce(os_, op=dist.ReduceOp.SUM)
-                        out["grad_dir/teacher_samples_global"] = float(ts.detach().cpu().item())
-                        out["grad_dir/on_samples_global"] = float(os_.detach().cpu().item())
-                    else:
-                        out["grad_dir/teacher_samples_global"] = float(grad_dir_step.get("teacher_samples", 0))
-                        out["grad_dir/on_samples_global"] = float(grad_dir_step.get("on_samples", 0))
-                except Exception:
-                    out["grad_dir/teacher_samples_global"] = float(grad_dir_step.get("teacher_samples", 0))
-                    out["grad_dir/on_samples_global"] = float(grad_dir_step.get("on_samples", 0))
+                # Attach already-computed global sample counts (so panels stay simple)
+                out["grad_dir/teacher_samples_global"] = float(teacher_samples_global)
+                out["grad_dir/on_samples_global"] = float(on_samples_global)
 
                 append_to_dict(metrics, out)
         except Exception:
