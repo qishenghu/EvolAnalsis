@@ -431,6 +431,133 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        # ------------------------------------------------------------------
+        # Gradient-direction diagnostics (teacher vs on-policy), per-step aggregated.
+        #
+        # Definition:
+        # - g_on_step      = sum over all micro-batches (epoch==0) of ∇θ on_pg_loss
+        # - g_teacher_step = sum over all micro-batches (epoch==0) of ∇θ teacher_off_pg_loss
+        # Then we log cosine/dot/norm on a small parameter subset (two probes: ln / proj).
+        #
+        # Rationale:
+        # - Stable and matches "per-step" semantics; independent of micro-batch ordering.
+        # - Avoids the earlier pitfall where teacher might not be in micro-batch 0.
+        # ------------------------------------------------------------------
+        grad_dir_enable = bool(self.config.get("teacher_grad_dir_diag_enable", True))
+        grad_dir_interval = int(self.config.get("teacher_grad_dir_diag_interval", 1))
+        grad_dir_interval = max(1, grad_dir_interval)
+        grad_dir_should_run = False
+        if grad_dir_enable:
+            try:
+                grad_dir_should_run = (int(self._teacher_grad_dir_diag_updates) % grad_dir_interval) == 0
+            except Exception:
+                grad_dir_should_run = True
+            try:
+                self._teacher_grad_dir_diag_updates += 1
+            except Exception:
+                pass
+
+        grad_dir_step = {
+            "run": bool(grad_dir_enable and grad_dir_should_run),
+            "teacher_samples": 0,
+            "on_samples": 0,
+            "missing_reason": 0.0,  # 0=ok, 2=no_teacher, 3=interval_skip, 4=disabled, 5=failed
+        }
+
+        grad_dir_acc_ln = None
+        grad_dir_acc_proj = None
+        grad_dir_params_ln = None
+        grad_dir_params_proj = None
+
+        if grad_dir_step["run"]:
+            try:
+                import re
+
+                def _extract_layer_idx(name: str) -> int | None:
+                    m = re.search(r"(?:^|\\.)model\\.layers\\.(\\d+)\\.", name)
+                    if m:
+                        return int(m.group(1))
+                    m = re.search(r"(?:^|\\.)layers\\.(\\d+)\\.", name)
+                    if m:
+                        return int(m.group(1))
+                    return None
+
+                name_excludes = self.config.get(
+                    "teacher_grad_dir_diag_param_name_excludes",
+                    ["lm_head", "embed", "wte", "word_embeddings", "tok_embeddings", "token_embeddings", "shared"],
+                )
+                if isinstance(name_excludes, str):
+                    name_excludes = [name_excludes]
+                name_excludes = [str(s) for s in list(name_excludes) if str(s)]
+
+                max_param_numel = int(self.config.get("teacher_grad_dir_diag_max_param_numel", 200_000))
+                max_param_numel = max(1, max_param_numel)
+                max_params = int(self.config.get("teacher_grad_dir_diag_max_params", 4))
+                max_params = max(1, min(32, max_params))
+
+                ln_contains = self.config.get("teacher_grad_dir_diag_param_name_contains_ln", ["norm", "ln", "layernorm"])
+                if isinstance(ln_contains, str):
+                    ln_contains = [ln_contains]
+                ln_contains = [str(s) for s in list(ln_contains) if str(s)]
+
+                proj_contains = self.config.get(
+                    "teacher_grad_dir_diag_param_name_contains_proj",
+                    ["q_proj.bias", "k_proj.bias", "v_proj.bias", "o_proj.bias", "down_proj.bias"],
+                )
+                if isinstance(proj_contains, str):
+                    proj_contains = [proj_contains]
+                proj_contains = [str(s) for s in list(proj_contains) if str(s)]
+
+                lf_ln = str(self.config.get("teacher_grad_dir_diag_layer_filter_mode_ln", "all")).lower().strip()
+                lf_proj = str(self.config.get("teacher_grad_dir_diag_layer_filter_mode_proj", "last_k")).lower().strip()
+                last_k_proj = int(self.config.get("teacher_grad_dir_diag_last_k_proj", 2))
+                last_k_proj = max(1, last_k_proj)
+
+                named_params = [(n, p) for n, p in self.actor_module.named_parameters() if p is not None and p.requires_grad]
+                layer_idxs = []
+                for n, _p in named_params:
+                    li = _extract_layer_idx(str(n))
+                    if li is not None:
+                        layer_idxs.append(li)
+                max_layer_idx = max(layer_idxs) if layer_idxs else None
+
+                def _select_params(include_substr: list[str], *, layer_filter_mode: str, last_k: int) -> list[tuple[str, torch.Tensor]]:
+                    cand: list[tuple[str, torch.Tensor]] = []
+                    for n, p in named_params:
+                        n = str(n)
+                        try:
+                            if int(p.numel()) > max_param_numel:
+                                continue
+                        except Exception:
+                            continue
+                        if name_excludes and any(x in n for x in name_excludes):
+                            continue
+                        if layer_filter_mode in ("last_k", "last", "tail") and max_layer_idx is not None:
+                            li = _extract_layer_idx(n)
+                            if li is not None and li < (int(max_layer_idx) - int(last_k) + 1):
+                                continue
+                        if include_substr and (not any(s in n for s in include_substr)):
+                            continue
+                        cand.append((n, p))
+                    cand = sorted(cand, key=lambda x: int(x[1].numel()))[:max_params]
+                    return cand
+
+                sel_ln = _select_params(ln_contains, layer_filter_mode=lf_ln, last_k=last_k_proj)
+                sel_proj = _select_params(proj_contains, layer_filter_mode=lf_proj, last_k=last_k_proj)
+                grad_dir_params_ln = [p for (_n, p) in sel_ln]
+                grad_dir_params_proj = [p for (_n, p) in sel_proj]
+
+                def _init_acc(params: list[torch.Tensor]):
+                    on = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+                    te = [torch.zeros_like(p, dtype=torch.float32) for p in params]
+                    return {"on": on, "te": te}
+
+                grad_dir_acc_ln = _init_acc(grad_dir_params_ln) if grad_dir_params_ln else None
+                grad_dir_acc_proj = _init_acc(grad_dir_params_proj) if grad_dir_params_proj else None
+            except Exception:
+                grad_dir_step["run"] = False
+                grad_dir_step["missing_reason"] = 5.0
+
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -718,13 +845,37 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         loss = policy_loss / self.gradient_accumulation
 
                     # Optional: teacher vs on-policy gradient direction diagnostics (run once per mini-batch)
-                    if micro_idx == 0:
-                        self._maybe_log_teacher_onpolicy_grad_dir(
-                            on_pg_loss=on_pg_loss,
-                            teacher_off_pg_loss=teacher_off_pg_loss,
-                            has_teacher_data=has_teacher_data,
-                            append_fn=lambda d: append_to_dict(metrics, {f"{k}": v for k, v in d.items()}),
-                        )
+                    # Per-step aggregated grad_dir: accumulate gradients across ALL micro-batches (epoch==0 only).
+                    if grad_dir_step["run"] and epoch == 0:
+                        try:
+                            # count samples (sanity check)
+                            em = exp_mask
+                            if em is not None and torch.is_tensor(em):
+                                is_off = (em.sum(dim=-1) > 0)
+                                grad_dir_step["on_samples"] += int((~is_off).sum().item())
+                            if has_teacher_data and (teacher_mask is not None) and torch.is_tensor(teacher_mask):
+                                grad_dir_step["teacher_samples"] += int((teacher_mask.sum(dim=-1) > 0).sum().item())
+
+                            def _accumulate(acc, params, loss_on, loss_te, has_te: bool):
+                                if acc is None or params is None or len(params) == 0:
+                                    return
+                                g_on = torch.autograd.grad(loss_on, params, retain_graph=True, allow_unused=True)
+                                if has_te and (loss_te is not None) and torch.is_tensor(loss_te):
+                                    g_te = torch.autograd.grad(loss_te, params, retain_graph=True, allow_unused=True)
+                                else:
+                                    g_te = [None] * len(params)
+                                for i, (go, gt) in enumerate(zip(g_on, g_te)):
+                                    if go is not None:
+                                        acc["on"][i].add_(go.detach().float())
+                                    if gt is not None:
+                                        acc["te"][i].add_(gt.detach().float())
+
+                            _accumulate(grad_dir_acc_ln, grad_dir_params_ln, on_pg_loss, teacher_off_pg_loss, bool(has_teacher_data))
+                            _accumulate(grad_dir_acc_proj, grad_dir_params_proj, on_pg_loss, teacher_off_pg_loss, bool(has_teacher_data))
+                        except Exception:
+                            # don't break training; mark as failed
+                            grad_dir_step["run"] = False
+                            grad_dir_step["missing_reason"] = 5.0
                     loss.backward()  # ⭐ Backpropagate the loss
 
                     ##################
@@ -823,5 +974,67 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
+
+        # ------------------------------------------------------------------
+        # Finalize per-step aggregated grad_dir metrics (log once per update_policy call)
+        # ------------------------------------------------------------------
+        try:
+            if not grad_dir_enable:
+                append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": 4.0})  # disabled
+            elif not grad_dir_should_run:
+                append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": 3.0})  # interval skip
+            elif not grad_dir_step.get("run", False):
+                # selection/accumulation failed
+                mr = float(grad_dir_step.get("missing_reason", 5.0))
+                append_to_dict(metrics, {"grad_dir/recorded": 0.0, "grad_dir/missing_reason": mr})
+            elif int(grad_dir_step.get("teacher_samples", 0)) <= 0:
+                append_to_dict(
+                    metrics,
+                    {
+                        "grad_dir/recorded": 0.0,
+                        "grad_dir/missing_reason": 2.0,  # no teacher in this step
+                        "grad_dir/teacher_samples": float(grad_dir_step.get("teacher_samples", 0)),
+                        "grad_dir/on_samples": float(grad_dir_step.get("on_samples", 0)),
+                        "grad_dir/aggregate_micro_batches": 1.0,
+                    },
+                )
+            else:
+                def _finalize_probe(prefix: str, acc, params):
+                    if acc is None or params is None or len(params) == 0:
+                        return {}
+                    dot = torch.tensor(0.0, device=acc["on"][0].device, dtype=torch.float32)
+                    n_on2 = torch.tensor(0.0, device=acc["on"][0].device, dtype=torch.float32)
+                    n_te2 = torch.tensor(0.0, device=acc["on"][0].device, dtype=torch.float32)
+                    vec_dim = 0
+                    for go, gt in zip(acc["on"], acc["te"]):
+                        dot = dot + (go * gt).sum()
+                        n_on2 = n_on2 + (go * go).sum()
+                        n_te2 = n_te2 + (gt * gt).sum()
+                        vec_dim += int(go.numel())
+                    n_on = torch.sqrt(n_on2 + 1e-12)
+                    n_te = torch.sqrt(n_te2 + 1e-12)
+                    cos = dot / (n_on * n_te + 1e-12)
+                    return {
+                        f"grad_dir/{prefix}/cos": float(cos.detach().cpu().item()),
+                        f"grad_dir/{prefix}/dot": float(dot.detach().cpu().item()),
+                        f"grad_dir/{prefix}/norm_on": float(n_on.detach().cpu().item()),
+                        f"grad_dir/{prefix}/norm_teacher": float(n_te.detach().cpu().item()),
+                        f"grad_dir/{prefix}/param_count": float(len(params)),
+                        f"grad_dir/{prefix}/vec_dim": float(vec_dim),
+                    }
+
+                out = {
+                    "grad_dir/recorded": 1.0,
+                    "grad_dir/missing_reason": 0.0,
+                    "grad_dir/aggregate_micro_batches": 1.0,
+                    "grad_dir/teacher_samples": float(grad_dir_step.get("teacher_samples", 0)),
+                    "grad_dir/on_samples": float(grad_dir_step.get("on_samples", 0)),
+                }
+                out.update(_finalize_probe("ln", grad_dir_acc_ln, grad_dir_params_ln))
+                out.update(_finalize_probe("proj", grad_dir_acc_proj, grad_dir_params_proj))
+                append_to_dict(metrics, out)
+        except Exception:
+            # never break training
+            pass
         self.actor_optimizer.zero_grad()
         return metrics
