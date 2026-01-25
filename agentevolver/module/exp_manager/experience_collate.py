@@ -792,3 +792,378 @@ class LUFFYTeacherRolloutMixer:
         """
         return None  # 不需要覆盖，生成完整 n_rollout
 
+
+# ==============================================================================
+# RePO (Replay-Enhanced Policy Optimization) Components
+# ==============================================================================
+
+class RePOReplayManager:
+    """
+    ⭐ RePO Replay Buffer Manager.
+    
+    Key differences from ExGRPO:
+    1. Stores ALL on-policy trajectories (not just successful ones)
+    2. Uses diverse replay strategies (full_scope, recency, reward, variance)
+    3. Epoch-based replay control (not training_progress based)
+    4. Supports G_off trajectories per task (default 8, vs ExGRPO's 1)
+    
+    Reference: RePO Paper Algorithm 1
+    """
+    
+    def __init__(
+        self,
+        max_trajectories_per_task: int = 32,
+        buffer_update_mode: str = "fifo",  # "fifo" or "reward_priority"
+        replay_strategy: str = "recency",  # "full_scope", "recency", "reward", "variance"
+        g_off: int = 8,  # Number of off-policy trajectories per task
+    ):
+        """
+        Initialize RePO Replay Manager.
+        
+        Args:
+            max_trajectories_per_task: Maximum trajectories to store per task
+            buffer_update_mode: How to handle buffer overflow
+                - "fifo": First-in-first-out (remove oldest)
+                - "reward_priority": Remove lowest reward trajectories
+            replay_strategy: Strategy for selecting trajectories
+            g_off: Number of off-policy trajectories to select per task
+        """
+        from collections import defaultdict
+        from agentevolver.module.exp_manager.replay_strategy import ReplayStrategyFactory
+        
+        self.max_trajectories_per_task = max_trajectories_per_task
+        self.buffer_update_mode = buffer_update_mode
+        self.g_off = g_off
+        
+        # Initialize replay strategy
+        self.replay_strategy = ReplayStrategyFactory.create(replay_strategy)
+        self.replay_strategy_name = replay_strategy
+        
+        # Buffer: task_id -> List[Trajectory]
+        # ⭐ Stores ALL trajectories, not just successful ones
+        self.repo_buffer: Dict[str, List["Trajectory"]] = defaultdict(list)
+        
+        # Global step counter (for recency strategy)
+        self.current_step: int = 0
+        
+        logger.info(
+            f"[RePO] Initialized ReplayManager: "
+            f"strategy={replay_strategy}, g_off={g_off}, "
+            f"max_per_task={max_trajectories_per_task}, "
+            f"buffer_mode={buffer_update_mode}"
+        )
+    
+    def save_all_trajectories(
+        self,
+        trajectories: List["Trajectory"],
+        global_step: int,
+    ) -> int:
+        """
+        Save ALL on-policy trajectories to the buffer.
+        
+        ⭐ Key difference from ExGRPO: Stores all trajectories, not just successful ones.
+        The replay strategy will select which ones to use later.
+        
+        Args:
+            trajectories: List of on-policy trajectories from current step
+            global_step: Current global training step (for recency tracking)
+            
+        Returns:
+            Number of trajectories saved
+        """
+        import copy
+        import time
+        
+        self.current_step = global_step
+        saved_count = 0
+        
+        for traj in trajectories:
+            task_id = traj.task_id
+            
+            # Deep copy to avoid modifying original
+            traj_copy = copy.deepcopy(traj)
+            
+            # Add metadata for replay strategies
+            if not hasattr(traj_copy, 'metadata') or traj_copy.metadata is None:
+                traj_copy.metadata = {}
+            
+            # Store reward for reward-oriented strategy
+            reward_val = 0.0
+            if hasattr(traj_copy, 'reward') and traj_copy.reward:
+                if hasattr(traj_copy.reward, 'outcome'):
+                    reward_val = float(traj_copy.reward.outcome)
+            traj_copy.metadata['reward'] = reward_val
+            
+            # Store step for recency strategy
+            traj_copy.metadata['stored_step'] = global_step
+            traj_copy.metadata['stored_timestamp'] = time.time()
+            
+            # Handle buffer overflow
+            if len(self.repo_buffer[task_id]) >= self.max_trajectories_per_task:
+                self._remove_one_trajectory(task_id)
+            
+            self.repo_buffer[task_id].append(traj_copy)
+            saved_count += 1
+        
+        logger.debug(
+            f"[RePO] Saved {saved_count} trajectories at step {global_step}. "
+            f"Buffer has {len(self.repo_buffer)} tasks."
+        )
+        
+        return saved_count
+    
+    def _remove_one_trajectory(self, task_id: str) -> None:
+        """Remove one trajectory from buffer based on update mode."""
+        if task_id not in self.repo_buffer or not self.repo_buffer[task_id]:
+            return
+        
+        if self.buffer_update_mode == "fifo":
+            # Remove oldest (first in list)
+            self.repo_buffer[task_id].pop(0)
+        elif self.buffer_update_mode == "reward_priority":
+            # Remove trajectory with lowest reward
+            trajs = self.repo_buffer[task_id]
+            min_idx = 0
+            min_reward = float('inf')
+            for i, t in enumerate(trajs):
+                r = t.metadata.get('reward', 0.0)
+                if r < min_reward:
+                    min_reward = r
+                    min_idx = i
+            self.repo_buffer[task_id].pop(min_idx)
+        else:
+            # Default to FIFO
+            self.repo_buffer[task_id].pop(0)
+    
+    def get_offpolicy_trajectories(
+        self,
+        task_id: str,
+        k: Optional[int] = None,
+    ) -> List["Trajectory"]:
+        """
+        Get off-policy trajectories for a task using the configured strategy.
+        
+        Args:
+            task_id: Task ID to get trajectories for
+            k: Number of trajectories to get (default: self.g_off)
+            
+        Returns:
+            List of selected trajectories (marked with is_experience_replay=True)
+        """
+        import copy
+        
+        if k is None:
+            k = self.g_off
+        
+        available = self.repo_buffer.get(task_id, [])
+        if not available:
+            return []
+        
+        # Use replay strategy to select trajectories
+        selected = self.replay_strategy.select(available, k)
+        
+        # Deep copy and mark as off-policy
+        result = []
+        for traj in selected:
+            traj_copy = copy.deepcopy(traj)
+            traj_copy.metadata['is_experience_replay'] = True
+            traj_copy.metadata['replay_strategy'] = self.replay_strategy_name
+            result.append(traj_copy)
+        
+        return result
+    
+    def get_valid_task_ids(self, min_trajectories: int = 1) -> List[str]:
+        """
+        Get task IDs that have enough trajectories for replay.
+        
+        Args:
+            min_trajectories: Minimum number of trajectories required
+            
+        Returns:
+            List of valid task IDs
+        """
+        return [
+            task_id for task_id, trajs in self.repo_buffer.items()
+            if len(trajs) >= min_trajectories
+        ]
+    
+    def get_stats(self) -> Dict:
+        """Get buffer statistics."""
+        total_tasks = len(self.repo_buffer)
+        total_trajs = sum(len(trajs) for trajs in self.repo_buffer.values())
+        
+        # Reward distribution
+        all_rewards = []
+        for trajs in self.repo_buffer.values():
+            for t in trajs:
+                all_rewards.append(t.metadata.get('reward', 0.0))
+        
+        return {
+            "total_tasks": total_tasks,
+            "total_trajectories": total_trajs,
+            "avg_trajectories_per_task": total_trajs / total_tasks if total_tasks > 0 else 0,
+            "current_step": self.current_step,
+            "strategy": self.replay_strategy_name,
+            "g_off": self.g_off,
+            "reward_mean": float(sum(all_rewards) / len(all_rewards)) if all_rewards else 0.0,
+            "reward_positive_ratio": sum(1 for r in all_rewards if r > 0) / len(all_rewards) if all_rewards else 0.0,
+        }
+
+
+class RePORolloutMixer:
+    """
+    ⭐ RePO Rollout Mixer for combining on-policy and off-policy trajectories.
+    
+    Key features:
+    1. Epoch-based replay control (replay_start_epoch)
+    2. Per-task off-policy mixing (G_on on-policy + G_off off-policy per task)
+    3. Separate advantage baseline for on/off-policy
+    
+    Unlike LUFFY (rollout-level mixing) or ExGRPO (task-level mixing),
+    RePO mixes at the task level but with more off-policy samples per task.
+    """
+    
+    def __init__(
+        self,
+        repo_manager: RePOReplayManager,
+        replay_start_epoch: int = 1,  # Start replay from epoch 1 (0-indexed)
+        g_on: int = 8,  # Number of on-policy rollouts per task
+        g_off: int = 8,  # Number of off-policy trajectories per task
+    ):
+        """
+        Initialize RePO Rollout Mixer.
+        
+        Args:
+            repo_manager: RePOReplayManager instance
+            replay_start_epoch: Epoch to start replay (0-indexed)
+            g_on: Number of on-policy rollouts per task
+            g_off: Number of off-policy trajectories per task
+        """
+        self.repo_manager = repo_manager
+        self.replay_start_epoch = replay_start_epoch
+        self.g_on = g_on
+        self.g_off = g_off
+        
+        logger.info(
+            f"[RePO] Initialized RolloutMixer: "
+            f"replay_start_epoch={replay_start_epoch}, "
+            f"g_on={g_on}, g_off={g_off}"
+        )
+    
+    def should_enable_replay(self, current_epoch: int) -> bool:
+        """Check if replay should be enabled for current epoch."""
+        return current_epoch >= self.replay_start_epoch
+    
+    def mix_trajectories(
+        self,
+        on_policy_cmt_array: List,
+        tasks: List["Task"],
+        env_manager,
+        config,
+        tokenizer,
+        current_epoch: int,
+    ) -> Tuple[List, Dict[str, int]]:
+        """
+        Mix on-policy and off-policy trajectories for RePO training.
+        
+        ⭐ Key logic:
+        1. Check if current_epoch >= replay_start_epoch
+        2. For each task, get G_off off-policy trajectories from buffer
+        3. Convert off-policy trajectories to CMT format
+        4. Combine with on-policy CMTs
+        
+        Args:
+            on_policy_cmt_array: On-policy CMT objects from rollout
+            tasks: Current batch tasks
+            env_manager: EnvManager for trajectory conversion
+            config: Config object
+            tokenizer: Tokenizer
+            current_epoch: Current training epoch (0-indexed)
+            
+        Returns:
+            Tuple of (mixed_cmt_array, stats_dict)
+        """
+        from collections import defaultdict
+        
+        stats = {
+            "current_epoch": current_epoch,
+            "replay_enabled": 0,
+            "total_tasks": len(tasks),
+            "tasks_with_offpolicy": 0,
+            "total_onpolicy": len(on_policy_cmt_array),
+            "total_offpolicy": 0,
+            "g_on": self.g_on,
+            "g_off": self.g_off,
+        }
+        
+        # Check if replay should be enabled
+        if not self.should_enable_replay(current_epoch):
+            logger.info(
+                f"[RePO] Epoch {current_epoch} < replay_start_epoch {self.replay_start_epoch}, "
+                f"using pure on-policy training"
+            )
+            stats["replay_enabled"] = 0
+            return on_policy_cmt_array, stats
+        
+        stats["replay_enabled"] = 1
+        
+        # Group on-policy CMTs by task_id
+        task_id_to_onpolicy: Dict[str, List] = defaultdict(list)
+        task_id_to_data_id: Dict[str, int] = {}
+        
+        for cmt in on_policy_cmt_array:
+            task_id = str(cmt.task_id) if hasattr(cmt, 'task_id') else str(cmt.data_id)
+            task_id_to_onpolicy[task_id].append(cmt)
+            
+            if hasattr(cmt, 'data_id'):
+                try:
+                    task_id_to_data_id[task_id] = int(cmt.data_id)
+                except (ValueError, TypeError):
+                    task_id_to_data_id[task_id] = hash(task_id) % 100000
+        
+        # Collect off-policy trajectories for each task
+        all_offpolicy_trajs = []
+        
+        for task in tasks:
+            task_id = task.task_id
+            
+            # Get off-policy trajectories from buffer
+            offpolicy_trajs = self.repo_manager.get_offpolicy_trajectories(
+                task_id=task_id,
+                k=self.g_off,
+            )
+            
+            if offpolicy_trajs:
+                stats["tasks_with_offpolicy"] += 1
+                all_offpolicy_trajs.extend(offpolicy_trajs)
+        
+        # Convert off-policy trajectories to CMT format
+        offpolicy_cmt_array = []
+        if all_offpolicy_trajs:
+            offpolicy_cmt_array = env_manager.convert_offpolicy_to_cmt(
+                offpolicy_trajectories=all_offpolicy_trajs,
+                config=config,
+                tokenizer=tokenizer,
+                task_id_to_data_id=task_id_to_data_id,
+            )
+            
+            # Mark as off-policy (for exp_mask)
+            for cmt in offpolicy_cmt_array:
+                if not hasattr(cmt, 'metadata') or cmt.metadata is None:
+                    cmt.metadata = {}
+                cmt.metadata['is_experience_replay'] = True
+                cmt.metadata['source'] = 'repo_buffer'
+        
+        stats["total_offpolicy"] = len(offpolicy_cmt_array)
+        
+        # Combine on-policy and off-policy CMTs
+        mixed_cmt_array = on_policy_cmt_array + offpolicy_cmt_array
+        
+        logger.info(
+            f"[RePO] Epoch {current_epoch}: Mixed {len(on_policy_cmt_array)} on-policy + "
+            f"{len(offpolicy_cmt_array)} off-policy = {len(mixed_cmt_array)} total. "
+            f"Tasks with off-policy: {stats['tasks_with_offpolicy']}/{len(tasks)}"
+        )
+        
+        return mixed_cmt_array, stats
+

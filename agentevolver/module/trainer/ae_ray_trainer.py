@@ -72,6 +72,12 @@ from agentevolver.module.exp_manager.experience_collate import (
     ExperienceMixCollateFn, 
     TeacherExperienceMixCollateFn,
     LUFFYTeacherRolloutMixer,
+    RePOReplayManager,
+    RePORolloutMixer,
+)
+from agentevolver.module.exp_manager.het_core_algos import (
+    repo_compute_grpo_advantage,
+    repo_compute_token_loss,
 )
 
 
@@ -2818,6 +2824,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     f"Saved {len(filtered_trajectories)} trajectories to memory "
                                     f"(skip_uid_set size: {len(self.exp_manager.skip_uid_set)})"
                                 )
+                        
+                        # ⭐ RePO: 保存所有 on-policy 轨迹到 RePO buffer（不只是成功的）
+                        if self.exp_manager.repo_enabled:
+                            repo_saved = self.exp_manager.repo_save_all_trajectories(
+                                trajectories=trajectories,
+                                global_step=self.global_steps,
+                            )
+                            logger.info(f"[RePO] Saved {repo_saved} trajectories to buffer at step {self.global_steps}")
                             
                             # 添加 experience replay 相关指标
                             metrics.update({

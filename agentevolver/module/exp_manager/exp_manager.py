@@ -98,6 +98,32 @@ class ExperienceManager(object):
                 self.load_teacher_trajectories(self.teacher_data_path)
             except Exception as e:
                 logger.warning(f"Failed to load teacher trajectories from {self.teacher_data_path}: {e}")
+        
+        # ⭐ RePO (Replay-Enhanced Policy Optimization) 相关属性
+        repo_config = self.exp_manager_config.get("repo", {})
+        self.repo_enabled = repo_config.get("enable", False)
+        self.repo_replay_start_epoch = repo_config.get("replay_start_epoch", 1)
+        self.repo_replay_strategy = repo_config.get("replay_strategy", "recency")
+        self.repo_g_on = repo_config.get("g_on", 8)
+        self.repo_g_off = repo_config.get("g_off", 8)
+        self.repo_max_trajectories_per_task = repo_config.get("max_trajectories_per_task", 32)
+        self.repo_buffer_update_mode = repo_config.get("buffer_update_mode", "fifo")
+        self.repo_store_all_trajectories = repo_config.get("store_all_trajectories", True)
+        self.repo_advantage_mode = repo_config.get("advantage_mode", "separate")
+        self.repo_clip_eps = repo_config.get("clip_eps", 0.2)
+        self.repo_use_importance_clipping = repo_config.get("use_importance_clipping", True)
+        
+        # RePO Replay Manager (initialized lazily)
+        self._repo_manager = None
+        self._repo_mixer = None
+        
+        if self.repo_enabled:
+            logger.info(
+                f"[ExperienceManager] RePO enabled: "
+                f"replay_start_epoch={self.repo_replay_start_epoch}, "
+                f"strategy={self.repo_replay_strategy}, "
+                f"g_on={self.repo_g_on}, g_off={self.repo_g_off}"
+            )
     
     def summarize_in_batch(self, trajectories: List[Trajectory]) -> None:
         trajectories_sorted = sorted(trajectories, key=lambda traj: traj.task_id)
@@ -1145,6 +1171,158 @@ class ExperienceManager(object):
             if task_id not in self.skip_uid_set:
                 self.difficulty2task_dict[success_count].append(task_id)
                 logger.debug(f"Task {task_id} moved to difficulty bucket {success_count}")
+
+    # ==================== RePO (Replay-Enhanced Policy Optimization) Methods ====================
+    
+    def get_repo_manager(self):
+        """
+        Get or create the RePO Replay Manager.
+        
+        Returns:
+            RePOReplayManager instance
+        """
+        if self._repo_manager is None:
+            from agentevolver.module.exp_manager.experience_collate import RePOReplayManager
+            self._repo_manager = RePOReplayManager(
+                max_trajectories_per_task=self.repo_max_trajectories_per_task,
+                buffer_update_mode=self.repo_buffer_update_mode,
+                replay_strategy=self.repo_replay_strategy,
+                g_off=self.repo_g_off,
+            )
+        return self._repo_manager
+    
+    def get_repo_mixer(self):
+        """
+        Get or create the RePO Rollout Mixer.
+        
+        Returns:
+            RePORolloutMixer instance
+        """
+        if self._repo_mixer is None:
+            from agentevolver.module.exp_manager.experience_collate import RePORolloutMixer
+            self._repo_mixer = RePORolloutMixer(
+                repo_manager=self.get_repo_manager(),
+                replay_start_epoch=self.repo_replay_start_epoch,
+                g_on=self.repo_g_on,
+                g_off=self.repo_g_off,
+            )
+        return self._repo_mixer
+    
+    def repo_save_all_trajectories(
+        self,
+        trajectories: List[Trajectory],
+        global_step: int,
+    ) -> int:
+        """
+        Save ALL on-policy trajectories to RePO buffer.
+        
+        ⭐ Key difference from ExGRPO:
+        - ExGRPO: Only saves successful trajectories (reward > 0)
+        - RePO: Saves ALL trajectories, uses strategy to select later
+        
+        Args:
+            trajectories: List of on-policy trajectories
+            global_step: Current global training step
+            
+        Returns:
+            Number of trajectories saved
+        """
+        if not self.repo_enabled:
+            return 0
+        
+        return self.get_repo_manager().save_all_trajectories(
+            trajectories=trajectories,
+            global_step=global_step,
+        )
+    
+    def repo_get_offpolicy_trajectories(
+        self,
+        task_id: str,
+        k: Optional[int] = None,
+    ) -> List[Trajectory]:
+        """
+        Get off-policy trajectories for a task from RePO buffer.
+        
+        Args:
+            task_id: Task ID
+            k: Number of trajectories to get (default: g_off)
+            
+        Returns:
+            List of selected trajectories
+        """
+        if not self.repo_enabled:
+            return []
+        
+        return self.get_repo_manager().get_offpolicy_trajectories(
+            task_id=task_id,
+            k=k,
+        )
+    
+    def repo_should_enable_replay(self, current_epoch: int) -> bool:
+        """
+        Check if RePO replay should be enabled for current epoch.
+        
+        Args:
+            current_epoch: Current training epoch (0-indexed)
+            
+        Returns:
+            bool: True if replay should be enabled
+        """
+        if not self.repo_enabled:
+            return False
+        
+        return self.get_repo_mixer().should_enable_replay(current_epoch)
+    
+    def repo_mix_trajectories(
+        self,
+        on_policy_cmt_array: List,
+        tasks: List,
+        env_manager,
+        config,
+        tokenizer,
+        current_epoch: int,
+    ) -> Tuple[List, Dict]:
+        """
+        Mix on-policy and off-policy trajectories for RePO training.
+        
+        Args:
+            on_policy_cmt_array: On-policy CMT objects
+            tasks: Current batch tasks
+            env_manager: EnvManager instance
+            config: Config object
+            tokenizer: Tokenizer
+            current_epoch: Current training epoch
+            
+        Returns:
+            Tuple of (mixed_cmt_array, stats_dict)
+        """
+        if not self.repo_enabled:
+            return on_policy_cmt_array, {"repo_enabled": False}
+        
+        return self.get_repo_mixer().mix_trajectories(
+            on_policy_cmt_array=on_policy_cmt_array,
+            tasks=tasks,
+            env_manager=env_manager,
+            config=config,
+            tokenizer=tokenizer,
+            current_epoch=current_epoch,
+        )
+    
+    def repo_get_stats(self) -> Dict:
+        """
+        Get RePO buffer statistics.
+        
+        Returns:
+            Dict with buffer statistics
+        """
+        if not self.repo_enabled:
+            return {"repo_enabled": False}
+        
+        stats = self.get_repo_manager().get_stats()
+        stats["repo_enabled"] = True
+        stats["replay_start_epoch"] = self.repo_replay_start_epoch
+        stats["advantage_mode"] = self.repo_advantage_mode
+        return stats
 
 
 class ExperienceWorker(object):
