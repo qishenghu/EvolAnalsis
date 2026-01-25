@@ -3464,6 +3464,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # ⭐ CHORD: 传递 training_progress 用于 μ(t) 调度
+                            training_progress = self.global_steps / max(1, self.total_training_steps)
+                            batch.meta_info["training_progress"] = training_progress
                             actor_output = self.actor_rollout_wg.update_actor(batch)  # ⭐ Update the actor with the new batch
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

@@ -1419,3 +1419,427 @@ def bam_compute_token_on_off_policy_loss_v3(
     }
 
     return ret_dict
+
+
+# ==============================================================================
+# RePO (Replay-Enhanced Policy Optimization) Advantage Computation
+# ==============================================================================
+
+def repo_compute_grpo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    exp_mask: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std: bool = True,
+    advantage_mode: str = "separate",
+) -> torch.Tensor:
+    """
+    Compute GRPO advantages with RePO's separate baseline for on/off-policy.
+    
+    ⭐ Key difference from standard GRPO:
+    - Standard GRPO: All samples use the same baseline (mean of all rewards)
+    - RePO (separate): On-policy uses on-policy baseline, off-policy uses all-samples baseline
+    
+    From RePO paper Section 3.2:
+    - For on-policy samples: A_i = (R_i - mean(R_on)) / std(R_on)
+    - For off-policy samples: A_j = (R_j - mean(R_all)) / std(R_all)
+    
+    Args:
+        token_level_rewards: Token-level rewards, shape (bs, response_len)
+            Typically reward is placed at the last valid token position
+        response_mask: Response mask, shape (bs, response_len)
+        index: Group indices for GRPO grouping, shape (bs,)
+            Samples with the same index belong to the same prompt/task
+        exp_mask: Experience mask, shape (bs, response_len) or (bs,)
+            1 = off-policy, 0 = on-policy
+        epsilon: Small value for numerical stability
+        norm_adv_by_std: Whether to normalize advantage by std
+            - True: A = (R - mean) / std (standard GRPO)
+            - False: A = R - mean (Dr.GRPO style)
+        advantage_mode: How to compute advantages
+            - "separate": RePO style, on/off use different baselines (recommended)
+            - "unified": ExGRPO style, all samples use same baseline
+            
+    Returns:
+        advantages: Token-level advantages, shape (bs, response_len)
+    """
+    # Get sequence-level rewards (sum over response tokens)
+    # Typically reward is placed at the last valid token, so sum works
+    seq_rewards = (token_level_rewards * response_mask).sum(dim=-1)  # (bs,)
+    
+    # Get sequence-level exp_mask
+    # If exp_mask is (bs, response_len), take max to get (bs,)
+    if exp_mask.dim() > 1:
+        seq_exp_mask = exp_mask.max(dim=-1).values  # (bs,)
+    else:
+        seq_exp_mask = exp_mask  # Already (bs,)
+    
+    # Convert to boolean masks
+    is_offpolicy = seq_exp_mask > 0.5  # (bs,) bool
+    is_onpolicy = ~is_offpolicy  # (bs,) bool
+    
+    # Group by index (task/prompt)
+    unique_indices = np.unique(index)
+    
+    # Initialize advantages
+    advantages = torch.zeros_like(token_level_rewards)
+    
+    for idx in unique_indices:
+        # Get samples belonging to this group
+        group_mask = (index == idx)  # (bs,) bool numpy
+        group_mask_tensor = torch.tensor(group_mask, device=token_level_rewards.device)
+        
+        # Get rewards for this group
+        group_rewards = seq_rewards[group_mask]  # (n_group,)
+        group_is_offpolicy = is_offpolicy[group_mask]  # (n_group,) bool
+        group_is_onpolicy = is_onpolicy[group_mask]  # (n_group,) bool
+        
+        if len(group_rewards) == 0:
+            continue
+        
+        if advantage_mode == "unified":
+            # ========== Unified mode (ExGRPO style) ==========
+            # All samples use the same baseline
+            mean_all = group_rewards.mean()
+            std_all = group_rewards.std() + epsilon
+            
+            if norm_adv_by_std:
+                group_advantages = (group_rewards - mean_all) / std_all
+            else:
+                group_advantages = group_rewards - mean_all
+        
+        elif advantage_mode == "separate":
+            # ========== Separate mode (RePO style) ==========
+            # On-policy: use on-policy baseline
+            # Off-policy: use all-samples baseline
+            
+            # Compute on-policy statistics
+            on_rewards = group_rewards[group_is_onpolicy]
+            if len(on_rewards) > 0:
+                mean_on = on_rewards.mean()
+                std_on = on_rewards.std() + epsilon
+            else:
+                # No on-policy samples, fallback to all
+                mean_on = group_rewards.mean()
+                std_on = group_rewards.std() + epsilon
+            
+            # Compute all-samples statistics
+            mean_all = group_rewards.mean()
+            std_all = group_rewards.std() + epsilon
+            
+            # Compute advantages
+            group_advantages = torch.zeros_like(group_rewards)
+            
+            # On-policy: use on-policy baseline
+            if norm_adv_by_std:
+                group_advantages[group_is_onpolicy] = (
+                    (group_rewards[group_is_onpolicy] - mean_on) / std_on
+                )
+            else:
+                group_advantages[group_is_onpolicy] = group_rewards[group_is_onpolicy] - mean_on
+            
+            # Off-policy: use all-samples baseline
+            if norm_adv_by_std:
+                group_advantages[group_is_offpolicy] = (
+                    (group_rewards[group_is_offpolicy] - mean_all) / std_all
+                )
+            else:
+                group_advantages[group_is_offpolicy] = group_rewards[group_is_offpolicy] - mean_all
+        
+        else:
+            raise ValueError(f"Unknown advantage_mode: {advantage_mode}. Use 'separate' or 'unified'.")
+        
+        # Broadcast sequence-level advantages to token level
+        # advantages[group_mask] = group_advantages (broadcasted)
+        group_indices = torch.where(group_mask_tensor)[0]
+        for i, gi in enumerate(group_indices):
+            # Set advantage for all response tokens in this sequence
+            advantages[gi] = group_advantages[i]
+    
+    return advantages
+
+
+# ==============================================================================
+# CHORD (Controllable Harmonization of On- and Off-Policy RL via Dynamic Weighting)
+# ==============================================================================
+
+def chord_mu_scheduler(
+    training_progress: float,
+    mu_max: float = 0.5,
+    lambda_decay: float = 2.0,
+) -> float:
+    """
+    CHORD 全局系数 μ(t) 调度器。
+    
+    公式：μ(t) = μ_max * (1 - t/T)^λ
+    
+    Args:
+        training_progress: 训练进度 t/T，范围 [0, 1]
+        mu_max: 初始 SFT 权重（论文默认 0.5）
+        lambda_decay: 衰减指数（论文默认 2.0）
+        
+    Returns:
+        float: 当前的 μ 值
+        
+    Example:
+        >>> chord_mu_scheduler(0.0, mu_max=0.5, lambda_decay=2.0)
+        0.5  # 训练开始，μ = μ_max
+        >>> chord_mu_scheduler(0.5, mu_max=0.5, lambda_decay=2.0)
+        0.125  # 训练中期，μ = 0.5 * 0.5^2 = 0.125
+        >>> chord_mu_scheduler(1.0, mu_max=0.5, lambda_decay=2.0)
+        0.0  # 训练结束，μ = 0
+    """
+    # 确保 training_progress 在 [0, 1] 范围内
+    training_progress = max(0.0, min(1.0, training_progress))
+    
+    # μ(t) = μ_max * (1 - t/T)^λ
+    mu = mu_max * ((1.0 - training_progress) ** lambda_decay)
+    
+    return mu
+
+
+def compute_chord_token_weights(
+    log_prob: torch.Tensor,
+    delta: float = 0.1,
+) -> torch.Tensor:
+    """
+    计算 CHORD 的 token-wise 加权 φ(d)。
+    
+    公式：φ(d) = d / (d + δ)
+    其中 d = exp(log_prob) = π_θ(y_i | x, y_{<i})
+    
+    Args:
+        log_prob: 当前策略对 expert token 的 log 概率，shape (bs, seq_len)
+        delta: 平滑参数（论文默认 0.1）
+        
+    Returns:
+        torch.Tensor: Token-wise 权重 φ(d)，shape (bs, seq_len)
+        
+    Example:
+        >>> log_prob = torch.tensor([[-0.1, -1.0, -5.0]])  # 概率: [0.90, 0.37, 0.007]
+        >>> compute_chord_token_weights(log_prob, delta=0.1)
+        tensor([[0.900, 0.787, 0.065]])  # 高概率 token 权重高，低概率 token 权重低
+    """
+    # d = exp(log_prob) = π_θ(y_i | x, y_{<i})
+    # Clamp log_prob to avoid numerical issues
+    d = torch.exp(log_prob.clamp(max=0))
+    
+    # φ(d) = d / (d + δ)
+    phi = d / (d + delta)
+    
+    return phi
+
+
+def compute_chord_sft_loss(
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    exp_mask: torch.Tensor,
+    delta: float = 0.1,
+    use_token_weighting: bool = True,
+    loss_agg_mode: str = "token-mean",
+) -> dict:
+    """
+    计算 CHORD 的加权 SFT Loss。
+    
+    公式：L_sft = -∑_i φ(d_i) * log π_θ(y_i | x, y_{<i})
+    
+    ⭐ 关键设计：
+    1. 只对 expert 数据 (exp_mask=1) 计算 SFT loss
+    2. 使用 φ(d) 加权，避免强制学习已掌握或无法学习的 token
+    3. 与 GRPO loss 分开计算，通过 μ(t) 动态加权合并
+    
+    Args:
+        log_prob: 当前策略的 log 概率，shape (bs, seq_len)
+        response_mask: Response 部分的 mask，shape (bs, seq_len)
+        exp_mask: Expert 数据的 mask，shape (bs, seq_len)，1=expert, 0=on-policy
+        delta: φ(d) 的平滑参数
+        use_token_weighting: 是否使用 token-wise 加权
+        loss_agg_mode: Loss 聚合模式
+        
+    Returns:
+        dict: 包含 sft_loss 和诊断指标
+    """
+    # 确保 exp_mask 是 float
+    exp_mask = exp_mask.float()
+    
+    # Expert token 的 mask
+    expert_mask = exp_mask * response_mask
+    
+    # 计算 SFT loss: -log_prob
+    sft_losses = -log_prob
+    
+    if use_token_weighting:
+        # 计算 token-wise 权重 φ(d)
+        phi = compute_chord_token_weights(log_prob, delta=delta)
+        
+        # 加权 SFT loss
+        weighted_sft_losses = phi * sft_losses
+    else:
+        # 不加权，使用原始 SFT loss
+        weighted_sft_losses = sft_losses
+        phi = torch.ones_like(sft_losses)
+    
+    # 聚合 loss（只对 expert token）
+    sft_loss = agg_loss(
+        loss_mat=weighted_sft_losses,
+        loss_mask=expert_mask,
+        loss_agg_mode=loss_agg_mode,
+    )
+    
+    # 处理 NaN（当没有 expert 数据时）
+    if sft_loss.isnan().item():
+        sft_loss = torch.tensor(0.0, device=log_prob.device)
+    
+    # 诊断指标
+    chord_diag = {}
+    with torch.no_grad():
+        # Expert token 数量
+        n_expert_tokens = expert_mask.sum().item()
+        chord_diag["n_expert_tokens"] = n_expert_tokens
+        
+        # φ(d) 统计
+        if n_expert_tokens > 0:
+            phi_expert = phi[expert_mask.bool()]
+            chord_diag["phi_mean"] = phi_expert.mean().item()
+            chord_diag["phi_std"] = phi_expert.std().item() if phi_expert.numel() > 1 else 0.0
+            chord_diag["phi_min"] = phi_expert.min().item()
+            chord_diag["phi_max"] = phi_expert.max().item()
+            
+            # log_prob 统计
+            log_prob_expert = log_prob[expert_mask.bool()]
+            chord_diag["log_prob_mean"] = log_prob_expert.mean().item()
+            chord_diag["log_prob_std"] = log_prob_expert.std().item() if log_prob_expert.numel() > 1 else 0.0
+            
+            # 原始 SFT loss（未加权）统计
+            sft_losses_expert = sft_losses[expert_mask.bool()]
+            chord_diag["sft_loss_unweighted_mean"] = sft_losses_expert.mean().item()
+        else:
+            chord_diag["phi_mean"] = 0.0
+            chord_diag["phi_std"] = 0.0
+            chord_diag["phi_min"] = 0.0
+            chord_diag["phi_max"] = 0.0
+            chord_diag["log_prob_mean"] = 0.0
+            chord_diag["log_prob_std"] = 0.0
+            chord_diag["sft_loss_unweighted_mean"] = 0.0
+    
+    return {
+        "sft_loss": sft_loss,
+        "weighted_sft_losses": weighted_sft_losses,
+        "chord_diag": chord_diag,
+    }
+
+
+def repo_compute_token_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    exp_mask: torch.Tensor,
+    cliprange: float = 0.2,
+    clip_eps: float = 0.2,
+    use_importance_clipping: bool = True,
+    loss_agg_mode: str = "token-mean",
+) -> dict:
+    """
+    Compute RePO policy loss with importance ratio clipping for off-policy data.
+    
+    ⭐ Key features:
+    1. On-policy: Standard PPO clipped objective
+    2. Off-policy: Importance ratio + clip to handle distribution shift
+    
+    From RePO paper:
+    - ratio = π_θ(o|q) / π_θ_old(o|q)
+    - L_off = -min(ratio * A, clip(ratio, 1-ε, 1+ε) * A)
+    
+    Args:
+        old_log_prob: Log probs from behavior policy (stored), shape (bs, seq_len)
+        log_prob: Log probs from current policy, shape (bs, seq_len)
+        advantages: Advantages (from repo_compute_grpo_advantage), shape (bs, seq_len)
+        response_mask: Response mask, shape (bs, seq_len)
+        exp_mask: Experience mask (1=off-policy, 0=on-policy), shape (bs, seq_len)
+        cliprange: Clip range for on-policy PPO
+        clip_eps: Clip epsilon for off-policy importance ratio
+        use_importance_clipping: Whether to clip importance ratio for off-policy
+        loss_agg_mode: Loss aggregation mode
+        
+    Returns:
+        dict with pg_loss, on_pg_loss, off_pg_loss, and diagnostics
+    """
+    # Compute importance ratio
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    
+    # ========== On-policy loss (standard PPO) ==========
+    on_pg_losses1 = -advantages * ratio
+    on_pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+    on_pg_losses = torch.maximum(on_pg_losses1, on_pg_losses2)
+    
+    on_policy_mask = (1.0 - exp_mask) * response_mask
+    on_pg_loss = verl_F.masked_mean(on_pg_losses, on_policy_mask)
+    
+    # Clip fraction for on-policy
+    on_clipfrac = verl_F.masked_mean(
+        torch.gt(on_pg_losses2, on_pg_losses1).float(), 
+        on_policy_mask
+    )
+    
+    # ========== Off-policy loss (with importance ratio clipping) ==========
+    if use_importance_clipping:
+        # PPO-style clipped objective for off-policy
+        off_pg_losses1 = -advantages * ratio
+        off_pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+        off_pg_losses = torch.maximum(off_pg_losses1, off_pg_losses2)
+        
+        off_clipfrac = verl_F.masked_mean(
+            torch.gt(off_pg_losses2, off_pg_losses1).float(),
+            exp_mask * response_mask
+        )
+    else:
+        # No clipping, just use ratio directly
+        off_pg_losses = -advantages * ratio
+        off_clipfrac = torch.tensor(0.0, device=log_prob.device)
+    
+    off_policy_mask = exp_mask * response_mask
+    off_pg_loss = verl_F.masked_mean(off_pg_losses, off_policy_mask)
+    off_pg_loss = torch.tensor(0.0, device=log_prob.device) if off_pg_loss.isnan().item() else off_pg_loss
+    
+    # ========== Combine losses ==========
+    exp_mask_float = exp_mask.float()
+    pg_losses = off_pg_losses * exp_mask_float + on_pg_losses * (1.0 - exp_mask_float)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    
+    # ========== Diagnostics ==========
+    def _masked_stats(x: torch.Tensor, m: torch.Tensor, prefix: str) -> dict:
+        out = {}
+        mask = m.bool()
+        if mask.sum() == 0:
+            out[f"{prefix}/count"] = torch.tensor(0.0, device=x.device)
+            return out
+        vals = x[mask]
+        out[f"{prefix}/count"] = torch.tensor(float(vals.numel()), device=x.device)
+        out[f"{prefix}/mean"] = vals.mean()
+        out[f"{prefix}/std"] = vals.std() if vals.numel() > 1 else torch.tensor(0.0, device=x.device)
+        out[f"{prefix}/min"] = vals.min()
+        out[f"{prefix}/max"] = vals.max()
+        return out
+    
+    diag_stats = {}
+    diag_stats.update(_masked_stats(ratio, on_policy_mask, "ratio/on"))
+    diag_stats.update(_masked_stats(ratio, off_policy_mask, "ratio/off"))
+    diag_stats.update(_masked_stats(advantages, on_policy_mask, "adv/on"))
+    diag_stats.update(_masked_stats(advantages, off_policy_mask, "adv/off"))
+    
+    return {
+        "pg_loss": pg_loss,
+        "pg_losses": pg_losses,
+        "on_pg_loss": on_pg_loss,
+        "off_pg_loss": off_pg_loss,
+        "on_pg_losses": on_pg_losses,
+        "off_pg_losses": off_pg_losses,
+        "on_pg_clipfrac": on_clipfrac,
+        "off_pg_clipfrac": off_clipfrac,
+        "ppo_kl": ppo_kl,
+        "repo_diag_stats": diag_stats,
+    }

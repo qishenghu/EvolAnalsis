@@ -768,6 +768,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     ##################
                     # ANNI 0814
                     from .het_core_algos import het_compute_token_on_off_policy_loss, het_compute_teacher_aware_loss, dapo_compute_policy_loss
+                    from .het_core_algos import chord_mu_scheduler, compute_chord_sft_loss
                     off_cliprange_high = self.config.get("off_cliprange_high", 1.0)
                     exp_mask = data["exp_mask"][:, -response_length:]
                     
@@ -777,6 +778,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     
                     # ⭐ DAPO (Decoupled Clip and Dynamic sAmpling Policy Optimization) configuration
                     use_dapo = self.config.get("use_dapo", False)
+                    
+                    # ⭐ CHORD (Controllable Harmonization of On- and Off-Policy RL) configuration
+                    use_chord = self.config.get("use_chord", False)
                     
                     # ⭐ Teacher Experience configuration
                     teacher_mask = data.get("teacher_mask", None)
@@ -807,8 +811,91 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             off_policy_shaping_mode=off_policy_shaping_mode,
                             off_policy_shaping_beta=off_policy_shaping_beta,
                         )  # ⭐ Compute policy loss using DAPO's Clip-Higher mechanism (Experience-Replay compatible)
+                    elif use_chord and has_teacher_data:
+                        # ========== CHORD 模式 ==========
+                        # CHORD (Controllable Harmonization of On- and Off-Policy RL)
+                        # 使用 SFT loss 代替 policy gradient 学习 expert 数据
+                        # 公式: L_chord = L_grpo + μ(t) * L_sft_weighted
+                        
+                        # Step 1: 计算 GRPO loss（只对 on-policy 数据）
+                        # 创建 on-policy-only mask（排除 expert 数据）
+                        on_policy_only_mask = torch.zeros_like(exp_mask)  # 全部视为 on-policy
+                        
+                        grpo_ret_dict = het_compute_token_on_off_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            exp_mask=on_policy_only_mask,  # ⭐ GRPO 只看 on-policy
+                            cliprange=clip_ratio,
+                            cliprange_low=clip_ratio_low,
+                            cliprange_high=clip_ratio_high,
+                            off_cliprange_high=off_cliprange_high,
+                            clip_ratio_c=clip_ratio_c,
+                            loss_agg_mode=loss_agg_mode,
+                            off_policy_shaping_mode=off_policy_shaping_mode,
+                            off_policy_shaping_beta=off_policy_shaping_beta,
+                        )
+                        grpo_loss = grpo_ret_dict["pg_loss"]
+                        
+                        # Step 2: 计算 CHORD SFT loss（只对 expert 数据）
+                        chord_delta = self.config.get("chord_delta", 0.1)
+                        chord_use_token_weighting = self.config.get("chord_use_token_weighting", True)
+                        
+                        sft_ret = compute_chord_sft_loss(
+                            log_prob=log_prob,
+                            response_mask=response_mask,
+                            exp_mask=exp_mask,  # ⭐ SFT 只看 expert 数据
+                            delta=chord_delta,
+                            use_token_weighting=chord_use_token_weighting,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        sft_loss = sft_ret["sft_loss"]
+                        
+                        # Step 3: 计算 μ(t) 并合并 loss
+                        # training_progress 从 meta_info 获取
+                        training_progress = 0.0
+                        if hasattr(data, 'meta_info') and isinstance(data.meta_info, dict):
+                            training_progress = data.meta_info.get("training_progress", 0.0)
+                        elif hasattr(data, '__getitem__'):
+                            try:
+                                meta = data.get("meta_info", {})
+                                if isinstance(meta, dict):
+                                    training_progress = meta.get("training_progress", 0.0)
+                            except Exception:
+                                pass
+                        
+                        chord_mu_max = self.config.get("chord_mu_max", 0.5)
+                        chord_lambda_decay = self.config.get("chord_lambda_decay", 2.0)
+                        
+                        mu = chord_mu_scheduler(
+                            training_progress=training_progress,
+                            mu_max=chord_mu_max,
+                            lambda_decay=chord_lambda_decay,
+                        )
+                        
+                        # ⭐ CHORD 总 loss: L_chord = L_grpo + μ * L_sft
+                        pg_loss = grpo_loss + mu * sft_loss
+                        
+                        # 构建 ret_dict（复用现有结构）
+                        ret_dict = grpo_ret_dict.copy()
+                        ret_dict["pg_loss"] = pg_loss
+                        
+                        # 记录 CHORD 诊断指标
+                        chord_metrics = {
+                            "chord/mu": mu,
+                            "chord/training_progress": training_progress,
+                            "chord/grpo_loss": grpo_loss.detach().item(),
+                            "chord/sft_loss": sft_loss.detach().item(),
+                            "chord/weighted_sft_loss": (mu * sft_loss).detach().item(),
+                        }
+                        chord_diag = sft_ret.get("chord_diag", {})
+                        for k, v in chord_diag.items():
+                            chord_metrics[f"chord/{k}"] = v
+                        append_to_dict(metrics, chord_metrics)
+                        
                     elif has_teacher_data:
-                        # ⭐ Teacher Experience: 使用 het_compute_teacher_aware_loss
+                        # ⭐ Teacher Experience: 使用 het_compute_teacher_aware_loss (LUFFY 模式)
                         # 获取 teacher 相关配置
                         teacher_use_log_prob = self.config.get("teacher_use_log_prob", False)
                         teacher_policy_shaping_enable = self.config.get("teacher_policy_shaping_enable", True)
