@@ -825,18 +825,20 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         # ========== CHORD 模式 ==========
                         # CHORD (Controllable Harmonization of On- and Off-Policy RL)
                         # 使用 SFT loss 代替 policy gradient 学习 expert 数据
-                        # 公式: L_chord = L_grpo + μ(t) * L_sft_weighted
+                        # 公式: L_chord = (1-μ) * L_grpo(on-policy) + μ * L_sft(expert)
+                        #
+                        # ⭐ 关键区别：
+                        # - GRPO loss 只计算 on-policy 数据（exp_mask=0）的 policy gradient
+                        # - SFT loss 只计算 expert 数据（exp_mask=1）的监督学习
+                        # - Expert 数据不参与 policy gradient，避免分布偏移
                         
-                        # Step 1: 计算 GRPO loss（只对 on-policy 数据）
-                        # 创建 on-policy-only mask（排除 expert 数据）
-                        on_policy_only_mask = torch.zeros_like(exp_mask)  # 全部视为 on-policy
-                        
+                        # Step 1: 计算 GRPO loss（只取 on-policy 数据的 loss）
                         grpo_ret_dict = het_compute_token_on_off_policy_loss(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
                             response_mask=response_mask,
-                            exp_mask=on_policy_only_mask,  # ⭐ GRPO 只看 on-policy
+                            exp_mask=exp_mask,  # ⭐ 使用原始 exp_mask 正确区分 on/off-policy
                             cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
                             cliprange_high=clip_ratio_high,
@@ -846,7 +848,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             off_policy_shaping_mode=off_policy_shaping_mode,
                             off_policy_shaping_beta=off_policy_shaping_beta,
                         )
-                        grpo_loss = grpo_ret_dict["pg_loss"]
+                        # ⭐ 只取 on_pg_loss（on-policy 数据的 policy gradient）
+                        # 忽略 off_pg_loss，因为 expert 数据由 SFT loss 负责
+                        grpo_loss = grpo_ret_dict["on_pg_loss"]
                         
                         # Step 2: 计算 CHORD SFT loss（只对 expert 数据）
                         chord_delta = self.config.get("chord_delta", 0.1)
@@ -878,8 +882,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             mu_valley=chord_mu_valley,
                         )
                         
-                        # ⭐ CHORD 总 loss: L_chord = L_grpo + μ * L_sft
-                        pg_loss = grpo_loss + mu * sft_loss
+                        # ⭐ CHORD 总 loss: L_chord = (1-μ) * L_grpo + μ * L_sft
+                        # 训练初期 μ 大：更多依赖 SFT（学习 expert）
+                        # 训练后期 μ 小：更多依赖 GRPO（on-policy 探索）
+                        pg_loss = (1 - mu) * grpo_loss + mu * sft_loss
                         
                         # 构建 ret_dict（复用现有结构）
                         ret_dict = grpo_ret_dict.copy()
