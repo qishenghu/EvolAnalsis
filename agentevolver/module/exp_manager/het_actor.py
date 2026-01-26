@@ -810,8 +810,17 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     
                     # ⭐ DR³ (Density-Ratio-Repair) configuration
                     use_dr3 = bool(self.config.get("use_dr3", False))
-                    dr3_cfg = self.config.get("dr3", {}) or {}
-                    # allow flat keys for backward-compat
+                    dr3_cfg_raw = self.config.get("dr3", {}) or {}
+                    # OmegaConf's DictConfig is not a plain dict; convert it so keys like sync_across_ranks work.
+                    try:
+                        from omegaconf import OmegaConf
+
+                        if OmegaConf.is_config(dr3_cfg_raw):
+                            dr3_cfg = OmegaConf.to_container(dr3_cfg_raw, resolve=True) or {}
+                        else:
+                            dr3_cfg = dr3_cfg_raw
+                    except Exception:
+                        dr3_cfg = dr3_cfg_raw
                     if not isinstance(dr3_cfg, dict):
                         dr3_cfg = {}
                     dr3_enable = bool(dr3_cfg.get("enable", True)) if use_dr3 else False
