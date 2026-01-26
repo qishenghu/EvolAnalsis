@@ -169,14 +169,6 @@ def het_compute_token_on_off_policy_loss(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-
-    # =============== teacher mask (robust) ===============
-    # NOTE: teacher_mask_float is used in both self-off-policy and teacher-off-policy branches.
-    # Some call-sites may pass teacher_mask=None; in that case treat as "no teacher tokens".
-    if teacher_mask is None:
-        teacher_mask_float = torch.zeros_like(exp_mask, dtype=exp_mask.dtype, device=exp_mask.device)
-    else:
-        teacher_mask_float = teacher_mask.float()
     on_pg_losses, on_pg_clipfrac, on_pg_clipfrac_lower = compute_pg_losses(cliprange_low, cliprange_high)
     on_pg_loss = verl_F.masked_mean(on_pg_losses, (1.0 - exp_mask) * response_mask)  # ⭐ Compute the on-policy loss
     # Cliphit rate for ON-policy tokens only (avoid off-policy dilution)
@@ -353,6 +345,10 @@ def het_compute_teacher_aware_loss(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
+
+    # =============== teacher mask (required) ===============
+    # teacher_mask is guaranteed not None here due to the early-return above.
+    teacher_mask_float = teacher_mask.float()
     
     # =============== On-policy loss（与现有逻辑相同） ===============
     on_pg_losses1 = -advantages * ratio
