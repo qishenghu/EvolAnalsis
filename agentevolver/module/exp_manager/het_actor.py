@@ -858,8 +858,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         on_sample = ~teacher_sample
 
                         # If teacher provides log_prob, we should NOT override; fall back to existing teacher loss path.
-                        # Also require both on/off to exist for stable discriminator training.
-                        if bool(teacher_use_log_prob) or (teacher_sample.sum().item() == 0) or (on_sample.sum().item() == 0):
+                        # NOTE: micro-batch can be teacher-only when ppo_micro_batch_size_per_gpu=1.
+                        #       DR³ must still run in that case (classifier training will be skipped on single-class batches).
+                        if bool(teacher_use_log_prob):
                             # fall back to existing LUFFY behavior
                             ret_dict = het_compute_teacher_aware_loss(
                                 old_log_prob=old_log_prob,
@@ -868,6 +869,13 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 response_mask=response_mask,
                                 exp_mask=exp_mask,
                                 teacher_mask=teacher_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                off_cliprange_high=off_cliprange_high,
+                                clip_ratio_c=clip_ratio_c,
+                                off_policy_shaping_mode=off_policy_shaping_mode,
+                                off_policy_shaping_beta=off_policy_shaping_beta,
                                 teacher_use_log_prob=teacher_use_log_prob,
                                 teacher_policy_shaping_enable=self.config.get("teacher_policy_shaping_enable", True),
                                 teacher_policy_shaping_mode=self.config.get("teacher_policy_shaping_mode", "p_div_p_beta"),
@@ -899,7 +907,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
                             # alpha estimated from current micro-batch composition
                             alpha_hat = float(teacher_sample.float().mean().detach().item())
-                            alpha_hat = float(min(max(alpha_hat, 1e-6), 1.0 - 1e-6))
+                            # Avoid extreme 0/1 in micro-batch (often single-sample); keep theoretical bound reasonable.
+                            alpha_hat = float(min(max(alpha_hat, 0.01), 0.99))
 
                             # Estimate w_alpha for all samples; off-policy label is teacher_sample
                             w_hat, dr3_metrics = self._dr3_est.step(

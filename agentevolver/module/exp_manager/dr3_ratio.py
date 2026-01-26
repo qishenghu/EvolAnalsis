@@ -193,9 +193,17 @@ class DR3RatioEstimator:
         assert self._opt is not None
 
         # Train discriminator a few steps (low overhead, local to rank)
+        # IMPORTANT: micro-batches can be single-class (all teacher or all on-policy).
+        # In that case, skip training to avoid collapsing the classifier.
         disc_loss_val = 0.0
         disc_acc_val = 0.0
-        if self.disc_steps_per_call > 0:
+        single_class = False
+        try:
+            single_class = bool((labels_on.min() == labels_on.max()).item())
+        except Exception:
+            single_class = False
+
+        if (self.disc_steps_per_call > 0) and (not single_class):
             for _ in range(self.disc_steps_per_call):
                 logits = self._disc(feats)
                 loss = self._bce(logits, labels_on)
