@@ -27,7 +27,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_chord_bz8_mix1
+  experiment_name: alfworld_3b_grpo_chord_bz8_mix1_mu_decay_50
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -96,14 +96,42 @@ actor_rollout_ref:
     # ============================================================================
     use_chord: true
     
-    # μ(t) 全局系数配置
-    # μ(t) = μ_max * (1 - t/T)^λ
-    # - μ_max: 初始 SFT 权重（论文默认 0.5）
-    # - lambda_decay: 衰减指数（论文默认 2.0）
-    chord_mu_max: 0.5
-    chord_lambda_decay: 2.0
+    # ============================================================================
+    # μ 三阶段调度配置（基于 CHORD 原作者实现）
+    # ============================================================================
+    # 三阶段调度：Warmup → Decay → 稳定
+    # 
+    # 1. Warmup 阶段（0 → mu_warmup_steps）：
+    #    μ 从 0 线性增长到 mu_peak
+    # 
+    # 2. Decay 阶段（mu_warmup_steps → mu_warmup_steps + mu_decay_steps）：
+    #    μ 从 mu_peak 按余弦曲线平滑衰减到 mu_valley
+    # 
+    # 3. 稳定阶段（mu_warmup_steps + mu_decay_steps → ∞）：
+    #    μ 保持在 mu_valley
+    # ============================================================================
     
+    # Warmup 阶段步数（chord-mu/chord-phi 可设为 0 跳过 warmup）
+    chord_mu_warmup_steps: 0 # original default 200
+    
+    # Decay 阶段步数
+    # - chord-mu: 200
+    # - chord-phi: 0（不衰减，保持在 peak）
+    chord_mu_decay_steps: 50 # original default 400
+    
+    # μ 的峰值（Warmup 结束时达到）
+    # - chord-mu: 0.9
+    # - chord-phi: 0.1
+    chord_mu_peak: 0.5
+    
+    # μ 的谷值/最终值（Decay 结束后保持）
+    # - chord-mu: 0.05
+    # - chord-phi: 0.1
+    chord_mu_valley: 0.02
+    
+    # ============================================================================
     # φ(d) Token-wise 加权配置
+    # ============================================================================
     # φ(d) = d / (d + δ)
     # - delta: 平滑参数（论文默认 0.1）
     # - use_token_weighting: 是否启用 token-wise 加权

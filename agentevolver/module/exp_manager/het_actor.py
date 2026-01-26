@@ -704,6 +704,16 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 teacher_traj_value_acc: dict[str, list[torch.Tensor]] = {}
 
                 # ------------------------------------------------------------------
+                # ⭐ CHORD: 获取 global_step（在 mini_batch 级别，micro-batch 循环之前）
+                # ------------------------------------------------------------------
+                chord_global_step: int = 0
+                try:
+                    if isinstance(mini_batch, DataProto) and hasattr(mini_batch, 'meta_info'):
+                        chord_global_step = int(mini_batch.meta_info.get("global_step", 0))
+                except Exception:
+                    chord_global_step = 0
+
+                # ------------------------------------------------------------------
                 # 7.8: gap->beta (compute once per mini-batch; apply to all micro-batches)
                 # ------------------------------------------------------------------
                 gap_beta_override: float | None = None
@@ -852,26 +862,20 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         )
                         sft_loss = sft_ret["sft_loss"]
                         
-                        # Step 3: 计算 μ(t) 并合并 loss
-                        # training_progress 从 meta_info 获取
-                        training_progress = 0.0
-                        if hasattr(data, 'meta_info') and isinstance(data.meta_info, dict):
-                            training_progress = data.meta_info.get("training_progress", 0.0)
-                        elif hasattr(data, '__getitem__'):
-                            try:
-                                meta = data.get("meta_info", {})
-                                if isinstance(meta, dict):
-                                    training_progress = meta.get("training_progress", 0.0)
-                            except Exception:
-                                pass
-                        
-                        chord_mu_max = self.config.get("chord_mu_max", 0.5)
-                        chord_lambda_decay = self.config.get("chord_lambda_decay", 2.0)
+                        # Step 3: 计算 μ 并合并 loss
+                        # ⭐ 使用预先获取的 chord_global_step（在 mini_batch 级别获取）
+                        # CHORD 原作者实现：三阶段调度（Warmup → Decay → 稳定）
+                        chord_mu_warmup_steps = self.config.get("chord_mu_warmup_steps", 200)
+                        chord_mu_decay_steps = self.config.get("chord_mu_decay_steps", 400)
+                        chord_mu_peak = self.config.get("chord_mu_peak", 0.5)
+                        chord_mu_valley = self.config.get("chord_mu_valley", 0.02)
                         
                         mu = chord_mu_scheduler(
-                            training_progress=training_progress,
-                            mu_max=chord_mu_max,
-                            lambda_decay=chord_lambda_decay,
+                            global_step=chord_global_step,
+                            mu_warmup_steps=chord_mu_warmup_steps,
+                            mu_decay_steps=chord_mu_decay_steps,
+                            mu_peak=chord_mu_peak,
+                            mu_valley=chord_mu_valley,
                         )
                         
                         # ⭐ CHORD 总 loss: L_chord = L_grpo + μ * L_sft
@@ -884,7 +888,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         # 记录 CHORD 诊断指标
                         chord_metrics = {
                             "chord/mu": mu,
-                            "chord/training_progress": training_progress,
+                            "chord/global_step": chord_global_step,
                             "chord/grpo_loss": grpo_loss.detach().item(),
                             "chord/sft_loss": sft_loss.detach().item(),
                             "chord/weighted_sft_loss": (mu * sft_loss).detach().item(),

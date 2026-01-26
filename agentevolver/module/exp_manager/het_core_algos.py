@@ -1565,38 +1565,72 @@ def repo_compute_grpo_advantage(
 # ==============================================================================
 
 def chord_mu_scheduler(
-    training_progress: float,
-    mu_max: float = 0.5,
-    lambda_decay: float = 2.0,
+    global_step: int,
+    mu_warmup_steps: int = 200,
+    mu_decay_steps: int = 400,
+    mu_peak: float = 0.5,
+    mu_valley: float = 0.02,
 ) -> float:
     """
-    CHORD 全局系数 μ(t) 调度器。
+    CHORD 全局系数 μ 调度器（三阶段：Warmup → Decay → 稳定）。
     
-    公式：μ(t) = μ_max * (1 - t/T)^λ
+    基于 CHORD 原作者代码实现：
+    https://github.com/modelscope/Trinity-RFT/tree/main/examples/mix_chord
+    
+    三阶段调度：
+    1. Warmup 阶段（global_step < mu_warmup_steps）：
+       - 线性增长：μ = (global_step / mu_warmup_steps) * mu_peak
+       - 从 0 线性增长到 mu_peak
+       
+    2. Decay 阶段（mu_warmup_steps ≤ global_step < mu_warmup_steps + mu_decay_steps）：
+       - 余弦衰减：cosine_decay = 0.5 * (1 + cos(π * adjusted_step / mu_decay_steps))
+       - decayed_mu = (mu_peak - mu_valley) * cosine_decay + mu_valley
+       - 从 mu_peak 按余弦曲线平滑衰减到 mu_valley
+       
+    3. 稳定阶段（global_step ≥ mu_warmup_steps + mu_decay_steps）：
+       - 保持在 mu_valley
     
     Args:
-        training_progress: 训练进度 t/T，范围 [0, 1]
-        mu_max: 初始 SFT 权重（论文默认 0.5）
-        lambda_decay: 衰减指数（论文默认 2.0）
+        global_step: 当前训练步数
+        mu_warmup_steps: Warmup 阶段步数（默认 200，chord-mu/chord-phi 可设为 0）
+        mu_decay_steps: Decay 阶段步数（默认 400，chord-mu 设为 200，chord-phi 设为 0）
+        mu_peak: μ 的峰值（默认 0.5，chord-mu 设为 0.9，chord-phi 设为 0.1）
+        mu_valley: μ 的谷值/最终值（默认 0.02，chord-mu 设为 0.05，chord-phi 设为 0.1）
         
     Returns:
         float: 当前的 μ 值
         
     Example:
-        >>> chord_mu_scheduler(0.0, mu_max=0.5, lambda_decay=2.0)
-        0.5  # 训练开始，μ = μ_max
-        >>> chord_mu_scheduler(0.5, mu_max=0.5, lambda_decay=2.0)
-        0.125  # 训练中期，μ = 0.5 * 0.5^2 = 0.125
-        >>> chord_mu_scheduler(1.0, mu_max=0.5, lambda_decay=2.0)
-        0.0  # 训练结束，μ = 0
+        >>> chord_mu_scheduler(0, mu_warmup_steps=200, mu_decay_steps=400, mu_peak=0.5, mu_valley=0.02)
+        0.0  # Warmup 开始
+        >>> chord_mu_scheduler(100, mu_warmup_steps=200, mu_decay_steps=400, mu_peak=0.5, mu_valley=0.02)
+        0.25  # Warmup 中期
+        >>> chord_mu_scheduler(200, mu_warmup_steps=200, mu_decay_steps=400, mu_peak=0.5, mu_valley=0.02)
+        0.5  # Warmup 结束，达到峰值
+        >>> chord_mu_scheduler(400, mu_warmup_steps=200, mu_decay_steps=400, mu_peak=0.5, mu_valley=0.02)
+        0.26  # Decay 中期
+        >>> chord_mu_scheduler(600, mu_warmup_steps=200, mu_decay_steps=400, mu_peak=0.5, mu_valley=0.02)
+        0.02  # Decay 结束，达到谷值
     """
-    # 确保 training_progress 在 [0, 1] 范围内
-    training_progress = max(0.0, min(1.0, training_progress))
+    import math
     
-    # μ(t) = μ_max * (1 - t/T)^λ
-    mu = mu_max * ((1.0 - training_progress) ** lambda_decay)
+    # 阶段 1: Warmup（线性增长）
+    if global_step < mu_warmup_steps:
+        if mu_warmup_steps == 0:
+            return mu_peak
+        return (global_step / mu_warmup_steps) * mu_peak
     
-    return mu
+    # 阶段 3: 稳定（保持在 mu_valley）
+    if global_step >= (mu_warmup_steps + mu_decay_steps):
+        return mu_valley
+    
+    # 阶段 2: Decay（余弦衰减）
+    if mu_decay_steps == 0:
+        return mu_valley
+    adjusted_step = global_step - mu_warmup_steps
+    cosine_decay = 0.5 * (1 + math.cos(math.pi * adjusted_step / mu_decay_steps))
+    decayed_mu = (mu_peak - mu_valley) * cosine_decay + mu_valley
+    return decayed_mu
 
 
 def compute_chord_token_weights(
