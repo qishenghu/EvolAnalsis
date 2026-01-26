@@ -445,6 +445,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
             "dr3_step/on_micro": 0.0,           # sum of on-policy samples across those micro-batches (micro-level)
             "dr3_step/buf_size_last": 0.0,      # last observed buffer size (per-rank)
             "dr3_step/buf_size_max": 0.0,       # max observed buffer size (per-rank)
+            # Step-level buffer write volume (after optional all_gather). This is the cleanest way to verify "+64".
+            "dr3_step/buf_pushed_sum": 0.0,
+            "dr3_step/buf_pushed_on_sum": 0.0,
+            "dr3_step/buf_pushed_off_sum": 0.0,
             "dr3_step/disc_trained_steps_sum": 0.0,
             "dr3_step/ess_off_window_last": 0.0,
             "dr3_step/dual_lambda_last": 0.0,
