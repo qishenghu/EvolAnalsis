@@ -957,7 +957,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             dr3_metrics = None
                             w_hat = None
 
-                    elif (ret_dict is None) and dr3_enable and has_teacher_data:
+                    # ------------------------------------------------------------------
+                    # Loss selection: ensure ret_dict is ALWAYS produced
+                    # ------------------------------------------------------------------
+                    if (ret_dict is None) and dr3_enable and has_teacher_data:
                         # ========== DR³ apply ==========
                         # 判别器训练/缓冲区更新已在上方“DR³ observe (ALWAYS)”执行（包含 on-policy 样本的 push）。
                         teacher_use_log_prob = bool(self.config.get("teacher_use_log_prob", False))
@@ -1066,7 +1069,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 except Exception:
                                     pass
 
-                    elif (ret_dict is None) and use_chord and has_teacher_data:
+                    if (ret_dict is None) and use_chord and has_teacher_data:
                         # ========== CHORD 模式 ==========
                         # CHORD (Controllable Harmonization of On- and Off-Policy RL)
                         # 使用 SFT loss 代替 policy gradient 学习 expert 数据
@@ -1149,7 +1152,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             chord_metrics[f"chord/{k}"] = v
                         append_to_dict(metrics, chord_metrics)
                         
-                    elif (ret_dict is None) and has_teacher_data:
+                    if (ret_dict is None) and has_teacher_data:
                         # ⭐ Teacher Experience: 使用 het_compute_teacher_aware_loss (LUFFY 模式)
                         # 获取 teacher 相关配置
                         teacher_use_log_prob = self.config.get("teacher_use_log_prob", False)
@@ -1251,7 +1254,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 if v is None or (not torch.is_tensor(v)) or v.numel() == 0:
                                     continue
                                 teacher_traj_value_acc.setdefault(str(k), []).append(v.detach())
-                    elif ret_dict is None:
+                    if ret_dict is None:
                         # Use original het_compute_token_on_off_policy_loss
                         ret_dict = het_compute_token_on_off_policy_loss(
                             old_log_prob=old_log_prob,
@@ -1268,6 +1271,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             off_policy_shaping_mode=off_policy_shaping_mode,
                             off_policy_shaping_beta=off_policy_shaping_beta,
                         )  # ⭐ Compute on-policy and off-policy losses
+
+                    # Hard safety guard: ret_dict must exist from one of the branches above.
+                    # If this triggers, it indicates a control-flow bug in loss selection.
+                    if ret_dict is None:
+                        raise RuntimeError(
+                            "update_policy: ret_dict is None after loss selection. "
+                            f"use_dapo={use_dapo}, dr3_enable={dr3_enable}, use_chord={use_chord}, "
+                            f"has_teacher_data={has_teacher_data}, dr3_apply_to={dr3_apply_to}"
+                        )
                     pg_loss = ret_dict["pg_loss"]
                     pg_losses = ret_dict["pg_losses"]
                     on_pg_losses = ret_dict["on_pg_losses"]
