@@ -838,7 +838,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     dr3_dual_lr = float(dr3_cfg.get("dual_lr", 0.05))
                     dr3_dual_init = float(dr3_cfg.get("dual_init", 0.0))
                     dr3_clip_eps = float(dr3_cfg.get("ppo_clip_eps", 0.2))
-
+                    
                     # ⭐ CHORD (Controllable Harmonization of On- and Off-Policy RL) configuration
                     use_chord = self.config.get("use_chord", False)
                     
@@ -856,7 +856,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     
                     # Ensure ret_dict is always set by one of the branches below.
                     ret_dict = None
-
+                    
                     if use_dapo:
                         # Use DAPO's decoupled asymmetric clipping mechanism
                         # ⭐ Experience-Replay compatible: pass off-policy shaping parameters
