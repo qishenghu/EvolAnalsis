@@ -135,6 +135,8 @@ class DR3RatioEstimator:
         buffer_size: int = 2048,
         train_batch_size: int = 128,
         ess_window: int = 32,
+        sync_across_ranks: bool = False,
+        sync_every_n_calls: int = 1,
         clip_max: float = 10.0,
         dual_enable: bool = True,
         ess_target_ratio: float = 0.5,
@@ -163,6 +165,9 @@ class DR3RatioEstimator:
         self.buffer_size = max(32, int(buffer_size))
         self.train_batch_size = max(8, int(train_batch_size))
         self.ess_window = max(1, int(ess_window))
+        self.sync_across_ranks = bool(sync_across_ranks)
+        self.sync_every_n_calls = max(1, int(sync_every_n_calls))
+        self._calls: int = 0
 
         self._buf_x: Optional[torch.Tensor] = None  # (N,F) on device
         self._buf_y: Optional[torch.Tensor] = None  # (N,) labels_on in {0,1} on device
@@ -243,8 +248,51 @@ class DR3RatioEstimator:
         assert self._disc is not None
         assert self._opt is not None
 
-        # Push into rolling buffer so discriminator can be trained across micro-batches.
-        self._push_buffer(feats, labels_on)
+        # --------------------------------------------------------------
+        # Optional: multi-GPU synchronization for robust discriminator training
+        # --------------------------------------------------------------
+        self._calls += 1
+        sync_metrics = {
+            "dr3/sync_enabled": 1.0 if self.sync_across_ranks else 0.0,
+            "dr3/sync_world_size": 1.0,
+            "dr3/sync_batch": float(feats.shape[0]),
+            "dr3/sync_has_both_classes": 0.0,
+            "dr3/sync_on_count": float(labels_on.sum().item()) if labels_on.numel() else 0.0,
+            "dr3/sync_off_count": float((1.0 - labels_on).sum().item()) if labels_on.numel() else 0.0,
+        }
+
+        feats_for_buffer = feats
+        labels_for_buffer = labels_on
+        if self.sync_across_ranks and (self._calls % self.sync_every_n_calls == 0):
+            try:
+                import torch.distributed as dist
+
+                if dist.is_available() and dist.is_initialized():
+                    ws = int(dist.get_world_size())
+                    sync_metrics["dr3/sync_world_size"] = float(ws)
+                    # all_gather current micro-batch features/labels across ranks
+                    feat_list = [torch.zeros_like(feats) for _ in range(ws)]
+                    lab_list = [torch.zeros_like(labels_on) for _ in range(ws)]
+                    dist.all_gather(feat_list, feats)
+                    dist.all_gather(lab_list, labels_on)
+                    feats_for_buffer = torch.cat(feat_list, dim=0)
+                    labels_for_buffer = torch.cat(lab_list, dim=0)
+                    sync_metrics["dr3/sync_batch"] = float(feats_for_buffer.shape[0])
+                    try:
+                        on_cnt = float(labels_for_buffer.sum().item())
+                        off_cnt = float((1.0 - labels_for_buffer).sum().item())
+                        sync_metrics["dr3/sync_on_count"] = on_cnt
+                        sync_metrics["dr3/sync_off_count"] = off_cnt
+                        sync_metrics["dr3/sync_has_both_classes"] = 1.0 if (on_cnt > 0 and off_cnt > 0) else 0.0
+                    except Exception:
+                        pass
+            except Exception:
+                # never break training
+                feats_for_buffer = feats
+                labels_for_buffer = labels_on
+
+        # Push into rolling buffer so discriminator can be trained across micro-batches (and optionally across ranks).
+        self._push_buffer(feats_for_buffer, labels_for_buffer)
 
         # Train discriminator a few steps (low overhead, local to rank)
         # With micro_batch_size=1, current micro-batch is often single-class.
@@ -318,6 +366,7 @@ class DR3RatioEstimator:
             "dr3/ess_window_len": float(len(self._w_off_hist)),
             "dr3/dual_lambda": float(self.dual.lam),
         }
+        metrics.update(sync_metrics)
         # Off-policy subset distribution (most important for analysis)
         try:
             off_idx = is_offpolicy.bool()

@@ -85,6 +85,9 @@ actor_rollout_ref:
       buffer_size: 2048
       train_batch_size: 128
       ess_window: 32
+      # Multi-GPU robustness: gather micro-batch features/labels across ranks so every rank sees both classes.
+      sync_across_ranks: true
+      sync_every_n_calls: 1
       # ratio clipping / stability
       clip_max: 10.0
       ppo_clip_eps: 0.2                  # reuse PPO-style clip for off-policy ratio after repair

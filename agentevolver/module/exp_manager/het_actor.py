@@ -437,6 +437,19 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
         metrics = {}
         # ------------------------------------------------------------------
+        # DR³ step-level diagnostics (avoid micro-batch confusion when micro_bsz=1)
+        # ------------------------------------------------------------------
+        dr3_step = {
+            "dr3_step/calls": 0.0,              # number of micro-batches that executed DR³ path on this rank
+            "dr3_step/teacher_micro": 0.0,      # sum of teacher samples across those micro-batches (micro-level)
+            "dr3_step/on_micro": 0.0,           # sum of on-policy samples across those micro-batches (micro-level)
+            "dr3_step/buf_size_last": 0.0,      # last observed buffer size (per-rank)
+            "dr3_step/buf_size_max": 0.0,       # max observed buffer size (per-rank)
+            "dr3_step/disc_trained_steps_sum": 0.0,
+            "dr3_step/ess_off_window_last": 0.0,
+            "dr3_step/dual_lambda_last": 0.0,
+        }
+        # ------------------------------------------------------------------
         # Gradient-direction diagnostics (teacher vs on-policy), per-step aggregated.
         #
         # Definition:
@@ -845,23 +858,106 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             off_policy_shaping_mode=off_policy_shaping_mode,
                             off_policy_shaping_beta=off_policy_shaping_beta,
                         )  # ⭐ Compute policy loss using DAPO's Clip-Higher mechanism (Experience-Replay compatible)
+                    # ------------------------------------------------------------------
+                    # DR³ observe (ALWAYS when enabled): push features/labels into buffer (and optionally sync across ranks).
+                    #
+                    # Rationale:
+                    # - With ppo_micro_batch_size_per_gpu=1, many micro-batches are single-class.
+                    # - In multi-GPU, if only some ranks call all_gather, it may deadlock.
+                    # Therefore, when DR³ is enabled we always call the estimator once per micro-batch,
+                    # and only *apply* the repair/loss when teacher(no_logprob) is present.
+                    # ------------------------------------------------------------------
+                    dr3_metrics = None
+                    w_hat = None
+                    if dr3_enable:
+                        try:
+                            if not hasattr(self, "_dr3_est") or (self._dr3_est is None):
+                                self._dr3_est = DR3RatioEstimator(
+                                    hidden=dr3_disc_hidden,
+                                    lr=dr3_disc_lr,
+                                    disc_steps_per_call=dr3_disc_steps,
+                                    clip_max=dr3_clip_max,
+                                    dual_enable=dr3_dual_enable,
+                                    ess_target_ratio=dr3_ess_target_ratio,
+                                    dual_lr=dr3_dual_lr,
+                                    dual_init=dr3_dual_init,
+                                    buffer_size=int(dr3_cfg.get("buffer_size", 2048)),
+                                    train_batch_size=int(dr3_cfg.get("train_batch_size", 128)),
+                                    ess_window=int(dr3_cfg.get("ess_window", 32)),
+                                    sync_across_ranks=bool(dr3_cfg.get("sync_across_ranks", False)),
+                                    sync_every_n_calls=int(dr3_cfg.get("sync_every_n_calls", 1)),
+                                )
+                            # Build teacher_sample even if teacher_mask missing (all False)
+                            teacher_sample = (
+                                (teacher_mask.sum(dim=-1) > 0)
+                                if (teacher_mask is not None and torch.is_tensor(teacher_mask))
+                                else torch.zeros(log_prob.size(0), device=log_prob.device, dtype=torch.bool)
+                            )
+                            # Stable alpha prior under rollout-level mixing is recommended.
+                            alpha_prior = dr3_cfg.get("alpha_prior", None)
+                            if alpha_prior is not None:
+                                try:
+                                    alpha_hat = float(alpha_prior)
+                                except Exception:
+                                    alpha_hat = float(teacher_sample.float().mean().detach().item())
+                            else:
+                                alpha_hat = float(teacher_sample.float().mean().detach().item())
+                            alpha_hat = float(min(max(alpha_hat, 0.01), 0.99))
+
+                            feats = compute_sequence_features(
+                                log_prob=log_prob.detach(),
+                                advantages=advantages.detach(),
+                                response_mask=response_mask.detach(),
+                            )
+                            w_hat, dr3_metrics = self._dr3_est.step(
+                                features=feats,
+                                is_offpolicy=teacher_sample.detach(),  # teacher==off-policy label
+                                alpha=alpha_hat,
+                            )
+                            # micro-level logs (OK)
+                            try:
+                                append_to_dict(metrics, dr3_metrics)
+                                metrics.update(
+                                    {
+                                        "dr3/teacher_samples_micro": float(teacher_sample.sum().item()),
+                                        "dr3/on_samples_micro": float((~teacher_sample).sum().item()),
+                                        "dr3/teacher_ratio_micro": float(alpha_hat),
+                                    }
+                                )
+                                # Step-level aggregation (per-rank) for debugging multi-GPU / micro-batch behavior
+                                dr3_step["dr3_step/calls"] += 1.0
+                                dr3_step["dr3_step/teacher_micro"] += float(teacher_sample.sum().item())
+                                dr3_step["dr3_step/on_micro"] += float((~teacher_sample).sum().item())
+                                try:
+                                    _bsz = float(dr3_metrics.get("dr3/buf_size", 0.0))
+                                    dr3_step["dr3_step/buf_size_last"] = _bsz
+                                    dr3_step["dr3_step/buf_size_max"] = max(float(dr3_step["dr3_step/buf_size_max"]), _bsz)
+                                except Exception:
+                                    pass
+                                try:
+                                    dr3_step["dr3_step/disc_trained_steps_sum"] += float(dr3_metrics.get("dr3/disc_trained_steps", 0.0))
+                                except Exception:
+                                    pass
+                                try:
+                                    dr3_step["dr3_step/ess_off_window_last"] = float(dr3_metrics.get("dr3/ess_off_window", 0.0))
+                                except Exception:
+                                    pass
+                                try:
+                                    dr3_step["dr3_step/dual_lambda_last"] = float(dr3_metrics.get("dr3/dual_lambda", 0.0))
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                        except Exception:
+                            dr3_metrics = None
+                            w_hat = None
+
                     elif dr3_enable and has_teacher_data:
-                        # ========== DR³ 模式 ==========
-                        # 目的：在 teacher 无 logprob/tokenizer 不同的场景下，用相对密度比 w_alpha
-                        #      对 teacher/off-policy 数据做“分布修复”，再复用 PPO-style ratio+clip。
-
-                        # teacher_use_log_prob 与 exp_manager.teacher_experience.use_log_prob 对齐（来自 config）
-                        teacher_use_log_prob = self.config.get("teacher_use_log_prob", False)
-
-                        # DR³ 默认只作用于 teacher(no_logprob)
-                        teacher_sample = (teacher_mask.sum(dim=-1) > 0) if (teacher_mask is not None and torch.is_tensor(teacher_mask)) else torch.zeros(log_prob.size(0), device=log_prob.device, dtype=torch.bool)
-                        on_sample = ~teacher_sample
-
-                        # If teacher provides log_prob, we should NOT override; fall back to existing teacher loss path.
-                        # NOTE: micro-batch can be teacher-only when ppo_micro_batch_size_per_gpu=1.
-                        #       DR³ must still run in that case (classifier training will be skipped on single-class batches).
-                        if bool(teacher_use_log_prob):
-                            # fall back to existing LUFFY behavior
+                        # ========== DR³ apply ==========
+                        # 判别器训练/缓冲区更新已在上方“DR³ observe (ALWAYS)”执行（包含 on-policy 样本的 push）。
+                        teacher_use_log_prob = bool(self.config.get("teacher_use_log_prob", False))
+                        if teacher_use_log_prob:
+                            # Teacher 有 logprob：保持现有 LUFFY 逻辑（不做 DR³ 修复）
                             ret_dict = het_compute_teacher_aware_loss(
                                 old_log_prob=old_log_prob,
                                 log_prob=log_prob,
@@ -876,7 +972,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 clip_ratio_c=clip_ratio_c,
                                 off_policy_shaping_mode=off_policy_shaping_mode,
                                 off_policy_shaping_beta=off_policy_shaping_beta,
-                                teacher_use_log_prob=teacher_use_log_prob,
+                                teacher_use_log_prob=True,
                                 teacher_policy_shaping_enable=self.config.get("teacher_policy_shaping_enable", True),
                                 teacher_policy_shaping_mode=self.config.get("teacher_policy_shaping_mode", "p_div_p_beta"),
                                 teacher_policy_shaping_beta=self.config.get("teacher_policy_shaping_beta", 0.1),
@@ -885,115 +981,85 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 teacher_loss_scale=teacher_loss_scale,
                             )
                         else:
-                            # Lazy init estimator (per-rank)
-                            if not hasattr(self, "_dr3_est") or (self._dr3_est is None):
-                                self._dr3_est = DR3RatioEstimator(
-                                    hidden=dr3_disc_hidden,
-                                    lr=dr3_disc_lr,
-                                    disc_steps_per_call=dr3_disc_steps,
-                                    clip_max=dr3_clip_max,
-                                    dual_enable=dr3_dual_enable,
-                                    ess_target_ratio=dr3_ess_target_ratio,
-                                    dual_lr=dr3_dual_lr,
-                                    dual_init=dr3_dual_init,
+                            # Teacher 无 logprob：用 DR³ 的 w_hat 修复 old_log_prob，再复用 RePO-style token loss
+                            if w_hat is None:
+                                # 极端兜底：避免崩溃，回退 LUFFY(no_logprob)（仍显式传 clip 参数）
+                                ret_dict = het_compute_teacher_aware_loss(
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=advantages,
+                                    response_mask=response_mask,
+                                    exp_mask=exp_mask,
+                                    teacher_mask=teacher_mask,
+                                    cliprange=clip_ratio,
+                                    cliprange_low=clip_ratio_low,
+                                    cliprange_high=clip_ratio_high,
+                                    off_cliprange_high=off_cliprange_high,
+                                    clip_ratio_c=clip_ratio_c,
+                                    off_policy_shaping_mode=off_policy_shaping_mode,
+                                    off_policy_shaping_beta=off_policy_shaping_beta,
+                                    teacher_use_log_prob=False,
+                                    teacher_policy_shaping_enable=self.config.get("teacher_policy_shaping_enable", True),
+                                    teacher_policy_shaping_mode=self.config.get("teacher_policy_shaping_mode", "p_div_p_beta"),
+                                    teacher_policy_shaping_beta=self.config.get("teacher_policy_shaping_beta", 0.1),
+                                    teacher_use_clip=self.config.get("teacher_use_clip", False),
+                                    loss_agg_mode=loss_agg_mode,
+                                    teacher_loss_scale=teacher_loss_scale,
                                 )
-
-                            # Features are computed from already available tensors (no teacher logits required)
-                            feats = compute_sequence_features(
-                                log_prob=log_prob.detach(),
-                                advantages=advantages.detach(),
-                                response_mask=response_mask.detach(),
-                            )
-
-                            # alpha estimated from current micro-batch composition
-                            # alpha for relative density ratio: prefer stable prior under rollout-level mixing.
-                            alpha_prior = dr3_cfg.get("alpha_prior", None)
-                            if alpha_prior is not None:
-                                try:
-                                    alpha_hat = float(alpha_prior)
-                                except Exception:
-                                    alpha_hat = float(teacher_sample.float().mean().detach().item())
                             else:
-                                alpha_hat = float(teacher_sample.float().mean().detach().item())
-                            # Avoid extreme 0/1 in micro-batch (often single-sample)
-                            alpha_hat = float(min(max(alpha_hat, 0.01), 0.99))
-
-                            # Estimate w_alpha for all samples; off-policy label is teacher_sample
-                            w_hat, dr3_metrics = self._dr3_est.step(
-                                features=feats,
-                                is_offpolicy=teacher_sample.detach(),
-                                alpha=alpha_hat,
-                            )
-
-                            # Apply only to teacher(no_logprob) by default
-                            apply_mask = teacher_sample
-                            if dr3_apply_to in ("all_offpolicy", "all_off", "offpolicy", "all"):
-                                apply_mask = (exp_mask.sum(dim=-1) > 0)
-
-                            # Repair old_log_prob for selected rows:
-                            # old_log_prob <- stopgrad(log_prob) - log(w_hat)
-                            log_w = torch.log(w_hat.clamp_min(1e-6)).unsqueeze(-1)  # (bs,1)
-                            log_prob_det = log_prob.detach()
-                            old_lp_new = old_log_prob.clone()
-                            if apply_mask.any():
-                                old_lp_new[apply_mask] = log_prob_det[apply_mask] - log_w[apply_mask]
-                            old_log_prob = old_lp_new
-
-                            # Now reuse PPO-style token loss with ratio = exp(log_prob - old_log_prob) ~ w_hat
-                            ret_dict = repo_compute_token_loss(
-                                old_log_prob=old_log_prob,
-                                log_prob=log_prob,
-                                advantages=advantages,
-                                response_mask=response_mask,
-                                exp_mask=exp_mask,
-                                cliprange=clip_ratio,
-                                clip_eps=dr3_clip_eps,
-                                use_importance_clipping=True,
-                                loss_agg_mode=loss_agg_mode,
-                            )
-                            # Align return schema with other loss functions expected by update_policy
-                            # (update_policy expects on_pg_clipfrac_lower to always exist).
-                            try:
-                                z = torch.tensor(0.0, device=log_prob.device)
-                                if "on_pg_clipfrac_lower" not in ret_dict:
-                                    ret_dict["on_pg_clipfrac_lower"] = z
-                                # keep optional fields present for downstream logging
-                                if "on_pg_cliphit_rate" not in ret_dict:
-                                    ret_dict["on_pg_cliphit_rate"] = z
-                                if "off_pg_cliphit_rate" not in ret_dict:
-                                    ret_dict["off_pg_cliphit_rate"] = z
-                                if "self_off_pg_cliphit_rate" not in ret_dict:
-                                    ret_dict["self_off_pg_cliphit_rate"] = z
-                                if "teacher_off_pg_cliphit_rate" not in ret_dict:
-                                    ret_dict["teacher_off_pg_cliphit_rate"] = z
-                            except Exception:
-                                pass
-
-                            # Attach DR³ metrics
-                            try:
-                                append_to_dict(metrics, dr3_metrics)
-                                # NOTE: micro-batch size can be 1, so counts here are micro-level.
-                                metrics.update(
-                                    {
-                                        "dr3/teacher_samples_micro": float(teacher_sample.sum().item()),
-                                        "dr3/on_samples_micro": float(on_sample.sum().item()),
-                                        "dr3/teacher_ratio_micro": float(alpha_hat),
-                                    }
+                                teacher_sample = (
+                                    (teacher_mask.sum(dim=-1) > 0)
+                                    if (teacher_mask is not None and torch.is_tensor(teacher_mask))
+                                    else torch.zeros(log_prob.size(0), device=log_prob.device, dtype=torch.bool)
                                 )
-                            except Exception:
-                                pass
+                                apply_mask = teacher_sample
+                                if dr3_apply_to in ("all_offpolicy", "all_off", "offpolicy", "all"):
+                                    apply_mask = (exp_mask.sum(dim=-1) > 0)
 
-                            # Log ratio diagnostics from RePO-style loss (very important for debugging DR³)
-                            try:
-                                diag = ret_dict.get("repo_diag_stats", None)
-                                if isinstance(diag, dict) and diag:
-                                    for k, v in diag.items():
-                                        if torch.is_tensor(v):
-                                            metrics[f"dr3_diag/{k}"] = v.detach().float().item()
-                                        else:
-                                            metrics[f"dr3_diag/{k}"] = float(v)
-                            except Exception:
-                                pass
+                                log_w = torch.log(w_hat.clamp_min(1e-6)).unsqueeze(-1)  # (bs,1)
+                                old_lp_new = old_log_prob.clone()
+                                if apply_mask.any():
+                                    old_lp_new[apply_mask] = log_prob.detach()[apply_mask] - log_w[apply_mask]
+                                old_log_prob = old_lp_new
+
+                                ret_dict = repo_compute_token_loss(
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=advantages,
+                                    response_mask=response_mask,
+                                    exp_mask=exp_mask,
+                                    cliprange=clip_ratio,
+                                    clip_eps=dr3_clip_eps,
+                                    use_importance_clipping=True,
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                                # Align return schema expected by update_policy logging
+                                try:
+                                    z = torch.tensor(0.0, device=log_prob.device)
+                                    if "on_pg_clipfrac_lower" not in ret_dict:
+                                        ret_dict["on_pg_clipfrac_lower"] = z
+                                    if "on_pg_cliphit_rate" not in ret_dict:
+                                        ret_dict["on_pg_cliphit_rate"] = z
+                                    if "off_pg_cliphit_rate" not in ret_dict:
+                                        ret_dict["off_pg_cliphit_rate"] = z
+                                    if "self_off_pg_cliphit_rate" not in ret_dict:
+                                        ret_dict["self_off_pg_cliphit_rate"] = z
+                                    if "teacher_off_pg_cliphit_rate" not in ret_dict:
+                                        ret_dict["teacher_off_pg_cliphit_rate"] = z
+                                except Exception:
+                                    pass
+
+                                # Log ratio diagnostics from RePO-style loss (important for validating DR³)
+                                try:
+                                    diag = ret_dict.get("repo_diag_stats", None)
+                                    if isinstance(diag, dict) and diag:
+                                        for k, v in diag.items():
+                                            if torch.is_tensor(v):
+                                                metrics[f"dr3_diag/{k}"] = v.detach().float().item()
+                                            else:
+                                                metrics[f"dr3_diag/{k}"] = float(v)
+                                except Exception:
+                                    pass
 
                     elif use_chord and has_teacher_data:
                         # ========== CHORD 模式 ==========
@@ -1559,6 +1625,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
             append_to_dict(metrics, grad_dir_out)
         except Exception:
             # never break training
+            pass
+        # Log DR³ step-level summary once per update_policy call (per-rank)
+        try:
+            if float(dr3_step.get("dr3_step/calls", 0.0)) > 0.0:
+                append_to_dict(metrics, dr3_step)
+        except Exception:
             pass
         self.actor_optimizer.zero_grad()
         return metrics
