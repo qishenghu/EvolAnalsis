@@ -940,6 +940,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 except Exception:
                                     pass
                                 try:
+                                    dr3_step["dr3_step/buf_pushed_sum"] += float(dr3_metrics.get("dr3/buf_pushed", 0.0))
+                                    dr3_step["dr3_step/buf_pushed_on_sum"] += float(dr3_metrics.get("dr3/buf_pushed_on", 0.0))
+                                    dr3_step["dr3_step/buf_pushed_off_sum"] += float(dr3_metrics.get("dr3/buf_pushed_off", 0.0))
+                                except Exception:
+                                    pass
+                                try:
                                     dr3_step["dr3_step/disc_trained_steps_sum"] += float(dr3_metrics.get("dr3/disc_trained_steps", 0.0))
                                 except Exception:
                                     pass

@@ -318,23 +318,60 @@ class DR3RatioEstimator:
                     ws = int(dist.get_world_size())
                     sync_metrics["dr3/sync_world_size"] = float(ws)
 
-                    # Check batch size consistency across ranks; skip sync if mismatch to avoid crash.
+                    # Gather batch sizes first (works even when per-rank micro-batch sizes differ).
                     bs_local = torch.tensor([int(feats.shape[0])], device=feats.device, dtype=torch.int32)
                     bs_list = [torch.zeros_like(bs_local) for _ in range(ws)]
                     dist.all_gather(bs_list, bs_local)
                     bss = [int(x.item()) for x in bs_list]
+                    bs_max = int(max(bss)) if bss else int(feats.shape[0])
+                    bs_sum = int(sum(bss)) if bss else int(feats.shape[0])
+                    sync_metrics["dr3/sync_bs_max"] = float(bs_max)
+                    sync_metrics["dr3/sync_bs_sum"] = float(bs_sum)
                     if len(set(bss)) != 1:
                         sync_metrics["dr3/sync_shape_ok"] = 0.0
                         sync_metrics["dr3/sync_skipped_shape_mismatch"] = 1.0
+
+                    # Robust all_gather with padding to max batch size.
+                    # This avoids deadlocks and lets rank0 build a "global" buffer even when some ranks have bs=0/1/2...
+                    if bs_max <= 0:
+                        # nothing to sync
+                        feats_for_buffer = feats
+                        labels_for_buffer = labels_on
                     else:
-                        # all_gather current micro-batch features/labels across ranks
-                        feat_list = [torch.zeros_like(feats) for _ in range(ws)]
-                        lab_list = [torch.zeros_like(labels_on) for _ in range(ws)]
-                        dist.all_gather(feat_list, feats)
-                        dist.all_gather(lab_list, labels_on)
-                        feats_for_buffer = torch.cat(feat_list, dim=0)
-                        labels_for_buffer = torch.cat(lab_list, dim=0)
-                        sync_metrics["dr3/sync_batch"] = float(feats_for_buffer.shape[0])
+                        fdim = int(feats.shape[-1])
+                        # pad feats/labels to (bs_max, ...)
+                        if int(feats.shape[0]) < bs_max:
+                            pad_n = bs_max - int(feats.shape[0])
+                            feats_pad = torch.cat(
+                                [feats, torch.zeros((pad_n, fdim), device=feats.device, dtype=feats.dtype)],
+                                dim=0,
+                            )
+                            labels_pad = torch.cat(
+                                [labels_on, torch.zeros((pad_n,), device=labels_on.device, dtype=labels_on.dtype)],
+                                dim=0,
+                            )
+                        else:
+                            feats_pad = feats
+                            labels_pad = labels_on
+
+                        feat_list = [torch.zeros_like(feats_pad) for _ in range(ws)]
+                        lab_list = [torch.zeros_like(labels_pad) for _ in range(ws)]
+                        dist.all_gather(feat_list, feats_pad)
+                        dist.all_gather(lab_list, labels_pad)
+
+                        # trim to real sizes then concat
+                        feats_cat = []
+                        labs_cat = []
+                        for i in range(ws):
+                            bi = int(bss[i]) if i < len(bss) else bs_max
+                            if bi <= 0:
+                                continue
+                            feats_cat.append(feat_list[i][:bi])
+                            labs_cat.append(lab_list[i][:bi])
+                        if feats_cat:
+                            feats_for_buffer = torch.cat(feats_cat, dim=0)
+                            labels_for_buffer = torch.cat(labs_cat, dim=0)
+                            sync_metrics["dr3/sync_batch"] = float(feats_for_buffer.shape[0])
                     try:
                         on_cnt = float(labels_for_buffer.sum().item())
                         off_cnt = float((1.0 - labels_for_buffer).sum().item())
@@ -420,6 +457,10 @@ class DR3RatioEstimator:
             "dr3/disc_loss": float(disc_loss_val),
             "dr3/disc_acc": float(disc_acc_val),
             "dr3/disc_trained_steps": float(disc_trained_steps),
+            # How many samples were pushed into the buffer in THIS call (after optional all_gather).
+            "dr3/buf_pushed": float(feats_for_buffer.shape[0]) if torch.is_tensor(feats_for_buffer) else 0.0,
+            "dr3/buf_pushed_on": float(labels_for_buffer.sum().item()) if torch.is_tensor(labels_for_buffer) else 0.0,
+            "dr3/buf_pushed_off": float((1.0 - labels_for_buffer).sum().item()) if torch.is_tensor(labels_for_buffer) else 0.0,
             "dr3/buf_size": float(self._buf_y.numel()) if self._buf_y is not None else 0.0,
             "dr3/w_mean": float(w_clipped.mean().item()) if w_clipped.numel() else 0.0,
             "dr3/w_std": float(w_clipped.std().item()) if w_clipped.numel() > 1 else 0.0,
