@@ -137,6 +137,8 @@ class DR3RatioEstimator:
         ess_window: int = 32,
         sync_across_ranks: bool = False,
         sync_every_n_calls: int = 1,
+        broadcast_params: bool = False,
+        broadcast_every_n_calls: int = 1,
         clip_max: float = 10.0,
         dual_enable: bool = True,
         ess_target_ratio: float = 0.5,
@@ -168,6 +170,8 @@ class DR3RatioEstimator:
         self.sync_across_ranks = bool(sync_across_ranks)
         self.sync_every_n_calls = max(1, int(sync_every_n_calls))
         self._calls: int = 0
+        self.broadcast_params = bool(broadcast_params)
+        self.broadcast_every_n_calls = max(1, int(broadcast_every_n_calls))
 
         self._buf_x: Optional[torch.Tensor] = None  # (N,F) on device
         self._buf_y: Optional[torch.Tensor] = None  # (N,) labels_on in {0,1} on device
@@ -180,6 +184,38 @@ class DR3RatioEstimator:
         self._opt = torch.optim.Adam(self._disc.parameters(), lr=self.lr)
         self._buf_x = torch.empty((0, in_dim), device=device, dtype=torch.float32)
         self._buf_y = torch.empty((0,), device=device, dtype=torch.float32)
+        # Optional: ensure all ranks start from identical discriminator params
+        if self.broadcast_params:
+            try:
+                import torch.distributed as dist
+
+                if dist.is_available() and dist.is_initialized():
+                    for p in self._disc.parameters():
+                        dist.broadcast(p.data, src=0)
+            except Exception:
+                pass
+
+    def _get_rank_world(self) -> tuple[int, int]:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                return int(dist.get_rank()), int(dist.get_world_size())
+        except Exception:
+            pass
+        return 0, 1
+
+    def _broadcast_model_params(self) -> None:
+        if not self.broadcast_params or self._disc is None:
+            return
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                for p in self._disc.parameters():
+                    dist.broadcast(p.data, src=0)
+        except Exception:
+            pass
 
     def _push_buffer(self, x: torch.Tensor, y: torch.Tensor) -> None:
         if self._buf_x is None or self._buf_y is None:
@@ -252,13 +288,24 @@ class DR3RatioEstimator:
         # Optional: multi-GPU synchronization for robust discriminator training
         # --------------------------------------------------------------
         self._calls += 1
+        rank, world_size = self._get_rank_world()
         sync_metrics = {
             "dr3/sync_enabled": 1.0 if self.sync_across_ranks else 0.0,
-            "dr3/sync_world_size": 1.0,
+            "dr3/sync_world_size": float(world_size),
+            "dr3/sync_rank": float(rank),
             "dr3/sync_batch": float(feats.shape[0]),
             "dr3/sync_has_both_classes": 0.0,
             "dr3/sync_on_count": float(labels_on.sum().item()) if labels_on.numel() else 0.0,
             "dr3/sync_off_count": float((1.0 - labels_on).sum().item()) if labels_on.numel() else 0.0,
+            # robustness: all_gather requires equal batch shapes across ranks
+            "dr3/sync_shape_ok": 1.0,
+            "dr3/sync_skipped_shape_mismatch": 0.0,
+        }
+        bcast_metrics = {
+            "dr3/bcast_enabled": 1.0 if self.broadcast_params else 0.0,
+            "dr3/bcast_world_size": float(world_size),
+            "dr3/bcast_rank": float(rank),
+            "dr3/bcast_happened": 0.0,
         }
 
         feats_for_buffer = feats
@@ -270,14 +317,24 @@ class DR3RatioEstimator:
                 if dist.is_available() and dist.is_initialized():
                     ws = int(dist.get_world_size())
                     sync_metrics["dr3/sync_world_size"] = float(ws)
-                    # all_gather current micro-batch features/labels across ranks
-                    feat_list = [torch.zeros_like(feats) for _ in range(ws)]
-                    lab_list = [torch.zeros_like(labels_on) for _ in range(ws)]
-                    dist.all_gather(feat_list, feats)
-                    dist.all_gather(lab_list, labels_on)
-                    feats_for_buffer = torch.cat(feat_list, dim=0)
-                    labels_for_buffer = torch.cat(lab_list, dim=0)
-                    sync_metrics["dr3/sync_batch"] = float(feats_for_buffer.shape[0])
+
+                    # Check batch size consistency across ranks; skip sync if mismatch to avoid crash.
+                    bs_local = torch.tensor([int(feats.shape[0])], device=feats.device, dtype=torch.int32)
+                    bs_list = [torch.zeros_like(bs_local) for _ in range(ws)]
+                    dist.all_gather(bs_list, bs_local)
+                    bss = [int(x.item()) for x in bs_list]
+                    if len(set(bss)) != 1:
+                        sync_metrics["dr3/sync_shape_ok"] = 0.0
+                        sync_metrics["dr3/sync_skipped_shape_mismatch"] = 1.0
+                    else:
+                        # all_gather current micro-batch features/labels across ranks
+                        feat_list = [torch.zeros_like(feats) for _ in range(ws)]
+                        lab_list = [torch.zeros_like(labels_on) for _ in range(ws)]
+                        dist.all_gather(feat_list, feats)
+                        dist.all_gather(lab_list, labels_on)
+                        feats_for_buffer = torch.cat(feat_list, dim=0)
+                        labels_for_buffer = torch.cat(lab_list, dim=0)
+                        sync_metrics["dr3/sync_batch"] = float(feats_for_buffer.shape[0])
                     try:
                         on_cnt = float(labels_for_buffer.sum().item())
                         off_cnt = float((1.0 - labels_for_buffer).sum().item())
@@ -300,7 +357,9 @@ class DR3RatioEstimator:
         disc_loss_val = 0.0
         disc_acc_val = 0.0
         disc_trained_steps = 0.0
-        if self.disc_steps_per_call > 0 and self._can_train():
+        # If using rank0-train + broadcast, only rank0 performs optimizer steps.
+        can_optimize = (not self.broadcast_params) or (rank == 0)
+        if self.disc_steps_per_call > 0 and self._can_train() and can_optimize:
             batch = self._sample_train_batch()
             if batch is not None:
                 xb, yb = batch
@@ -315,6 +374,11 @@ class DR3RatioEstimator:
                         pred = (torch.sigmoid(logits) > 0.5).float()
                         disc_acc_val = float((pred == yb).float().mean().item())
                     disc_trained_steps += 1.0
+
+        # Broadcast discriminator parameters from rank0 to all ranks (optional).
+        if self.broadcast_params and (self._calls % self.broadcast_every_n_calls == 0):
+            self._broadcast_model_params()
+            bcast_metrics["dr3/bcast_happened"] = 1.0
 
         with torch.no_grad():
             logits = self._disc(feats)
@@ -367,6 +431,7 @@ class DR3RatioEstimator:
             "dr3/dual_lambda": float(self.dual.lam),
         }
         metrics.update(sync_metrics)
+        metrics.update(bcast_metrics)
         # Off-policy subset distribution (most important for analysis)
         try:
             off_idx = is_offpolicy.bool()

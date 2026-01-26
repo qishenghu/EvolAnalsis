@@ -88,6 +88,9 @@ actor_rollout_ref:
       # Multi-GPU robustness: gather micro-batch features/labels across ranks so every rank sees both classes.
       sync_across_ranks: true
       sync_every_n_calls: 1
+      # Train discriminator only on rank0, then broadcast params to all ranks.
+      broadcast_params: true
+      broadcast_every_n_calls: 1
       # ratio clipping / stability
       clip_max: 10.0
       ppo_clip_eps: 0.2                  # reuse PPO-style clip for off-policy ratio after repair

@@ -886,6 +886,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     ess_window=int(dr3_cfg.get("ess_window", 32)),
                                     sync_across_ranks=bool(dr3_cfg.get("sync_across_ranks", False)),
                                     sync_every_n_calls=int(dr3_cfg.get("sync_every_n_calls", 1)),
+                                    broadcast_params=bool(dr3_cfg.get("broadcast_params", False)),
+                                    broadcast_every_n_calls=int(dr3_cfg.get("broadcast_every_n_calls", 1)),
                                 )
                             # Build teacher_sample even if teacher_mask missing (all False)
                             teacher_sample = (
