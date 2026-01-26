@@ -1777,6 +1777,10 @@ def repo_compute_token_loss(
     cliprange: float = 0.2,
     clip_eps: float = 0.2,
     use_importance_clipping: bool = True,
+    # Optional: ExGRPO/LUFFY-style shaping on OFF-policy ratios for early acceleration.
+    # If enabled, OFF-policy uses ratio_shaped = ratio / (ratio + beta) and disables clipping on off-policy branch.
+    off_ratio_shaping_enable: bool = False,
+    off_ratio_shaping_beta: float = 0.1,
     loss_agg_mode: str = "token-mean",
 ) -> dict:
     """
@@ -1823,13 +1827,20 @@ def repo_compute_token_loss(
         on_policy_mask
     )
     
-    # ========== Off-policy loss (with importance ratio clipping) ==========
-    if use_importance_clipping:
+    # ========== Off-policy loss ==========
+    if off_ratio_shaping_enable:
+        # ExGRPO/LUFFY policy shaping: f(x) = x / (x + beta)
+        # This is more aggressive for early learning and typically reduces variance vs raw ratios.
+        beta = float(off_ratio_shaping_beta) if float(off_ratio_shaping_beta) > 0 else 0.1
+        ratio_shaped = ratio / (ratio + beta)
+        off_pg_losses = -advantages * ratio_shaped
+        off_clipfrac = torch.tensor(0.0, device=log_prob.device)
+    elif use_importance_clipping:
         # PPO-style clipped objective for off-policy
         off_pg_losses1 = -advantages * ratio
         off_pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
         off_pg_losses = torch.maximum(off_pg_losses1, off_pg_losses2)
-        
+
         off_clipfrac = verl_F.masked_mean(
             torch.gt(off_pg_losses2, off_pg_losses1).float(),
             exp_mask * response_mask

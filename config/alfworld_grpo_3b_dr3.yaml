@@ -78,9 +78,9 @@ actor_rollout_ref:
       feature_mode: "v2"                # "v1" (5 dims) | "v2" (richer, still cheap)
       # Optional warmup: only observe+train D for first N steps; start applying repair after that.
       # This can reduce early-step noise when buffer/discriminator is not yet stable.
-      apply_warmup_steps: 5
+      apply_warmup_steps: 2
       # Optional extra gate: require buffer size >= this value before applying repair.
-      apply_min_buf_size: 256
+      apply_min_buf_size: 64
       # When ppo_micro_batch_size_per_gpu=1, per-micro alpha is often 0/1.
       # Use a stable prior matching rollout-level mixing: n_teacher_rollouts_per_task / n_rollout = 1/8 = 0.125.
       alpha_prior: 0.125
@@ -100,6 +100,10 @@ actor_rollout_ref:
       # ratio clipping / stability
       clip_max: 10.0
       ppo_clip_eps: 0.2                  # reuse PPO-style clip for off-policy ratio after repair
+      # Early acceleration: during first N steps, use ExGRPO/LUFFY-style shaping on repaired ratio (w_hat)
+      # f(w)=w/(w+beta), no clipping on off-policy branch during this phase.
+      ratio_shaping_steps: 100
+      ratio_shaping_beta: 0.1
       # closed-loop dual ESS
       dual_enable: true
       ess_target_ratio: 0.5
@@ -111,7 +115,7 @@ actor_rollout_ref:
     # 禁用 LUFFY shaping（DR³ 不需要；否则会引入额外 bias）
     teacher_use_log_prob: false
     teacher_policy_shaping_enable: false
-    teacher_use_clip: true
+    teacher_use_clip: false
 
     use_dapo: false
     fsdp_config:

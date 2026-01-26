@@ -838,6 +838,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     dr3_dual_lr = float(dr3_cfg.get("dual_lr", 0.05))
                     dr3_dual_init = float(dr3_cfg.get("dual_init", 0.0))
                     dr3_clip_eps = float(dr3_cfg.get("ppo_clip_eps", 0.2))
+                    # Optional: early-stage acceleration via shaping on repaired off-policy ratio (w_hat)
+                    dr3_ratio_shaping_steps = int(dr3_cfg.get("ratio_shaping_steps", 0))
+                    dr3_ratio_shaping_beta = float(dr3_cfg.get("ratio_shaping_beta", 0.1))
                     
                     # ⭐ CHORD (Controllable Harmonization of On- and Off-Policy RL) configuration
                     use_chord = self.config.get("use_chord", False)
@@ -1079,8 +1082,22 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     cliprange=clip_ratio,
                                     clip_eps=dr3_clip_eps,
                                     use_importance_clipping=True,
+                                    off_ratio_shaping_enable=(
+                                        dr3_ratio_shaping_steps > 0 and (chord_global_step < dr3_ratio_shaping_steps)
+                                    ),
+                                    off_ratio_shaping_beta=dr3_ratio_shaping_beta,
                                     loss_agg_mode=loss_agg_mode,
                                 )
+                                try:
+                                    metrics["dr3/ratio_shaping_enabled"] = (
+                                        1.0
+                                        if (dr3_ratio_shaping_steps > 0 and (chord_global_step < dr3_ratio_shaping_steps))
+                                        else 0.0
+                                    )
+                                    metrics["dr3/ratio_shaping_steps"] = float(dr3_ratio_shaping_steps)
+                                    metrics["dr3/ratio_shaping_beta"] = float(dr3_ratio_shaping_beta)
+                                except Exception:
+                                    pass
                                 # Align return schema expected by update_policy logging
                                 try:
                                     z = torch.tensor(0.0, device=log_prob.device)
