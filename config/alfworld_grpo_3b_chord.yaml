@@ -15,15 +15,19 @@ defaults:
 # 
 # 核心思想：将 SFT 作为 on-policy RL 的动态加权辅助目标
 # 
-# 公式：L_chord = L_grpo + μ(t) * L_sft_weighted
+# 公式：L_chord = (1-μ) * L_grpo + μ * L_sft_weighted
 # 其中：
-#   - μ(t) = μ_max * (1 - t/T)^λ  # 全局系数，随训练衰减
+#   - μ: 全局系数，三阶段调度（Warmup → Decay → 稳定）
 #   - L_sft_weighted = -∑ φ(d) * log π(y|x)  # 加权 SFT loss
 #   - φ(d) = d / (d + δ)  # Token-wise 权重
 # 
+# 语义解释：
+#   - μ 大（训练初期）：更多依赖 SFT loss（学习 expert）
+#   - μ 小（训练后期）：更多依赖 GRPO loss（on-policy 探索）
+# 
 # 与 LUFFY 的区别：
 #   - LUFFY: Expert 数据使用 Policy Gradient + p/(p+β) shaping
-#   - CHORD: Expert 数据使用 SFT loss + φ(d) + μ(t) 动态衰减
+#   - CHORD: Expert 数据使用 SFT loss + φ(d) + μ 动态衰减
 # ============================================================================
 
 trainer:
