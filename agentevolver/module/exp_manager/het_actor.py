@@ -943,6 +943,23 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 use_importance_clipping=True,
                                 loss_agg_mode=loss_agg_mode,
                             )
+                            # Align return schema with other loss functions expected by update_policy
+                            # (update_policy expects on_pg_clipfrac_lower to always exist).
+                            try:
+                                z = torch.tensor(0.0, device=log_prob.device)
+                                if "on_pg_clipfrac_lower" not in ret_dict:
+                                    ret_dict["on_pg_clipfrac_lower"] = z
+                                # keep optional fields present for downstream logging
+                                if "on_pg_cliphit_rate" not in ret_dict:
+                                    ret_dict["on_pg_cliphit_rate"] = z
+                                if "off_pg_cliphit_rate" not in ret_dict:
+                                    ret_dict["off_pg_cliphit_rate"] = z
+                                if "self_off_pg_cliphit_rate" not in ret_dict:
+                                    ret_dict["self_off_pg_cliphit_rate"] = z
+                                if "teacher_off_pg_cliphit_rate" not in ret_dict:
+                                    ret_dict["teacher_off_pg_cliphit_rate"] = z
+                            except Exception:
+                                pass
 
                             # Attach DR³ metrics
                             try:
