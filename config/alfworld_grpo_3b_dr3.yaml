@@ -75,10 +75,16 @@ actor_rollout_ref:
     dr3:
       enable: true
       apply_to: "teacher_no_logprob"     # "teacher_no_logprob" | "all_offpolicy"
+      # When ppo_micro_batch_size_per_gpu=1, per-micro alpha is often 0/1.
+      # Use a stable prior matching rollout-level mixing: n_teacher_rollouts_per_task / n_rollout = 1/8 = 0.125.
+      alpha_prior: 0.125
       # discriminator
       disc_hidden: 64
       disc_lr: 5e-4
       disc_steps_per_call: 1
+      buffer_size: 2048
+      train_batch_size: 128
+      ess_window: 32
       # ratio clipping / stability
       clip_max: 10.0
       ppo_clip_eps: 0.2                  # reuse PPO-style clip for off-policy ratio after repair

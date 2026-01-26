@@ -906,8 +906,16 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             )
 
                             # alpha estimated from current micro-batch composition
-                            alpha_hat = float(teacher_sample.float().mean().detach().item())
-                            # Avoid extreme 0/1 in micro-batch (often single-sample); keep theoretical bound reasonable.
+                            # alpha for relative density ratio: prefer stable prior under rollout-level mixing.
+                            alpha_prior = dr3_cfg.get("alpha_prior", None)
+                            if alpha_prior is not None:
+                                try:
+                                    alpha_hat = float(alpha_prior)
+                                except Exception:
+                                    alpha_hat = float(teacher_sample.float().mean().detach().item())
+                            else:
+                                alpha_hat = float(teacher_sample.float().mean().detach().item())
+                            # Avoid extreme 0/1 in micro-batch (often single-sample)
                             alpha_hat = float(min(max(alpha_hat, 0.01), 0.99))
 
                             # Estimate w_alpha for all samples; off-policy label is teacher_sample
@@ -964,10 +972,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             # Attach DR³ metrics
                             try:
                                 append_to_dict(metrics, dr3_metrics)
+                                # NOTE: micro-batch size can be 1, so counts here are micro-level.
                                 metrics.update(
                                     {
-                                        "dr3/teacher_samples": float(teacher_sample.sum().item()),
-                                        "dr3/on_samples": float(on_sample.sum().item()),
+                                        "dr3/teacher_samples_micro": float(teacher_sample.sum().item()),
+                                        "dr3/on_samples_micro": float(on_sample.sum().item()),
+                                        "dr3/teacher_ratio_micro": float(alpha_hat),
                                     }
                                 )
                             except Exception:

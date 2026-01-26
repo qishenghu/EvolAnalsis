@@ -132,6 +132,9 @@ class DR3RatioEstimator:
         hidden: int = 64,
         lr: float = 5e-4,
         disc_steps_per_call: int = 1,
+        buffer_size: int = 2048,
+        train_batch_size: int = 128,
+        ess_window: int = 32,
         clip_max: float = 10.0,
         dual_enable: bool = True,
         ess_target_ratio: float = 0.5,
@@ -151,11 +154,59 @@ class DR3RatioEstimator:
 
         self.dual = DR3DualESS(enable=bool(dual_enable), ess_target_ratio=float(ess_target_ratio), lr=float(dual_lr), lam=float(dual_init))
 
+        # ------------------------------------------------------------------
+        # ⭐ Make DR³ robust for ppo_micro_batch_size_per_gpu=1
+        # ------------------------------------------------------------------
+        # We maintain:
+        # - a rolling feature/label buffer for discriminator training across micro-batches
+        # - a rolling window of off-policy weights for ESS/dual update (so ESS != 1 forever)
+        self.buffer_size = max(32, int(buffer_size))
+        self.train_batch_size = max(8, int(train_batch_size))
+        self.ess_window = max(1, int(ess_window))
+
+        self._buf_x: Optional[torch.Tensor] = None  # (N,F) on device
+        self._buf_y: Optional[torch.Tensor] = None  # (N,) labels_on in {0,1} on device
+        self._w_off_hist: list[torch.Tensor] = []   # list of 1D CPU tensors
+
     def _maybe_init(self, *, device: torch.device, in_dim: int) -> None:
         if self._disc is not None:
             return
         self._disc = DR3Discriminator(in_dim=in_dim, hidden=self.hidden).to(device)
         self._opt = torch.optim.Adam(self._disc.parameters(), lr=self.lr)
+        self._buf_x = torch.empty((0, in_dim), device=device, dtype=torch.float32)
+        self._buf_y = torch.empty((0,), device=device, dtype=torch.float32)
+
+    def _push_buffer(self, x: torch.Tensor, y: torch.Tensor) -> None:
+        if self._buf_x is None or self._buf_y is None:
+            return
+        x = x.detach().float()
+        y = y.detach().float().view(-1)
+        if x.numel() == 0 or y.numel() == 0:
+            return
+        self._buf_x = torch.cat([self._buf_x, x], dim=0)
+        self._buf_y = torch.cat([self._buf_y, y], dim=0)
+        if self._buf_x.shape[0] > self.buffer_size:
+            extra = int(self._buf_x.shape[0] - self.buffer_size)
+            self._buf_x = self._buf_x[extra:]
+            self._buf_y = self._buf_y[extra:]
+
+    def _can_train(self) -> bool:
+        if self._buf_y is None:
+            return False
+        if int(self._buf_y.numel()) < 8:
+            return False
+        try:
+            return bool((self._buf_y.min() < 0.5) and (self._buf_y.max() > 0.5))
+        except Exception:
+            return False
+
+    def _sample_train_batch(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        if self._buf_x is None or self._buf_y is None or (not self._can_train()):
+            return None
+        n = int(self._buf_y.numel())
+        bs = min(self.train_batch_size, n)
+        idx = torch.randint(low=0, high=n, size=(bs,), device=self._buf_y.device)
+        return self._buf_x[idx], self._buf_y[idx]
 
     @staticmethod
     def effective_sample_size(w: torch.Tensor, eps: float = 1e-8) -> float:
@@ -192,28 +243,30 @@ class DR3RatioEstimator:
         assert self._disc is not None
         assert self._opt is not None
 
+        # Push into rolling buffer so discriminator can be trained across micro-batches.
+        self._push_buffer(feats, labels_on)
+
         # Train discriminator a few steps (low overhead, local to rank)
-        # IMPORTANT: micro-batches can be single-class (all teacher or all on-policy).
-        # In that case, skip training to avoid collapsing the classifier.
+        # With micro_batch_size=1, current micro-batch is often single-class.
+        # We train on the rolling buffer (which mixes classes over time).
         disc_loss_val = 0.0
         disc_acc_val = 0.0
-        single_class = False
-        try:
-            single_class = bool((labels_on.min() == labels_on.max()).item())
-        except Exception:
-            single_class = False
-
-        if (self.disc_steps_per_call > 0) and (not single_class):
-            for _ in range(self.disc_steps_per_call):
-                logits = self._disc(feats)
-                loss = self._bce(logits, labels_on)
-                self._opt.zero_grad(set_to_none=True)
-                loss.backward()
-                self._opt.step()
-                disc_loss_val = float(loss.detach().item())
-                with torch.no_grad():
-                    pred = (torch.sigmoid(logits) > 0.5).float()
-                    disc_acc_val = float((pred == labels_on).float().mean().item())
+        disc_trained_steps = 0.0
+        if self.disc_steps_per_call > 0 and self._can_train():
+            batch = self._sample_train_batch()
+            if batch is not None:
+                xb, yb = batch
+                for _ in range(self.disc_steps_per_call):
+                    logits = self._disc(xb)
+                    loss = self._bce(logits, yb)
+                    self._opt.zero_grad(set_to_none=True)
+                    loss.backward()
+                    self._opt.step()
+                    disc_loss_val = float(loss.detach().item())
+                    with torch.no_grad():
+                        pred = (torch.sigmoid(logits) > 0.5).float()
+                        disc_acc_val = float((pred == yb).float().mean().item())
+                    disc_trained_steps += 1.0
 
         with torch.no_grad():
             logits = self._disc(feats)
@@ -230,11 +283,21 @@ class DR3RatioEstimator:
             clip_upper = float(max(self.eps, clip_upper))
             w_clipped = torch.clamp(w, 0.0, clip_upper)
 
-            # Diagnostics on off-policy subset
+            # Diagnostics on off-policy subset (rolling window)
             off_idx = is_offpolicy.bool()
-            w_off = w_clipped[off_idx]
-            ess = self.effective_sample_size(w_off, eps=self.eps)
-            self.dual.update(ess=ess, n=int(off_idx.sum().item()))
+            if off_idx.any():
+                self._w_off_hist.append(w_clipped[off_idx].detach().float().cpu().flatten())
+                if len(self._w_off_hist) > self.ess_window:
+                    self._w_off_hist = self._w_off_hist[-self.ess_window :]
+
+            w_hist = None
+            try:
+                if self._w_off_hist:
+                    w_hist = torch.cat([t for t in self._w_off_hist if torch.is_tensor(t) and t.numel() > 0], dim=0)
+            except Exception:
+                w_hist = None
+            ess = self.effective_sample_size(w_hist, eps=self.eps) if (w_hist is not None) else 0.0
+            self.dual.update(ess=ess, n=int(w_hist.numel()) if (w_hist is not None) else 0)
 
             clipfrac = 0.0
             if off_idx.any():
@@ -244,12 +307,15 @@ class DR3RatioEstimator:
             "dr3/alpha": float(alpha),
             "dr3/disc_loss": float(disc_loss_val),
             "dr3/disc_acc": float(disc_acc_val),
+            "dr3/disc_trained_steps": float(disc_trained_steps),
+            "dr3/buf_size": float(self._buf_y.numel()) if self._buf_y is not None else 0.0,
             "dr3/w_mean": float(w_clipped.mean().item()) if w_clipped.numel() else 0.0,
             "dr3/w_std": float(w_clipped.std().item()) if w_clipped.numel() > 1 else 0.0,
             "dr3/w_max": float(w_clipped.max().item()) if w_clipped.numel() else 0.0,
             "dr3/w_clip_upper": float(clip_upper),
             "dr3/w_clipfrac_off": float(clipfrac),
-            "dr3/ess_off": float(ess),
+            "dr3/ess_off_window": float(ess),
+            "dr3/ess_window_len": float(len(self._w_off_hist)),
             "dr3/dual_lambda": float(self.dual.lam),
         }
         # Off-policy subset distribution (most important for analysis)
