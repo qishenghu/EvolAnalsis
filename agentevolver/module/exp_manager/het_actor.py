@@ -922,10 +922,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 alpha_hat = float(teacher_sample.float().mean().detach().item())
                             alpha_hat = float(min(max(alpha_hat, 0.01), 0.99))
 
+                            dr3_feature_mode = str(dr3_cfg.get("feature_mode", "v2"))
                             feats = compute_sequence_features(
                                 log_prob=log_prob.detach(),
                                 advantages=advantages.detach(),
                                 response_mask=response_mask.detach(),
+                                ref_log_prob=data.get("ref_log_prob", None)[:, -response_length:].detach()
+                                if (self.config.use_kl_loss and (data.get("ref_log_prob", None) is not None))
+                                else None,
+                                feature_mode=dr3_feature_mode,
                             )
                             w_hat, dr3_metrics = self._dr3_est.step(
                                 features=feats,
@@ -1009,7 +1014,23 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             )
                         else:
                             # Teacher 无 logprob：用 DR³ 的 w_hat 修复 old_log_prob，再复用 RePO-style token loss
-                            if w_hat is None:
+                            # Optional: warmup before using D for inference (still observe+train during warmup)
+                            dr3_apply_warmup_steps = int(dr3_cfg.get("apply_warmup_steps", 0))
+                            dr3_apply_min_buf_size = int(dr3_cfg.get("apply_min_buf_size", 0))
+                            dr3_buf_size_now = float(dr3_metrics.get("dr3/buf_size", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            dr3_apply_ready = True
+                            if chord_global_step < dr3_apply_warmup_steps:
+                                dr3_apply_ready = False
+                            if dr3_apply_min_buf_size > 0 and dr3_buf_size_now < float(dr3_apply_min_buf_size):
+                                dr3_apply_ready = False
+                            try:
+                                metrics["dr3/apply_ready"] = 1.0 if dr3_apply_ready else 0.0
+                                metrics["dr3/apply_warmup_steps"] = float(dr3_apply_warmup_steps)
+                                metrics["dr3/apply_min_buf_size"] = float(dr3_apply_min_buf_size)
+                            except Exception:
+                                pass
+
+                            if (w_hat is None) or (not dr3_apply_ready):
                                 # 极端兜底：避免崩溃，回退 LUFFY(no_logprob)（仍显式传 clip 参数）
                                 ret_dict = het_compute_teacher_aware_loss(
                                     old_log_prob=old_log_prob,

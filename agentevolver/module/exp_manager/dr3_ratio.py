@@ -57,11 +57,26 @@ def _masked_min(x: torch.Tensor, m: torch.Tensor, fill: float = 0.0) -> torch.Te
     return v
 
 
+def _masked_max(x: torch.Tensor, m: torch.Tensor, fill: float = 0.0) -> torch.Tensor:
+    # If mask is all-zero for a row, return fill.
+    # We use -inf outside mask then take max.
+    m_bool = m.bool()
+    if x.dim() != 2 or m_bool.dim() != 2:
+        raise ValueError("Expected 2D tensors for _masked_max")
+    x2 = x.clone()
+    x2[~m_bool] = float("-inf")
+    v, _ = x2.max(dim=-1)
+    v = torch.where(torch.isfinite(v), v, torch.full_like(v, float(fill)))
+    return v
+
+
 def compute_sequence_features(
     *,
     log_prob: torch.Tensor,        # (bs, T)
     advantages: torch.Tensor,      # (bs, T)
     response_mask: torch.Tensor,   # (bs, T)
+    ref_log_prob: Optional[torch.Tensor] = None,  # (bs, T) optional
+    feature_mode: str = "v2",      # "v1" | "v2"
 ) -> torch.Tensor:
     """
     Build a compact per-sequence feature vector from already-available tensors.
@@ -69,12 +84,56 @@ def compute_sequence_features(
     """
     with torch.no_grad():
         m = response_mask
-        lp_mean = _masked_mean(log_prob, m)
-        lp_std = _masked_std(log_prob, m)
-        lp_min = _masked_min(log_prob, m, fill=0.0)
-        adv_abs_mean = _masked_mean(advantages.abs(), m)
+        feature_mode = str(feature_mode).lower().strip()
         resp_len = m.float().sum(dim=-1)
-        feats = torch.stack([lp_mean, lp_std, lp_min, adv_abs_mean, resp_len], dim=-1)
+
+        # v1: original minimal feature set (5 dims)
+        if feature_mode in ("v1", "min", "minimal"):
+            lp_mean = _masked_mean(log_prob, m)
+            lp_std = _masked_std(log_prob, m)
+            lp_min = _masked_min(log_prob, m, fill=0.0)
+            adv_abs_mean = _masked_mean(advantages.abs(), m)
+            feats = torch.stack([lp_mean, lp_std, lp_min, adv_abs_mean, resp_len], dim=-1)
+        else:
+            # v2: still cheap, but adds tail/shape signals and optional KL-to-ref
+            lp_mean = _masked_mean(log_prob, m)
+            lp_std = _masked_std(log_prob, m)
+            lp_min = _masked_min(log_prob, m, fill=0.0)
+            lp_max = _masked_max(log_prob, m, fill=0.0)
+
+            # fraction of very-low-prob tokens (captures mismatch / long-tail)
+            m_bool = m.bool()
+            denom = m_bool.sum(dim=-1).float().clamp_min(1.0)
+            low_thr = -10.0
+            lp_low_ratio = ((log_prob < low_thr) & m_bool).sum(dim=-1).float() / denom
+
+            adv_mean = _masked_mean(advantages, m)
+            adv_std = _masked_std(advantages, m)
+            adv_abs_mean = _masked_mean(advantages.abs(), m)
+            adv_pos_ratio = ((advantages > 0) & m_bool).sum(dim=-1).float() / denom
+
+            # KL-to-ref proxy: mean(logp - ref_logp) on response tokens if available
+            if ref_log_prob is not None and torch.is_tensor(ref_log_prob) and ref_log_prob.shape == log_prob.shape:
+                kl_ref_mean = _masked_mean((log_prob - ref_log_prob), m)
+            else:
+                kl_ref_mean = torch.zeros_like(lp_mean)
+
+            feats = torch.stack(
+                [
+                    lp_mean,
+                    lp_std,
+                    lp_min,
+                    lp_max,
+                    lp_low_ratio,
+                    adv_mean,
+                    adv_std,
+                    adv_abs_mean,
+                    adv_pos_ratio,
+                    resp_len,
+                    kl_ref_mean,
+                ],
+                dim=-1,
+            )
         feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
         return feats
 

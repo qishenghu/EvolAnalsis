@@ -75,6 +75,12 @@ actor_rollout_ref:
     dr3:
       enable: true
       apply_to: "teacher_no_logprob"     # "teacher_no_logprob" | "all_offpolicy"
+      feature_mode: "v2"                # "v1" (5 dims) | "v2" (richer, still cheap)
+      # Optional warmup: only observe+train D for first N steps; start applying repair after that.
+      # This can reduce early-step noise when buffer/discriminator is not yet stable.
+      apply_warmup_steps: 5
+      # Optional extra gate: require buffer size >= this value before applying repair.
+      apply_min_buf_size: 256
       # When ppo_micro_batch_size_per_gpu=1, per-micro alpha is often 0/1.
       # Use a stable prior matching rollout-level mixing: n_teacher_rollouts_per_task / n_rollout = 1/8 = 0.125.
       alpha_prior: 0.125
