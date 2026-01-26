@@ -1666,6 +1666,22 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         try:
             if float(dr3_step.get("dr3_step/calls", 0.0)) > 0.0:
                 append_to_dict(metrics, dr3_step)
+                # Also expose a compact step view under dr3/step_* so it appears alongside dr3/* metrics
+                # (some loggers truncate long key lists and dr3_step/* may be missed in console output).
+                try:
+                    step_view = {
+                        "dr3/step_calls": float(dr3_step.get("dr3_step/calls", 0.0)),
+                        "dr3/step_buf_pushed_sum": float(dr3_step.get("dr3_step/buf_pushed_sum", 0.0)),
+                        "dr3/step_buf_pushed_on_sum": float(dr3_step.get("dr3_step/buf_pushed_on_sum", 0.0)),
+                        "dr3/step_buf_pushed_off_sum": float(dr3_step.get("dr3_step/buf_pushed_off_sum", 0.0)),
+                        "dr3/step_buf_size_last": float(dr3_step.get("dr3_step/buf_size_last", 0.0)),
+                        "dr3/step_disc_trained_steps_sum": float(dr3_step.get("dr3_step/disc_trained_steps_sum", 0.0)),
+                        "dr3/step_ess_off_window_last": float(dr3_step.get("dr3_step/ess_off_window_last", 0.0)),
+                        "dr3/step_dual_lambda_last": float(dr3_step.get("dr3_step/dual_lambda_last", 0.0)),
+                    }
+                    append_to_dict(metrics, step_view)
+                except Exception:
+                    pass
         except Exception:
             pass
         self.actor_optimizer.zero_grad()
