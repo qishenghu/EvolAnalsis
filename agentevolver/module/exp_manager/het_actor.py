@@ -947,6 +947,18 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             except Exception:
                                 pass
 
+                            # Log ratio diagnostics from RePO-style loss (very important for debugging DR³)
+                            try:
+                                diag = ret_dict.get("repo_diag_stats", None)
+                                if isinstance(diag, dict) and diag:
+                                    for k, v in diag.items():
+                                        if torch.is_tensor(v):
+                                            metrics[f"dr3_diag/{k}"] = v.detach().float().item()
+                                        else:
+                                            metrics[f"dr3_diag/{k}"] = float(v)
+                            except Exception:
+                                pass
+
                     elif use_chord and has_teacher_data:
                         # ========== CHORD 模式 ==========
                         # CHORD (Controllable Harmonization of On- and Off-Policy RL)
