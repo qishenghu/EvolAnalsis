@@ -839,8 +839,16 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     dr3_dual_init = float(dr3_cfg.get("dual_init", 0.0))
                     dr3_clip_eps = float(dr3_cfg.get("ppo_clip_eps", 0.2))
                     # Optional: early-stage acceleration via shaping on repaired off-policy ratio (w_hat)
+                    # - step: enable for first N steps
+                    # - always: always enable
+                    # - off: disable
+                    # - auto: closed-loop; enable until discriminator/buffer/ESS are sufficiently stable
+                    dr3_ratio_shaping_mode = str(dr3_cfg.get("ratio_shaping_mode", "step")).lower().strip()
                     dr3_ratio_shaping_steps = int(dr3_cfg.get("ratio_shaping_steps", 0))
                     dr3_ratio_shaping_beta = float(dr3_cfg.get("ratio_shaping_beta", 0.1))
+                    dr3_ratio_shaping_auto_acc_min = float(dr3_cfg.get("ratio_shaping_auto_acc_min", 0.85))
+                    dr3_ratio_shaping_auto_buf_min = int(dr3_cfg.get("ratio_shaping_auto_buf_min", 256))
+                    dr3_ratio_shaping_auto_ess_min = float(dr3_cfg.get("ratio_shaping_auto_ess_min", 8.0))
                     
                     # ⭐ CHORD (Controllable Harmonization of On- and Off-Policy RL) configuration
                     use_chord = self.config.get("use_chord", False)
@@ -1082,20 +1090,59 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     cliprange=clip_ratio,
                                     clip_eps=dr3_clip_eps,
                                     use_importance_clipping=True,
-                                    off_ratio_shaping_enable=(
-                                        dr3_ratio_shaping_steps > 0 and (chord_global_step < dr3_ratio_shaping_steps)
-                                    ),
+                                    off_ratio_shaping_enable=False,  # set below
                                     off_ratio_shaping_beta=dr3_ratio_shaping_beta,
                                     loss_agg_mode=loss_agg_mode,
                                 )
+                                # Decide shaping enable (step/always/off/auto)
+                                shaping_enable = False
+                                if dr3_ratio_shaping_mode in ("always", "on", "true", "1"):
+                                    shaping_enable = True
+                                elif dr3_ratio_shaping_mode in ("off", "false", "0", "none"):
+                                    shaping_enable = False
+                                elif dr3_ratio_shaping_mode in ("auto", "closed_loop", "closed-loop"):
+                                    # enable shaping until signals are stable enough
+                                    _acc = float(dr3_metrics.get("dr3/disc_acc", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                                    _buf = float(dr3_metrics.get("dr3/buf_size", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                                    _ess = float(dr3_metrics.get("dr3/ess_off_window", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                                    shaping_enable = not (
+                                        (_acc >= dr3_ratio_shaping_auto_acc_min)
+                                        and (_buf >= float(dr3_ratio_shaping_auto_buf_min))
+                                        and (_ess >= dr3_ratio_shaping_auto_ess_min)
+                                    )
+                                else:
+                                    # default: step-based
+                                    shaping_enable = (dr3_ratio_shaping_steps > 0) and (chord_global_step < dr3_ratio_shaping_steps)
+
+                                # Re-run off-policy shaping decision by adjusting the already-produced ret_dict losses is hard;
+                                # instead, recompute with desired flag (cheap compared to rollout).
+                                if shaping_enable:
+                                    ret_dict = repo_compute_token_loss(
+                                        old_log_prob=old_log_prob,
+                                        log_prob=log_prob,
+                                        advantages=advantages,
+                                        response_mask=response_mask,
+                                        exp_mask=exp_mask,
+                                        cliprange=clip_ratio,
+                                        clip_eps=dr3_clip_eps,
+                                        use_importance_clipping=True,
+                                        off_ratio_shaping_enable=True,
+                                        off_ratio_shaping_beta=dr3_ratio_shaping_beta,
+                                        loss_agg_mode=loss_agg_mode,
+                                    )
+
                                 try:
-                                    metrics["dr3/ratio_shaping_enabled"] = (
+                                    metrics["dr3/ratio_shaping_enabled"] = 1.0 if shaping_enable else 0.0
+                                    metrics["dr3/ratio_shaping_mode"] = float(
                                         1.0
-                                        if (dr3_ratio_shaping_steps > 0 and (chord_global_step < dr3_ratio_shaping_steps))
-                                        else 0.0
+                                        if dr3_ratio_shaping_mode in ("always", "on", "true", "1")
+                                        else (2.0 if dr3_ratio_shaping_mode in ("auto", "closed_loop", "closed-loop") else 0.0)
                                     )
                                     metrics["dr3/ratio_shaping_steps"] = float(dr3_ratio_shaping_steps)
                                     metrics["dr3/ratio_shaping_beta"] = float(dr3_ratio_shaping_beta)
+                                    metrics["dr3/ratio_shaping_auto_acc_min"] = float(dr3_ratio_shaping_auto_acc_min)
+                                    metrics["dr3/ratio_shaping_auto_buf_min"] = float(dr3_ratio_shaping_auto_buf_min)
+                                    metrics["dr3/ratio_shaping_auto_ess_min"] = float(dr3_ratio_shaping_auto_ess_min)
                                 except Exception:
                                     pass
                                 # Align return schema expected by update_policy logging

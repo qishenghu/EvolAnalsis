@@ -102,8 +102,17 @@ actor_rollout_ref:
       ppo_clip_eps: 0.2                  # reuse PPO-style clip for off-policy ratio after repair
       # Early acceleration: during first N steps, use ExGRPO/LUFFY-style shaping on repaired ratio (w_hat)
       # f(w)=w/(w+beta), no clipping on off-policy branch during this phase.
-      ratio_shaping_steps: 100
+      # ratio_shaping_mode:
+      # - "step": enable for first ratio_shaping_steps steps
+      # - "auto": closed-loop; enable until disc/buffer/ESS are stable enough, then automatically turn off
+      # - "always": always enable (not recommended for protecting asymptotic)
+      # - "off": disable
+      ratio_shaping_mode: "auto"
       ratio_shaping_beta: 0.1
+      # closed-loop thresholds (only used when ratio_shaping_mode="auto")
+      ratio_shaping_auto_acc_min: 0.85
+      ratio_shaping_auto_buf_min: 256
+      ratio_shaping_auto_ess_min: 8.0
       # closed-loop dual ESS
       dual_enable: true
       ess_target_ratio: 0.5
