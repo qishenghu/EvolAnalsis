@@ -841,6 +841,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
                         teacher_loss_scale = teacher_loss_scale[:, -response_length:]
                     
+                    # Ensure ret_dict is always set by one of the branches below.
+                    ret_dict = None
+
                     if use_dapo:
                         # Use DAPO's decoupled asymmetric clipping mechanism
                         # ⭐ Experience-Replay compatible: pass off-policy shaping parameters
@@ -954,7 +957,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             dr3_metrics = None
                             w_hat = None
 
-                    elif dr3_enable and has_teacher_data:
+                    elif (ret_dict is None) and dr3_enable and has_teacher_data:
                         # ========== DR³ apply ==========
                         # 判别器训练/缓冲区更新已在上方“DR³ observe (ALWAYS)”执行（包含 on-policy 样本的 push）。
                         teacher_use_log_prob = bool(self.config.get("teacher_use_log_prob", False))
@@ -1063,7 +1066,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 except Exception:
                                     pass
 
-                    elif use_chord and has_teacher_data:
+                    elif (ret_dict is None) and use_chord and has_teacher_data:
                         # ========== CHORD 模式 ==========
                         # CHORD (Controllable Harmonization of On- and Off-Policy RL)
                         # 使用 SFT loss 代替 policy gradient 学习 expert 数据
@@ -1146,7 +1149,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             chord_metrics[f"chord/{k}"] = v
                         append_to_dict(metrics, chord_metrics)
                         
-                    elif has_teacher_data:
+                    elif (ret_dict is None) and has_teacher_data:
                         # ⭐ Teacher Experience: 使用 het_compute_teacher_aware_loss (LUFFY 模式)
                         # 获取 teacher 相关配置
                         teacher_use_log_prob = self.config.get("teacher_use_log_prob", False)
@@ -1248,7 +1251,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 if v is None or (not torch.is_tensor(v)) or v.numel() == 0:
                                     continue
                                 teacher_traj_value_acc.setdefault(str(k), []).append(v.detach())
-                    else:
+                    elif ret_dict is None:
                         # Use original het_compute_token_on_off_policy_loss
                         ret_dict = het_compute_token_on_off_policy_loss(
                             old_log_prob=old_log_prob,
