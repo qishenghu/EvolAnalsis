@@ -87,7 +87,7 @@ actor_rollout_ref:
       # discriminator
       disc_hidden: 64
       disc_lr: 5e-4
-      disc_steps_per_call: 1
+      disc_steps_per_call: 2
       buffer_size: 2048
       train_batch_size: 128
       ess_window: 32
