@@ -77,6 +77,7 @@ def compute_sequence_features(
     response_mask: torch.Tensor,   # (bs, T)
     ref_log_prob: Optional[torch.Tensor] = None,  # (bs, T) optional
     feature_mode: str = "v2",      # "v1" | "v2"
+    extra_seq_features: Optional[torch.Tensor] = None,  # (bs, K) optional
 ) -> torch.Tensor:
     """
     Build a compact per-sequence feature vector from already-available tensors.
@@ -164,15 +165,56 @@ def compute_sequence_features(
                 dim=-1,
             )
         feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        if extra_seq_features is not None and torch.is_tensor(extra_seq_features):
+            try:
+                extra = extra_seq_features.detach().float()
+                if extra.dim() == 1:
+                    extra = extra.view(-1, 1)
+                if extra.dim() == 2 and extra.shape[0] == feats.shape[0]:
+                    extra = torch.nan_to_num(extra, nan=0.0, posinf=0.0, neginf=0.0)
+                    feats = torch.cat([feats, extra], dim=-1)
+            except Exception:
+                pass
         return feats
 
 
 class DR3Discriminator(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 64):
+    def __init__(
+        self,
+        *,
+        in_dim: int,
+        hidden: int = 64,
+        stats_dim: int = 0,
+        hidden_proj_dim: int = 0,
+        hidden_proj_dropout: float = 0.0,
+    ):
         super().__init__()
         h = int(hidden)
+        self.in_dim = int(in_dim)
+        self.stats_dim = int(stats_dim)
+        self.hidden_proj_dim = int(hidden_proj_dim)
+        self.hidden_proj_dropout = float(hidden_proj_dropout)
+
+        # Optional projection for high-dimensional hidden features:
+        # input x is assumed to be [stats (first stats_dim dims), hidden (remaining dims)].
+        # If hidden_proj_dim>0, we map hidden -> hidden_proj_dim before feeding MLP.
+        self.hidden_proj: Optional[nn.Module] = None
+        self._use_hidden_proj = False
+        if self.hidden_proj_dim > 0 and self.stats_dim > 0 and self.stats_dim < self.in_dim:
+            hidden_in = int(self.in_dim - self.stats_dim)
+            self.hidden_proj = nn.Sequential(
+                nn.Linear(hidden_in, int(self.hidden_proj_dim)),
+                nn.LayerNorm(int(self.hidden_proj_dim)),
+                nn.Dropout(float(self.hidden_proj_dropout)) if float(self.hidden_proj_dropout) > 0 else nn.Identity(),
+            )
+            self._use_hidden_proj = True
+
+        mlp_in = int(self.in_dim)
+        if self._use_hidden_proj:
+            mlp_in = int(self.stats_dim + self.hidden_proj_dim)
+
         self.net = nn.Sequential(
-            nn.Linear(in_dim, h),
+            nn.Linear(mlp_in, h),
             nn.Tanh(),
             nn.Linear(h, h),
             nn.Tanh(),
@@ -180,6 +222,15 @@ class DR3Discriminator(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._use_hidden_proj and self.hidden_proj is not None:
+            try:
+                stats = x[:, : self.stats_dim]
+                hid = x[:, self.stats_dim :]
+                hid2 = self.hidden_proj(hid)
+                x = torch.cat([stats, hid2], dim=-1)
+            except Exception:
+                # fall back to raw input
+                pass
         return self.net(x).squeeze(-1)  # (bs,)
 
 
@@ -232,10 +283,18 @@ class DR3RatioEstimator:
         ess_target_ratio: float = 0.5,
         dual_lr: float = 0.05,
         dual_init: float = 0.0,
+        disc_weight_decay: float = 0.0,
+        disc_stats_dim: int = 0,
+        disc_hidden_proj_dim: int = 0,
+        disc_hidden_proj_dropout: float = 0.0,
         eps: float = 1e-6,
     ):
         self.hidden = int(hidden)
         self.lr = float(lr)
+        self.disc_weight_decay = float(disc_weight_decay)
+        self.disc_stats_dim = int(disc_stats_dim)
+        self.disc_hidden_proj_dim = int(disc_hidden_proj_dim)
+        self.disc_hidden_proj_dropout = float(disc_hidden_proj_dropout)
         self.disc_steps_per_call = max(0, int(disc_steps_per_call))
         self.clip_max = float(clip_max)
         self.eps = float(eps)
@@ -299,8 +358,14 @@ class DR3RatioEstimator:
     def _maybe_init(self, *, device: torch.device, in_dim: int) -> None:
         if self._disc is not None:
             return
-        self._disc = DR3Discriminator(in_dim=in_dim, hidden=self.hidden).to(device)
-        self._opt = torch.optim.Adam(self._disc.parameters(), lr=self.lr)
+        self._disc = DR3Discriminator(
+            in_dim=in_dim,
+            hidden=self.hidden,
+            stats_dim=self.disc_stats_dim,
+            hidden_proj_dim=self.disc_hidden_proj_dim,
+            hidden_proj_dropout=self.disc_hidden_proj_dropout,
+        ).to(device)
+        self._opt = torch.optim.Adam(self._disc.parameters(), lr=self.lr, weight_decay=float(self.disc_weight_decay))
         self._buf_x = torch.empty((0, in_dim), device=device, dtype=torch.float32)
         self._buf_y = torch.empty((0,), device=device, dtype=torch.float32)
         # Optional: ensure all ranks start from identical discriminator params

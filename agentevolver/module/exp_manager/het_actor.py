@@ -25,6 +25,7 @@ from typing import Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
@@ -64,6 +65,291 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         self._gap_beta_updates: int = 0
         # Teacher-vs-onpolicy gradient direction diagnostics (default disabled)
         self._teacher_grad_dir_diag_updates: int = 0
+        # DR³ hidden-feature capture (lazy init; only enabled for feature_mode containing "hidden")
+        self._dr3_hidden_hook_handle = None
+        self._dr3_hidden_last: torch.Tensor | None = None  # per-token hidden (shape depends on rmpad)
+        self._dr3_pooled_hidden: torch.Tensor | None = None  # (bs, H)
+
+    def _dr3_hidden_enabled(self) -> bool:
+        """
+        Enable DR³ hidden-state features only when explicitly requested via config.
+        This keeps default behavior identical to upstream verl.
+        """
+        try:
+            if not bool(self.config.get("use_dr3", False)):
+                return False
+            dr3_cfg = self.config.get("dr3", {}) or {}
+            fm = str(dr3_cfg.get("feature_mode", "")).lower().strip()
+            return ("hidden" in fm) or (fm in ("v5", "v5_hidden", "hidden", "repr", "embedding"))
+        except Exception:
+            return False
+
+    def _dr3_install_hidden_hook(self) -> None:
+        if self._dr3_hidden_hook_handle is not None:
+            return
+        try:
+            # unwrap common wrappers
+            root = self.actor_module
+            if hasattr(root, "module"):
+                try:
+                    root = root.module
+                except Exception:
+                    pass
+
+            # best-effort locate decoder layers across common HF architectures
+            candidates = []
+            try:
+                if hasattr(root, "model") and hasattr(root.model, "layers"):
+                    candidates.append(root.model.layers)
+            except Exception:
+                pass
+            try:
+                if hasattr(root, "transformer") and hasattr(root.transformer, "h"):
+                    candidates.append(root.transformer.h)
+            except Exception:
+                pass
+            try:
+                if hasattr(root, "gpt_neox") and hasattr(root.gpt_neox, "layers"):
+                    candidates.append(root.gpt_neox.layers)
+            except Exception:
+                pass
+
+            layers = None
+            for c in candidates:
+                try:
+                    if isinstance(c, (nn.ModuleList, list, tuple)) and len(c) > 0:
+                        layers = c
+                        break
+                except Exception:
+                    continue
+            if layers is None:
+                return
+
+            last_layer = layers[-1]
+
+            def _hook(_mod, _inp, out):
+                try:
+                    # out may be tensor or tuple; take first tensor
+                    hs = out[0] if isinstance(out, (tuple, list)) else out
+                    if torch.is_tensor(hs):
+                        self._dr3_hidden_last = hs.detach()
+                except Exception:
+                    self._dr3_hidden_last = None
+
+            self._dr3_hidden_hook_handle = last_layer.register_forward_hook(_hook)
+        except Exception:
+            self._dr3_hidden_hook_handle = None
+
+    def _dr3_pool_hidden_for_response(
+        self,
+        *,
+        full_hidden: torch.Tensor,     # (bs, seqlen, H)
+        response_length: int,
+        response_mask: torch.Tensor,   # (bs, response_length)
+    ) -> torch.Tensor:
+        """
+        Take last-layer hidden and mean-pool over response tokens using the same mask as loss/logprob.
+        Returns: (bs, H)
+        """
+        # align with log_prob slicing in verl: take positions [-response_length-1:-1]
+        h_resp = full_hidden[:, -response_length - 1 : -1, :]  # (bs, response_length, H)
+        m = response_mask.float().clamp_min(0.0).unsqueeze(-1)  # (bs, response_length, 1)
+        denom = m.sum(dim=1).clamp_min(1.0)
+        pooled = (h_resp * m).sum(dim=1) / denom  # (bs, H)
+        # stabilize scale
+        try:
+            pooled = F.layer_norm(pooled.float(), (pooled.shape[-1],))
+        except Exception:
+            pooled = pooled.float()
+        return pooled
+
+    def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Override verl's _forward_micro_batch ONLY when DR³ hidden features are enabled.
+        Otherwise, defer to parent implementation to avoid affecting other functionality.
+        """
+        if not self._dr3_hidden_enabled():
+            self._dr3_pooled_hidden = None
+            return super()._forward_micro_batch(micro_batch=micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+
+        # Lazy hook install
+        self._dr3_install_hidden_hook()
+        self._dr3_hidden_last = None
+        self._dr3_pooled_hidden = None
+
+        response_length = micro_batch["responses"].size(-1)
+        multi_modal_inputs = {}
+        if "multi_modal_inputs" in micro_batch.keys():
+            for key in micro_batch["multi_modal_inputs"][0].keys():
+                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
+
+        # Build a response mask consistent with update_policy (multi_turn uses loss_mask).
+        try:
+            if "loss_mask" in micro_batch.keys():
+                resp_mask = micro_batch["loss_mask"][:, -response_length:]
+            else:
+                resp_mask = micro_batch["attention_mask"][:, -response_length:]
+        except Exception:
+            resp_mask = micro_batch["attention_mask"][:, -response_length:]
+
+        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+            input_ids = micro_batch["input_ids"]
+            batch_size, seqlen = input_ids.shape
+            attention_mask = micro_batch["attention_mask"]
+            position_ids = micro_batch["position_ids"]
+            entropy = None
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # (total_nnz, 1)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                if position_ids.dim() == 3:
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)
+                else:
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+
+                input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+
+                # pad and slice the inputs if sp > 1
+                if self.use_ulysses_sp:
+                    is_vlm_model = "multi_modal_inputs" in micro_batch.keys()
+                    if is_vlm_model:
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                    else:
+                        input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                            input_ids_rmpad,
+                            position_ids_rmpad=position_ids_rmpad,
+                            sp_size=self.ulysses_sequence_parallel_size,
+                        )
+                    input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad_rolled,
+                        position_ids_rmpad=None,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+
+                input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)
+
+                extra_args = {}
+                if self.use_fused_kernels:
+                    extra_args["temperature"] = temperature
+                    extra_args["return_dict"] = True
+                else:
+                    # ensure we get a dict-like output across HF models
+                    extra_args["return_dict"] = True
+
+                output = self.actor_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )
+
+                if self.use_fused_kernels:
+                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+                    entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
+                else:
+                    logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab)
+                    logits_rmpad.div_(temperature)
+                    inplace_backward = True
+                    if calculate_entropy:
+                        inplace_backward = False
+                    log_probs = logprobs_from_logits(
+                        logits=logits_rmpad,
+                        labels=input_ids_rmpad_rolled,
+                        inplace_backward=inplace_backward,
+                    )
+                    if calculate_entropy:
+                        if not self.config.entropy_checkpointing:
+                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+                        else:
+                            entropy_rmpad = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, logits_rmpad)
+
+                # gather log_prob if sp > 1
+                if self.use_ulysses_sp:
+                    log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                    if calculate_entropy:
+                        entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+
+                if calculate_entropy:
+                    full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1 : -1]
+                full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1), indices=indices, batch=batch_size, seqlen=seqlen)
+                log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]
+
+                # --- DR³ hidden pooling ---
+                try:
+                    hs = self._dr3_hidden_last
+                    if torch.is_tensor(hs):
+                        # expected: (1, total_nnz, H)
+                        if hs.dim() == 3 and hs.shape[0] == 1:
+                            hs2 = hs.squeeze(0)  # (total_nnz, H)
+                        elif hs.dim() == 3 and hs.shape[1] == 1:
+                            hs2 = hs.squeeze(1)  # (total_nnz, H) for seq-first outputs
+                        else:
+                            hs2 = hs.reshape(-1, hs.shape[-1])
+                        if self.use_ulysses_sp:
+                            hs2 = gather_outpus_and_unpad(hs2, gather_dim=0, unpad_dim=0, padding_size=pad_size)
+                        full_hidden = pad_input(hidden_states=hs2, indices=indices, batch=batch_size, seqlen=seqlen)  # (bs, seqlen, H)
+                        self._dr3_pooled_hidden = self._dr3_pool_hidden_for_response(
+                            full_hidden=full_hidden,
+                            response_length=response_length,
+                            response_mask=resp_mask,
+                        )
+                except Exception:
+                    self._dr3_pooled_hidden = None
+
+            else:
+                extra_args = {}
+                if self.use_fused_kernels:
+                    extra_args["temperature"] = temperature
+                else:
+                    extra_args["return_dict"] = True
+
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    **extra_args,
+                )
+
+                if self.use_fused_kernels:
+                    log_probs = output.log_probs[:, -response_length - 1 : -1]
+                    entropy = output.entropy[:, -response_length - 1 : -1]
+                else:
+                    logits = output.logits
+                    logits.div_(temperature)
+                    logits = logits[:, -response_length - 1 : -1, :]
+                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if calculate_entropy:
+                        entropy = verl_F.entropy_from_logits(logits)
+
+                # --- DR³ hidden pooling (no rmpad) ---
+                try:
+                    hs = self._dr3_hidden_last
+                    if torch.is_tensor(hs) and hs.dim() == 3:
+                        # hs is (bs, seqlen, H) in most HF models
+                        if hs.shape[0] != batch_size and hs.shape[1] == batch_size:
+                            hs = hs.transpose(0, 1)
+                        self._dr3_pooled_hidden = self._dr3_pool_hidden_for_response(
+                            full_hidden=hs,
+                            response_length=response_length,
+                            response_mask=resp_mask,
+                        )
+                except Exception:
+                    self._dr3_pooled_hidden = None
+
+        return entropy, log_probs
 
     def _maybe_log_teacher_onpolicy_grad_dir(
         self,
@@ -832,6 +1118,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     dr3_disc_hidden = int(dr3_cfg.get("disc_hidden", 64))
                     dr3_disc_lr = float(dr3_cfg.get("disc_lr", 5e-4))
                     dr3_disc_steps = int(dr3_cfg.get("disc_steps_per_call", 1))
+                    dr3_disc_wd = float(dr3_cfg.get("disc_weight_decay", 0.0))
+                    dr3_hidden_proj_dim = int(dr3_cfg.get("hidden_proj_dim", 64))
+                    dr3_hidden_proj_dropout = float(dr3_cfg.get("hidden_proj_dropout", 0.0))
                     dr3_clip_max = float(dr3_cfg.get("clip_max", 10.0))
                     dr3_dual_enable = bool(dr3_cfg.get("dual_enable", True))
                     dr3_ess_target_ratio = float(dr3_cfg.get("ess_target_ratio", 0.5))
@@ -899,11 +1188,22 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     if dr3_enable:
                         try:
                             if not hasattr(self, "_dr3_est") or (self._dr3_est is None):
+                                # If feature mode contains hidden, base mode is v3 (7 dims), plus pooled hidden appended.
+                                # We only enable a projection layer inside discriminator in that case.
+                                _fm = str(dr3_cfg.get("feature_mode", "v2")).lower().strip()
+                                _is_hidden = ("hidden" in _fm) or (_fm in ("v5", "v5_hidden", "hidden", "repr", "embedding"))
+                                _stats_dim = 7 if _is_hidden else 0
+                                _proj_dim = int(dr3_hidden_proj_dim) if _is_hidden else 0
+                                _proj_drop = float(dr3_hidden_proj_dropout) if _is_hidden else 0.0
                                 self._dr3_est = DR3RatioEstimator(
                                     hidden=dr3_disc_hidden,
                                     lr=dr3_disc_lr,
                                     disc_steps_per_call=dr3_disc_steps,
                                     clip_max=dr3_clip_max,
+                                    disc_weight_decay=dr3_disc_wd,
+                                    disc_stats_dim=_stats_dim,
+                                    disc_hidden_proj_dim=_proj_dim,
+                                    disc_hidden_proj_dropout=_proj_drop,
                                     dual_enable=dr3_dual_enable,
                                     ess_target_ratio=dr3_ess_target_ratio,
                                     dual_lr=dr3_dual_lr,
@@ -941,12 +1241,20 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 if alpha_mode is not None:
                                     alpha_arg = None
                                     alpha_mode_arg = str(alpha_mode)
-                                else:
+                            else:
                                     # backward-compatible: use micro-batch teacher ratio (can be 0/1 when micro-batch=1)
                                     alpha_arg = float(teacher_sample.float().mean().detach().item())
                                     alpha_mode_arg = "micro"
 
                             dr3_feature_mode = str(dr3_cfg.get("feature_mode", "v2"))
+                            fm_norm = str(dr3_feature_mode).lower().strip()
+                            # If feature_mode contains "hidden", we concatenate pooled last-layer hidden (computed in _forward_micro_batch override).
+                            extra_seq = None
+                            base_mode = dr3_feature_mode
+                            if ("hidden" in fm_norm) or (fm_norm in ("v5", "v5_hidden", "hidden", "repr", "embedding")):
+                                base_mode = "v3"  # no-adv base
+                                extra_seq = getattr(self, "_dr3_pooled_hidden", None)
+
                             feats = compute_sequence_features(
                                 log_prob=log_prob.detach(),
                                 advantages=advantages.detach(),
@@ -954,7 +1262,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 ref_log_prob=data.get("ref_log_prob", None)[:, -response_length:].detach()
                                 if (self.config.use_kl_loss and (data.get("ref_log_prob", None) is not None))
                                 else None,
-                                feature_mode=dr3_feature_mode,
+                                feature_mode=base_mode,
+                                extra_seq_features=extra_seq,
                             )
                             w_hat, dr3_metrics = self._dr3_est.step(
                                 features=feats,
