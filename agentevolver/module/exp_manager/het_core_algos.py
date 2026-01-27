@@ -345,7 +345,7 @@ def het_compute_teacher_aware_loss(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-
+    
     # =============== teacher mask (required) ===============
     # teacher_mask is guaranteed not None here due to the early-return above.
     teacher_mask_float = teacher_mask.float()
@@ -1840,7 +1840,7 @@ def repo_compute_token_loss(
         off_pg_losses1 = -advantages * ratio
         off_pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
         off_pg_losses = torch.maximum(off_pg_losses1, off_pg_losses2)
-
+        
         off_clipfrac = verl_F.masked_mean(
             torch.gt(off_pg_losses2, off_pg_losses1).float(),
             exp_mask * response_mask
