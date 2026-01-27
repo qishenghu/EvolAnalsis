@@ -288,6 +288,7 @@ class DR3RatioEstimator:
         disc_hidden_proj_dim: int = 0,
         disc_hidden_proj_dropout: float = 0.0,
         disc_label_smoothing: float = 0.0,
+        disc_train_min_buf_size: int = 0,
         eps: float = 1e-6,
     ):
         self.hidden = int(hidden)
@@ -297,6 +298,7 @@ class DR3RatioEstimator:
         self.disc_hidden_proj_dim = int(disc_hidden_proj_dim)
         self.disc_hidden_proj_dropout = float(disc_hidden_proj_dropout)
         self.disc_label_smoothing = float(disc_label_smoothing)
+        self.disc_train_min_buf_size = max(0, int(disc_train_min_buf_size))
         self.disc_steps_per_call = max(0, int(disc_steps_per_call))
         self.clip_max = float(clip_max)
         self.eps = float(eps)
@@ -420,7 +422,10 @@ class DR3RatioEstimator:
     def _can_train(self) -> bool:
         if self._buf_y is None:
             return False
-        if int(self._buf_y.numel()) < 8:
+        n = int(self._buf_y.numel())
+        if n < 8:
+            return False
+        if self.disc_train_min_buf_size > 0 and n < int(self.disc_train_min_buf_size):
             return False
         try:
             return bool((self._buf_y.min() < 0.5) and (self._buf_y.max() > 0.5))
@@ -601,6 +606,7 @@ class DR3RatioEstimator:
         disc_loss_val = 0.0
         disc_acc_val = 0.0
         disc_trained_steps = 0.0
+        disc_train_ready = 1.0 if self._can_train() else 0.0
         # If using rank0-train + broadcast, only rank0 performs optimizer steps.
         can_optimize = (not self.broadcast_params) or (rank == 0)
         if self.disc_steps_per_call > 0 and self._can_train() and can_optimize:
@@ -729,6 +735,7 @@ class DR3RatioEstimator:
             "dr3/disc_loss": float(disc_loss_val),
             "dr3/disc_acc": float(disc_acc_val),
             "dr3/disc_trained_steps": float(disc_trained_steps),
+            "dr3/disc_train_ready": float(disc_train_ready),
             # How many samples were pushed into the buffer in THIS call (after optional all_gather).
             "dr3/buf_pushed": float(feats_for_buffer.shape[0]) if torch.is_tensor(feats_for_buffer) else 0.0,
             "dr3/buf_pushed_on": float(labels_for_buffer.sum().item()) if torch.is_tensor(labels_for_buffer) else 0.0,

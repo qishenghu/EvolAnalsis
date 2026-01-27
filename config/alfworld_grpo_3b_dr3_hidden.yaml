@@ -89,6 +89,9 @@ actor_rollout_ref:
       # Avoid early discriminator overconfidence (esp. with balanced sampling):
       # require enough buffer so teacher samples are not heavily re-sampled.
       apply_min_buf_size: 512
+      # Additionally, delay discriminator *training* (optimizer steps) until buffer is large enough.
+      # (Buffer still collects samples before this threshold.)
+      disc_train_min_buf_size: 256
 
       alpha_mode: "sync_batch_ema"
       alpha_ema_beta: 0.9
