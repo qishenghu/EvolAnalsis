@@ -84,6 +84,13 @@ actor_rollout_ref:
       disc_weight_decay: 0.02
       # Only applied when feature_mode contains "hidden" (v5_hidden): soften labels to avoid early saturation.
       disc_label_smoothing: 0.1
+      # B1: Temperature scaling for discriminator output (>1 → softer D, reduces overconfidence)
+      # Typical values: 1.5~2.0 when using hidden features
+      disc_temperature: 1.5
+      # A1: Age-weighted loss for discriminator (decay factor per step, 0=disabled)
+      # Newer samples get higher weight, reduces θ-drift impact
+      # Typical values: 0.02~0.1 (weight halves every ~35 steps @ 0.02, ~7 steps @ 0.1)
+      disc_age_weight_decay: 0.05
 
       apply_warmup_steps: 10
       # Avoid early discriminator overconfidence (esp. with balanced sampling):

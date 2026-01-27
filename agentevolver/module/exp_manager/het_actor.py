@@ -1123,6 +1123,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     dr3_hidden_proj_dropout = float(dr3_cfg.get("hidden_proj_dropout", 0.0))
                     dr3_disc_label_smoothing = float(dr3_cfg.get("disc_label_smoothing", 0.0))
                     dr3_disc_train_min_buf_size = int(dr3_cfg.get("disc_train_min_buf_size", 0))
+                    # B1: temperature scaling for discriminator output (>1 → softer probabilities)
+                    dr3_disc_temperature = float(dr3_cfg.get("disc_temperature", 1.0))
+                    # A1: age-weighted loss decay (0 = disabled, typical values 0.01~0.1)
+                    dr3_disc_age_weight_decay = float(dr3_cfg.get("disc_age_weight_decay", 0.0))
                     dr3_clip_max = float(dr3_cfg.get("clip_max", 10.0))
                     dr3_dual_enable = bool(dr3_cfg.get("dual_enable", True))
                     dr3_ess_target_ratio = float(dr3_cfg.get("ess_target_ratio", 0.5))
@@ -1199,6 +1203,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 _proj_drop = float(dr3_hidden_proj_dropout) if _is_hidden else 0.0
                                 _ls = float(dr3_disc_label_smoothing) if _is_hidden else 0.0
                                 _train_min_buf = int(dr3_disc_train_min_buf_size) if _is_hidden else 0
+                                # B1 + A1: temperature scaling and age-weighted loss (only when hidden features enabled)
+                                _temp = float(dr3_disc_temperature) if _is_hidden else 1.0
+                                _age_decay = float(dr3_disc_age_weight_decay) if _is_hidden else 0.0
                                 self._dr3_est = DR3RatioEstimator(
                                     hidden=dr3_disc_hidden,
                                     lr=dr3_disc_lr,
@@ -1210,6 +1217,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     disc_hidden_proj_dropout=_proj_drop,
                                     disc_label_smoothing=_ls,
                                     disc_train_min_buf_size=_train_min_buf,
+                                    disc_temperature=_temp,
+                                    disc_age_weight_decay=_age_decay,
                                     dual_enable=dr3_dual_enable,
                                     ess_target_ratio=dr3_ess_target_ratio,
                                     dual_lr=dr3_dual_lr,

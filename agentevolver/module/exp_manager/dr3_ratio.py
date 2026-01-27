@@ -289,6 +289,10 @@ class DR3RatioEstimator:
         disc_hidden_proj_dropout: float = 0.0,
         disc_label_smoothing: float = 0.0,
         disc_train_min_buf_size: int = 0,
+        # B1: Temperature scaling for discriminator output (>1 → softer probabilities)
+        disc_temperature: float = 1.0,
+        # A1: Age-weighted loss for discriminator (decay factor per step)
+        disc_age_weight_decay: float = 0.0,
         eps: float = 1e-6,
     ):
         self.hidden = int(hidden)
@@ -299,13 +303,17 @@ class DR3RatioEstimator:
         self.disc_hidden_proj_dropout = float(disc_hidden_proj_dropout)
         self.disc_label_smoothing = float(disc_label_smoothing)
         self.disc_train_min_buf_size = max(0, int(disc_train_min_buf_size))
+        # B1: temperature scaling
+        self.disc_temperature = float(max(0.1, disc_temperature))
+        # A1: age-weighted loss decay (0 = disabled, typical values 0.01~0.1)
+        self.disc_age_weight_decay = float(max(0.0, disc_age_weight_decay))
         self.disc_steps_per_call = max(0, int(disc_steps_per_call))
         self.clip_max = float(clip_max)
         self.eps = float(eps)
 
         self._disc: Optional[DR3Discriminator] = None
         self._opt: Optional[torch.optim.Optimizer] = None
-        self._bce = nn.BCEWithLogitsLoss()
+        self._bce = nn.BCEWithLogitsLoss(reduction="none")  # per-sample for age weighting
 
         self.dual = DR3DualESS(enable=bool(dual_enable), ess_target_ratio=float(ess_target_ratio), lr=float(dual_lr), lam=float(dual_init))
 
@@ -321,11 +329,13 @@ class DR3RatioEstimator:
         self.sync_across_ranks = bool(sync_across_ranks)
         self.sync_every_n_calls = max(1, int(sync_every_n_calls))
         self._calls: int = 0
+        self._global_step: int = 0  # A1: monotonic step counter for age weighting
         self.broadcast_params = bool(broadcast_params)
         self.broadcast_every_n_calls = max(1, int(broadcast_every_n_calls))
 
         self._buf_x: Optional[torch.Tensor] = None  # (N,F) on device
         self._buf_y: Optional[torch.Tensor] = None  # (N,) labels_on in {0,1} on device
+        self._buf_step: Optional[torch.Tensor] = None  # (N,) step_id when sample was added (for age weighting)
         self._w_off_hist: list[torch.Tensor] = []   # list of 1D CPU tensors
         self._alpha_ema: Optional[float] = None
 
@@ -372,6 +382,7 @@ class DR3RatioEstimator:
         self._opt = torch.optim.Adam(self._disc.parameters(), lr=self.lr, weight_decay=float(self.disc_weight_decay))
         self._buf_x = torch.empty((0, in_dim), device=device, dtype=torch.float32)
         self._buf_y = torch.empty((0,), device=device, dtype=torch.float32)
+        self._buf_step = torch.empty((0,), device=device, dtype=torch.int64)  # A1: step_id for age weighting
         # Optional: ensure all ranks start from identical discriminator params
         if self.broadcast_params:
             try:
@@ -412,12 +423,19 @@ class DR3RatioEstimator:
         y = y.detach().float().view(-1)
         if x.numel() == 0 or y.numel() == 0:
             return
+        n_new = int(x.shape[0])
+        # A1: assign current step_id to all new samples
+        step_ids = torch.full((n_new,), self._global_step, device=x.device, dtype=torch.int64)
         self._buf_x = torch.cat([self._buf_x, x], dim=0)
         self._buf_y = torch.cat([self._buf_y, y], dim=0)
+        if self._buf_step is not None:
+            self._buf_step = torch.cat([self._buf_step, step_ids], dim=0)
         if self._buf_x.shape[0] > self.buffer_size:
             extra = int(self._buf_x.shape[0] - self.buffer_size)
             self._buf_x = self._buf_x[extra:]
             self._buf_y = self._buf_y[extra:]
+            if self._buf_step is not None:
+                self._buf_step = self._buf_step[extra:]
 
     def _can_train(self) -> bool:
         if self._buf_y is None:
@@ -432,7 +450,11 @@ class DR3RatioEstimator:
         except Exception:
             return False
 
-    def _sample_train_batch(self) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def _sample_train_batch(self) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        Returns: (features, labels, step_ids) or None
+        A1: step_ids are used for age-weighted loss computation.
+        """
         if self._buf_x is None or self._buf_y is None or (not self._can_train()):
             return None
         n = int(self._buf_y.numel())
@@ -451,13 +473,15 @@ class DR3RatioEstimator:
                 idx = torch.cat([sel_on, sel_off], dim=0)
                 # shuffle
                 idx = idx[torch.randperm(idx.numel(), device=idx.device)]
-                return self._buf_x[idx], self._buf_y[idx]
+                step_ids = self._buf_step[idx] if self._buf_step is not None else torch.zeros_like(idx)
+                return self._buf_x[idx], self._buf_y[idx], step_ids
         except Exception:
             pass
 
         # Fallback: uniform sampling
         idx = torch.randint(low=0, high=n, size=(bs,), device=self._buf_y.device)
-        return self._buf_x[idx], self._buf_y[idx]
+        step_ids = self._buf_step[idx] if self._buf_step is not None else torch.zeros_like(idx)
+        return self._buf_x[idx], self._buf_y[idx], step_ids
 
     @staticmethod
     def effective_sample_size(w: torch.Tensor, eps: float = 1e-8) -> float:
@@ -607,12 +631,13 @@ class DR3RatioEstimator:
         disc_acc_val = 0.0
         disc_trained_steps = 0.0
         disc_train_ready = 1.0 if self._can_train() else 0.0
+        disc_age_weight_mean = 0.0
         # If using rank0-train + broadcast, only rank0 performs optimizer steps.
         can_optimize = (not self.broadcast_params) or (rank == 0)
         if self.disc_steps_per_call > 0 and self._can_train() and can_optimize:
             batch = self._sample_train_batch()
             if batch is not None:
-                xb, yb = batch
+                xb, yb, step_ids = batch
                 for _ in range(self.disc_steps_per_call):
                     logits = self._disc(xb)
                     # Optional label smoothing to prevent discriminator over-confidence.
@@ -622,7 +647,19 @@ class DR3RatioEstimator:
                     if ls > 0:
                         ls = float(min(max(ls, 0.0), 0.5))
                         yb_used = yb * (1.0 - ls) + 0.5 * ls
-                    loss = self._bce(logits, yb_used)
+                    # A1: per-sample BCE loss (reduction="none")
+                    loss_per_sample = self._bce(logits, yb_used)
+                    # A1: age-weighted loss (newer samples have higher weight)
+                    if self.disc_age_weight_decay > 0:
+                        age = (self._global_step - step_ids.float()).clamp_min(0.0)
+                        # weight = exp(-decay * age), newer samples (age=0) have weight=1
+                        age_weight = torch.exp(-self.disc_age_weight_decay * age)
+                        # normalize weights so mean=1 (preserve overall loss scale)
+                        age_weight = age_weight / age_weight.mean().clamp_min(self.eps)
+                        loss = (loss_per_sample * age_weight).mean()
+                        disc_age_weight_mean = float(age_weight.mean().item())
+                    else:
+                        loss = loss_per_sample.mean()
                     self._opt.zero_grad(set_to_none=True)
                     loss.backward()
                     self._opt.step()
@@ -637,8 +674,15 @@ class DR3RatioEstimator:
             self._broadcast_model_params()
             bcast_metrics["dr3/bcast_happened"] = 1.0
 
+        # A1: increment global step counter (once per call, after buffer push)
+        self._global_step += 1
+
         with torch.no_grad():
             logits = self._disc(feats)
+            # B1: Temperature scaling for discriminator output
+            # T > 1 → softer probabilities, reduces over-confidence
+            if self.disc_temperature != 1.0:
+                logits = logits / self.disc_temperature
             d = torch.sigmoid(logits).clamp(min=self.eps, max=1.0 - self.eps)  # (bs,)
             # --------------------------------------------------------------
             # Decide alpha_used:
@@ -736,6 +780,12 @@ class DR3RatioEstimator:
             "dr3/disc_acc": float(disc_acc_val),
             "dr3/disc_trained_steps": float(disc_trained_steps),
             "dr3/disc_train_ready": float(disc_train_ready),
+            # B1: temperature scaling
+            "dr3/disc_temperature": float(self.disc_temperature),
+            # A1: age-weighted loss
+            "dr3/disc_age_weight_decay": float(self.disc_age_weight_decay),
+            "dr3/disc_age_weight_mean": float(disc_age_weight_mean),
+            "dr3/global_step": float(self._global_step),
             # How many samples were pushed into the buffer in THIS call (after optional all_gather).
             "dr3/buf_pushed": float(feats_for_buffer.shape[0]) if torch.is_tensor(feats_for_buffer) else 0.0,
             "dr3/buf_pushed_on": float(labels_for_buffer.sum().item()) if torch.is_tensor(labels_for_buffer) else 0.0,
