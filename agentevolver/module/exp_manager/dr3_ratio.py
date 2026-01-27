@@ -287,6 +287,7 @@ class DR3RatioEstimator:
         disc_stats_dim: int = 0,
         disc_hidden_proj_dim: int = 0,
         disc_hidden_proj_dropout: float = 0.0,
+        disc_label_smoothing: float = 0.0,
         eps: float = 1e-6,
     ):
         self.hidden = int(hidden)
@@ -295,6 +296,7 @@ class DR3RatioEstimator:
         self.disc_stats_dim = int(disc_stats_dim)
         self.disc_hidden_proj_dim = int(disc_hidden_proj_dim)
         self.disc_hidden_proj_dropout = float(disc_hidden_proj_dropout)
+        self.disc_label_smoothing = float(disc_label_smoothing)
         self.disc_steps_per_call = max(0, int(disc_steps_per_call))
         self.clip_max = float(clip_max)
         self.eps = float(eps)
@@ -607,7 +609,14 @@ class DR3RatioEstimator:
                 xb, yb = batch
                 for _ in range(self.disc_steps_per_call):
                     logits = self._disc(xb)
-                    loss = self._bce(logits, yb)
+                    # Optional label smoothing to prevent discriminator over-confidence.
+                    # y in {0,1} -> y' = y*(1-eps) + 0.5*eps  (e.g., eps=0.1 => 0->0.05, 1->0.95)
+                    yb_used = yb
+                    ls = float(self.disc_label_smoothing)
+                    if ls > 0:
+                        ls = float(min(max(ls, 0.0), 0.5))
+                        yb_used = yb * (1.0 - ls) + 0.5 * ls
+                    loss = self._bce(logits, yb_used)
                     self._opt.zero_grad(set_to_none=True)
                     loss.backward()
                     self._opt.step()

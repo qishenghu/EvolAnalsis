@@ -80,19 +80,23 @@ actor_rollout_ref:
       feature_mode: "v5_hidden"
       # v5_hidden: project pooled hidden (H) -> hidden_proj_dim before feeding discriminator MLP
       hidden_proj_dim: 64
-      hidden_proj_dropout: 0.1
-      disc_weight_decay: 0.01
+      hidden_proj_dropout: 0.2
+      disc_weight_decay: 0.02
+      # Only applied when feature_mode contains "hidden" (v5_hidden): soften labels to avoid early saturation.
+      disc_label_smoothing: 0.1
 
       apply_warmup_steps: 10
-      apply_min_buf_size: 128
+      # Avoid early discriminator overconfidence (esp. with balanced sampling):
+      # require enough buffer so teacher samples are not heavily re-sampled.
+      apply_min_buf_size: 512
 
       alpha_mode: "sync_batch_ema"
       alpha_ema_beta: 0.9
 
       disc_hidden: 64
-      disc_lr: 2e-4
-      disc_steps_per_call: 2
-      buffer_size: 1048
+      disc_lr: 1e-4
+      disc_steps_per_call: 1
+      buffer_size: 1024
       train_batch_size: 128
       ess_window: 32
 
