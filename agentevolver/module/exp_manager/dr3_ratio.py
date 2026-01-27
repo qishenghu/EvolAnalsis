@@ -94,6 +94,35 @@ def compute_sequence_features(
             lp_min = _masked_min(log_prob, m, fill=0.0)
             adv_abs_mean = _masked_mean(advantages.abs(), m)
             feats = torch.stack([lp_mean, lp_std, lp_min, adv_abs_mean, resp_len], dim=-1)
+        elif feature_mode in ("v3", "v2_noadv", "noadv", "no_adv"):
+            # v3: advantage-free features (closer to density-ratio objective; avoids reward/adv leakage)
+            lp_mean = _masked_mean(log_prob, m)
+            lp_std = _masked_std(log_prob, m)
+            lp_min = _masked_min(log_prob, m, fill=0.0)
+            lp_max = _masked_max(log_prob, m, fill=0.0)
+
+            m_bool = m.bool()
+            denom = m_bool.sum(dim=-1).float().clamp_min(1.0)
+            low_thr = -10.0
+            lp_low_ratio = ((log_prob < low_thr) & m_bool).sum(dim=-1).float() / denom
+
+            if ref_log_prob is not None and torch.is_tensor(ref_log_prob) and ref_log_prob.shape == log_prob.shape:
+                kl_ref_mean = _masked_mean((log_prob - ref_log_prob), m)
+            else:
+                kl_ref_mean = torch.zeros_like(lp_mean)
+
+            feats = torch.stack(
+                [
+                    lp_mean,
+                    lp_std,
+                    lp_min,
+                    lp_max,
+                    lp_low_ratio,
+                    resp_len,
+                    kl_ref_mean,
+                ],
+                dim=-1,
+            )
         else:
             # v2: still cheap, but adds tail/shape signals and optional KL-to-ref
             lp_mean = _masked_mean(log_prob, m)
@@ -235,6 +264,37 @@ class DR3RatioEstimator:
         self._buf_x: Optional[torch.Tensor] = None  # (N,F) on device
         self._buf_y: Optional[torch.Tensor] = None  # (N,) labels_on in {0,1} on device
         self._w_off_hist: list[torch.Tensor] = []   # list of 1D CPU tensors
+        self._alpha_ema: Optional[float] = None
+
+    @staticmethod
+    def _clip_alpha(alpha: float, eps: float) -> float:
+        # Avoid extreme alpha causing 1/(1-alpha) blow-ups and unstable weights.
+        return float(min(max(float(alpha), float(eps)), 1.0 - float(eps)))
+
+    def _estimate_alpha_from_labels(self, labels_on: torch.Tensor) -> Optional[float]:
+        """
+        labels_on: (n,) float tensor in {0,1} (1=on, 0=off/teacher)
+        returns off_ratio in [0,1] or None if empty
+        """
+        try:
+            if labels_on is None or (not torch.is_tensor(labels_on)) or labels_on.numel() <= 0:
+                return None
+            off_cnt = float((1.0 - labels_on.float()).sum().item())
+            tot = float(labels_on.numel())
+            if tot <= 0:
+                return None
+            return off_cnt / tot
+        except Exception:
+            return None
+
+    def _update_alpha_ema(self, alpha_raw: float, beta: float) -> float:
+        beta = float(min(max(beta, 0.0), 0.999))
+        a = float(alpha_raw)
+        if self._alpha_ema is None:
+            self._alpha_ema = a
+        else:
+            self._alpha_ema = float(beta) * float(self._alpha_ema) + (1.0 - float(beta)) * a
+        return float(self._alpha_ema)
 
     def _maybe_init(self, *, device: torch.device, in_dim: int) -> None:
         if self._disc is not None:
@@ -305,6 +365,25 @@ class DR3RatioEstimator:
             return None
         n = int(self._buf_y.numel())
         bs = min(self.train_batch_size, n)
+
+        # Prefer class-balanced sampling for better discriminator training/calibration.
+        try:
+            y = self._buf_y
+            idx_on = (y > 0.5).nonzero(as_tuple=False).view(-1)
+            idx_off = (y <= 0.5).nonzero(as_tuple=False).view(-1)
+            if idx_on.numel() > 0 and idx_off.numel() > 0 and bs >= 2:
+                bs_on = bs // 2
+                bs_off = bs - bs_on
+                sel_on = idx_on[torch.randint(low=0, high=int(idx_on.numel()), size=(bs_on,), device=y.device)]
+                sel_off = idx_off[torch.randint(low=0, high=int(idx_off.numel()), size=(bs_off,), device=y.device)]
+                idx = torch.cat([sel_on, sel_off], dim=0)
+                # shuffle
+                idx = idx[torch.randperm(idx.numel(), device=idx.device)]
+                return self._buf_x[idx], self._buf_y[idx]
+        except Exception:
+            pass
+
+        # Fallback: uniform sampling
         idx = torch.randint(low=0, high=n, size=(bs,), device=self._buf_y.device)
         return self._buf_x[idx], self._buf_y[idx]
 
@@ -328,7 +407,9 @@ class DR3RatioEstimator:
         *,
         features: torch.Tensor,  # (bs, F), detached
         is_offpolicy: torch.Tensor,  # (bs,) bool; off-policy/teacher label=0
-        alpha: float,
+        alpha: Optional[float] = None,
+        alpha_mode: str = "prior_or_micro",  # "prior_or_micro" | "sync_batch_ema" | "sync_batch" | "micro" | "buffer_ema" | "buffer"
+        alpha_ema_beta: float = 0.9,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Returns:
@@ -479,8 +560,58 @@ class DR3RatioEstimator:
         with torch.no_grad():
             logits = self._disc(feats)
             d = torch.sigmoid(logits).clamp(min=self.eps, max=1.0 - self.eps)  # (bs,)
-            one_minus_alpha = float(max(self.eps, 1.0 - float(alpha)))
-            w = d / one_minus_alpha
+            # --------------------------------------------------------------
+            # Decide alpha_used:
+            # - If alpha is provided (alpha_prior): use it.
+            # - Else estimate from actual on/off ratio (micro/sync/buffer) and optionally EMA smooth it.
+            # --------------------------------------------------------------
+            alpha_mode_norm = str(alpha_mode).lower().strip()
+            alpha_raw: Optional[float] = None
+            if alpha is not None:
+                alpha_used = float(alpha)
+                alpha_raw = float(alpha)
+                alpha_mode_used = "prior"
+            else:
+                # auto estimation
+                if alpha_mode_norm in ("sync_batch_ema", "sync_ema", "auto", "sync"):
+                    alpha_raw = self._estimate_alpha_from_labels(labels_for_buffer)
+                    alpha_mode_used = "sync_batch_ema"
+                elif alpha_mode_norm in ("sync_batch", "sync_noema", "sync_raw"):
+                    alpha_raw = self._estimate_alpha_from_labels(labels_for_buffer)
+                    alpha_mode_used = "sync_batch"
+                elif alpha_mode_norm in ("buffer_ema", "buf_ema"):
+                    alpha_raw = self._estimate_alpha_from_labels(self._buf_y) if self._buf_y is not None else None
+                    alpha_mode_used = "buffer_ema"
+                elif alpha_mode_norm in ("buffer", "buf"):
+                    alpha_raw = self._estimate_alpha_from_labels(self._buf_y) if self._buf_y is not None else None
+                    alpha_mode_used = "buffer"
+                elif alpha_mode_norm in ("micro", "micro_batch", "batch"):
+                    alpha_raw = self._estimate_alpha_from_labels(labels_on)
+                    alpha_mode_used = "micro"
+                else:
+                    # backward-compatible default: prior_or_micro
+                    alpha_raw = self._estimate_alpha_from_labels(labels_on)
+                    alpha_mode_used = "prior_or_micro"
+
+                if alpha_raw is None:
+                    alpha_raw = float(0.5)  # safe fallback (won't be applied if no off-policy anyway)
+                    alpha_mode_used = f"{alpha_mode_used}_fallback"
+
+                if "ema" in alpha_mode_used:
+                    alpha_used = self._update_alpha_ema(alpha_raw, beta=float(alpha_ema_beta))
+                else:
+                    alpha_used = float(alpha_raw)
+
+            alpha_used = self._clip_alpha(alpha_used, eps=self.eps)
+            one_minus_alpha = float(max(self.eps, 1.0 - alpha_used))
+
+            # Convert discriminator posterior to likelihood ratio r = p/q.
+            # With class-balanced training batches, the implicit training prior is ~0.5,
+            # so r_hat ≈ d / (1-d).
+            r_hat = d / (1.0 - d)
+
+            # Relative density ratio w_alpha = p / ((1-α)p + αq) = r / ((1-α)r + α)
+            w = r_hat / (one_minus_alpha * r_hat + alpha_used)
 
             # Base theoretical upper bound for relative ratio
             base_upper = 1.0 / one_minus_alpha
@@ -512,7 +643,15 @@ class DR3RatioEstimator:
                 clipfrac = float((w[off_idx] > clip_upper).float().mean().item())
 
         metrics = {
-            "dr3/alpha": float(alpha),
+            # keep "dr3/alpha" as the alpha actually used for weighting/clipping
+            "dr3/alpha": float(alpha_used),
+            "dr3/alpha_mode": float(
+                0.0
+                if alpha_mode_used.startswith("prior")
+                else (1.0 if "sync" in alpha_mode_used else (2.0 if "buffer" in alpha_mode_used else 3.0))
+            ),
+            "dr3/alpha_raw": float(alpha_raw) if alpha_raw is not None else 0.0,
+            "dr3/alpha_ema": float(self._alpha_ema) if self._alpha_ema is not None else 0.0,
             "dr3/disc_loss": float(disc_loss_val),
             "dr3/disc_acc": float(disc_acc_val),
             "dr3/disc_trained_steps": float(disc_trained_steps),

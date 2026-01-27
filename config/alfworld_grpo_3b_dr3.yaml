@@ -75,19 +75,23 @@ actor_rollout_ref:
     dr3:
       enable: true
       apply_to: "teacher_no_logprob"     # "teacher_no_logprob" | "all_offpolicy"
-      feature_mode: "v2"                # "v1" (5 dims) | "v2" (richer, still cheap)
+      # Stronger default: avoid advantage leakage into discriminator (better theory + often better behavior).
+      feature_mode: "v3"                # "v1" | "v2" | "v3"(no-adv)
       # Optional warmup: only observe+train D for first N steps; start applying repair after that.
       # This can reduce early-step noise when buffer/discriminator is not yet stable.
-      apply_warmup_steps: 2
+      apply_warmup_steps: 10
       # Optional extra gate: require buffer size >= this value before applying repair.
-      apply_min_buf_size: 64
-      # When ppo_micro_batch_size_per_gpu=1, per-micro alpha is often 0/1.
-      # Use a stable prior matching rollout-level mixing: n_teacher_rollouts_per_task / n_rollout = 1/8 = 0.125.
-      alpha_prior: 0.125
+      apply_min_buf_size: 256
+      # α selection:
+      # - If you set alpha_prior, DR³ will always use it (stable but may be biased when teacher rollouts are missing).
+      # - Recommended stronger default: estimate α from actual (sync'ed) on/off ratio + EMA smoothing.
+      # alpha_prior: 0.125
+      alpha_mode: "sync_batch_ema"       # "sync_batch_ema" | "sync_batch" | "buffer_ema" | "buffer" | "micro"
+      alpha_ema_beta: 0.9
       # discriminator
       disc_hidden: 64
       disc_lr: 5e-4
-      disc_steps_per_call: 2
+      disc_steps_per_call: 4
       buffer_size: 2048
       train_batch_size: 128
       ess_window: 32
@@ -111,8 +115,8 @@ actor_rollout_ref:
       ratio_shaping_beta: 0.1
       # closed-loop thresholds (only used when ratio_shaping_mode="auto")
       ratio_shaping_auto_acc_min: 0.85
-      ratio_shaping_auto_buf_min: 256
-      ratio_shaping_auto_ess_min: 8.0
+      ratio_shaping_auto_buf_min: 512
+      ratio_shaping_auto_ess_min: 16.0
       # closed-loop dual ESS
       dual_enable: true
       ess_target_ratio: 0.5

@@ -922,16 +922,29 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 if (teacher_mask is not None and torch.is_tensor(teacher_mask))
                                 else torch.zeros(log_prob.size(0), device=log_prob.device, dtype=torch.bool)
                             )
-                            # Stable alpha prior under rollout-level mixing is recommended.
+                            # Alpha selection:
+                            # - If alpha_prior is provided: use it (stable rollout-level prior).
+                            # - Else optionally estimate alpha from actual on/off ratio via DR³ estimator (alpha_mode).
+                            # - Fallback (backward-compatible): micro-batch ratio.
                             alpha_prior = dr3_cfg.get("alpha_prior", None)
+                            alpha_mode = dr3_cfg.get("alpha_mode", None)
+                            alpha_ema_beta = float(dr3_cfg.get("alpha_ema_beta", 0.9))
+                            alpha_arg = None
+                            alpha_mode_arg = "prior_or_micro"
                             if alpha_prior is not None:
                                 try:
-                                    alpha_hat = float(alpha_prior)
+                                    alpha_arg = float(alpha_prior)
+                                    alpha_mode_arg = "prior"
                                 except Exception:
-                                    alpha_hat = float(teacher_sample.float().mean().detach().item())
-                            else:
-                                alpha_hat = float(teacher_sample.float().mean().detach().item())
-                            alpha_hat = float(min(max(alpha_hat, 0.01), 0.99))
+                                    alpha_arg = None
+                            if alpha_arg is None:
+                                if alpha_mode is not None:
+                                    alpha_arg = None
+                                    alpha_mode_arg = str(alpha_mode)
+                                else:
+                                    # backward-compatible: use micro-batch teacher ratio (can be 0/1 when micro-batch=1)
+                                    alpha_arg = float(teacher_sample.float().mean().detach().item())
+                                    alpha_mode_arg = "micro"
 
                             dr3_feature_mode = str(dr3_cfg.get("feature_mode", "v2"))
                             feats = compute_sequence_features(
@@ -946,7 +959,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             w_hat, dr3_metrics = self._dr3_est.step(
                                 features=feats,
                                 is_offpolicy=teacher_sample.detach(),  # teacher==off-policy label
-                                alpha=alpha_hat,
+                                alpha=alpha_arg,
+                                alpha_mode=alpha_mode_arg,
+                                alpha_ema_beta=alpha_ema_beta,
                             )
                             # micro-level logs (OK)
                             try:
@@ -955,7 +970,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     {
                                         "dr3/teacher_samples_micro": float(teacher_sample.sum().item()),
                                         "dr3/on_samples_micro": float((~teacher_sample).sum().item()),
-                                        "dr3/teacher_ratio_micro": float(alpha_hat),
+                                        # Note: micro-level teacher ratio (not necessarily the alpha used by DR³ if alpha_mode=auto/ema)
+                                        "dr3/teacher_ratio_micro": float(teacher_sample.float().mean().detach().item()),
                                     }
                                 )
                                 # Step-level aggregation (per-rank) for debugging multi-GPU / micro-batch behavior
