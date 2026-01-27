@@ -17,7 +17,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_dr3_hidden_teacher72b_bz8_ntr1
+  experiment_name: alfworld_3b_grpo_dr3_hidden_teacher72b_bz8_ntr1_hidden_v5
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
