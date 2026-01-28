@@ -1406,6 +1406,53 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     teacher_loss_scale=teacher_loss_scale,
                                 )
                             else:
+                                # ----------------------------------------------------------
+                                # ⭐ Reward-gap gate (explicit teacher fade-out)
+                                #
+                                # Motivation:
+                                # - v5_hidden tends to keep teacher influence strong even in late stage,
+                                #   which can hurt asymptotic performance.
+                                # - We reuse trainer-produced `teacher_loss_scale` (computed from reward gap)
+                                #   as a closed-loop gate in [0,1].
+                                #
+                                # Effect:
+                                # - Scale teacher-token advantages by gate (0→no teacher gradient, 1→full DR³).
+                                # - Keeps density-ratio repair semantics on w_hat, while controlling teacher impact.
+                                # ----------------------------------------------------------
+                                dr3_gap_gate_enable = bool(dr3_cfg.get("gap_gate_enable", False))
+                                advantages_used = advantages
+                                gate_s = None  # (bs,1) or None
+                                if dr3_gap_gate_enable:
+                                    try:
+                                        if teacher_loss_scale is not None and torch.is_tensor(teacher_loss_scale):
+                                            # teacher_loss_scale is (bs, resp_len) token-level; reduce to per-sample gate.
+                                            gate_s = teacher_loss_scale.float().mean(dim=-1, keepdim=True).clamp(0.0, 1.0)
+                                        else:
+                                            gate_s = torch.ones((log_prob.size(0), 1), device=log_prob.device, dtype=torch.float32)
+
+                                        if teacher_mask is not None and torch.is_tensor(teacher_mask):
+                                            tm = teacher_mask.float()
+                                            if tm.dim() == 2 and tm.shape[-1] != response_length and tm.shape[-1] > response_length:
+                                                tm = tm[:, -response_length:]
+                                            # multiplier = 1 for non-teacher tokens; gate for teacher tokens
+                                            mult = (1.0 - tm) + tm * gate_s
+                                            advantages_used = advantages * mult
+
+                                        # logs
+                                        metrics["dr3/gap_gate_enabled"] = 1.0
+                                        metrics["dr3/gap_gate_mean"] = float(gate_s.mean().detach().item())
+                                        metrics["dr3/gap_gate_min"] = float(gate_s.min().detach().item())
+                                        metrics["dr3/gap_gate_max"] = float(gate_s.max().detach().item())
+                                    except Exception:
+                                        # safe fallback: do not gate
+                                        advantages_used = advantages
+                                        metrics["dr3/gap_gate_enabled"] = 0.0
+                                else:
+                                    try:
+                                        metrics["dr3/gap_gate_enabled"] = 0.0
+                                    except Exception:
+                                        pass
+
                                 teacher_sample = (
                                     (teacher_mask.sum(dim=-1) > 0)
                                     if (teacher_mask is not None and torch.is_tensor(teacher_mask))
@@ -1424,7 +1471,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 ret_dict = repo_compute_token_loss(
                                     old_log_prob=old_log_prob,
                                     log_prob=log_prob,
-                                    advantages=advantages,
+                                    advantages=advantages_used,
                                     response_mask=response_mask,
                                     exp_mask=exp_mask,
                                     cliprange=clip_ratio,
@@ -1460,7 +1507,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     ret_dict = repo_compute_token_loss(
                                         old_log_prob=old_log_prob,
                                         log_prob=log_prob,
-                                        advantages=advantages,
+                                        advantages=advantages_used,
                                         response_mask=response_mask,
                                         exp_mask=exp_mask,
                                         cliprange=clip_ratio,

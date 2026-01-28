@@ -17,7 +17,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_dr3_hidden_teacher72b_bz8_ntr1_hidden_v5
+  experiment_name: alfworld_3b_grpo_dr3_hidden_teacher72b_bz8_ntr1_hidden_v5_gap_gate
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -78,6 +78,11 @@ actor_rollout_ref:
       # - The actor will capture last-layer hidden states via a forward hook (repo-local override),
       #   mean-pool over response tokens, layer-norm, then concatenate to v3 features.
       feature_mode: "v5_hidden"
+      # ⭐ NEW: reward-gap gate (explicit teacher fade-out)
+      # Uses trainer-computed `diag/group_teacher_minus_on_reward_mean` to produce `teacher_loss_scale` in [0,1],
+      # then actor scales teacher-token advantages by this gate during DR³ apply.
+      # Intuition: early gap is large → gate≈1; late gap shrinks → gate→0 to protect asymptotic performance.
+      gap_gate_enable: true
       # v5_hidden: project pooled hidden (H) -> hidden_proj_dim before feeding discriminator MLP
       hidden_proj_dim: 64
       hidden_proj_dropout: 0.2
@@ -252,6 +257,25 @@ exp_manager:
       enable: false
       mode: "p_div_p_beta"
       beta: 0.1
+
+    # ⭐ NEW: Adaptive teacher weight from reward-gap (writes `teacher_loss_scale` into batch)
+    # This is consumed by DR³ reward-gap gate when dr3.gap_gate_enable=true.
+    adaptive_weight:
+      enable: true
+      # current implementation supports: gap_linear
+      mode: "gap_linear"
+      # recommend "group" (per-task/per-uid) for stable fade-out; fallback to batch if grouping missing.
+      gate_level: "group"
+      # gate = clip((gap - epsilon) / tau, min, max)
+      # Use small epsilon so tiny gaps don't keep teacher influence alive.
+      epsilon: 0.02
+      # tau controls how quickly gate reaches 1; with AlfWorld rewards in [0,1], 0.3 is a good start.
+      tau: 0.30
+      min: 0.0
+      max: 1.0
+      ema:
+        enable: true
+        beta: 0.9
 
 attribution_driven_credit_assignment:
   enable: false

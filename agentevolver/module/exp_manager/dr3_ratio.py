@@ -631,7 +631,9 @@ class DR3RatioEstimator:
         disc_acc_val = 0.0
         disc_trained_steps = 0.0
         disc_train_ready = 1.0 if self._can_train() else 0.0
-        disc_age_weight_mean = 0.0
+        disc_age_mean = 0.0
+        disc_age_weight_min = 0.0
+        disc_age_weight_max = 0.0
         # If using rank0-train + broadcast, only rank0 performs optimizer steps.
         can_optimize = (not self.broadcast_params) or (rank == 0)
         if self.disc_steps_per_call > 0 and self._can_train() and can_optimize:
@@ -651,13 +653,16 @@ class DR3RatioEstimator:
                     loss_per_sample = self._bce(logits, yb_used)
                     # A1: age-weighted loss (newer samples have higher weight)
                     if self.disc_age_weight_decay > 0:
-                        age = (self._global_step - step_ids.float()).clamp_min(0.0)
+                        age = (float(self._global_step) - step_ids.float()).clamp_min(0.0)
                         # weight = exp(-decay * age), newer samples (age=0) have weight=1
                         age_weight = torch.exp(-self.disc_age_weight_decay * age)
                         # normalize weights so mean=1 (preserve overall loss scale)
                         age_weight = age_weight / age_weight.mean().clamp_min(self.eps)
                         loss = (loss_per_sample * age_weight).mean()
-                        disc_age_weight_mean = float(age_weight.mean().item())
+                        # Note: mean is ~1 by construction; log age/weight range for observability.
+                        disc_age_mean = float(age.mean().item()) if age.numel() else 0.0
+                        disc_age_weight_min = float(age_weight.min().item()) if age_weight.numel() else 0.0
+                        disc_age_weight_max = float(age_weight.max().item()) if age_weight.numel() else 0.0
                     else:
                         loss = loss_per_sample.mean()
                     self._opt.zero_grad(set_to_none=True)
@@ -784,7 +789,9 @@ class DR3RatioEstimator:
             "dr3/disc_temperature": float(self.disc_temperature),
             # A1: age-weighted loss
             "dr3/disc_age_weight_decay": float(self.disc_age_weight_decay),
-            "dr3/disc_age_weight_mean": float(disc_age_weight_mean),
+            "dr3/disc_age_mean": float(disc_age_mean),
+            "dr3/disc_age_weight_min": float(disc_age_weight_min),
+            "dr3/disc_age_weight_max": float(disc_age_weight_max),
             "dr3/global_step": float(self._global_step),
             # How many samples were pushed into the buffer in THIS call (after optional all_gather).
             "dr3/buf_pushed": float(feats_for_buffer.shape[0]) if torch.is_tensor(feats_for_buffer) else 0.0,
