@@ -17,7 +17,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: alfworld_3b_grpo_dr3_hidden_teacher72b_bz8_ntr1_hidden_v5_gap_gate
+  experiment_name: alfworld_3b_grpo_dr3_v3aug_teacher72b_bz8_ntr1_gap_gate
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -74,10 +74,9 @@ actor_rollout_ref:
       enable: true
       apply_to: "teacher_no_logprob"
 
-      # ⭐ Enable hidden pooled features + v3(no-adv) base stats:
-      # - The actor will capture last-layer hidden states via a forward hook (repo-local override),
-      #   mean-pool over response tokens, layer-norm, then concatenate to v3 features.
-      feature_mode: "v5_hidden"
+      # ⭐ Use augmented v3 features (no hidden states; less overfit than v5_hidden)
+      # v3_aug = v3(no-adv) + richer logprob/kl shape features (still cheap; no reward leakage).
+      feature_mode: "v3_aug"
       # ⭐ NEW: reward-gap gate (explicit teacher fade-out)
       # Uses trainer-computed `diag/group_teacher_minus_on_reward_mean` to produce `teacher_loss_scale` in [0,1],
       # then actor scales teacher-token advantages by this gate during DR³ apply.
@@ -88,14 +87,14 @@ actor_rollout_ref:
       hidden_proj_dropout: 0.2
       disc_weight_decay: 0.02
       # Only applied when feature_mode contains "hidden" (v5_hidden): soften labels to avoid early saturation.
-      disc_label_smoothing: 0.1
+      disc_label_smoothing: 0.05
       # B1: Temperature scaling for discriminator output (>1 → softer D, reduces overconfidence)
       # Typical values: 1.5~2.0 when using hidden features
-      disc_temperature: 1.5
+      disc_temperature: 1.2
       # A1: Age-weighted loss for discriminator (decay factor per step, 0=disabled)
       # Newer samples get higher weight, reduces θ-drift impact
       # Typical values: 0.02~0.1 (weight halves every ~35 steps @ 0.02, ~7 steps @ 0.1)
-      disc_age_weight_decay: 0.05
+      disc_age_weight_decay: 0.02
 
       apply_warmup_steps: 10
       # Avoid early discriminator overconfidence (esp. with balanced sampling):
@@ -125,7 +124,7 @@ actor_rollout_ref:
 
       ratio_shaping_mode: "auto"
       ratio_shaping_beta: 0.1
-      ratio_shaping_auto_acc_min: 0.85
+      ratio_shaping_auto_acc_min: 0.80
       ratio_shaping_auto_buf_min: 512
       ratio_shaping_auto_ess_min: 16.0
 
@@ -267,15 +266,18 @@ exp_manager:
       # recommend "group" (per-task/per-uid) for stable fade-out; fallback to batch if grouping missing.
       gate_level: "group"
       # gate = clip((gap - epsilon) / tau, min, max)
-      # Use small epsilon so tiny gaps don't keep teacher influence alive.
-      epsilon: 0.02
-      # tau controls how quickly gate reaches 1; with AlfWorld rewards in [0,1], 0.3 is a good start.
-      tau: 0.30
+      # A more conservative default (less aggressive fade-out) to avoid hurting reward:
+      # - epsilon=0: don't suppress small positive gaps too early
+      # - tau larger: requires a larger gap to fully open the gate
+      epsilon: 0.0
+      # with AlfWorld rewards in [0,1], 0.5 tends to keep gate open longer than 0.3.
+      tau: 0.50
       min: 0.0
       max: 1.0
       ema:
         enable: true
-        beta: 0.9
+        # smoother gate to reduce jitter in early training
+        beta: 0.95
 
 attribution_driven_credit_assignment:
   enable: false

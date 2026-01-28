@@ -1201,11 +1201,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 _stats_dim = 7 if _is_hidden else 0
                                 _proj_dim = int(dr3_hidden_proj_dim) if _is_hidden else 0
                                 _proj_drop = float(dr3_hidden_proj_dropout) if _is_hidden else 0.0
-                                _ls = float(dr3_disc_label_smoothing) if _is_hidden else 0.0
-                                _train_min_buf = int(dr3_disc_train_min_buf_size) if _is_hidden else 0
-                                # B1 + A1: temperature scaling and age-weighted loss (only when hidden features enabled)
-                                _temp = float(dr3_disc_temperature) if _is_hidden else 1.0
-                                _age_decay = float(dr3_disc_age_weight_decay) if _is_hidden else 0.0
+                                # Regularization knobs are generally useful for *all* feature modes (not only hidden).
+                                # Keep defaults backward-compatible (0 / 1.0), so behavior only changes if user sets them.
+                                _ls = float(dr3_disc_label_smoothing)
+                                _train_min_buf = int(dr3_disc_train_min_buf_size)
+                                _temp = float(dr3_disc_temperature)
+                                _age_decay = float(dr3_disc_age_weight_decay)
                                 self._dr3_est = DR3RatioEstimator(
                                     hidden=dr3_disc_hidden,
                                     lr=dr3_disc_lr,
@@ -1420,6 +1421,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 # - Keeps density-ratio repair semantics on w_hat, while controlling teacher impact.
                                 # ----------------------------------------------------------
                                 dr3_gap_gate_enable = bool(dr3_cfg.get("gap_gate_enable", False))
+                                # Memory-lean gating:
+                                # - Avoid constructing token-level `mult` (bs, resp_len) which can increase peak VRAM.
+                                # - Teacher trajectories are sample-level; scaling per-sample advantages is sufficient.
                                 advantages_used = advantages
                                 gate_s = None  # (bs,1) or None
                                 if dr3_gap_gate_enable:
@@ -1430,13 +1434,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         else:
                                             gate_s = torch.ones((log_prob.size(0), 1), device=log_prob.device, dtype=torch.float32)
 
-                                        if teacher_mask is not None and torch.is_tensor(teacher_mask):
-                                            tm = teacher_mask.float()
-                                            if tm.dim() == 2 and tm.shape[-1] != response_length and tm.shape[-1] > response_length:
-                                                tm = tm[:, -response_length:]
-                                            # multiplier = 1 for non-teacher tokens; gate for teacher tokens
-                                            mult = (1.0 - tm) + tm * gate_s
-                                            advantages_used = advantages * mult
+                                        teacher_sample = (
+                                            (teacher_mask.sum(dim=-1) > 0)
+                                            if (teacher_mask is not None and torch.is_tensor(teacher_mask))
+                                            else torch.zeros(log_prob.size(0), device=log_prob.device, dtype=torch.bool)
+                                        )
+                                        if teacher_sample.any():
+                                            # Only allocate a cloned tensor when we actually need to change values.
+                                            advantages_used = advantages.clone()
+                                            advantages_used[teacher_sample] = advantages_used[teacher_sample] * gate_s[teacher_sample]
 
                                         # logs
                                         metrics["dr3/gap_gate_enabled"] = 1.0

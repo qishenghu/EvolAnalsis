@@ -95,6 +95,54 @@ def compute_sequence_features(
             lp_min = _masked_min(log_prob, m, fill=0.0)
             adv_abs_mean = _masked_mean(advantages.abs(), m)
             feats = torch.stack([lp_mean, lp_std, lp_min, adv_abs_mean, resp_len], dim=-1)
+        elif feature_mode in ("v3_aug", "v3_plus", "v3_augmented", "v4"):
+            # v3_aug: advantage-free, but richer shape signals than v3.
+            # Goal: keep density-ratio narrative (no reward/adv leakage) while improving discriminability
+            # without using high-capacity hidden states (which can overfit).
+            lp_mean = _masked_mean(log_prob, m)
+            lp_std = _masked_std(log_prob, m)
+            lp_min = _masked_min(log_prob, m, fill=0.0)
+            lp_max = _masked_max(log_prob, m, fill=0.0)
+
+            m_bool = m.bool()
+            denom = m_bool.sum(dim=-1).float().clamp_min(1.0)
+
+            low_thr1 = -10.0
+            low_thr2 = -20.0
+            high_thr = -1.0
+            lp_low_ratio_10 = ((log_prob < low_thr1) & m_bool).sum(dim=-1).float() / denom
+            lp_low_ratio_20 = ((log_prob < low_thr2) & m_bool).sum(dim=-1).float() / denom
+            lp_high_ratio_1 = ((log_prob > high_thr) & m_bool).sum(dim=-1).float() / denom
+
+            if ref_log_prob is not None and torch.is_tensor(ref_log_prob) and ref_log_prob.shape == log_prob.shape:
+                dlp = (log_prob - ref_log_prob)
+                kl_ref_mean = _masked_mean(dlp, m)
+                kl_ref_std = _masked_std(dlp, m)
+                kl_ref_abs_mean = _masked_mean(dlp.abs(), m)
+                kl_ref_pos_ratio = ((dlp > 0) & m_bool).sum(dim=-1).float() / denom
+            else:
+                kl_ref_mean = torch.zeros_like(lp_mean)
+                kl_ref_std = torch.zeros_like(lp_mean)
+                kl_ref_abs_mean = torch.zeros_like(lp_mean)
+                kl_ref_pos_ratio = torch.zeros_like(lp_mean)
+
+            feats = torch.stack(
+                [
+                    lp_mean,
+                    lp_std,
+                    lp_min,
+                    lp_max,
+                    lp_low_ratio_10,
+                    lp_low_ratio_20,
+                    lp_high_ratio_1,
+                    resp_len,
+                    kl_ref_mean,
+                    kl_ref_std,
+                    kl_ref_abs_mean,
+                    kl_ref_pos_ratio,
+                ],
+                dim=-1,
+            )
         elif feature_mode in ("v3", "v2_noadv", "noadv", "no_adv"):
             # v3: advantage-free features (closer to density-ratio objective; avoids reward/adv leakage)
             lp_mean = _masked_mean(log_prob, m)
