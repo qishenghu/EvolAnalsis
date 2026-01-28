@@ -85,7 +85,7 @@ actor_rollout_ref:
       # v5_hidden: project pooled hidden (H) -> hidden_proj_dim before feeding discriminator MLP
       hidden_proj_dim: 64
       hidden_proj_dropout: 0.2
-      disc_weight_decay: 0.02
+      disc_weight_decay: 0.005
       # Only applied when feature_mode contains "hidden" (v5_hidden): soften labels to avoid early saturation.
       disc_label_smoothing: 0.05
       # B1: Temperature scaling for discriminator output (>1 → softer D, reduces overconfidence)
@@ -108,8 +108,8 @@ actor_rollout_ref:
       alpha_ema_beta: 0.9
 
       disc_hidden: 64
-      disc_lr: 1e-4
-      disc_steps_per_call: 1
+      disc_lr: 3e-4
+      disc_steps_per_call: 2
       buffer_size: 1024
       train_batch_size: 128
       ess_window: 32
