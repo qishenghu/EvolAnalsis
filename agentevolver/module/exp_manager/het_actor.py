@@ -1421,6 +1421,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 # - Keeps density-ratio repair semantics on w_hat, while controlling teacher impact.
                                 # ----------------------------------------------------------
                                 dr3_gap_gate_enable = bool(dr3_cfg.get("gap_gate_enable", False))
+                                # Optional non-linear gate: gate_used = gate ** gate_power (power>=1 makes late-stage fade-out stronger)
+                                dr3_gap_gate_power = float(dr3_cfg.get("gap_gate_power", 1.0))
+                                if not (dr3_gap_gate_power > 0.0):
+                                    dr3_gap_gate_power = 1.0
                                 # Memory-lean gating:
                                 # - Avoid constructing token-level `mult` (bs, resp_len) which can increase peak VRAM.
                                 # - Teacher trajectories are sample-level; scaling per-sample advantages is sufficient.
@@ -1434,6 +1438,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         else:
                                             gate_s = torch.ones((log_prob.size(0), 1), device=log_prob.device, dtype=torch.float32)
 
+                                        # Apply optional non-linear compression (keeps early ~1 almost unchanged, shrinks mid/late gates)
+                                        if dr3_gap_gate_power != 1.0:
+                                            gate_s = gate_s.pow(dr3_gap_gate_power)
+
                                         teacher_sample = (
                                             (teacher_mask.sum(dim=-1) > 0)
                                             if (teacher_mask is not None and torch.is_tensor(teacher_mask))
@@ -1446,6 +1454,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
                                         # logs
                                         metrics["dr3/gap_gate_enabled"] = 1.0
+                                        metrics["dr3/gap_gate_power"] = float(dr3_gap_gate_power)
                                         metrics["dr3/gap_gate_mean"] = float(gate_s.mean().detach().item())
                                         metrics["dr3/gap_gate_min"] = float(gate_s.min().detach().item())
                                         metrics["dr3/gap_gate_max"] = float(gate_s.max().detach().item())
@@ -1456,6 +1465,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 else:
                                     try:
                                         metrics["dr3/gap_gate_enabled"] = 0.0
+                                        metrics["dr3/gap_gate_power"] = float(dr3_gap_gate_power)
                                     except Exception:
                                         pass
 
