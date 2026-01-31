@@ -316,19 +316,15 @@ class EnvService:
         try:
             if instance_id not in self.env_actors:
                 raise ValueError(f"Instance {instance_id} not found!")
-            env_type = self.instance_env_types.get(instance_id)
-            # For shared actors (like alfworld), pass instance_id as first parameter
-            if env_type in ["alfworld"]:
-                return await self.env_actors[instance_id].get_info.remote(
-                    instance_id,
-                    messages,
-                    params,
-                )
-            else:
-                return await self.env_actors[instance_id].get_info.remote(
-                    messages,
-                    params,
-                )
+            # All env actors are `RemoteEnv` (including per-instance actors), so we
+            # always pass `instance_id` to address the correct env instance within
+            # the actor. AlfWorld uses a shared actor, others are typically one-actor
+            # per instance, but the interface is consistent.
+            return await self.env_actors[instance_id].get_info.remote(
+                instance_id,
+                messages,
+                params,
+            )
         except Exception as e:
             print(f"Error in get_info: {str(e)}")
             raise
@@ -381,14 +377,19 @@ class EnvService:
                 init_state = await env_actor.get_init_state.remote(instance_id, params)
             elif env_type == "webshop":
                 params["server"] = SIM_SERVER
-                env_actor = env_remote_cls.remote(task_id, instance_id, params)
+                # Default behavior: one actor per instance, but still use RemoteEnv
+                # wrapper to keep a unified interface.
+                env_actor = env_remote_cls.remote()
                 self.env_actors[instance_id] = env_actor
-                init_state = await env_actor.get_init_state.remote(params)
+                await env_actor.create_env_instance.remote(task_id, instance_id, params)
+                init_state = await env_actor.get_init_state.remote(instance_id, params)
             else:
-                # Default behavior: one actor per instance
-                env_actor = env_remote_cls.remote(task_id, instance_id, params)
+                # Default behavior: one actor per instance.
+                # NOTE: `RemoteEnv.__init__` takes no args, so do NOT pass task_id/instance_id here.
+                env_actor = env_remote_cls.remote()
                 self.env_actors[instance_id] = env_actor
-                init_state = await env_actor.get_init_state.remote(params)
+                await env_actor.create_env_instance.remote(task_id, instance_id, params)
+                init_state = await env_actor.get_init_state.remote(instance_id, params)
 
             # For shared actors, we still track instance_id -> actor mapping
             # for step/evaluate/release operations
@@ -436,19 +437,12 @@ class EnvService:
         try:
             if instance_id not in self.env_actors:
                 raise ValueError(f"Instance {instance_id} not found!")
-            env_type = self.instance_env_types.get(instance_id)
-            # For shared actors (like alfworld), pass instance_id as first parameter
-            if env_type in ["alfworld"]:
-                data = await self.env_actors[instance_id].step.remote(
-                    instance_id,
-                    action,
-                    params,
-                )
-            else:
-                data = await self.env_actors[instance_id].step.remote(
-                    action,
-                    params,
-                )
+            # All env actors are `RemoteEnv` and require `instance_id` to route calls.
+            data = await self.env_actors[instance_id].step.remote(
+                instance_id,
+                action,
+                params,
+            )
             
             return data
 
@@ -481,19 +475,12 @@ class EnvService:
         try:
             if instance_id not in self.env_actors:
                 raise ValueError(f"Instance {instance_id} not found!")
-            env_type = self.instance_env_types.get(instance_id)
-            # For shared actors (like alfworld), pass instance_id as first parameter
-            if env_type in ["alfworld"]:
-                return await self.env_actors[instance_id].evaluate.remote(
-                    instance_id,
-                    messages,
-                    params,
-                )
-            else:
-                return await self.env_actors[instance_id].evaluate.remote(
-                    messages,
-                    params,
-                )
+            # All env actors are `RemoteEnv` and require `instance_id` to route calls.
+            return await self.env_actors[instance_id].evaluate.remote(
+                instance_id,
+                messages,
+                params,
+            )
         except Exception as e:
             print(f"Error in evaluate: {str(e)}")
             raise
@@ -522,7 +509,8 @@ class EnvService:
             await env_actor.close.remote(instance_id)
             # Don't kill the shared actor, just remove the instance mapping
         else:
-            await env_actor.close.remote()
+            # Per-instance actor: close the env instance then kill the actor.
+            await env_actor.close.remote(instance_id)
             ray.kill(self.env_actors[instance_id])
         
         del self.env_actors[instance_id]
