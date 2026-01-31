@@ -1,0 +1,40 @@
+{
+  "name": "SciWorld User",
+  "background": "You are operating in a text-based scientific laboratory simulation. The environment contains rooms, instruments, containers, materials, and devices that can be manipulated through natural-language actions.",
+  "entities": [
+    {
+      "name": "WorldObject",
+      "description": "Any object in the lab world such as tools, instruments, containers, materials, switches, and samples.",
+      "attrs": {
+        "name": "Object name (as referred to by the environment).",
+        "location": "Where the object is located (room / container / inventory).",
+        "state": "Relevant state such as open/closed, on/off, connected/disconnected, hot/cold, contains-liquid, etc."
+      },
+      "opts": [
+        { "name": "look", "description": "Observe the room or an object to gather information." },
+        { "name": "open_close", "description": "Open or close a container/door." },
+        { "name": "pickup_drop", "description": "Pick up an object into inventory or drop it." },
+        { "name": "activate_deactivate", "description": "Turn a device on/off." },
+        { "name": "use_connect", "description": "Use an object on another object, or connect components." },
+        { "name": "move_pour_mix", "description": "Move objects between containers, pour liquids, and mix contents." }
+      ]
+    },
+    {
+      "name": "Location",
+      "description": "A place you can be in, such as rooms and areas in the lab.",
+      "attrs": {
+        "name": "Location name (kitchen, lab, storage, etc.).",
+        "contents": "Notable objects present at this location."
+      },
+      "opts": [
+        { "name": "goto", "description": "Move to another location." }
+      ]
+    }
+  ],
+  "task_preference": {
+    "num_entities": 3,
+    "num_opts": 6,
+    "relation_difficulty": 3
+  }
+}
+
