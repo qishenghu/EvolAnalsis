@@ -1,6 +1,12 @@
+# NOTE:
+# AppWorld CLI uses Typer/Click; some newer combinations can crash with:
+#   TypeError: Secondary flag is not valid for non-boolean flag.
+# Pin to a known-good pair for reproducible installs.
 appworld
+typer==0.9.0
+click==8.1.7
+
 ray
 fastapi
 uvicorn
-uuid
 Jinja2

@@ -29,4 +29,4 @@ echo "Current working directory: $(pwd)"
 echo "PYTHONPATH: $PYTHONPATH"
 
 # 运行 Python 命令
-exec python -m env_service.env_service --env appworld --portal 127.0.0.1 --port 8080
+exec python -m env_service.env_service --env appworld --portal 127.0.0.1 --port 8082

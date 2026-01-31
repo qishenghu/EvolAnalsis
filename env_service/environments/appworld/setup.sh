@@ -35,6 +35,12 @@ conda install -n appworld -y libcst
 echo "📋 安装 Python 依赖..."
 conda run -n appworld pip install -r "$SCRIPT_DIR/requirements.txt"
 
+# 5. Fix Typer/Click compatibility for AppWorld CLI (reproducible)
+# Some Typer/Click combinations crash during CLI command registration with:
+#   TypeError: Secondary flag is not valid for non-boolean flag.
+echo "🧩 固定 Typer/Click 版本以避免 AppWorld CLI 报错..."
+conda run -n appworld pip install "typer==0.9.0" "click==8.1.7"
+
 # 5. 初始化 appworld
 echo "📁 初始化 appworld..."
 conda run -n appworld appworld install
