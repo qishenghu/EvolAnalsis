@@ -337,31 +337,43 @@ class AlfworldEnv(BaseEnv):
             List[str]: List of task IDs (as strings representing game indices).
         
         Note:
-            - "train" → mappings_train.json (2420 tasks)
-            - "val", "dev", "test" → mappings_test.json (200 tasks)
+            ✅ Align with AgentGym eval protocol (local cached eval indices):
+            - train → AgentGym mappings_train.json (2420 tasks)
+            - val/dev/test → env_service/environments/alfworld/alfworld_test.json (200 tasks)
         """
         params = params or {}
-        
-        # Determine mapping file based on split
-        # For validation, use test set (200 tasks)
+
         if split == "train":
             mapping_file = os.path.join(AGENTGYM_ROOT, "configs", "mappings_train.json")
-        else:  # val, dev, test → all use test set
+            if not os.path.exists(mapping_file):
+                raise FileNotFoundError(f"Mapping file not found: {mapping_file}")
+            with open(mapping_file, "r", encoding="utf-8") as f:
+                mappings = json.load(f)
+            return [str(mapping["item_id"]) for mapping in mappings]
+
+        # val/dev/test → local cached eval indices
+        here = os.path.dirname(__file__)
+        test_path = os.path.join(here, "alfworld_test.json")
+        if not os.path.exists(test_path):
+            # Fallback to AgentGym mappings_test.json if the local cached file is missing.
             mapping_file = os.path.join(AGENTGYM_ROOT, "configs", "mappings_test.json")
-        
-        if not os.path.exists(mapping_file):
-            raise FileNotFoundError(f"Mapping file not found: {mapping_file}")
-        
-        # Load mappings
-        with open(mapping_file, "r") as f:
-            mappings = json.load(f)
-        
-        # Return task IDs (using item_id as the index)
-        # For simplicity, we return indices as strings
-        # The actual game file path will be resolved in get_init_state
-        task_ids = [str(mapping["item_id"]) for mapping in mappings]
-        
-        return task_ids
+            if not os.path.exists(mapping_file):
+                raise FileNotFoundError(f"Neither {test_path} nor {mapping_file} exists.")
+            with open(mapping_file, "r", encoding="utf-8") as f:
+                mappings = json.load(f)
+            return [str(mapping["item_id"]) for mapping in mappings]
+
+        with open(test_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # item_id format: "alfworld_2420"
+        idxs: List[int] = []
+        for it in data:
+            item_id = str(it.get("item_id", ""))
+            m = re.match(r"^alfworld_(\d+)$", item_id)
+            if not m:
+                raise ValueError(f"Unexpected AlfWorld eval item_id: {item_id}")
+            idxs.append(int(m.group(1)))
+        return [str(i) for i in idxs]
     
     def _parse_action_from_llm_output(self, llm_output: str) -> Optional[str]:
         """

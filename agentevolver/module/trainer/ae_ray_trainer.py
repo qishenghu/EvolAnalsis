@@ -865,45 +865,101 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         from verl.trainer.main_ppo import create_rl_dataset
         # load train dataset from files or environment
         env_client=EnvClient(self.config.env_service.env_url)
+        env_type = str(self.config.env_service.env_type)
         if self.config.data.train_files is not None:
             train_seed_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
             assert isinstance(train_seed_dataset,RLHFDataset), "train_dataset must be RLHFDataset"
-            self.train_task_manager.load_tasks_from_dataset(train_seed_dataset,env_type=self.config.env_service.env_type)
+            self.train_task_manager.load_tasks_from_dataset(train_seed_dataset,env_type=env_type)
+            train_source = f"files({self.config.data.train_files})"
         else:
             # self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train")
             max_train_tasks = self.config.data.get("max_train_tasks", None)
             shuffle = self.config.data.get("shuffle", True) # by default, shuffle the train tasks
             seed = self.config.data.get("seed", 2026)
-            self.train_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="train", max_tasks=max_train_tasks, shuffle=shuffle, seed=seed)
+            self.train_task_manager.load_tasks_from_environment(
+                env_client,
+                env_type=env_type,
+                split="train",
+                max_tasks=max_train_tasks,
+                shuffle=shuffle,
+                seed=seed,
+            )
+            train_source = f"env(split=train, max_train_tasks={max_train_tasks}, shuffle={shuffle}, seed={seed})"
         
         # load val dataset
         if self.config.data.val_files is not None:
             val_seed_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
             assert isinstance(val_seed_dataset,RLHFDataset), "train_dataset must be RLHFDataset"
-            self.val_task_manager.load_tasks_from_dataset(val_seed_dataset,env_type=self.config.env_service.env_type)
+            self.val_task_manager.load_tasks_from_dataset(val_seed_dataset,env_type=env_type)
+            val_source = f"files({self.config.data.val_files})"
         else:
             num_loaded_val_tasks = 0
+            val_source = "env(unknown)"
             if 'val_on_test' in os.environ.get("DEBUG_ARG",'') or (self.config.data.val_type == 'test_normal' and self.config.env_service.env_type == "appworld"):
                 logger.warning("using test_normal as val dataset")
-                num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="test_normal", shuffle=False)
+                num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=env_type,split="test_normal", shuffle=False)
+                val_source = "env(split=test_normal)"
             else:
                 # For AlfWorld, val and dev both return test set (200 tasks)
                 # So we only need to load once to avoid duplicates
-                if self.config.env_service.env_type == "alfworld":
+                if env_type == "alfworld":
                     # Only load from 'val' split (which now returns test set)
                     try:
-                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split="val", shuffle=False)
+                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=env_type,split="val", shuffle=False)
+                        val_source = "env(split=val)"
                     except:
                         logger.warning(f"failed to load val dataset from environment, split=val")
                 else:
-                    # For other environments, try both 'val' and 'dev'
-                    for split in ['val','dev']:
+                    # For other environments:
+                    # - Prefer a single split to avoid accidentally loading the same IDs twice (common in programmatic envs).
+                    # - Fallback to dev only if val is unavailable.
+                    for split in ["val", "dev"]:
                         try:
-                            num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=self.config.env_service.env_type,split=split)
-                        except:
-                            logger.warning(f"failed to load val dataset from environment, split={split}. this may be *normal* if your dataset is split into train/dev")    
+                            loaded = self.val_task_manager.load_tasks_from_environment(
+                                env_client,
+                                env_type=env_type,
+                                split=split,
+                                shuffle=False,
+                            )
+                            num_loaded_val_tasks += loaded
+                            if loaded > 0:
+                                val_source = f"env(split={split})"
+                                break
+                        except Exception:
+                            logger.warning(
+                                f"failed to load val dataset from environment, split={split}. "
+                                f"this may be *normal* if your dataset is split into train/dev"
+                            )
             
             assert num_loaded_val_tasks > 0, "failed to load val/dev dataset from environment"
+
+        # ------------------------------------------------------------------
+        # 🔥 Very visible dataset size logging (train/val) for sanity checks
+        # ------------------------------------------------------------------
+        try:
+            train_tasks = list(self.train_task_manager.seed_tasks)
+            val_tasks = list(self.val_task_manager.seed_tasks)
+
+            train_ids = [t.task_id for t in train_tasks]
+            val_ids = [t.task_id for t in val_tasks]
+            train_unique = len(set(train_ids))
+            val_unique = len(set(val_ids))
+            overlap = len(set(train_ids) & set(val_ids))
+
+            banner = "=" * 88
+            msg = (
+                f"\n{banner}\n"
+                f"📌 DATASET SIZES (env={env_type})\n"
+                f"  - train: {len(train_tasks)} tasks (unique task_id={train_unique})  source={train_source}\n"
+                f"  -   val: {len(val_tasks)} tasks (unique task_id={val_unique})  source={val_source}\n"
+                f"  - train∩val overlap (by task_id): {overlap}\n"
+                f"{banner}\n"
+            )
+            # Use both logger and print to ensure visibility in different launch modes.
+            logger.warning(msg)
+            print(msg, flush=True)
+        except Exception as e:
+            logger.warning(f"failed to print dataset sizes: {e}")
         
         self.train_dataset = FullDataset(
             self.train_task_manager,
@@ -2084,6 +2140,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        # Summary counters (help interpret what val metrics actually average over)
+        n_val_tasks = 0
 
         for i, test_data in enumerate(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
@@ -2133,6 +2191,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             open_query=test_gen_batch.non_tensor_batch["extras"][i]['open_query'],
                             # evaluator=gen_batch.non_tensor_batch['extras'][i]['evaluator'], # avoid potential bugs
                          ) for i in range(len(test_gen_batch))]
+                n_val_tasks += len(tasks)
                 task_exp_configs = self.exp_manager.get_complete_exp_configs(tasks, mode="validate")
                 print("=" * 10 + "start validate rollout" + "=" * 10)
                 trajectories = self.env_manager.rollout(tasks, task_exp_configs, mode="validate", epoch=f"test.1.{i}")  # ⭐ Execute the rollout to generate trajectories
@@ -2210,6 +2269,24 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+
+        # ------------------------------------------------------------------
+        # ✅ Add "true" aggregate validation metrics over ALL validation outputs
+        # ------------------------------------------------------------------
+        # These metrics are what people usually mean by "average val performance":
+        # average reward over all validation trajectories produced in this _validate() call.
+        try:
+            import numpy as _np
+
+            env_name = str(self.config.env_service.env_type)
+            scores_arr = _np.asarray(sample_scores, dtype=float)
+            metric_dict[f"val-summary/{env_name}/reward_mean_all"] = float(scores_arr.mean()) if scores_arr.size else 0.0
+            metric_dict[f"val-summary/{env_name}/reward_std_all"] = float(scores_arr.std()) if scores_arr.size else 0.0
+            metric_dict[f"val-summary/{env_name}/n_outputs"] = int(scores_arr.size)
+            metric_dict[f"val-summary/{env_name}/n_tasks"] = int(n_val_tasks)
+            metric_dict[f"val-summary/{env_name}/n_unique_prompts"] = int(len(set(sample_inputs)))
+        except Exception as e:
+            logger.warning(f"failed to compute val-summary metrics: {e}")
 
         return metric_dict
     

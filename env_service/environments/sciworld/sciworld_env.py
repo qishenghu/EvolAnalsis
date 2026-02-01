@@ -9,6 +9,7 @@ agent 需要通过一系列操作完成科学实验任务。
 
 import os
 import re
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -347,8 +348,12 @@ Important:
         """
         Get a list of task IDs for the specified split.
         
-        ScienceWorld has ~30 task types with multiple variations each.
-        Total tasks = sum of variations across all task types.
+        ✅ Align with AgentGym eval protocol:
+        - val/dev/test: use AgentGym eval indices from `env_service/environments/sciworld/sciworld_test.json` (200 tasks)
+        - train: return indices that DO NOT overlap with the eval indices.
+          We approximate the candidate pool as [0, max(eval_idx)+1) (covers all eval indices)
+          and remove eval indices. This guarantees no overlap, and works with AgentGym's
+          `games[data_idx]` indexing as long as eval indices are valid.
         
         Args:
             split (str): "train", "val", "test", "dev"
@@ -357,21 +362,34 @@ Important:
         Returns:
             List[str]: List of task IDs.
         """
-        params = params or {}
-        
-        # ScienceWorld has approximately 3000+ total task variations
-        # We'll use a simpler approach with indexed task IDs
-        # The actual mapping is done by the server (games list in environment.py)
-        total_tasks = params.get("total_tasks", 3000)
-        
-        if split == "train":
-            # Use 80% for training
-            task_ids = [str(i) for i in range(int(total_tasks * 0.8))]
-        else:  # val, dev, test
-            # Use 20% for testing
-            task_ids = [str(i) for i in range(int(total_tasks * 0.8), total_tasks)]
-        
-        return task_ids
+        _ = params or {}
+
+        def _load_eval_indices() -> List[int]:
+            here = os.path.dirname(__file__)
+            test_path = os.path.join(here, "sciworld_test.json")
+            with open(test_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # item_id format: "sciworld_606"
+            idxs: List[int] = []
+            for it in data:
+                item_id = str(it.get("item_id", ""))
+                m = re.match(r"^sciworld_(\d+)$", item_id)
+                if not m:
+                    raise ValueError(f"Unexpected SciWorld eval item_id: {item_id}")
+                idxs.append(int(m.group(1)))
+            return idxs
+
+        eval_idxs = _load_eval_indices()
+        eval_set = set(eval_idxs)
+
+        if split in ("val", "dev", "test"):
+            return [str(i) for i in eval_idxs]
+
+        # train: exclude eval indices
+        max_eval = max(eval_idxs) if eval_idxs else 0
+        candidate_max = max_eval + 1
+        train_ids = [str(i) for i in range(candidate_max) if i not in eval_set]
+        return train_ids
     
     def _parse_action_from_llm_output(self, llm_output: str) -> Optional[str]:
         """

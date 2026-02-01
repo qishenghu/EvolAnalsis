@@ -291,7 +291,12 @@ class EnvService:
         """
 
         env_cls = Registry.get(env_type)
-        return env_cls.get_query_list(split)
+        # Some env adapters accept (split, params), while older ones only accept (split).
+        # Keep backward compatibility and allow passing extra params when supported.
+        try:
+            return env_cls.get_query_list(split, params)
+        except TypeError:
+            return env_cls.get_query_list(split)
 
     async def get_info(
         self,

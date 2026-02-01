@@ -9,6 +9,7 @@ agent 需要在网格世界中完成各种导航和操作任务。
 
 import os
 import re
+import json
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -37,7 +38,12 @@ class BabyaiEnv(BaseEnv):
     # BabyAI 有 40 个关卡，每个关卡可以用不同的种子生成不同实例
     # 总任务数 = 40 levels * seeds
     NUM_LEVELS = 40
-    SEEDS_PER_LEVEL = 50  # 每个关卡使用 50 个种子，总共 2000 个任务
+
+    # Align with AgentGym paper / eval protocol (user-provided):
+    # Train uses a curated subset of 18 BabyAI levels.
+    BABYAI_ALLOWED_CATEGORIES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 19, 20, 21, 30, 31, 33, 36]
+    # In AgentGym, BabyAI train indices are drawn from [0, 1804) with the level determined by (i % 40 + 1).
+    BABYAI_BASE_TRAIN_SIZE = 1804
     
     def __init__(self, task_id: str = None, instance_id: str = None, params: Dict[str, Any] = None):
         """
@@ -343,9 +349,9 @@ Important:
         """
         Get a list of task IDs for the specified split.
         
-        BabyAI uses data_idx = level_idx + seed * 40
-        - Training: 80% of tasks
-        - Test: 20% of tasks
+        ✅ Align with AgentGym eval protocol:
+        - train: curated BabyAI_TRAIN_INDEX derived from categories (see AgentGym paper)
+        - val/dev/test: use AgentGym eval indices from `env_service/environments/babyai/babyai_test.json` (90 tasks)
         
         Args:
             split (str): "train", "val", "test", "dev"
@@ -354,19 +360,34 @@ Important:
         Returns:
             List[str]: List of task IDs.
         """
-        params = params or {}
-        
-        # Total tasks: 40 levels * 50 seeds = 2000 tasks
-        total_tasks = BabyaiEnv.NUM_LEVELS * BabyaiEnv.SEEDS_PER_LEVEL
-        
+        _ = params or {}
+
+        def _load_eval_indices() -> List[int]:
+            here = os.path.dirname(__file__)
+            test_path = os.path.join(here, "babyai_test.json")
+            with open(test_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # item_id format: "babyai_1804"
+            idxs: List[int] = []
+            for it in data:
+                item_id = str(it.get("item_id", ""))
+                m = re.match(r"^babyai_(\d+)$", item_id)
+                if not m:
+                    raise ValueError(f"Unexpected BabyAI eval item_id: {item_id}")
+                idxs.append(int(m.group(1)))
+            return idxs
+
         if split == "train":
-            # Use 80% for training (first 1600 tasks)
-            task_ids = [str(i) for i in range(int(total_tasks * 0.8))]
-        else:  # val, dev, test
-            # Use 20% for testing (last 400 tasks)
-            task_ids = [str(i) for i in range(int(total_tasks * 0.8), total_tasks)]
-        
-        return task_ids
+            # BABYAI_TRAIN_INDEX = [i for i in range(1804) if (i % 40 + 1) in BABYAI_ALLOWED_CATEGORIES]
+            allowed = set(BabyaiEnv.BABYAI_ALLOWED_CATEGORIES)
+            return [
+                str(i)
+                for i in range(BabyaiEnv.BABYAI_BASE_TRAIN_SIZE)
+                if ((i % BabyaiEnv.NUM_LEVELS) + 1) in allowed
+            ]
+
+        # val/dev/test → AgentGym eval set
+        return [str(i) for i in _load_eval_indices()]
     
     def _parse_action_from_llm_output(self, llm_output: str) -> Optional[str]:
         """
