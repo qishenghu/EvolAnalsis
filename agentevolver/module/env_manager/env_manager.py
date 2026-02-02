@@ -721,16 +721,28 @@ class ParallelEnvManager(object):
                 sample.extras = extras  # ⭐ Add extra information to each sample
             sample_arr_final += sample_arr
 
-        # Step 2: Calculate how many samples need to be removed
+        # Step 2: Make sample count "world_size"-friendly when possible.
+        #
+        # NOTE:
+        # Historically we *removed* `remainder = len(samples) % world_size` samples so the count is divisible.
+        # However, when `len(samples) < world_size`, `remainder == len(samples)` and we would remove *all* samples,
+        # causing downstream `max()` on empty lists during validation (common on the last val batch).
+        # In that small-batch case we keep samples as-is.
         world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
         remainder = len(sample_arr_final) % world_size
         if remainder != 0:
-            import random
-            remove_indices = random.sample(range(len(sample_arr_final)), remainder)
-            # Sort in reverse order to avoid index shifting during removal
-            remove_indices.sort(reverse=True)
-            for idx in remove_indices:
-                sample_arr_final.pop(idx)  # ⭐ Remove samples to make the total number divisible by world size
+            if len(sample_arr_final) < world_size:
+                logger.warning(
+                    f"[trajectories_to_samples] Got only {len(sample_arr_final)} samples (< world_size={world_size}); "
+                    f"skip trimming-to-divisor to avoid producing an empty batch."
+                )
+            else:
+                import random
+                remove_indices = random.sample(range(len(sample_arr_final)), remainder)
+                # Sort in reverse order to avoid index shifting during removal
+                remove_indices.sort(reverse=True)
+                for idx in remove_indices:
+                    sample_arr_final.pop(idx)  # ⭐ Remove samples to make the total number divisible by world size
 
         # Randomly remove some samples, so that the number of samples is divisible by 8
         return sample_arr_final
