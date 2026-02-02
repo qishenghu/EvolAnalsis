@@ -2140,6 +2140,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        sample_success_rates = []
         # Summary counters (help interpret what val metrics actually average over)
         n_val_tasks = 0
 
@@ -2230,6 +2231,32 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
+            # Also collect success_rate from env rollouts (if available)
+            try:
+                rs_list = test_batch.non_tensor_batch.get("reward_scores", None)
+                if rs_list is None and hasattr(test_output_gen_batch, "non_tensor_batch"):
+                    rs_list = test_output_gen_batch.non_tensor_batch.get("reward_scores", None)
+                if rs_list is not None:
+                    sr_list: list[float] = []
+                    for rs in list(rs_list):
+                        if isinstance(rs, dict):
+                            sr = rs.get("success_rate", None)
+                            if sr is None:
+                                # fallback: treat outcome>0 as success
+                                sr = 1.0 if float(rs.get("outcome", 0.0)) > 0.0 else 0.0
+                            sr_list.append(float(sr))
+                        else:
+                            # unknown type; fallback to 0
+                            sr_list.append(0.0)
+                    if len(sr_list) == len(scores):
+                        sample_success_rates.extend(sr_list)
+                    else:
+                        logger.warning(
+                            f"validate: success_rate length mismatch (success_rate={len(sr_list)}, scores={len(scores)}); skip val-summary success_rate for this batch"
+                        )
+            except Exception as e:
+                logger.warning(f"validate: failed to collect success_rate: {e}")
+
             reward_extra_infos_dict["reward"].extend(scores)
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
@@ -2285,6 +2312,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             metric_dict[f"val-summary/{env_name}/n_outputs"] = int(scores_arr.size)
             metric_dict[f"val-summary/{env_name}/n_tasks"] = int(n_val_tasks)
             metric_dict[f"val-summary/{env_name}/n_unique_prompts"] = int(len(set(sample_inputs)))
+            sr_arr = _np.asarray(sample_success_rates, dtype=float)
+            metric_dict[f"val-summary/{env_name}/success_rate_mean_all"] = float(sr_arr.mean()) if sr_arr.size else 0.0
         except Exception as e:
             logger.warning(f"failed to compute val-summary metrics: {e}")
 

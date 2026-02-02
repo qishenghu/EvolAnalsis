@@ -308,8 +308,14 @@ Important:
         Returns:
             float: Evaluation score (0.0 to 1.0).
         """
-        # ScienceWorld score is a percentage (0-100), normalize to 0-1
-        return float(self.current_score) / 100.0 if self.current_score else 0.0
+        # ScienceWorld exposes an integer-ish `score` (often interpreted as percentage).
+        # Paper-style evaluation is non-negative: failed trajectories should not produce negative reward.
+        # So we clamp score into [0, 100] then normalize to [0, 1].
+        if self.current_score is None:
+            return 0.0
+        score = float(self.current_score)
+        score = max(0.0, min(100.0, score))
+        return score / 100.0
     
     def get_info(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
