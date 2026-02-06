@@ -102,7 +102,7 @@ actor_rollout_ref:
       completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
       enable: true
       format: llama3_json
-      max_steps: 30
+      max_steps: 50
       tool_config_path: ""
   ref:
     log_prob_micro_batch_size_per_gpu: 1

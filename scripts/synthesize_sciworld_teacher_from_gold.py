@@ -3,7 +3,7 @@ import argparse, json, os, re, sys
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-SCIWORLD_BASE_SYSTEM_PROMPT = """You are a scientific experiment assistant in a text-based simulation environment. Your task is to perform scientific experiments by interacting with objects in the environment.
+SCIWORLD_BASE_SYSTEM_PROMPT = '''You are a scientific experiment assistant in a text-based simulation environment. Your task is to perform scientific experiments by interacting with objects in the environment.
 
 At each step, you will receive:
 1. The task description (what experiment you need to perform)
@@ -34,11 +34,12 @@ Important:
 1. Read the task description carefully.
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
-4. Some experiments may require multiple steps."""
+4. Some experiments may require multiple steps.'''
+
 
 SYNTH_SYSTEM_PROMPT = """You will be given a ScienceWorld task, the current observation, and the next action that will be taken.
 
-Write ONLY the Thought (1-3 sentences) that would plausibly lead to taking that action.
+Write ONLY the Thought(1-3 sentences) that would plausibly lead to taking that action.
 
 Hard constraints:
 - Output ONLY the Thought text. Do NOT include "Action:".
@@ -286,7 +287,7 @@ def main():
                         # Safe fallback: ensure non-empty thought for downstream consumers.
                         thought = "To make progress on the task, I will take the next action."
 
-                    messages.append({"role":"assistant","content":f"Thought: {thought}\n\nAction: {action}"})
+                    messages.append({"role":"assistant","content":f"Thought:\n{thought}\n\nAction:\n{action}"})
                     # user replay content aligns with sciworld_env.py: "<observation>\n\n<hints>"
                     obs_after = str(steps[i].get("observation",""))
                     hint_after = _get_step_hint_str(rec, i)
