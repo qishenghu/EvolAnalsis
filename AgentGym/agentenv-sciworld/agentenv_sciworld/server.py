@@ -37,7 +37,12 @@ def step_visual(body: StepRequestBody):
 
 @app.post("/reset")
 def reset(body: ResetRequestBody):
-    return server.reset(body.id, body.data_idx)
+    return server.reset(
+        body.id,
+        body.data_idx,
+        generate_gold_path=body.generate_gold_path,
+        simplification_str=body.simplification_str,
+    )
 
 @app.post("/close")
 def close(body: CloseRequestBody):
@@ -51,6 +56,10 @@ def get_observation(id: int):
 @app.get("/action_hint")
 def get_action_hint(id: int):
     return server.get_action_hint(id)
+
+@app.get("/gold_action_sequence")
+def get_gold_action_sequence(id: int):
+    return server.get_gold_action_sequence(id)
 
 
 @app.get("/goals")

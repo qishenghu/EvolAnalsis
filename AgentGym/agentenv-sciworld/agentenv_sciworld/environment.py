@@ -33,7 +33,12 @@ class SciWorldEnv:
                 self.info[idx] = {"deleted": False, "done": False}
 
             self.ls.append(idx)
-            print(f"-------Env {idx} created--------")
+            # Avoid crashing the API when stdout is closed (BrokenPipeError can happen
+            # when the server is daemonized / stdout is redirected).
+            try:
+                print(f"-------Env {idx} created--------")
+            except BrokenPipeError:
+                pass
             return {"id": idx}
         except Exception as e:
             return {"error": str(e)}
@@ -96,11 +101,20 @@ class SciWorldEnv:
         except Exception as e:
             return {"error": str(e)}
 
-    def reset(self, idx: int, data_idx: int):
+    def reset(
+        self,
+        idx: int,
+        data_idx: int,
+        generate_gold_path: bool = False,
+        simplification_str: str = "",
+    ):
         try:
             self._check_id(idx, True)
             self.env[idx].load(
-                self.games[data_idx]["taskName"], self.games[data_idx]["variationIdx"]
+                self.games[data_idx]["taskName"],
+                self.games[data_idx]["variationIdx"],
+                simplificationStr=simplification_str or "",
+                generateGoldPath=bool(generate_gold_path),
             )
 
             task_description = self.env[idx].getTaskDescription()
@@ -115,6 +129,8 @@ class SciWorldEnv:
                 "score": info["score"],
                 "deleted": False,
                 "done": done,
+                "gold_path_generated": bool(generate_gold_path),
+                "simplification_str": simplification_str or "",
             }
             self.info[idx].update(payload)
             return payload
@@ -123,14 +139,17 @@ class SciWorldEnv:
 
     def get_observation(self, idx: int):
         try:
-            self._check_id(idx)
+            self._check_id(idx, allow_done=True)
             return self.info[idx]["observation"]
         except Exception as e:
             return {"error": str(e)}
 
     def get_action_hint(self, idx: int):
         try:
-            self._check_id(idx)
+            # Allow fetching hints even after the episode is done.
+            # `env_service/environments/sciworld/sciworld_env.py` appends action hints
+            # after each step regardless of termination, so the server must support it.
+            self._check_id(idx, allow_done=True)
             return {
                 "possible_actions": self.env[idx].getPossibleActions(),
                 "possible_objects": self.env[idx].getPossibleObjects(),
@@ -138,26 +157,34 @@ class SciWorldEnv:
         except Exception as e:
             return {"error": str(e)}
 
+    def get_gold_action_sequence(self, idx: int):
+        """Return the gold action sequence (if generated during reset/load)."""
+        try:
+            self._check_id(idx, allow_done=True)
+            return {"gold_action_sequence": self.env[idx].get_gold_action_sequence()}
+        except Exception as e:
+            return {"error": str(e)}
+
     def get_goals(self, idx: int):
         try:
-            self._check_id(idx)
+            self._check_id(idx, allow_done=True)
             return {"goals": self.env[idx].getGoalProgressStr()}
         except Exception as e:
             return {"error": str(e)}
 
     def get_detailed_info(self, idx: int):
         try:
-            self._check_id(idx)
+            self._check_id(idx, allow_done=True)
             return self.info[idx]
         except Exception as e:
             return {"error": str(e)}
 
-    def _check_id(self, idx: int, is_reset: bool = False):
+    def _check_id(self, idx: int, is_reset: bool = False, allow_done: bool = False):
         if idx not in self.info:
             raise ValueError(f"The id {idx} is not valid.")
         if self.info[idx]["deleted"]:
             raise ValueError(f"The task with environment {idx} has been deleted.")
-        if not is_reset and self.info[idx]["done"]:
+        if (not allow_done) and (not is_reset) and self.info[idx]["done"]:
             raise ValueError(f"The task with environment {idx} has finished.")
 
     def close(self,idx):
@@ -166,12 +193,15 @@ class SciWorldEnv:
         self.env[idx].close()
         self.info[idx]["deleted"]=True
         self.ls.remove(idx)
-        print(f"-------Env {idx} closed--------")
+        try:
+            print(f"-------Env {idx} closed--------")
+        except BrokenPipeError:
+            pass
         return True
     # Below ONLY used in visualization mode
     def get_task_description(self, idx: int):
         try:
-            self._check_id(idx)
+            self._check_id(idx, allow_done=True)
             task_desc = self.env[idx].get_task_description()
             return {"task_description": task_desc}
         except Exception as e:
@@ -179,7 +209,7 @@ class SciWorldEnv:
         
     def get_object_tree(self, idx: int):
         try:
-            self._check_id(idx)
+            self._check_id(idx, allow_done=True)
             object_tree = self.env[idx].getObjectTree()
             return {"object_tree": object_tree}
         except Exception as e:
@@ -187,7 +217,7 @@ class SciWorldEnv:
         
     def get_current_state(self, idx: int):
         try:
-            self._check_id(idx)
+            self._check_id(idx, allow_done=True)
             state = {
                 "observation": self.env[idx].look(),
                 "inventory": self.env[idx].inventory(),
