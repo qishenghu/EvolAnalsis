@@ -22,7 +22,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: sciworld_3b_grpo_chord_bz8_mix1_mu_decay_50_wo_kl
+  experiment_name: sciworld_3b_grpo_chord_bz8_mix1_mu_decay_50_wo_kl_binary_reward
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1

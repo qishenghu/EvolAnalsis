@@ -311,11 +311,16 @@ Important:
         # ScienceWorld exposes an integer-ish `score` (often interpreted as percentage).
         # Paper-style evaluation is non-negative: failed trajectories should not produce negative reward.
         # So we clamp score into [0, 100] then normalize to [0, 1].
+        #
+        # ⭐ AgentGym-style binary outcome:
+        # Some AgentGym settings binarize the final outcome: only a perfect completion (score==1.0)
+        # is treated as success; any partial progress (<1.0) is treated as failure (0.0).
         if self.current_score is None:
             return 0.0
         score = float(self.current_score)
         score = max(0.0, min(100.0, score))
-        return score / 100.0
+        normalized = score / 100.0
+        return 1.0 if normalized >= 1.0 else 0.0
     
     def get_info(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
