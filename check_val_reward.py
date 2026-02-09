@@ -14,4 +14,5 @@ if __name__ == "__main__":
     with open(args.output_file, "r") as f:
         val_data = [json.loads(line) for line in f]
     avg_reward = sum([x['reward'] for x in val_data]) / len(val_data)
-    print(f"Average reward: {avg_reward}, Length: {len(val_data)}")
+    avg_success = sum([x['score'] == 1.0 for x in val_data]) / len(val_data)
+    print(f"Average reward: {avg_reward}, Average success: {avg_success}, Length: {len(val_data)}")
