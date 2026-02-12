@@ -26,7 +26,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: sciworld_3b_grpo_bz8_binary_reward
+  experiment_name: sciworld_3b_grpo_bz8_800
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1

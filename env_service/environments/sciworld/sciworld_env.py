@@ -207,14 +207,14 @@ Important:
         try:
             hints = self._get("/action_hint", {"id": self.remote_env_id})
             if isinstance(hints, dict):
-                possible_actions = hints.get("possible_actions", [])[:10]
-                possible_objects = hints.get("possible_objects", [])[:10]
+                valid_actions = hints.get("possible_actions", [])
+                valid_objs = hints.get("possible_objects", [])
                 
-                hint_str = ""
-                if possible_actions:
-                    hint_str += f"Suggested actions: {possible_actions}\n"
-                if possible_objects:
-                    hint_str += f"Nearby objects: {possible_objects}"
+                hint_str = f"Valid actions: {valid_actions}\nOBJ needs to be replaced with one of the following objects: {valid_objs}"
+                # if possible_actions:
+                #    hint_str += f"Suggested actions: {possible_actions}\n"
+                # if possible_objects:
+                #    hint_str += f"Nearby objects: {possible_objects}"
                 return hint_str
         except:
             pass
@@ -320,8 +320,9 @@ Important:
         score = float(self.current_score)
         score = max(0.0, min(100.0, score))
         normalized = score / 100.0
-        return 1.0 if normalized >= 1.0 else 0.0
-    
+        #return 1.0 if normalized >= 1.0 else 0.0
+        return normalized
+
     def get_info(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
         Get information about the environment.
