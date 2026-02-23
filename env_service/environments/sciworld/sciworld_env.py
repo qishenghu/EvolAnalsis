@@ -176,21 +176,36 @@ At each step, you will receive:
 2. Your current observation (what you can see/do)
 3. Hints about available actions and objects
 
-Common action patterns:
-- look around: observe your surroundings
-- look at [object]: examine an object closely
-- pick up [object]: take an object
-- put [object] in [container]: place an object somewhere
-- open [object]: open a container/door
-- close [object]: close a container/door
-- move to [location]: go to another location
-- activate [object]: turn on a device
-- deactivate [object]: turn off a device
-- use [object] on [target]: use one object on another
-- focus on [object]: focus your attention
-- wait: wait for something to happen
+Available actions:
+[
+{{"action": "open OBJ", "description": "open a container"}},
+{{"action": "close OBJ", "description": "close a container"}},
+{{"action": "activate OBJ", "description": "activate a device"}},
+{{"action": "deactivate OBJ", "description": "deactivate a device"}},
+{{"action": "connect OBJ to OBJ", "description": "connect electrical components"}},
+{{"action": "disconnect OBJ", "description": "disconnect electrical components"}},
+{{"action": "use OBJ [on OBJ]", "description": "use a device/item"}},
+{{"action": "look around", "description": "describe the current room"}},
+{{"action": "look at OBJ", "description": "describe an object in detail"}},
+{{"action": "look in OBJ", "description": "describe a container's contents"}},
+{{"action": "read OBJ", "description": "read a note or book"}},
+{{"action": "move OBJ to OBJ", "description": "move an object to a container"}},
+{{"action": "pick up OBJ", "description": "move an object to the inventory"}},
+{{"action": "put down OBJ", "description": "drop an inventory item"}},
+{{"action": "pour OBJ into OBJ", "description": "pour a liquid into a container"}},
+{{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"}},
+{{"action": "mix OBJ", "description": "chemically mix a container"}},
+{{"action": "go to LOC", "description": "move to a new location"}},
+{{"action": "eat OBJ", "description": "eat a food"}},
+{{"action": "flush OBJ", "description": "flush a toilet"}},
+{{"action": "focus on OBJ", "description": "signal intent on a task object"}},
+{{"action": "wait", "description": "take no action for 10 iterations"}},
+{{"action": "wait1", "description": "take no action for 1 iteration"}},
+{{"action": "task", "description": "describe current task"}},
+{{"action": "inventory", "description": "list your inventory"}}
+]
 
-You should choose from two actions: "THOUGHT" or "ACTION".
+In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
 - If you choose "THOUGHT", first analyze the task and current state, then output your action.
   Format: "Thought:\nyour thoughts.\n\nAction:\nyour next action"
 - If you choose "ACTION", directly output the action.
