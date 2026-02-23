@@ -782,15 +782,43 @@ class ParallelEnvManager(object):
             rollout_ids.append(sample.rollout_id)
             # Discard samples with prompt length exceeding limit
             if len(sample.prompt_ids) > self.config.data.max_prompt_length:
-                raise RuntimeError(f"Sample has prompt_ids length {len(sample.prompt_ids)} ")
+                raise RuntimeError(
+                    f"Sample {getattr(sample, 'request_id', 'unknown')} has prompt_ids length {len(sample.prompt_ids)} "
+                    f"greater than max_prompt_length {self.config.data.max_prompt_length}."
+                )
 
-            # Warn if response is longer than expected (but still include it)
+            # If response is longer than expected, truncate instead of crashing the whole batch.
+            #
+            # In multi-turn environments (e.g., SciWorld), the response segment may include many env/user tokens
+            # (loss_mask=0) in addition to assistant tokens (loss_mask=1). Length overflows are therefore common
+            # when max_steps is large or observations are verbose.
+            #
+            # Previously we raised here, which made training unstable (whole batches dropped).
             if len(sample.response_ids) > self.config.data.max_response_length:
                 logger.warning(
                     f"Sample {sample.request_id} has response_ids length {len(sample.response_ids)} "
                     f"greater than max_response_length {self.config.data.max_response_length}."
                 )
-                raise RuntimeError(f"Sample has prompt_ids length {len(sample.prompt_ids)} ")
+                # Ensure Sample truncation parameters match current config, then truncate.
+                try:
+                    sample.max_prompt_len = self.config.data.max_prompt_length
+                    sample.max_response_len = self.config.data.max_response_length
+                    sample.max_model_len = self.config.data.max_prompt_length + self.config.data.max_response_length
+                    sample.truncate_output_ids()
+                except Exception as _e:
+                    logger.warning(f"Failed to truncate overlong sample {sample.request_id}: {_e}")
+                # Hard guard: if still overlong, hard-truncate response-related arrays.
+                if len(sample.response_ids) > self.config.data.max_response_length:
+                    max_r = self.config.data.max_response_length
+                    sample.response_ids = sample.response_ids[:max_r]
+                    sample.response_attention_mask = sample.response_attention_mask[:max_r]
+                    sample.response_position_ids = sample.response_position_ids[:max_r]
+                    sample.response_loss_mask = sample.response_loss_mask[:max_r]
+                    # Rebuild concatenated fields
+                    sample.input_ids = sample.prompt_ids + sample.response_ids
+                    sample.attention_mask = sample.prompt_attention_mask + sample.response_attention_mask
+                    sample.position_ids = sample.prompt_position_ids + sample.response_position_ids
+                    sample.loss_mask = sample.prompt_loss_mask + sample.response_loss_mask
 
             # ------------- shuchang 0714: append step_ids and steps_texts ------------
             resp_ids = sample.response_ids

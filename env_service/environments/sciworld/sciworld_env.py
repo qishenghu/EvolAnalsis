@@ -174,7 +174,7 @@ class SciworldEnv(BaseEnv):
 At each step, you will receive:
 1. The task description (what experiment you need to perform)
 2. Your current observation (what you can see/do)
-3. Hints about available actions and objects
+3. OBJ candidates (the objects that can be interacted with in the current state).
 
 Available actions:
 [
@@ -215,17 +215,19 @@ Important:
 1. Read the task description carefully.
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
-4. Some experiments may require multiple steps.'''
+4. OBJ in the selected action should be replaced with one of the OBJ candidates.
+'''
 
     def _get_action_hints(self) -> str:
         """Get action hints from the server."""
         try:
             hints = self._get("/action_hint", {"id": self.remote_env_id})
             if isinstance(hints, dict):
-                valid_actions = hints.get("possible_actions", [])
                 valid_objs = hints.get("possible_objects", [])
                 
-                hint_str = f"Valid actions: {valid_actions}\nOBJ needs to be replaced with one of the following objects: {valid_objs}"
+                # Keep only object candidates to reduce token usage.
+                # Valid action templates already exist in the system prompt.
+                hint_str = f"OBJ candidates: {valid_objs}"
                 # if possible_actions:
                 #    hint_str += f"Suggested actions: {possible_actions}\n"
                 # if possible_objects:
