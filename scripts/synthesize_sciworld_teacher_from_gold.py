@@ -133,7 +133,7 @@ def parse_args():
     p.add_argument(
         "--history_steps",
         type=int,
-        default=15,
+        default=10,
         help="How many recent interaction steps to include in Interaction history (0 = only current observation).",
     )
     p.add_argument(
