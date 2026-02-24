@@ -191,8 +191,12 @@ class TeacherTrajectoryCollector:
                         )
                         
                         # 检查是否成功
-                        success = (trajectory.reward and 
-                                  trajectory.reward.outcome == 1.0)
+                        # - Prefer success_rate (binary flag) if present
+                        # - This allows env-specific success definitions (e.g., SciWorld: done && score>0)
+                        success = bool(
+                            trajectory.reward
+                            and float(getattr(trajectory.reward, "success_rate", 0.0)) > 0.0
+                        )
                         
                         # 标记为 Teacher 轨迹
                         trajectory.metadata = trajectory.metadata or {}
@@ -272,7 +276,7 @@ class TeacherTrajectoryCollector:
             "rollout_id": traj.rollout_id,
             "messages": traj.steps,  # Multi-turn 对话历史
             "reward": traj.reward.outcome if traj.reward else 0.0,
-            "success": traj.reward.outcome == 1.0 if traj.reward else False,
+            "success": (float(getattr(traj.reward, "success_rate", 0.0)) > 0.0) if traj.reward else False,
             "teacher_model": traj.metadata.get("teacher_model", "unknown") if traj.metadata else "unknown",
             "metadata": {
                 "is_teacher": True,

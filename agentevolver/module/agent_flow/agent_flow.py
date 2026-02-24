@@ -161,8 +161,30 @@ class AgentFlow(BaseAgentFlow):
             score = env.evaluate(instance_id, params={"sparse": self.sparse})  # ⭐ Evaluate the score from the environment
             reason = "Outcome 1 = success, 0 = failure."
 
-        if score >= 1: success_rate = 1.0
-        else: success_rate = 0.0
+        # ---------------------------
+        # Success definition
+        # ---------------------------
+        # Default: treat "perfect score" as success (legacy behavior).
+        # SciWorld override (align with EPO-style `won`): success iff done AND raw score > 0.
+        success_rate = 0.0
+        if not err_in_env:
+            try:
+                env_info = env.get_tools_info(instance_id, messages={}, params={})
+            except Exception:
+                env_info = None
+
+            env_id = env_info.get("env_id") if isinstance(env_info, dict) else None
+            if env_id == "sciworld":
+                done_flag = bool(env_info.get("done", self.cmt.is_terminated)) if isinstance(env_info, dict) else bool(self.cmt.is_terminated)
+                raw_score_val = 0.0
+                if isinstance(env_info, dict):
+                    try:
+                        raw_score_val = float(env_info.get("score", 0.0) or 0.0)
+                    except Exception:
+                        raw_score_val = 0.0
+                success_rate = 1.0 if (done_flag and raw_score_val > 0.0) else 0.0
+            else:
+                success_rate = 1.0 if float(score) >= 1.0 else 0.0
 
         self.cmt.reward = Reward(outcome=score, success_rate=success_rate, madness=self.cmt.compute_madness(), description=reason)  # ⭐ Set the reward for the context
         self.cmt.reward = self.cmt.reward_patch(self.cmt.reward)

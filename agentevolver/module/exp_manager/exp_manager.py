@@ -300,9 +300,13 @@ class ExperienceManager(object):
             task_id = traj.task_id
             task_id_to_trajectories[task_id].append(traj)
         
-        # 计算每个 task 的 difficulty（reward=1 的数量）
+        # 计算每个 task 的 difficulty（成功次数）
         for task_id, trajs in task_id_to_trajectories.items():
-            success_count = sum(1 for traj in trajs if traj.reward and traj.reward.outcome == 1.0)
+            success_count = sum(
+                1
+                for traj in trajs
+                if traj.reward and float(getattr(traj.reward, "success_rate", 0.0)) > 0.0
+            )
             new_difficulty = success_count
             
             # 检查 task_id 是否已经在某个难度的桶中
@@ -479,7 +483,11 @@ class ExperienceManager(object):
             task_id_to_entropy_list[task_id].append((avg_entropy, traj))
         
         for task_id, trajs in task_id_to_trajectories.items():
-            success_count = sum(1 for traj in trajs if traj.reward and traj.reward.outcome == 1.0)
+            success_count = sum(
+                1
+                for traj in trajs
+                if traj.reward and float(getattr(traj.reward, "success_rate", 0.0)) > 0.0
+            )
             # ⭐ 使用实际的 on-policy rollout 数量，而不是基准 n_rollout
             # 对于 experience task，实际 rollout 数量 = n_rollout - n_offpolicy
             actual_rollout_count = len(trajs)
@@ -508,8 +516,9 @@ class ExperienceManager(object):
                 # ⭐ ExGRPO 设计：存储所有 reward 为正的 trajectories，取用时再选最优的
                 # 不再在存储时只选择一个最优的
                 successful_trajs = [
-                    t for e, t in task_id_to_entropy_list[task_id] 
-                    if t.reward and t.reward.outcome == 1.0
+                    t
+                    for e, t in task_id_to_entropy_list[task_id]
+                    if t.reward and float(getattr(t.reward, "success_rate", 0.0)) > 0.0
                 ]
                 if successful_trajs:
                     # 将所有成功的轨迹都加入待保存列表
@@ -745,8 +754,13 @@ class ExperienceManager(object):
         
         # 设置 reward
         reward_val = traj_dict.get("reward", 0.0)
-        success = traj_dict.get("success", reward_val == 1.0)
-        traj.reward = Reward(outcome=reward_val if success else 0.0)
+        # Default success heuristic: positive reward indicates success.
+        # (If traj_dict already has an explicit success flag, respect it.)
+        success = traj_dict.get("success", reward_val > 0)
+        traj.reward = Reward(
+            outcome=reward_val if success else 0.0,
+            success_rate=1.0 if success else 0.0,
+        )
         
         # 设置 metadata
         traj.metadata = traj_dict.get("metadata", {})
@@ -1152,7 +1166,7 @@ class ExperienceManager(object):
         for traj in trajectories:
             task_id = traj.task_id
             task_ids_seen.add(task_id)
-            if traj.reward and traj.reward.outcome == 1.0:
+            if traj.reward and float(getattr(traj.reward, "success_rate", 0.0)) > 0.0:
                 task_id_to_success_count[task_id] += 1
         
         # 更新 difficulty2task_dict
