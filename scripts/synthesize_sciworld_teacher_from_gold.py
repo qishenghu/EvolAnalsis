@@ -53,27 +53,33 @@ Important:
 '''
 
 
-SYNTH_SYSTEM_PROMPT = """You will be given a ScienceWorld task, the current observation, and the next action that will be taken.
+SYNTH_SYSTEM_PROMPT = """You will be given a ScienceWorld task, previous interactions, the current observation, and the next action that will be taken.
 
 Your job: write ONLY the Thought that *causally justifies* taking that action in the current state.
 The Thought should read like online reasoning, not a generic template.
 
 Output format:
 - Output ONLY the Thought text (do NOT include "Thought:" and do NOT include "Action:").
-- 1-3 sentences total.
+- 1-4 sentences total.
 
 Hard constraints:
-1) Evidence binding: explicitly cite 1-2 concrete details from the observation/hints (exact object names, room name, or a state like "door is open/closed", "in inventory", "device is off/broken"). The cited details must be checkable in the provided text.
+1) Evidence binding: explicitly cite 1-2 concrete details from the observation/hints (exact object names, room name, or a state like "door is open/closed", "in inventory", etc.).
 2) Minimal planning: include one short checkpoint about what you expect to learn/achieve right after this action.
-3) No unsupported hedging: avoid "might", "likely", "probably", "maybe" unless you also cite a specific observed reason (e.g., "I don't see X here" / "the only heat source listed is Y").
-4) Avoid boilerplate: do NOT use the phrase "I need to ... so I should ...", and avoid vague filler like "to make progress" or "to proceed".
-5) Do NOT mention that the next action was given to you.
+3) Avoid boilerplate and vague filler.
+4) Do NOT mention that the next action was given to you.
 
 Bad example (too generic):
-I need to find the item, so I should look around.
+I need to find orange juice, so I should go to the kitchen.
 
 Good example (evidence-bound + checkpoint):
-I'm in the kitchen and the cupboard is closed; opening it can reveal containers like a metal pot. After opening it, I'll check the contents for something usable for heating/holding the target substance."""
+I am currently in the bathroom, which does not contain any appliances or containers suitable for melting orange juice. The kitchen is more likely to have heat sources like a stove and is also more likely to store orange juice. Since the door to the kitchen is visible but currently closed, I need to open it in order to access the kitchen and verify the next step.
+
+Bad example:
+I need to find the orange juice to melt it. I need to open the fridge.
+
+Good example (reflective reasoning):
+I already checked the counter drawer and it didn't contain orange juice. Since fridge commonly store liquids like juice, the most plausible next step is to look inside the fridge. Opening it should reveal whether orange juice is present so I can proceed to heat it next.
+"""
 
 LEGACY_ACTIONS_MARKER = "Valid actions:"
 LEGACY_SUGGESTED_MARKER = "Suggested actions:"
@@ -123,6 +129,18 @@ def parse_args():
         type=str,
         default="env_service/environments/sciworld/sciworld_env.py",
         help="Path to sciworld_env.py to extract the latest system prompt and hint template.",
+    )
+    p.add_argument(
+        "--history_steps",
+        type=int,
+        default=15,
+        help="How many recent interaction steps to include in Interaction history (0 = only current observation).",
+    )
+    p.add_argument(
+        "--history_max_chars_per_obs",
+        type=int,
+        default=0,
+        help="Truncate each observation in history to this many characters (0 = no truncation).",
     )
     return p.parse_args()
 
@@ -319,6 +337,86 @@ def _strip_thought_action(text: str) -> Tuple[str, Optional[str]]:
         return "", act or None
     return t, None
 
+
+def _truncate_text(s: str, max_chars: int) -> str:
+    s = (s or "").strip()
+    if max_chars and max_chars > 0 and len(s) > max_chars:
+        # Keep the beginning (usually room/object listing) and the end (often contains key state lines).
+        head = s[: max_chars // 2].rstrip()
+        tail = s[-max_chars // 2 :].lstrip()
+        return f"{head}\n...\n{tail}"
+    return s
+
+
+def _build_interaction_history(
+    *,
+    task_desc: str,
+    init_obs: str,
+    init_hint: str,
+    steps: List[Dict[str, Any]],
+    actions: List[str],
+    thoughts_so_far: List[str],
+    current_obs: str,
+    current_hint: str,
+    history_steps: int,
+    max_chars_per_obs: int,
+) -> str:
+    """
+    Build a compact, reflective interaction history for step t (current_obs).
+    Format:
+      Obs#0 ...
+      Thought#0 ...
+      Action#0 ...
+      Obs#1 ...
+      ...
+      Obs#t ...
+    """
+    t = len(thoughts_so_far)  # current step index
+    # Determine which steps to include (rolling window).
+    if history_steps is None or history_steps < 0:
+        history_steps = 0
+    start = max(0, t - history_steps)
+
+    lines: List[str] = []
+
+    # Helper to format observation with optional hints
+    def fmt_obs(idx: int, obs: str, hint: str) -> str:
+        obs2 = _truncate_text(str(obs or ""), max_chars_per_obs)
+        if hint:
+            # Keep hint attached to the observation block to make history easier to read/parse.
+            return f"Obs#{idx}:\n{obs2}\n{hint}".strip()
+        return f"Obs#{idx}:\n{obs2}".strip()
+
+    # If window starts at 0, include Obs#0 from init.
+    if start == 0:
+        lines.append(fmt_obs(0, init_obs, init_hint))
+    else:
+        # Otherwise include the observation at start (which is after action start-1).
+        # Label it as Obs#start to keep indices monotonic in the window.
+        prev_obs = str(steps[start - 1].get("observation", "")) if (start - 1) < len(steps) else ""
+        lines.append(fmt_obs(start, prev_obs, ""))
+
+    # Add (Thought, Action, Obs) for steps in [start, t-1]
+    for j in range(start, t):
+        th = (thoughts_so_far[j] or "").strip()
+        act = str(actions[j]).strip() if j < len(actions) else ""
+        obs_after = str(steps[j].get("observation", "")) if j < len(steps) else ""
+        lines.append(f"Thought#{j}:\n{th}".strip())
+        lines.append(f"Action#{j}:\n{act}".strip())
+        lines.append(fmt_obs(j + 1, obs_after, ""))  # omit hints in history by default to save tokens
+
+    # Finally include current observation. Use Obs#t only once:
+    # - if start==0, Obs#0 is init; after j=t-1, last appended is Obs#t (after action t-1).
+    # - current_obs is also Obs#t in our synthesis loop, so we only add it if it differs.
+    if not lines or (lines and (f"Obs#{t}:" not in lines[-1])):
+        lines.append(fmt_obs(t, current_obs, current_hint))
+    else:
+        # Replace last obs with a version that includes current_hint (and optional truncation),
+        # since the loop version omitted hints.
+        lines[-1] = fmt_obs(t, current_obs, current_hint)
+
+    return "\n\n".join(lines).strip()
+
 def main():
     args=parse_args()
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
@@ -400,15 +498,31 @@ def main():
                     {"role":"user","content":f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{_get_hint_str_from_record(rec, hint_template)}"},
                 ]
                 turn_lp=[]; acc_lp=[]; has_lp=True
+                thoughts_so_far: List[str] = []
                 for i in range(n):
                     action=str(actions[i])
                     pre_obs = init_obs if i==0 else str(steps[i-1].get("observation",""))
                     # In training replay, each user message also includes action hints.
                     pre_hint = _get_hint_str_from_record(rec, hint_template) if i==0 else _get_step_hint_str(rec, i-1, hint_template)
                     pre_user_content = f"{pre_obs}\n\n{pre_hint}" if pre_hint else pre_obs
+
+                    # Build reflective interaction history up to Obs#i (current observation).
+                    # We omit hints for older steps by default to control token growth, but keep the current hint.
+                    history = _build_interaction_history(
+                        task_desc=task_desc,
+                        init_obs=init_obs,
+                        init_hint=_get_hint_str_from_record(rec, hint_template),
+                        steps=steps,
+                        actions=actions,
+                        thoughts_so_far=thoughts_so_far,
+                        current_obs=pre_obs,
+                        current_hint=pre_hint,
+                        history_steps=int(args.history_steps),
+                        max_chars_per_obs=int(args.history_max_chars_per_obs),
+                    )
                     synth_msgs=[
                         {"role":"system","content":SYNTH_SYSTEM_PROMPT},
-                        {"role":"user","content":f"Task:\n{task_desc}\n\nObservation:\n{pre_user_content}\n\nNext action:\n{action}\n"},
+                        {"role":"user","content":f"Task:\n{task_desc}\n\nInteraction history:\n{history}\n\nNext action:\n{action}\n"},
                     ]
                     resp, meta = llm(synth_msgs)
                     # Model is instructed to output Thought only.
@@ -423,6 +537,7 @@ def main():
                         thought = "To make progress on the task, I will take the next action."
 
                     messages.append({"role":"assistant","content":f"Thought:\n{thought}\n\nAction:\n{action}"})
+                    thoughts_so_far.append(thought)
                     # user replay content aligns with sciworld_env.py: "<observation>\n\n<hints>"
                     obs_after = str(steps[i].get("observation",""))
                     hint_after = _get_step_hint_str(rec, i, hint_template)
