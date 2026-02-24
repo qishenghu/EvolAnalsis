@@ -167,6 +167,37 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
     # 计算分组统计
     onpolicy_rewards = sequence_reward[is_onpolicy] if is_onpolicy.any() else torch.tensor([0.0])
     teacher_rewards = sequence_reward[is_teacher] if is_teacher.any() else torch.tensor([0.0])
+
+    # ---------------------------
+    # On-policy success-rate metric (trajectory-level)
+    # ---------------------------
+    # Prefer env-provided `success_rate` from non-tensor reward_scores when available.
+    # Fallback: treat outcome>0 as success.
+    success_rate_vec: torch.Tensor
+    rs_list = batch.non_tensor_batch.get("reward_scores", None)
+    if rs_list is not None:
+        try:
+            sr_vals: list[float] = []
+            for rs in list(rs_list):
+                if isinstance(rs, dict):
+                    sr = rs.get("success_rate", None)
+                    if sr is None:
+                        sr = 1.0 if float(rs.get("outcome", 0.0)) > 0.0 else 0.0
+                    sr_vals.append(float(sr))
+                else:
+                    sr_vals.append(0.0)
+            if len(sr_vals) == sequence_reward.size(0):
+                success_rate_vec = torch.tensor(
+                    sr_vals, dtype=torch.float32, device=sequence_reward.device
+                )
+            else:
+                success_rate_vec = (sequence_reward > 0).float()
+        except Exception:
+            success_rate_vec = (sequence_reward > 0).float()
+    else:
+        success_rate_vec = (sequence_reward > 0).float()
+
+    onpolicy_success = success_rate_vec[is_onpolicy] if is_onpolicy.any() else torch.tensor([0.0])
     
     metrics = {
         # score
@@ -182,6 +213,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "critic/rewards_onpolicy/max": torch.max(onpolicy_rewards).detach().item() if is_onpolicy.any() else 0.0,
         "critic/rewards_onpolicy/min": torch.min(onpolicy_rewards).detach().item() if is_onpolicy.any() else 0.0,
         "critic/rewards_onpolicy/count": is_onpolicy.sum().detach().item(),
+        # ⭐ on-policy success-rate (mean over on-policy samples)
+        "critic/success_onpolicy/mean": torch.mean(onpolicy_success).detach().item() if is_onpolicy.any() else 0.0,
         # ⭐ teacher rewards
         "critic/rewards_teacher/mean": torch.mean(teacher_rewards).detach().item() if is_teacher.any() else 0.0,
         "critic/rewards_teacher/max": torch.max(teacher_rewards).detach().item() if is_teacher.any() else 0.0,

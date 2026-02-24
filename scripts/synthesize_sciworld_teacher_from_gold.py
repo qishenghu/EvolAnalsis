@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, os, re, sys
+import argparse, ast, json, os, re, sys
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -8,23 +8,38 @@ SCIWORLD_BASE_SYSTEM_PROMPT = '''You are a scientific experiment assistant in a 
 At each step, you will receive:
 1. The task description (what experiment you need to perform)
 2. Your current observation (what you can see/do)
-3. Hints about available actions and objects
+3. OBJ candidates (the objects that can be interacted with in the current state).
 
-Common action patterns:
-- look around: observe your surroundings
-- look at [object]: examine an object closely
-- pick up [object]: take an object
-- put [object] in [container]: place an object somewhere
-- open [object]: open a container/door
-- close [object]: close a container/door
-- move to [location]: go to another location
-- activate [object]: turn on a device
-- deactivate [object]: turn off a device
-- use [object] on [target]: use one object on another
-- focus on [object]: focus your attention
-- wait: wait for something to happen
+Available actions:
+[
+{{"action": "open OBJ", "description": "open a container"}},
+{{"action": "close OBJ", "description": "close a container"}},
+{{"action": "activate OBJ", "description": "activate a device"}},
+{{"action": "deactivate OBJ", "description": "deactivate a device"}},
+{{"action": "connect OBJ to OBJ", "description": "connect electrical components"}},
+{{"action": "disconnect OBJ", "description": "disconnect electrical components"}},
+{{"action": "use OBJ [on OBJ]", "description": "use a device/item"}},
+{{"action": "look around", "description": "describe the current room"}},
+{{"action": "look at OBJ", "description": "describe an object in detail"}},
+{{"action": "look in OBJ", "description": "describe a container's contents"}},
+{{"action": "read OBJ", "description": "read a note or book"}},
+{{"action": "move OBJ to OBJ", "description": "move an object to a container"}},
+{{"action": "pick up OBJ", "description": "move an object to the inventory"}},
+{{"action": "put down OBJ", "description": "drop an inventory item"}},
+{{"action": "pour OBJ into OBJ", "description": "pour a liquid into a container"}},
+{{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"}},
+{{"action": "mix OBJ", "description": "chemically mix a container"}},
+{{"action": "go to LOC", "description": "move to a new location"}},
+{{"action": "eat OBJ", "description": "eat a food"}},
+{{"action": "flush OBJ", "description": "flush a toilet"}},
+{{"action": "focus on OBJ", "description": "signal intent on a task object"}},
+{{"action": "wait", "description": "take no action for 10 iterations"}},
+{{"action": "wait1", "description": "take no action for 1 iteration"}},
+{{"action": "task", "description": "describe current task"}},
+{{"action": "inventory", "description": "list your inventory"}}
+]
 
-You should choose from two actions: "THOUGHT" or "ACTION".
+In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
 - If you choose "THOUGHT", first analyze the task and current state, then output your action.
   Format: "Thought:\nyour thoughts.\n\nAction:\nyour next action"
 - If you choose "ACTION", directly output the action.
@@ -34,16 +49,36 @@ Important:
 1. Read the task description carefully.
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
-4. Some experiments may require multiple steps.'''
+4. OBJ in the selected action should be replaced with one of the OBJ candidates.
+'''
 
 
 SYNTH_SYSTEM_PROMPT = """You will be given a ScienceWorld task, the current observation, and the next action that will be taken.
 
-Write ONLY the Thought(1-3 sentences) that would plausibly lead to taking that action.
+Your job: write ONLY the Thought that *causally justifies* taking that action in the current state.
+The Thought should read like online reasoning, not a generic template.
+
+Output format:
+- Output ONLY the Thought text (do NOT include "Thought:" and do NOT include "Action:").
+- 1-3 sentences total.
 
 Hard constraints:
-- Output ONLY the Thought text. Do NOT include "Action:".
-- Do NOT mention that the next action was given to you."""
+1) Evidence binding: explicitly cite 1-2 concrete details from the observation/hints (exact object names, room name, or a state like "door is open/closed", "in inventory", "device is off/broken"). The cited details must be checkable in the provided text.
+2) Minimal planning: include one short checkpoint about what you expect to learn/achieve right after this action.
+3) No unsupported hedging: avoid "might", "likely", "probably", "maybe" unless you also cite a specific observed reason (e.g., "I don't see X here" / "the only heat source listed is Y").
+4) Avoid boilerplate: do NOT use the phrase "I need to ... so I should ...", and avoid vague filler like "to make progress" or "to proceed".
+5) Do NOT mention that the next action was given to you.
+
+Bad example (too generic):
+I need to find the item, so I should look around.
+
+Good example (evidence-bound + checkpoint):
+I'm in the kitchen and the cupboard is closed; opening it can reveal containers like a metal pot. After opening it, I'll check the contents for something usable for heating/holding the target substance."""
+
+LEGACY_ACTIONS_MARKER = "Valid actions:"
+LEGACY_SUGGESTED_MARKER = "Suggested actions:"
+LEGACY_NEARBY_OBJECTS_MARKER = "Nearby objects:"
+LEGACY_OBJECTS_MARKER = "OBJ needs to be replaced with one of the following objects:"
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -83,6 +118,12 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--max_tokens", type=int, default=256)
     p.add_argument("--collect_log_prob", choices=["true","false"], default="true")
+    p.add_argument(
+        "--env_py",
+        type=str,
+        default="env_service/environments/sciworld/sciworld_env.py",
+        help="Path to sciworld_env.py to extract the latest system prompt and hint template.",
+    )
     return p.parse_args()
 
 def _iter_jsonl(paths: List[str]) -> Iterable[Dict[str, Any]]:
@@ -124,21 +165,113 @@ def load_gold_records(inputs: List[str]) -> List[Dict[str, Any]]:
     return [by_id[k] for k in sorted(by_id)]
 
 
-def _get_hint_str_from_record(rec: Dict[str, Any]) -> str:
-    # augmented format
-    if isinstance(rec.get("init_hints"), dict) and isinstance(rec["init_hints"].get("hint_str"), str):
-        return rec["init_hints"]["hint_str"]
-    # raw format
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def extract_system_prompt_from_env_py(env_py: str) -> Optional[str]:
+    try:
+        text = _read_text(env_py)
+    except Exception:
+        return None
+    m = re.search(
+        r"def\s+_get_system_prompt\s*\([^)]*\)\s*->\s*str\s*:\s*.*?\n\s*return\s+'''([\s\S]*?)'''\s*\n",
+        text,
+        re.MULTILINE,
+    )
+    return m.group(1).strip() if m else None
+
+
+def extract_hint_template_from_env_py(env_py: str) -> Optional[str]:
+    try:
+        text = _read_text(env_py)
+    except Exception:
+        return None
+    m_block = re.search(
+        r"def\s+_get_action_hints\s*\([^)]*\)\s*->\s*str\s*:\s*([\s\S]*?)\n\s*def\s",
+        text,
+        re.MULTILINE,
+    )
+    block = m_block.group(1) if m_block else text
+    m = re.search(r"hint_str\s*=\s*f([\"'])(.*?)\1", block, re.MULTILINE)
+    return m.group(2).strip() if m else None
+
+
+def render_hint(template: str, objs: Any) -> str:
+    s = (template or "").strip()
+    if not s:
+        s = "OBJ candidates: {valid_objs}"
+    if isinstance(objs, str):
+        objs_repr = objs
+        objs_len = ""
+    else:
+        objs_repr = repr(objs)
+        try:
+            objs_len = str(len(objs))
+        except Exception:
+            objs_len = ""
+    s = s.replace("{valid_objs}", objs_repr)
+    s = s.replace("{len(valid_objs)}", objs_len)
+    return s.strip()
+
+
+def _try_parse_py_list(list_text: str) -> Tuple[Any, bool]:
+    t = (list_text or "").strip()
+    if not t:
+        return [], True
+    try:
+        v = ast.literal_eval(t)
+        return v, True
+    except Exception:
+        return t, False
+
+
+def _extract_objects_from_hint_block(hint_block: str) -> Tuple[Any, bool]:
+    hb = (hint_block or "").strip()
+    if not hb:
+        return [], True
+    if LEGACY_OBJECTS_MARKER in hb:
+        after = hb.split(LEGACY_OBJECTS_MARKER, 1)[1].strip()
+        return _try_parse_py_list(after)
+    if LEGACY_NEARBY_OBJECTS_MARKER in hb:
+        after = hb.split(LEGACY_NEARBY_OBJECTS_MARKER, 1)[1].strip()
+        return _try_parse_py_list(after)
+    if "OBJ candidates" in hb and ":" in hb:
+        after = hb.split(":", 1)[1].strip()
+        return _try_parse_py_list(after)
+    if ":" in hb:
+        after = hb.rsplit(":", 1)[1].strip()
+        return _try_parse_py_list(after)
+    return hb, False
+
+
+def _get_hint_str_from_record(rec: Dict[str, Any], hint_template: str) -> str:
+    init_h = rec.get("init_hints")
+    if isinstance(init_h, dict):
+        objs = init_h.get("possible_objects")
+        if isinstance(objs, list):
+            return render_hint(hint_template, objs)
+        hs = init_h.get("hint_str")
+        if isinstance(hs, str) and hs.strip():
+            objs2, ok = _extract_objects_from_hint_block(hs)
+            return render_hint(hint_template, objs2 if ok else hs)
     return ""
 
 
-def _get_step_hint_str(rec: Dict[str, Any], step_idx: int) -> str:
-    # augmented format: steps_augmented[t].hints.hint_str (after action)
+def _get_step_hint_str(rec: Dict[str, Any], step_idx: int, hint_template: str) -> str:
+    # augmented format: steps_augmented[t].hints.* (after action)
     steps_aug = rec.get("steps_augmented")
     if isinstance(steps_aug, list) and step_idx < len(steps_aug):
         h = steps_aug[step_idx].get("hints", {})
-        if isinstance(h, dict) and isinstance(h.get("hint_str"), str):
-            return h["hint_str"]
+        if isinstance(h, dict):
+            objs = h.get("possible_objects")
+            if isinstance(objs, list):
+                return render_hint(hint_template, objs)
+            hs = h.get("hint_str")
+            if isinstance(hs, str) and hs.strip():
+                objs2, ok = _extract_objects_from_hint_block(hs)
+                return render_hint(hint_template, objs2 if ok else hs)
     return ""
 
 def load_completed(output_path: str, resume_policy: str) -> set:
@@ -215,6 +348,8 @@ def main():
 
     mode="a" if (args.resume and os.path.exists(args.output)) else "w"
     ok=0; err=0
+    system_prompt = extract_system_prompt_from_env_py(args.env_py) or SCIWORLD_BASE_SYSTEM_PROMPT
+    hint_template = extract_hint_template_from_env_py(args.env_py) or "OBJ candidates: {valid_objs}"
     with open(args.output, mode, encoding="utf-8") as wf:
         for rec in gold:
             data_idx=int(rec["data_idx"])
@@ -260,16 +395,16 @@ def main():
 
             try:
                 messages=[
-                    {"role":"system","content":SCIWORLD_BASE_SYSTEM_PROMPT},
+                    {"role":"system","content":system_prompt},
                     {"role":"assistant","content":"OK. I'll help you complete this scientific experiment step by step."},
-                    {"role":"user","content":f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{_get_hint_str_from_record(rec)}"},
+                    {"role":"user","content":f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{_get_hint_str_from_record(rec, hint_template)}"},
                 ]
                 turn_lp=[]; acc_lp=[]; has_lp=True
                 for i in range(n):
                     action=str(actions[i])
                     pre_obs = init_obs if i==0 else str(steps[i-1].get("observation",""))
                     # In training replay, each user message also includes action hints.
-                    pre_hint = _get_hint_str_from_record(rec) if i==0 else _get_step_hint_str(rec, i-1)
+                    pre_hint = _get_hint_str_from_record(rec, hint_template) if i==0 else _get_step_hint_str(rec, i-1, hint_template)
                     pre_user_content = f"{pre_obs}\n\n{pre_hint}" if pre_hint else pre_obs
                     synth_msgs=[
                         {"role":"system","content":SYNTH_SYSTEM_PROMPT},
@@ -290,7 +425,7 @@ def main():
                     messages.append({"role":"assistant","content":f"Thought:\n{thought}\n\nAction:\n{action}"})
                     # user replay content aligns with sciworld_env.py: "<observation>\n\n<hints>"
                     obs_after = str(steps[i].get("observation",""))
-                    hint_after = _get_step_hint_str(rec, i)
+                    hint_after = _get_step_hint_str(rec, i, hint_template)
                     user_after = f"{obs_after}\n\n{hint_after}" if hint_after else obs_after
                     messages.append({"role":"user","content":user_after})
                     if meta and "log_probs" in meta and has_lp:
