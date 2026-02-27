@@ -239,7 +239,7 @@ Important:
             hint_str = ""
             # if possible_actions:
             hint_str += f"Available actions: {possible_actions}\n"
-            hint_str += f"OBJ candidates: {valid_objs}"
+            hint_str += f"OBJ must be replaced with exactly one of the following candidates, using the exact string as provided: {valid_objs}."
             # if possible_objects:
             #    hint_str += f"Nearby objects: {possible_objects}"
             return hint_str
