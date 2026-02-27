@@ -235,6 +235,7 @@ Important:
             possible_actions = hints.get("possible_actions", [])
             # Keep only object candidates to reduce token usage.
             # Valid action templates already exist in the system prompt.
+            hint_str = ""
             if possible_actions:
                 hint_str += f"Available actions: {possible_actions}\n"
             hint_str = f"OBJ candidates: {valid_objs}"
