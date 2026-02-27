@@ -237,8 +237,8 @@ Important:
             # Keep only object candidates to reduce token usage.
             # Valid action templates already exist in the system prompt.
             hint_str = ""
-            if possible_actions:
-                hint_str += f"Available actions: {possible_actions}\n"
+            # if possible_actions:
+            hint_str += f"Available actions: {possible_actions}\n"
             hint_str = f"OBJ candidates: {valid_objs}"
             # if possible_objects:
             #    hint_str += f"Nearby objects: {possible_objects}"
