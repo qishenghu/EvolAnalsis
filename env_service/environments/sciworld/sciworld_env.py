@@ -223,7 +223,8 @@ Important:
 1. Read the task description carefully.
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
-4. OBJ in the selected action should be replaced with one of the OBJ candidates.
+4. OBJ in the selected action should be replaced with one of the OBJ candidates using the exact string as provided.
+5. If the environment returns \"No known action matches that input.\", that means your previous action is invalid and you should try more options.
 '''
 
     def _get_action_hints(self) -> str:
