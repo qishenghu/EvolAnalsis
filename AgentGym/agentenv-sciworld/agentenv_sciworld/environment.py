@@ -106,14 +106,15 @@ class SciWorldEnv:
         idx: int,
         data_idx: int,
         generate_gold_path: bool = False,
-        simplification_str: str = "",
+        simplification_str: str = "easy",
     ):
         try:
             self._check_id(idx, True)
+            print(f"-------Env {idx} reset with simplification_str: {simplification_str}--------")
             self.env[idx].load(
                 self.games[data_idx]["taskName"],
                 self.games[data_idx]["variationIdx"],
-                simplificationStr=simplification_str or "",
+                simplificationStr=simplification_str or "easy",
                 generateGoldPath=bool(generate_gold_path),
             )
 
