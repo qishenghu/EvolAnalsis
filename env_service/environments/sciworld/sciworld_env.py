@@ -55,6 +55,12 @@ class SciworldEnv(BaseEnv):
             or os.environ.get("SCIWORLD_SERVER_URL", "http://127.0.0.1:36004")
         ).rstrip("/")
 
+        # ScienceWorld simplification preset (e.g. "easy", "teleportAction,openDoors", or "")
+        self.simplification_str: str = (
+            self.params.get("simplification_str")
+            or os.environ.get("SCIWORLD_SIMPLIFICATION", "easy")
+        )
+
         # 远端 ScienceWorld server 上的 env id
         self.remote_env_id: Optional[int] = None
         self.current_data_idx = None
@@ -124,6 +130,7 @@ class SciworldEnv(BaseEnv):
         reset_payload = {
             "id": self.remote_env_id,
             "data_idx": int(data_idx),
+            "simplification_str": self.simplification_str,
         }
         reset_result = self._post("/reset", reset_payload)
 
