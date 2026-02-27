@@ -56,10 +56,11 @@ class SciworldEnv(BaseEnv):
         ).rstrip("/")
 
         # ScienceWorld simplification preset (e.g. "easy", "teleportAction,openDoors", or "")
-        self.simplification_str: str = (
-            self.params.get("simplification_str")
-            or os.environ.get("SCIWORLD_SIMPLIFICATION", "easy")
-        )
+        # self.simplification_str: str = (
+        #     self.params.get("simplification_str")
+        #     or os.environ.get("SCIWORLD_SIMPLIFICATION", "easy")
+        # )
+        self.simplification_str = "easy"
 
         # 远端 ScienceWorld server 上的 env id
         self.remote_env_id: Optional[int] = None
