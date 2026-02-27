@@ -11,19 +11,23 @@ This script will:
 - For each data_idx (task variation index), POST /reset with generate_gold_path=true
 - GET /gold_action_sequence to fetch the gold actions
 - Replay each action with POST /step and record observations/scores
+- After reset and after each step, GET /action_hint to save possible_actions/possible_objects
 - Save one JSON object per line (JSONL)
 
 Note:
 - ScienceWorld's gold action sequence is not guaranteed to be optimal.
 - Gold path generation may fail for some tasks; we record the error.
+- Use --workers N to run N tasks in parallel (each worker uses a separate env).
 """
 
 import argparse
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -120,7 +124,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--task_start", type=int, default=0)
     p.add_argument("--task_end", type=int, default=None)
     p.add_argument("--max_tasks", type=int, default=None)
-    p.add_argument("--simplification_str", type=str, default="", help='e.g. "easy" or "teleportAction,openDoors"')
+    p.add_argument("--simplification_str", type=str, default="easy", help='e.g. "easy" or "teleportAction,openDoors"')
     p.add_argument("--max_steps", type=int, default=200, help="Max replay steps (cap gold action length)")
     p.add_argument("--sleep_sec", type=float, default=0.0, help="Optional sleep between steps (debug/throttle)")
     p.add_argument("--resume", action="store_true", help="Resume: skip data_idx already present in output")
@@ -134,7 +138,137 @@ def parse_args() -> argparse.Namespace:
         "'no_error' (skip only records without error), "
         "'success' (skip only records with success=true). Default: no_error.",
     )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers (each uses a separate env). Default: 1 (sequential).",
+    )
     return p.parse_args()
+
+
+def _collect_one_task(
+    server_url: str,
+    env_id: int,
+    data_idx: int,
+    args: argparse.Namespace,
+) -> Tuple[int, Dict[str, Any]]:
+    """Collect gold trajectory for one data_idx. Returns (data_idx, record)."""
+    record: Dict[str, Any] = {
+        "env": "sciworld",
+        "data_idx": data_idx,
+        "collected_at": datetime.now().isoformat(),
+        "server_url": server_url,
+        "simplification_str": args.simplification_str,
+    }
+    try:
+        reset = _post(
+            server_url,
+            "/reset",
+            {
+                "id": env_id,
+                "data_idx": int(data_idx),
+                "generate_gold_path": True,
+                "simplification_str": args.simplification_str,
+            },
+        )
+        if "error" in reset:
+            raise RuntimeError(reset["error"])
+
+        record.update(
+            {
+                "task_name": reset.get("task_name", ""),
+                "var_num": reset.get("var_num", None),
+                "task_description": reset.get("task_description", ""),
+                "initial_observation": reset.get("observation", ""),
+            }
+        )
+
+        try:
+            init_hints = _get(server_url, "/action_hint", {"id": env_id})
+            if "error" not in init_hints:
+                record["init_hints"] = {
+                    "possible_actions": init_hints.get("possible_actions", []) or [],
+                    "possible_objects": init_hints.get("possible_objects", []) or [],
+                }
+        except Exception:
+            pass
+
+        gold_resp = _get(server_url, "/gold_action_sequence", {"id": env_id})
+        if "error" in gold_resp:
+            raise RuntimeError(gold_resp["error"])
+        gold_actions = gold_resp.get("gold_action_sequence", [])
+        record["gold_action_sequence"] = gold_actions
+
+        steps: List[Dict[str, Any]] = []
+        final_score = None
+        done = False
+        for i, action in enumerate(gold_actions[: max(0, int(args.max_steps))]):
+            step = _post(server_url, "/step", {"id": env_id, "action": action})
+            if "error" in step:
+                raise RuntimeError(step["error"])
+
+            hints: Dict[str, Any] = {}
+            try:
+                hints_resp = _get(server_url, "/action_hint", {"id": env_id})
+                if "error" not in hints_resp:
+                    hints = {
+                        "possible_actions": hints_resp.get("possible_actions", []) or [],
+                        "possible_objects": hints_resp.get("possible_objects", []) or [],
+                    }
+            except Exception:
+                pass
+
+            step_record: Dict[str, Any] = {
+                "t": i,
+                "action": action,
+                "observation": step.get("observation", ""),
+                "reward": step.get("reward", None),
+                "score": step.get("score", None),
+                "done": step.get("done", None),
+            }
+            if hints:
+                step_record["possible_actions"] = hints["possible_actions"]
+                step_record["possible_objects"] = hints["possible_objects"]
+            steps.append(step_record)
+
+            final_score = step.get("score", final_score)
+            done = bool(step.get("done", False))
+            if args.sleep_sec and args.sleep_sec > 0:
+                time.sleep(args.sleep_sec)
+            if done:
+                break
+
+        record["steps"] = steps
+        record["final_score"] = final_score
+        record["done"] = done
+        record["success"] = bool(final_score == 100) if final_score is not None else False
+
+    except Exception as e:
+        record["error"] = str(e)
+
+    return (data_idx, record)
+
+
+def _worker_process_tasks(
+    server_url: str,
+    env_id: int,
+    task_ids: List[int],
+    args: argparse.Namespace,
+    output_path: str,
+    write_lock: threading.Lock,
+    stats: Dict[str, Any],
+) -> None:
+    """Worker: process assigned task_ids on env_id, write results with lock."""
+    for data_idx in task_ids:
+        _, record = _collect_one_task(server_url, env_id, data_idx, args)
+        ok = "error" not in record
+        with write_lock:
+            with open(output_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            stats["n_ok"] += 1 if ok else 0
+            stats["n_err"] += 0 if ok else 1
+            print(f"[{stats['n_ok']}/{stats['n_err']}] data_idx={data_idx} ok={ok}")
 
 
 def main() -> None:
@@ -176,100 +310,79 @@ def main() -> None:
                 f"skip {before - len(task_ids)} completed, remaining {len(task_ids)}"
             )
 
-    # Create one remote env and reuse it.
-    created = _post(args.server_url, "/create", {})
-    if "error" in created:
-        raise RuntimeError(f"Failed to create SciWorld env: {created['error']}")
-    env_id = int(created["id"])
-    print(f"Created remote SciWorld env id={env_id} at {args.server_url}")
+    n_workers = max(1, int(args.workers))
+    if n_workers > 1:
+        # Create N envs for parallel workers
+        env_ids: List[int] = []
+        for _ in range(n_workers):
+            created = _post(args.server_url, "/create", {})
+            if "error" in created:
+                raise RuntimeError(f"Failed to create SciWorld env: {created['error']}")
+            env_ids.append(int(created["id"]))
+        print(f"Created {n_workers} envs (ids={env_ids}) at {args.server_url}")
 
-    n_ok = 0
-    n_err = 0
-    mode = "a" if (args.resume and os.path.exists(args.output)) else "w"
-    with open(args.output, mode, encoding="utf-8") as f:
-        for data_idx in task_ids:
-            record: Dict[str, Any] = {
-                "env": "sciworld",
-                "data_idx": data_idx,
-                "collected_at": datetime.now().isoformat(),
-                "server_url": args.server_url,
-                "simplification_str": args.simplification_str,
-            }
-            try:
-                reset = _post(
+        # Split tasks among workers
+        chunks: List[List[int]] = [[] for _ in range(n_workers)]
+        for i, tid in enumerate(task_ids):
+            chunks[i % n_workers].append(tid)
+
+        mode = "a" if (args.resume and os.path.exists(args.output)) else "w"
+        if mode == "w":
+            open(args.output, "w").close()
+
+        write_lock = threading.Lock()
+        stats: Dict[str, Any] = {"n_ok": 0, "n_err": 0}
+
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            futures = [
+                ex.submit(
+                    _worker_process_tasks,
                     args.server_url,
-                    "/reset",
-                    {
-                        "id": env_id,
-                        "data_idx": int(data_idx),
-                        "generate_gold_path": True,
-                        "simplification_str": args.simplification_str,
-                    },
+                    env_ids[w],
+                    chunks[w],
+                    args,
+                    args.output,
+                    write_lock,
+                    stats,
                 )
-                if "error" in reset:
-                    raise RuntimeError(reset["error"])
+                for w in range(n_workers)
+            ]
+            for fut in as_completed(futures):
+                fut.result()
 
-                record.update(
-                    {
-                        "task_name": reset.get("task_name", ""),
-                        "var_num": reset.get("var_num", None),
-                        "task_description": reset.get("task_description", ""),
-                        "initial_observation": reset.get("observation", ""),
-                    }
-                )
+        for eid in env_ids:
+            try:
+                _post(args.server_url, "/close", {"id": eid})
+            except Exception:
+                pass
+        print(f"Done. ok={stats['n_ok']}, err={stats['n_err']}, output={args.output}")
 
-                gold_resp = _get(args.server_url, "/gold_action_sequence", {"id": env_id})
-                if "error" in gold_resp:
-                    raise RuntimeError(gold_resp["error"])
-                gold_actions = gold_resp.get("gold_action_sequence", [])
-                record["gold_action_sequence"] = gold_actions
+    else:
+        # Sequential (original behavior)
+        created = _post(args.server_url, "/create", {})
+        if "error" in created:
+            raise RuntimeError(f"Failed to create SciWorld env: {created['error']}")
+        env_id = int(created["id"])
+        print(f"Created remote SciWorld env id={env_id} at {args.server_url}")
 
-                steps: List[Dict[str, Any]] = []
-                final_score = None
-                done = False
-                for i, action in enumerate(gold_actions[: max(0, int(args.max_steps))]):
-                    step = _post(args.server_url, "/step", {"id": env_id, "action": action})
-                    if "error" in step:
-                        raise RuntimeError(step["error"])
-                    steps.append(
-                        {
-                            "t": i,
-                            "action": action,
-                            "observation": step.get("observation", ""),
-                            "reward": step.get("reward", None),
-                            "score": step.get("score", None),
-                            "done": step.get("done", None),
-                        }
-                    )
-                    final_score = step.get("score", final_score)
-                    done = bool(step.get("done", False))
-                    if args.sleep_sec and args.sleep_sec > 0:
-                        time.sleep(args.sleep_sec)
-                    if done:
-                        break
+        n_ok = 0
+        n_err = 0
+        mode = "a" if (args.resume and os.path.exists(args.output)) else "w"
+        with open(args.output, mode, encoding="utf-8") as f:
+            for data_idx in task_ids:
+                _, record = _collect_one_task(args.server_url, env_id, data_idx, args)
+                ok = "error" not in record
+                n_ok += 1 if ok else 0
+                n_err += 0 if ok else 1
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                print(f"[{n_ok}/{n_err}] data_idx={data_idx} ok={ok}")
 
-                record["steps"] = steps
-                record["final_score"] = final_score
-                record["done"] = done
-                record["success"] = bool(final_score == 100) if final_score is not None else False
-
-                n_ok += 1
-
-            except Exception as e:
-                record["error"] = str(e)
-                n_err += 1
-
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            f.flush()
-            print(f"[{n_ok}/{n_err}] data_idx={data_idx} ok={('error' not in record)}")
-
-    # Best-effort close
-    try:
-        _post(args.server_url, "/close", {"id": env_id})
-    except Exception:
-        pass
-
-    print(f"Done. ok={n_ok}, err={n_err}, output={args.output}")
+        try:
+            _post(args.server_url, "/close", {"id": env_id})
+        except Exception:
+            pass
+        print(f"Done. ok={n_ok}, err={n_err}, output={args.output}")
 
 
 if __name__ == "__main__":

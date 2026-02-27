@@ -213,19 +213,27 @@ Available actions:
 {{"action": "inventory", "description": "list your inventory"}}
 ]
 
-In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
-- If you choose "THOUGHT", first analyze the task and current state, then output your action.
-  Format: "Thought:\nyour thoughts.\n\nAction:\nyour next action"
-- If you choose "ACTION", directly output the action.
-  Format: "Action:\nyour next action"
-
 Important:
 1. Read the task description carefully.
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
 4. OBJ in the selected action should be replaced with one of the OBJ candidates using the exact string as provided.
 5. If the environment returns \"No known action matches that input.\", that means your previous action is invalid and you should try more options.
+
+In each turn, you must output your thought/reasoning and then output your action in the following format:
+```
+Thought:
+your thoughts.
+Action:
+your next action
+```
 '''
+
+# In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
+# - If you choose "THOUGHT", first analyze the task and current state, then output your action.
+#   Format: "Thought:\nyour thoughts.\n\nAction:\nyour next action"
+# - If you choose "ACTION", directly output the action.
+#   Format: "Action:\nyour next action"
 
     def _get_action_hints(self) -> str:
         """Get action hints from the server."""

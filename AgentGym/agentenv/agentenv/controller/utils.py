@@ -134,6 +134,7 @@ class BaseAdapter:
         action
         ```
         """
+        text = text.replace("`", "")
         invalid_format_flg = False
         _split = text.rsplit("Action:", 1)
         if len(_split) == 0:
