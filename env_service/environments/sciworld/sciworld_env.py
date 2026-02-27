@@ -231,12 +231,13 @@ Important:
             hints = self._get("/action_hint", {"id": self.remote_env_id})
             if isinstance(hints, dict):
                 valid_objs = hints.get("possible_objects", [])
-                
+
+                possible_actions = hints.get("possible_actions", [])
                 # Keep only object candidates to reduce token usage.
                 # Valid action templates already exist in the system prompt.
+                if possible_actions:
+                   hint_str += f"Available actions: {possible_actions}\n"
                 hint_str = f"OBJ candidates: {valid_objs}"
-                # if possible_actions:
-                #    hint_str += f"Suggested actions: {possible_actions}\n"
                 # if possible_objects:
                 #    hint_str += f"Nearby objects: {possible_objects}"
                 return hint_str
