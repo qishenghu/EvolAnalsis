@@ -227,22 +227,22 @@ Important:
 
     def _get_action_hints(self) -> str:
         """Get action hints from the server."""
-        try:
-            hints = self._get("/action_hint", {"id": self.remote_env_id})
-            if isinstance(hints, dict):
-                valid_objs = hints.get("possible_objects", [])
+        # try:
+        hints = self._get("/action_hint", {"id": self.remote_env_id})
+        if isinstance(hints, dict):
+            valid_objs = hints.get("possible_objects", [])
 
-                possible_actions = hints.get("possible_actions", [])
-                # Keep only object candidates to reduce token usage.
-                # Valid action templates already exist in the system prompt.
-                if possible_actions:
-                   hint_str += f"Available actions: {possible_actions}\n"
-                hint_str = f"OBJ candidates: {valid_objs}"
-                # if possible_objects:
-                #    hint_str += f"Nearby objects: {possible_objects}"
-                return hint_str
-        except:
-            pass
+            possible_actions = hints.get("possible_actions", [])
+            # Keep only object candidates to reduce token usage.
+            # Valid action templates already exist in the system prompt.
+            if possible_actions:
+                hint_str += f"Available actions: {possible_actions}\n"
+            hint_str = f"OBJ candidates: {valid_objs}"
+            # if possible_objects:
+            #    hint_str += f"Nearby objects: {possible_objects}"
+            return hint_str
+        # except:
+            # pass
         return ""
     
     def step(self, action: Dict[str, Any], params: Dict[str, Any] = None) -> Dict[str, Any]:
