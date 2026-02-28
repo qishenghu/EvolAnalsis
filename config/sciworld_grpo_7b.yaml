@@ -79,8 +79,8 @@ actor_rollout_ref:
   rollout:
     use_qwen3: false
     enable_request_id: false
-    prompt_length: 24556
-    response_length: 1024
+    prompt_length: 25068
+    response_length: 512
     max_model_len: 25580
     temperature: 0.9
     log_prob_micro_batch_size_per_gpu: 1
@@ -102,7 +102,7 @@ actor_rollout_ref:
       completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
       enable: true
       format: llama3_json
-      max_steps: 50
+      max_steps: 30
       tool_config_path: ""
   ref:
     log_prob_micro_batch_size_per_gpu: 1
