@@ -35,11 +35,11 @@ kill_port() {
 
 # Run GRPO baseline (default)
 python launcher.py \
-  --conf config/sciworld_grpo_3b.yaml
+  --conf config/sciworld_grpo_7b.yaml
  # --with-alfworld
 
-python launcher.py \
-  --conf config/sciworld_grpo_3b_dr3_hidden.yaml
+#python launcher.py \
+#  --conf config/sciworld_grpo_3b_dr3_hidden.yaml
 
 #python launcher.py \
 #  --conf config/sciworld_grpo_3b_teacher_only_no_logprob_random.yaml

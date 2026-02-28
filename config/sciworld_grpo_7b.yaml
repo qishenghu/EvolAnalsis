@@ -79,8 +79,8 @@ actor_rollout_ref:
   rollout:
     use_qwen3: false
     enable_request_id: false
-    prompt_length: 20480
-    response_length: 2048
+    prompt_length: 24556
+    response_length: 1024
     max_model_len: 25580
     temperature: 0.9
     log_prob_micro_batch_size_per_gpu: 1
@@ -116,8 +116,8 @@ critic:
 
 data:
   train_batch_size: 8
-  max_prompt_length: 4000
-  max_response_length: 21580
+  max_prompt_length: 1500
+  max_response_length: 24080
   filter_overlong_prompts: true
   truncation: "error"
   return_raw_chat: true
