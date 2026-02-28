@@ -97,6 +97,7 @@ actor_rollout_ref:
     context_template: "linear"
     context_template_train_sp_action: false
     max_env_len: 4096
+    sliding_window_size: -1  # -1=disabled (full history); >0=keep N recent LLM turns full, compress older ones to action-only (EPO style)
     sparse: true
   actor:
     # clip range high for off-policy samples

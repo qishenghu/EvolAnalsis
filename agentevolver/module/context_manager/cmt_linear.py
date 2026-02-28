@@ -47,6 +47,9 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         max_model_len: int = self.config.actor_rollout_ref.rollout.max_model_len
         self.max_seq_length: int = max_model_len - max_response_length  # ⭐ Calculate the maximum sequence length for the context window
         self.max_env_output_length: int = self.config.actor_rollout_ref.rollout.max_env_len
+        self.sliding_window_size: int = getattr(
+            self.config.actor_rollout_ref.rollout, "sliding_window_size", -1
+        )
         self.blackout_token_combo = tokenizer.encode("<|im_start|>assistant\n")
         self.generated_token_cnt = 0
 
@@ -383,7 +386,100 @@ class Linear_CMT(Trajectory, ContextManagerBase):
             tokenizer=self.tokenizer,
         )  # ⭐ Create an ExtendedMessage object with the environment content
         self.full_context += [ext_msg]  # ⭐ Add the ExtendedMessage to the full context
+        self._compress_old_context()
         return
+
+    # ------------------------------------------------------------------
+    # Sliding-window context compression (EPO / agl-envs style)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_action_line(content: str) -> str:
+        """Extract the 'Action: ...' line from an LLM output. Fallback to last line."""
+        for line in content.split("\n"):
+            stripped = line.strip()
+            if stripped.lower().startswith("action:"):
+                return stripped
+        return content.split("\n")[-1].strip() if content.strip() else "(no action)"
+
+    @staticmethod
+    def _strip_action_hints(content: str) -> str:
+        """Remove action hint blocks from an env observation, keeping only
+        the actual observation text.  Recognises markers produced by
+        ``sciworld_env._get_action_hints`` (``Available actions:``,
+        ``OBJ candidates:``, ``OBJ must be replaced``).
+        """
+        lines = content.split("\n")
+        kept: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(("Available actions:", "OBJ candidates:",
+                                   "OBJ must be replaced")):
+                break
+            kept.append(line)
+        result = "\n".join(kept).strip()
+        return result if result else content
+
+    def _retoken(self, msg: 'ExtendedMessage', new_content: str) -> None:
+        """Update *msg* in-place: set ``_content_for_future`` and regenerate
+        ``token_arr`` so that rollout and training stay consistent."""
+        msg._content_for_future = new_content
+        msg._sw_compressed = True
+        dummy_msg = [{"role": "assistant", "content": "dummy text"}]
+        msg.token_arr, _ = msg.get_inc_simple(
+            text_frag_from=self.tokenizer.apply_chat_template(
+                dummy_msg, tokenize=False
+            ),
+            text_frag_to=self.tokenizer.apply_chat_template(
+                dummy_msg + [{"role": msg.role, "content": new_content}],
+                tokenize=False,
+            ),
+            tokenizer=self.tokenizer,
+        )
+
+    def _compress_old_context(self):
+        """Compress old turns outside the sliding window.
+
+        For each interaction turn (LLM reply + env observation) older than
+        the most recent ``sliding_window_size`` turns:
+
+        * **LLM (assistant) messages** – replaced by the ``Action: …`` line
+          only (Thought is dropped).
+        * **Env (user) messages** – ``Available actions`` and ``OBJ
+          candidates`` hints are stripped, keeping only the observation text.
+
+        Both ``_content_for_future`` (rollout) and ``token_arr`` (training)
+        are updated so that the two paths stay consistent.
+
+        Set ``sliding_window_size`` to -1 to disable (default).
+        """
+        if self.sliding_window_size < 0:
+            return
+
+        llm_indices = [
+            i for i, c in enumerate(self.full_context) if c.author == "llm"
+        ]
+        if len(llm_indices) <= self.sliding_window_size:
+            return
+
+        cutoff = (
+            llm_indices[-self.sliding_window_size]
+            if self.sliding_window_size > 0
+            else len(self.full_context)
+        )
+
+        for idx in range(cutoff):
+            msg = self.full_context[idx]
+            if getattr(msg, "_sw_compressed", False):
+                continue
+            if msg.author == "initialization":
+                continue
+
+            if msg.author == "llm":
+                self._retoken(msg, self._extract_action_line(msg.content))
+            elif msg.author == "env":
+                stripped = self._strip_action_hints(msg.content)
+                if len(stripped) < len(msg._content_for_future):
+                    self._retoken(msg, stripped)
 
     def to_role_content(self, ext_msg_array: List[ExtendedMessage]) -> List[dict]:
         """
