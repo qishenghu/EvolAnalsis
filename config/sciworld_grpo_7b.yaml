@@ -30,7 +30,11 @@ trainer:
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
-  total_epochs: 1
+  # --- Training duration control ---
+  # Option A (default): control by total_training_steps (set total_epochs high enough to not be the bottleneck)
+  # Option B: set total_training_steps to null and use total_epochs + max_train_tasks to control
+  total_training_steps: 100
+  total_epochs: 999  # effectively unlimited; total_training_steps is the real limit
   save_freq: 100
   test_freq: 50
   val_before_train: false
@@ -63,7 +67,7 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 1
     ppo_mini_batch_size: 8
     use_kl_loss: true
-    kl_loss_coef: 0.001
+    kl_loss_coef: 0.001  # aligned with EPO (was 0.001, too weak → verbose drift)
     kl_loss_type: low_var_kl
     entropy_coeff: 0
     off_cliprange_high: 0.6
@@ -87,7 +91,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.4
     n: 8
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
@@ -116,7 +120,7 @@ critic:
   forward_max_token_len_per_gpu: 25580
 
 data:
-  train_batch_size: 8
+  train_batch_size: 16
   max_prompt_length: 1500
   max_response_length: 24080
   filter_overlong_prompts: true
@@ -127,7 +131,7 @@ data:
   # For SciWorld, EnvService maps non-train splits to the "last 20%" range.
   val_batch_size: 8
   val_type: "val"
-  max_train_tasks: 800
+  max_train_tasks: null  # null = use all available tasks; total_training_steps controls when to stop
   shuffle: true
   seed: 2026
 
