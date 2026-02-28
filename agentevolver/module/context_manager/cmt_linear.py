@@ -394,11 +394,22 @@ class Linear_CMT(Trajectory, ContextManagerBase):
     # ------------------------------------------------------------------
     @staticmethod
     def _extract_action_line(content: str) -> str:
-        """Extract the 'Action: ...' line from an LLM output. Fallback to last line."""
-        for line in content.split("\n"):
+        """Extract the action from an LLM output that uses
+        ``Thought:\\n...\\nAction:\\n<action>`` or ``Action: <action>`` format.
+        """
+        lines = content.split("\n")
+        for i, line in enumerate(lines):
             stripped = line.strip()
-            if stripped.lower().startswith("action:"):
-                return stripped
+            if not stripped.lower().startswith("action:"):
+                continue
+            after_colon = stripped[len("action:"):].strip()
+            if after_colon:
+                return f"Action: {after_colon}"
+            for j in range(i + 1, len(lines)):
+                next_line = lines[j].strip()
+                if next_line:
+                    return f"Action: {next_line}"
+            return "Action: (empty)"
         return content.split("\n")[-1].strip() if content.strip() else "(no action)"
 
     @staticmethod
