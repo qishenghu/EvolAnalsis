@@ -637,6 +637,10 @@ class ParallelEnvManager(object):
                     )
                     cmt.full_context.append(ext_msg)
             
+            # Apply the same sliding-window compression as on-policy rollouts
+            # so that DR3 discriminator sees a consistent format.
+            cmt._compress_old_context()
+            
             # 标记为 experience replay
             cmt.metadata["is_experience_replay"] = True
             cmt.metadata["old_log_probs"] = traj.metadata.get("old_log_probs")

@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
-import argparse, ast, json, os, re, sys
+"""
+Synthesize teacher trajectories for ScienceWorld DR3 training.
+
+Reads gold trajectories (from collect_sciworld_gold_trajectories.py),
+uses a teacher LLM to generate Thought reasoning for each gold action,
+and outputs multi-turn trajectories aligned with the training format
+(system prompt, hint format, reward scheme all match sciworld_env.py).
+
+Usage:
+    python scripts/synthesize_sciworld_teacher_from_gold.py \
+        --model_path Qwen/Qwen2.5-7B-Instruct \
+        --inputs data/sciworld/gold_trajectories.jsonl \
+        --output data/teacher_trajectories/sciworld_gold_qwen7b_synth.jsonl
+"""
+
+import argparse, json, os, re, sys
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-SCIWORLD_BASE_SYSTEM_PROMPT = '''You are a scientific experiment assistant in a text-based simulation environment. Your task is to perform scientific experiments by interacting with objects in the environment.
+# ---------------------------------------------------------------------------
+# System prompt – kept in sync with sciworld_env.py._get_system_prompt()
+# ---------------------------------------------------------------------------
+SCIWORLD_SYSTEM_PROMPT = '''You are a scientific experiment assistant in a text-based simulation environment. Your task is to perform scientific experiments by interacting with objects in the environment.
 
 At each step, you will receive:
 1. The task description (what experiment you need to perform)
@@ -12,47 +30,50 @@ At each step, you will receive:
 
 Available actions:
 [
-{{"action": "open OBJ", "description": "open a container"}},
-{{"action": "close OBJ", "description": "close a container"}},
-{{"action": "activate OBJ", "description": "activate a device"}},
-{{"action": "deactivate OBJ", "description": "deactivate a device"}},
-{{"action": "connect OBJ to OBJ", "description": "connect electrical components"}},
-{{"action": "disconnect OBJ", "description": "disconnect electrical components"}},
-{{"action": "use OBJ [on OBJ]", "description": "use a device/item"}},
-{{"action": "look around", "description": "describe the current room"}},
-{{"action": "look at OBJ", "description": "describe an object in detail"}},
-{{"action": "look in OBJ", "description": "describe a container's contents"}},
-{{"action": "read OBJ", "description": "read a note or book"}},
-{{"action": "move OBJ to OBJ", "description": "move an object to a container"}},
-{{"action": "pick up OBJ", "description": "move an object to the inventory"}},
-{{"action": "put down OBJ", "description": "drop an inventory item"}},
-{{"action": "pour OBJ into OBJ", "description": "pour a liquid into a container"}},
-{{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"}},
-{{"action": "mix OBJ", "description": "chemically mix a container"}},
-{{"action": "go to LOC", "description": "move to a new location"}},
-{{"action": "eat OBJ", "description": "eat a food"}},
-{{"action": "flush OBJ", "description": "flush a toilet"}},
-{{"action": "focus on OBJ", "description": "signal intent on a task object"}},
-{{"action": "wait", "description": "take no action for 10 iterations"}},
-{{"action": "wait1", "description": "take no action for 1 iteration"}},
-{{"action": "task", "description": "describe current task"}},
-{{"action": "inventory", "description": "list your inventory"}}
+{"action": "open OBJ", "description": "open a container"},
+{"action": "close OBJ", "description": "close a container"},
+{"action": "activate OBJ", "description": "activate a device"},
+{"action": "deactivate OBJ", "description": "deactivate a device"},
+{"action": "connect OBJ to OBJ", "description": "connect electrical components"},
+{"action": "disconnect OBJ", "description": "disconnect electrical components"},
+{"action": "use OBJ [on OBJ]", "description": "use a device/item"},
+{"action": "look around", "description": "describe the current room"},
+{"action": "look at OBJ", "description": "describe an object in detail"},
+{"action": "look in OBJ", "description": "describe a container's contents"},
+{"action": "read OBJ", "description": "read a note or book"},
+{"action": "move OBJ to OBJ", "description": "move an object to a container"},
+{"action": "pick up OBJ", "description": "move an object to the inventory"},
+{"action": "put down OBJ", "description": "drop an inventory item"},
+{"action": "pour OBJ into OBJ", "description": "pour a liquid into a container"},
+{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"},
+{"action": "mix OBJ", "description": "chemically mix a container"},
+{"action": "go to LOC", "description": "move to a new location"},
+{"action": "eat OBJ", "description": "eat a food"},
+{"action": "flush OBJ", "description": "flush a toilet"},
+{"action": "focus on OBJ", "description": "signal intent on a task object"},
+{"action": "wait", "description": "take no action for 10 iterations"},
+{"action": "wait1", "description": "take no action for 1 iteration"},
+{"action": "task", "description": "describe current task"},
+{"action": "inventory", "description": "list your inventory"}
 ]
-
-In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
-- If you choose "THOUGHT", first analyze the task and current state, then output your action.
-  Format: "Thought:\nyour thoughts.\n\nAction:\nyour next action"
-- If you choose "ACTION", directly output the action.
-  Format: "Action:\nyour next action"
 
 Important:
 1. Read the task description carefully.
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
-4. OBJ in the selected action should be replaced with one of the OBJ candidates.
+4. OBJ in the selected action should be replaced with one of the OBJ candidates using the exact string as provided.
+5. If the environment returns "No known action matches that input.", that means your previous action is invalid and you should try more options.
+
+In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
+- If you choose "THOUGHT", first analyze the task and current state, then output your action.
+  Format: "Thought:\\nyour thoughts.\\n\\nAction:\\nyour next action"
+- If you choose "ACTION", directly output the action.
+  Format: "Action:\\nyour next action"
 '''
 
-
+# ---------------------------------------------------------------------------
+# Thought-synthesis prompt (sent to the teacher LLM)
+# ---------------------------------------------------------------------------
 SYNTH_SYSTEM_PROMPT = """You will be given a ScienceWorld task, previous interactions, the current observation, and the next action that will be taken.
 
 Your job: write ONLY the Thought that *causally justifies* taking that action in the current state.
@@ -81,68 +102,35 @@ Good example (reflective reasoning):
 I already checked the counter drawer and it didn't contain orange juice. Since fridge commonly store liquids like juice, the most plausible next step is to look inside the fridge. Opening it should reveal whether orange juice is present so I can proceed to heat it next.
 """
 
-LEGACY_ACTIONS_MARKER = "Valid actions:"
-LEGACY_SUGGESTED_MARKER = "Suggested actions:"
-LEGACY_NEARBY_OBJECTS_MARKER = "Nearby objects:"
-LEGACY_OBJECTS_MARKER = "OBJ needs to be replaced with one of the following objects:"
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--inputs",
-        nargs="+",
-        default=[
-            # Prefer augmented file if present; otherwise fall back to raw gold files.
-            "data/teacher_trajectories/sciworld_gold_augmented.jsonl",
-            "data/teacher_trajectories/sciworld_gold.jsonl",
-            "data/teacher_trajectories/sciworld_gold_retry_404.jsonl",
-        ],
-    )
-    p.add_argument("--output", default="data/teacher_trajectories/sciworld_gold_qwen7b_synth.jsonl")
-    # Optional: after synthesis, export a filtered {base}.jsonl/{base}.pkl like AlfWorld teacher pipeline.
-    # This mirrors `scripts/filter_teacher_trajectories.py`.
-    p.add_argument(
-        "--export_base",
-        type=str,
-        default=None,
-        help="If set, run post-filtering and export {export_base}.jsonl and {export_base}.pkl",
-    )
-    p.add_argument(
-        "--export_threshold",
-        type=float,
-        default=1.0,
-        help="Reward threshold for export filtering (default: 1.0)",
-    )
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--resume_policy", choices=["any","no_error","success"], default="no_error")
-    p.add_argument("--max_tasks", type=int, default=None)
-    p.add_argument("--max_steps_per_task", type=int, default=None)
-    p.add_argument("--success_only", action="store_true", default=False)
-    p.add_argument("--model_path", default="Qwen/Qwen2.5-7B-Instruct")
-    p.add_argument("--tensor_parallel_size", type=int, default=4)
-    p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
-    p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--max_tokens", type=int, default=256)
-    p.add_argument("--collect_log_prob", choices=["true","false"], default="true")
-    p.add_argument(
-        "--env_py",
-        type=str,
-        default="env_service/environments/sciworld/sciworld_env.py",
-        help="Path to sciworld_env.py to extract the latest system prompt and hint template.",
-    )
-    p.add_argument(
-        "--history_steps",
-        type=int,
-        default=10,
-        help="How many recent interaction steps to include in Interaction history (0 = only current observation).",
-    )
-    p.add_argument(
-        "--history_max_chars_per_obs",
-        type=int,
-        default=0,
-        help="Truncate each observation in history to this many characters (0 = no truncation).",
-    )
-    return p.parse_args()
+# ===================================================================
+# Hint rendering – matches sciworld_env.py._get_action_hints() format
+# ===================================================================
+
+def render_action_hints(possible_actions: Any, possible_objects: Any) -> str:
+    """Render action hints in the same format as sciworld_env.py._get_action_hints()."""
+    hint = ""
+    if possible_actions:
+        hint += f"Available actions: {possible_actions}\n"
+    if possible_objects:
+        hint += f"OBJ must be replaced with exactly one of the following candidates, using the exact string as provided: {possible_objects}."
+    return hint.strip()
+
+
+def _get_init_hints(rec: Dict[str, Any]) -> str:
+    ih = rec.get("init_hints")
+    if not isinstance(ih, dict):
+        return ""
+    return render_action_hints(ih.get("possible_actions"), ih.get("possible_objects"))
+
+
+def _get_step_hints(step: Dict[str, Any]) -> str:
+    return render_action_hints(step.get("possible_actions"), step.get("possible_objects"))
+
+
+# ===================================================================
+# Gold record loading
+# ===================================================================
 
 def _iter_jsonl(paths: List[str]) -> Iterable[Dict[str, Any]]:
     for path in paths:
@@ -150,28 +138,31 @@ def _iter_jsonl(paths: List[str]) -> Iterable[Dict[str, Any]]:
             continue
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
-                s=line.strip()
-                if not s: 
+                s = line.strip()
+                if not s:
                     continue
                 try:
                     yield json.loads(s)
                 except Exception:
                     continue
 
-def _best_record(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+
+def _best_record(a: Dict, b: Dict) -> Dict:
     a_err = "error" in a
     b_err = "error" in b
     if a_err != b_err:
         return b if a_err else a
-    a_score = a.get("final_score"); b_score = b.get("final_score")
-    if isinstance(a_score,(int,float)) and isinstance(b_score,(int,float)) and a_score!=b_score:
-        return a if a_score>b_score else b
-    if len(a.get("steps",[]) or []) != len(b.get("steps",[]) or []):
-        return a if len(a.get("steps",[]) or []) > len(b.get("steps",[]) or []) else b
+    a_score = a.get("final_score")
+    b_score = b.get("final_score")
+    if isinstance(a_score, (int, float)) and isinstance(b_score, (int, float)) and a_score != b_score:
+        return a if a_score > b_score else b
+    if len(a.get("steps", []) or []) != len(b.get("steps", []) or []):
+        return a if len(a.get("steps", []) or []) > len(b.get("steps", []) or []) else b
     return b
 
+
 def load_gold_records(inputs: List[str]) -> List[Dict[str, Any]]:
-    by_id: Dict[int, Dict[str, Any]] = {}
+    by_id: Dict[int, Dict] = {}
     for rec in _iter_jsonl(inputs):
         if "data_idx" not in rec:
             continue
@@ -183,138 +174,29 @@ def load_gold_records(inputs: List[str]) -> List[Dict[str, Any]]:
     return [by_id[k] for k in sorted(by_id)]
 
 
-def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def extract_system_prompt_from_env_py(env_py: str) -> Optional[str]:
-    try:
-        text = _read_text(env_py)
-    except Exception:
-        return None
-    m = re.search(
-        r"def\s+_get_system_prompt\s*\([^)]*\)\s*->\s*str\s*:\s*.*?\n\s*return\s+'''([\s\S]*?)'''\s*\n",
-        text,
-        re.MULTILINE,
-    )
-    return m.group(1).strip() if m else None
-
-
-def extract_hint_template_from_env_py(env_py: str) -> Optional[str]:
-    try:
-        text = _read_text(env_py)
-    except Exception:
-        return None
-    m_block = re.search(
-        r"def\s+_get_action_hints\s*\([^)]*\)\s*->\s*str\s*:\s*([\s\S]*?)\n\s*def\s",
-        text,
-        re.MULTILINE,
-    )
-    block = m_block.group(1) if m_block else text
-    m = re.search(r"hint_str\s*=\s*f([\"'])(.*?)\1", block, re.MULTILINE)
-    return m.group(2).strip() if m else None
-
-
-def render_hint(template: str, objs: Any) -> str:
-    s = (template or "").strip()
-    if not s:
-        s = "OBJ candidates: {valid_objs}"
-    if isinstance(objs, str):
-        objs_repr = objs
-        objs_len = ""
-    else:
-        objs_repr = repr(objs)
-        try:
-            objs_len = str(len(objs))
-        except Exception:
-            objs_len = ""
-    s = s.replace("{valid_objs}", objs_repr)
-    s = s.replace("{len(valid_objs)}", objs_len)
-    return s.strip()
-
-
-def _try_parse_py_list(list_text: str) -> Tuple[Any, bool]:
-    t = (list_text or "").strip()
-    if not t:
-        return [], True
-    try:
-        v = ast.literal_eval(t)
-        return v, True
-    except Exception:
-        return t, False
-
-
-def _extract_objects_from_hint_block(hint_block: str) -> Tuple[Any, bool]:
-    hb = (hint_block or "").strip()
-    if not hb:
-        return [], True
-    if LEGACY_OBJECTS_MARKER in hb:
-        after = hb.split(LEGACY_OBJECTS_MARKER, 1)[1].strip()
-        return _try_parse_py_list(after)
-    if LEGACY_NEARBY_OBJECTS_MARKER in hb:
-        after = hb.split(LEGACY_NEARBY_OBJECTS_MARKER, 1)[1].strip()
-        return _try_parse_py_list(after)
-    if "OBJ candidates" in hb and ":" in hb:
-        after = hb.split(":", 1)[1].strip()
-        return _try_parse_py_list(after)
-    if ":" in hb:
-        after = hb.rsplit(":", 1)[1].strip()
-        return _try_parse_py_list(after)
-    return hb, False
-
-
-def _get_hint_str_from_record(rec: Dict[str, Any], hint_template: str) -> str:
-    init_h = rec.get("init_hints")
-    if isinstance(init_h, dict):
-        objs = init_h.get("possible_objects")
-        if isinstance(objs, list):
-            return render_hint(hint_template, objs)
-        hs = init_h.get("hint_str")
-        if isinstance(hs, str) and hs.strip():
-            objs2, ok = _extract_objects_from_hint_block(hs)
-            return render_hint(hint_template, objs2 if ok else hs)
-    return ""
-
-
-def _get_step_hint_str(rec: Dict[str, Any], step_idx: int, hint_template: str) -> str:
-    # augmented format: steps_augmented[t].hints.* (after action)
-    steps_aug = rec.get("steps_augmented")
-    if isinstance(steps_aug, list) and step_idx < len(steps_aug):
-        h = steps_aug[step_idx].get("hints", {})
-        if isinstance(h, dict):
-            objs = h.get("possible_objects")
-            if isinstance(objs, list):
-                return render_hint(hint_template, objs)
-            hs = h.get("hint_str")
-            if isinstance(hs, str) and hs.strip():
-                objs2, ok = _extract_objects_from_hint_block(hs)
-                return render_hint(hint_template, objs2 if ok else hs)
-    return ""
-
 def load_completed(output_path: str, resume_policy: str) -> set:
-    done=set()
+    done = set()
     if not os.path.exists(output_path):
         return done
-    with open(output_path,"r",encoding="utf-8") as f:
+    with open(output_path, "r", encoding="utf-8") as f:
         for line in f:
-            s=line.strip()
-            if not s: 
+            s = line.strip()
+            if not s:
                 continue
             try:
-                obj=json.loads(s)
+                obj = json.loads(s)
             except Exception:
                 continue
-            tid=obj.get("task_id")
-            if tid is None: 
+            tid = obj.get("task_id")
+            if tid is None:
                 continue
             try:
-                tid=int(tid)
+                tid = int(tid)
             except Exception:
                 continue
-            if resume_policy=="any":
+            if resume_policy == "any":
                 done.add(tid)
-            elif resume_policy=="success":
+            elif resume_policy == "success":
                 if obj.get("success") is True:
                     done.add(tid)
             else:
@@ -322,162 +204,189 @@ def load_completed(output_path: str, resume_policy: str) -> set:
                     done.add(tid)
     return done
 
-def _strip_thought_action(text: str) -> Tuple[str, Optional[str]]:
-    t=(text or "").strip()
-    if not t:
-        return "", None
-    m=re.search(r"Thought:\s*(.*?)\n\s*\n\s*Action:\s*(.*)$", t, flags=re.I|re.S)
+
+# ===================================================================
+# Thought synthesis helpers
+# ===================================================================
+
+def _strip_thought_markers(text: str) -> str:
+    """Remove Thought:/Action: markers if the model included them."""
+    t = (text or "").strip()
+    m = re.search(r"Thought:\s*(.*?)(\n\s*\n\s*Action:|\Z)", t, flags=re.I | re.S)
     if m:
-        thought=m.group(1).strip()
-        act=m.group(2).strip().splitlines()[0].strip() if m.group(2).strip() else ""
-        return thought, act or None
-    m2=re.search(r"Action:\s*(.*)$", t, flags=re.I|re.S)
+        return m.group(1).strip()
+    if t.lower().startswith("thought:"):
+        return t.split(":", 1)[-1].strip()
+    m2 = re.search(r"Action:", t, flags=re.I)
     if m2:
-        act=m2.group(1).strip().splitlines()[0].strip()
-        return "", act or None
-    return t, None
+        return t[: m2.start()].strip()
+    return t
 
 
-def _truncate_text(s: str, max_chars: int) -> str:
-    s = (s or "").strip()
-    if max_chars and max_chars > 0 and len(s) > max_chars:
-        # Keep the beginning (usually room/object listing) and the end (often contains key state lines).
-        head = s[: max_chars // 2].rstrip()
-        tail = s[-max_chars // 2 :].lstrip()
-        return f"{head}\n...\n{tail}"
-    return s
-
-
-def _build_interaction_history(
-    *,
+def _build_synth_context(
     task_desc: str,
-    init_obs: str,
-    init_hint: str,
-    steps: List[Dict[str, Any]],
+    steps: List[Dict],
     actions: List[str],
     thoughts_so_far: List[str],
-    current_obs: str,
-    current_hint: str,
-    history_steps: int,
-    max_chars_per_obs: int,
+    init_obs: str,
+    init_hint: str,
+    current_step_idx: int,
+    next_action: str,
+    history_steps: int = 10,
 ) -> str:
-    """
-    Build a compact, reflective interaction history for step t (current_obs).
-    Format:
-      Obs#0 ...
-      Thought#0 ...
-      Action#0 ...
-      Obs#1 ...
-      ...
-      Obs#t ...
-    """
-    t = len(thoughts_so_far)  # current step index
-    # Determine which steps to include (rolling window).
-    if history_steps is None or history_steps < 0:
-        history_steps = 0
+    """Build the user message for the thought-synthesis LLM call."""
+    t = current_step_idx
     start = max(0, t - history_steps)
 
     lines: List[str] = []
+    lines.append(f"Task:\n{task_desc}")
 
-    # Helper to format observation with optional hints
-    def fmt_obs(idx: int, obs: str, hint: str) -> str:
-        obs2 = _truncate_text(str(obs or ""), max_chars_per_obs)
-        if hint:
-            # Keep hint attached to the observation block to make history easier to read/parse.
-            return f"Obs#{idx}:\n{obs2}\n{hint}".strip()
-        return f"Obs#{idx}:\n{obs2}".strip()
-
-    # If window starts at 0, include Obs#0 from init.
     if start == 0:
-        lines.append(fmt_obs(0, init_obs, init_hint))
+        obs0 = init_obs
+        hint0 = init_hint
     else:
-        # Otherwise include the observation at start (which is after action start-1).
-        # Label it as Obs#start to keep indices monotonic in the window.
-        prev_obs = str(steps[start - 1].get("observation", "")) if (start - 1) < len(steps) else ""
-        lines.append(fmt_obs(start, prev_obs, ""))
+        obs0 = str(steps[start - 1].get("observation", "")) if (start - 1) < len(steps) else ""
+        hint0 = ""
 
-    # Add (Thought, Action, Obs) for steps in [start, t-1]
+    lines.append(f"\nInteraction history:")
+    lines.append(f"Obs#{start}:\n{obs0}")
+    if hint0:
+        lines.append(hint0)
+
     for j in range(start, t):
-        th = (thoughts_so_far[j] or "").strip()
+        th = (thoughts_so_far[j] or "").strip() if j < len(thoughts_so_far) else ""
         act = str(actions[j]).strip() if j < len(actions) else ""
         obs_after = str(steps[j].get("observation", "")) if j < len(steps) else ""
-        lines.append(f"Thought#{j}:\n{th}".strip())
-        lines.append(f"Action#{j}:\n{act}".strip())
-        lines.append(fmt_obs(j + 1, obs_after, ""))  # omit hints in history by default to save tokens
+        if th:
+            lines.append(f"Thought#{j}: {th}")
+        lines.append(f"Action#{j}: {act}")
+        lines.append(f"Obs#{j + 1}: {obs_after}")
 
-    # Finally include current observation. Use Obs#t only once:
-    # - if start==0, Obs#0 is init; after j=t-1, last appended is Obs#t (after action t-1).
-    # - current_obs is also Obs#t in our synthesis loop, so we only add it if it differs.
-    if not lines or (lines and (f"Obs#{t}:" not in lines[-1])):
-        lines.append(fmt_obs(t, current_obs, current_hint))
+    # Current observation (before the action we're synthesising thought for)
+    if t == 0:
+        cur_obs = init_obs
+        cur_hint = init_hint
     else:
-        # Replace last obs with a version that includes current_hint (and optional truncation),
-        # since the loop version omitted hints.
-        lines[-1] = fmt_obs(t, current_obs, current_hint)
+        cur_obs = str(steps[t - 1].get("observation", "")) if (t - 1) < len(steps) else ""
+        cur_hint = _get_step_hints(steps[t - 1]) if (t - 1) < len(steps) else ""
 
-    return "\n\n".join(lines).strip()
+    if f"Obs#{t}:" not in "\n".join(lines[-2:]):
+        lines.append(f"Obs#{t}: {cur_obs}")
+        if cur_hint:
+            lines.append(cur_hint)
+
+    lines.append(f"\nNext action:\n{next_action}")
+
+    return "\n\n".join(lines)
+
+
+# ===================================================================
+# CLI
+# ===================================================================
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Synthesize SciWorld teacher trajectories with Thought reasoning")
+    p.add_argument("--inputs", nargs="+", default=["data/sciworld/gold_trajectories.jsonl"])
+    p.add_argument("--output", default="data/teacher_trajectories/sciworld_gold_qwen7b_synth.jsonl")
+    p.add_argument("--export_base", type=str, default=None)
+    p.add_argument("--export_threshold", type=float, default=1.0)
+    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume_policy", choices=["any", "no_error", "success"], default="no_error")
+    p.add_argument("--max_tasks", type=int, default=None)
+    p.add_argument("--max_steps_per_task", type=int, default=None)
+    p.add_argument("--success_only", action="store_true", default=False)
+    p.add_argument("--model_path", default="Qwen/Qwen2.5-7B-Instruct")
+    p.add_argument("--tensor_parallel_size", type=int, default=4)
+    p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--max_tokens", type=int, default=256)
+    p.add_argument("--collect_log_prob", choices=["true", "false"], default="true")
+    p.add_argument("--history_steps", type=int, default=10)
+    # Task subset filtering (match training config)
+    p.add_argument(
+        "--task_subset",
+        type=int,
+        default=None,
+        help="Only synthesize for the first N training task_ids (after shuffle with --task_seed). "
+             "Matches the training config's max_train_tasks + seed.",
+    )
+    p.add_argument("--task_seed", type=int, default=2026, help="Seed for task shuffling (match training config data.seed)")
+    return p.parse_args()
+
+
+def _get_training_task_subset(n_tasks: int, seed: int) -> set:
+    """Reproduce the exact task subset used by training (max_train_tasks + seed)."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from env_service.environments.sciworld.sciworld_env import SciworldEnv
+    import random
+
+    all_ids = SciworldEnv.get_query_list("train")
+    rng = random.Random(seed)
+    rng.shuffle(all_ids)
+    return set(all_ids[:n_tasks])
+
+
+# ===================================================================
+# Main
+# ===================================================================
 
 def main():
-    args=parse_args()
+    args = parse_args()
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    gold=load_gold_records(args.inputs)
-    gold=[r for r in gold if "error" not in r]
+
+    gold = load_gold_records(args.inputs)
+    gold = [r for r in gold if "error" not in r]
     if args.success_only:
-        gold=[r for r in gold if r.get("success") is True]
+        gold = [r for r in gold if r.get("success") is True]
+    # Filter to training task subset (reproduces max_train_tasks + seed from config)
+    if args.task_subset and args.task_subset > 0:
+        subset_ids = _get_training_task_subset(args.task_subset, args.task_seed)
+        before = len(gold)
+        gold = [r for r in gold if str(r["data_idx"]) in subset_ids]
+        print(f"Task subset (n={args.task_subset}, seed={args.task_seed}): {before} -> {len(gold)} records")
     if args.resume:
-        done=load_completed(args.output, args.resume_policy)
+        done = load_completed(args.output, args.resume_policy)
         if done:
-            gold=[r for r in gold if int(r["data_idx"]) not in done]
-            print(f"Resume enabled (policy={args.resume_policy}): remaining={len(gold)}")
-    if args.max_tasks and args.max_tasks>0:
-        gold=gold[:args.max_tasks]
+            gold = [r for r in gold if int(r["data_idx"]) not in done]
+            print(f"Resume (policy={args.resume_policy}): remaining={len(gold)}")
+    if args.max_tasks and args.max_tasks > 0:
+        gold = gold[: args.max_tasks]
+
+    total_steps = sum(min(len(r.get("steps", [])), len(r.get("gold_action_sequence", []))) for r in gold)
+    print(f"Gold records to process: {len(gold)}, total steps: {total_steps}")
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from agentevolver.module.teacher import create_teacher_llm
-    llm=create_teacher_llm({
-        "type":"vllm",
+
+    llm = create_teacher_llm({
+        "type": "vllm",
         "model_path": args.model_path,
         "temperature": args.temperature,
         "max_tokens": args.max_tokens,
         "tensor_parallel_size": args.tensor_parallel_size,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "collect_log_prob": (args.collect_log_prob=="true"),
+        "collect_log_prob": (args.collect_log_prob == "true"),
     })
 
-    mode="a" if (args.resume and os.path.exists(args.output)) else "w"
-    ok=0; err=0
-    system_prompt = extract_system_prompt_from_env_py(args.env_py) or SCIWORLD_BASE_SYSTEM_PROMPT
-    hint_template = extract_hint_template_from_env_py(args.env_py) or "OBJ candidates: {valid_objs}"
+    system_prompt = SCIWORLD_SYSTEM_PROMPT
+
+    mode = "a" if (args.resume and os.path.exists(args.output)) else "w"
+    ok = 0
+    err = 0
+
     with open(args.output, mode, encoding="utf-8") as wf:
         for rec in gold:
-            data_idx=int(rec["data_idx"])
-            task_desc=rec.get("task_description","")
-            init_obs=rec.get("initial_observation","")
+            data_idx = int(rec["data_idx"])
+            task_desc = rec.get("task_description", "")
+            init_obs = rec.get("initial_observation", "")
+            init_hint = _get_init_hints(rec)
             actions = rec.get("gold_action_sequence", []) or []
-            # Support both raw gold format (`steps`) and augmented format (`steps_augmented`).
-            steps = rec.get("steps", None)
-            if not isinstance(steps, list):
-                steps_aug = rec.get("steps_augmented", []) or []
-                if isinstance(steps_aug, list) and steps_aug:
-                    # Normalize to the raw `steps` shape expected by the synthesizer.
-                    steps = [
-                        {
-                            "t": s.get("t", i),
-                            "action": s.get("action", ""),
-                            "observation": s.get("observation", ""),
-                            "reward": s.get("reward", None),
-                            "score": s.get("score", None),
-                            "done": s.get("done", None),
-                        }
-                        for i, s in enumerate(steps_aug)
-                    ]
-                else:
-                    steps = []
-            n=min(len(actions), len(steps))
-            if args.max_steps_per_task and args.max_steps_per_task>0:
-                n=min(n, int(args.max_steps_per_task))
+            steps = rec.get("steps", []) or []
+            n = min(len(actions), len(steps))
+            if args.max_steps_per_task and args.max_steps_per_task > 0:
+                n = min(n, int(args.max_steps_per_task))
 
-            out={
+            out: Dict[str, Any] = {
                 "task_id": str(data_idx),
                 "data_id": str(data_idx),
                 "rollout_id": f"{data_idx}_gold_synth_0",
@@ -492,90 +401,104 @@ def main():
             }
 
             try:
-                messages=[
-                    {"role":"system","content":system_prompt},
-                    {"role":"assistant","content":"OK. I'll help you complete this scientific experiment step by step."},
-                    {"role":"user","content":f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{_get_hint_str_from_record(rec, hint_template)}"},
+                # Build multi-turn messages matching training format
+                messages: List[Dict[str, str]] = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "assistant", "content": "OK. I'll help you complete this scientific experiment step by step."},
+                    {"role": "user", "content": f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{init_hint}"},
                 ]
-                turn_lp=[]; acc_lp=[]; has_lp=True
-                thoughts_so_far: List[str] = []
-                for i in range(n):
-                    action=str(actions[i])
-                    pre_obs = init_obs if i==0 else str(steps[i-1].get("observation",""))
-                    # In training replay, each user message also includes action hints.
-                    pre_hint = _get_hint_str_from_record(rec, hint_template) if i==0 else _get_step_hint_str(rec, i-1, hint_template)
-                    pre_user_content = f"{pre_obs}\n\n{pre_hint}" if pre_hint else pre_obs
 
-                    # Build reflective interaction history up to Obs#i (current observation).
-                    # We omit hints for older steps by default to control token growth, but keep the current hint.
-                    history = _build_interaction_history(
+                acc_lp: List[float] = []
+                turn_lp: List[Dict] = []
+                has_lp = True
+                thoughts_so_far: List[str] = []
+
+                for i in range(n):
+                    action = str(actions[i])
+
+                    # Ask LLM to generate Thought for this action
+                    synth_user = _build_synth_context(
                         task_desc=task_desc,
-                        init_obs=init_obs,
-                        init_hint=_get_hint_str_from_record(rec, hint_template),
                         steps=steps,
                         actions=actions,
                         thoughts_so_far=thoughts_so_far,
-                        current_obs=pre_obs,
-                        current_hint=pre_hint,
+                        init_obs=init_obs,
+                        init_hint=init_hint,
+                        current_step_idx=i,
+                        next_action=action,
                         history_steps=int(args.history_steps),
-                        max_chars_per_obs=int(args.history_max_chars_per_obs),
                     )
-                    synth_msgs=[
-                        {"role":"system","content":SYNTH_SYSTEM_PROMPT},
-                        {"role":"user","content":f"Task:\n{task_desc}\n\nInteraction history:\n{history}\n\nNext action:\n{action}\n"},
+                    synth_msgs = [
+                        {"role": "system", "content": SYNTH_SYSTEM_PROMPT},
+                        {"role": "user", "content": synth_user},
                     ]
                     resp, meta = llm(synth_msgs)
-                    # Model is instructed to output Thought only.
-                    thought = (resp or "").strip()
-                    # If model still returns Thought:/Action: blocks, strip them.
-                    thought2, _ = _strip_thought_action(thought)
-                    thought = thought2.strip()
-                    if thought.lower().startswith("thought:"):
-                        thought = thought.split(":", 1)[-1].strip()
+
+                    thought = _strip_thought_markers(resp or "")
                     if not thought:
-                        # Safe fallback: ensure non-empty thought for downstream consumers.
                         thought = "To make progress on the task, I will take the next action."
 
-                    messages.append({"role":"assistant","content":f"Thought:\n{thought}\n\nAction:\n{action}"})
+                    # Append assistant turn (Thought + Action)
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"Thought:\n{thought}\n\nAction:\n{action}",
+                    })
                     thoughts_so_far.append(thought)
-                    # user replay content aligns with sciworld_env.py: "<observation>\n\n<hints>"
-                    obs_after = str(steps[i].get("observation",""))
-                    hint_after = _get_step_hint_str(rec, i, hint_template)
-                    user_after = f"{obs_after}\n\n{hint_after}" if hint_after else obs_after
-                    messages.append({"role":"user","content":user_after})
-                    if meta and "log_probs" in meta and has_lp:
-                        turn_lp.append({"turn_idx": i, "log_probs": meta.get("log_probs",[]), "token_ids": meta.get("token_ids",[]), "tokens": meta.get("tokens",[])})
-                        acc_lp.extend(meta.get("log_probs",[]))
 
-                final_score=rec.get("final_score")
-                done=bool(rec.get("done", False))
-                outcome=max(0.0, min(100.0, float(final_score)))/100.0 if isinstance(final_score,(int,float)) else 0.0
-                out.update({"messages": messages, "reward": outcome, "success": bool(outcome==1.0), "is_terminated": done})
-                out["metadata"]["has_log_prob"] = bool(has_lp and len(acc_lp)>0)
+                    # Append user turn (env observation + action hints)
+                    obs_after = str(steps[i].get("observation", ""))
+                    hint_after = _get_step_hints(steps[i])
+                    user_content = f"{obs_after}\n\n{hint_after}" if hint_after else obs_after
+                    messages.append({"role": "user", "content": user_content})
+
+                    # Collect log probs
+                    if meta and "log_probs" in meta and has_lp:
+                        turn_lp.append({
+                            "turn_idx": i,
+                            "log_probs": meta.get("log_probs", []),
+                            "token_ids": meta.get("token_ids", []),
+                            "tokens": meta.get("tokens", []),
+                        })
+                        acc_lp.extend(meta.get("log_probs", []))
+
+                # Binary reward (EPO-style: done AND score > 0)
+                final_score = rec.get("final_score")
+                done = bool(rec.get("done", False))
+                reward = 1.0 if (done and isinstance(final_score, (int, float)) and final_score > 0) else 0.0
+
+                out.update({
+                    "messages": messages,
+                    "reward": reward,
+                    "success": reward > 0,
+                    "is_terminated": done,
+                })
+                out["metadata"]["has_log_prob"] = bool(has_lp and len(acc_lp) > 0)
                 out["metadata"]["num_turns"] = n
                 out["metadata"]["total_generated_tokens"] = len(acc_lp) if has_lp else 0
-                # Log-probs here (if any) cover ONLY the synthesized Thought, not the appended Action.
                 if out["metadata"]["has_log_prob"]:
                     out["metadata"]["log_prob_scope"] = "thought_only"
                     out["thought_log_probs"] = acc_lp
                     out["thought_log_probs_per_turn"] = turn_lp
 
-                wf.write(json.dumps(out, ensure_ascii=False)+"\n"); wf.flush()
+                wf.write(json.dumps(out, ensure_ascii=False) + "\n")
+                wf.flush()
                 ok += 1
-                print(f"[ok={ok} err={err}] task_id={data_idx} turns={n} success={out['success']}")
+                print(f"[ok={ok} err={err}] task_id={data_idx} turns={n} reward={reward}")
+
             except Exception as e:
-                out["error"]=str(e)
-                wf.write(json.dumps(out, ensure_ascii=False)+"\n"); wf.flush()
+                out["error"] = str(e)
+                wf.write(json.dumps(out, ensure_ascii=False) + "\n")
+                wf.flush()
                 err += 1
                 print(f"[ok={ok} err={err}] task_id={data_idx} ERROR: {e}", file=sys.stderr)
 
-    # Optional export in AlfWorld-style filtered JSONL+PKL.
+    print(f"\nDone. ok={ok}, err={err}, output={args.output}")
+
+    # Optional export
     if args.export_base:
         try:
-            sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             from scripts.filter_teacher_trajectories import filter_trajectories
-
-            print(f"\nExporting filtered teacher trajectories to base={args.export_base} ...")
+            print(f"\nExporting filtered teacher trajectories to {args.export_base} ...")
             filter_trajectories(
                 input_path=args.output,
                 output_base=args.export_base,
@@ -585,6 +508,6 @@ def main():
         except Exception as e:
             print(f"WARNING: export failed: {e}", file=sys.stderr)
 
-if __name__=="__main__":
-    main()
 
+if __name__ == "__main__":
+    main()
