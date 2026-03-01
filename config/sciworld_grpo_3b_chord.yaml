@@ -115,8 +115,8 @@ actor_rollout_ref:
   rollout:
     use_qwen3: false
     enable_request_id: false
-    prompt_length: 20480
-    response_length: 2048
+    prompt_length: 25068
+    response_length: 512
     max_model_len: 25580
     temperature: 0.9
     log_prob_micro_batch_size_per_gpu: 1
@@ -132,6 +132,7 @@ actor_rollout_ref:
     context_template: "linear"
     context_template_train_sp_action: false
     max_env_len: 4096
+    sliding_window_size: 3
     sparse: true
     multi_turn:
       completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
@@ -154,8 +155,8 @@ critic:
 # ============================================================================
 data:
   train_batch_size: 8
-  max_prompt_length: 4000
-  max_response_length: 21580
+  max_prompt_length: 1500
+  max_response_length: 24080
   filter_overlong_prompts: true
   truncation: "error"
   return_raw_chat: true
@@ -240,7 +241,7 @@ exp_manager:
   teacher_experience:
     enable: true
     mix_mode: "rollout_level"
-    data_path: "data/teacher_trajectories/sciworld_gold_qwen72b_filtered.pkl"
+    data_path: "data/teacher_trajectories/sciworld_gold_qwen72b_800_filtered.pkl"
     n_teacher_rollouts_per_task: 1
     max_trajectories_per_task: 6
     select_mode: "random"

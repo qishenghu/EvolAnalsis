@@ -9,9 +9,9 @@ defaults:
   - _self_
 
 # ============================================================================
-# SciWorld GRPO Training Configuration (3B)
+# SciWorld GRPO Training Configuration (7B)
 # ============================================================================
-# This configuration mirrors `config/alfworld_grpo_3b.yaml` but trains on SciWorld
+# This configuration mirrors `config/sciworld_grpo_3b.yaml` but trains a 7B model
 # via EnvService (which proxies to the AgentGym SciWorld server).
 #
 # Assumptions:
@@ -26,7 +26,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: sciworld_3b_grpo_bz8_2400
+  experiment_name: sciworld_3b_grpo_bz8
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -79,8 +79,8 @@ actor_rollout_ref:
   rollout:
     use_qwen3: false
     enable_request_id: false
-    prompt_length: 20480
-    response_length: 2048
+    prompt_length: 25068
+    response_length: 512
     max_model_len: 25580
     temperature: 0.9
     log_prob_micro_batch_size_per_gpu: 1
@@ -96,6 +96,7 @@ actor_rollout_ref:
     context_template: "linear"
     context_template_train_sp_action: false
     max_env_len: 4096
+    sliding_window_size: 3  # keep last 3 LLM turns full, compress older to action-only
     sparse: true
     # SciWorld is multi-turn by design; keep multi_turn enabled.
     multi_turn:
@@ -116,17 +117,17 @@ critic:
 
 data:
   train_batch_size: 8
-  max_prompt_length: 4000
-  max_response_length: 21580
+  max_prompt_length: 1500
+  max_response_length: 24080
   filter_overlong_prompts: true
   truncation: "error"
   return_raw_chat: true
   train_files: null
   val_files: null
-  val_batch_size: 8
   # For SciWorld, EnvService maps non-train splits to the "last 20%" range.
+  val_batch_size: 8
   val_type: "val"
-  max_train_tasks: 2400
+  max_train_tasks: 800
   shuffle: true
   seed: 2026
 
@@ -135,7 +136,7 @@ env_service:
   env_url: "http://127.0.0.1:8084"
 
 task_manager:
-  # Keep exploration/synthesis off by default (same as alfworld_grpo_3b.yaml).
+  # Keep exploration/synthesis off by default (same as sciworld_grpo_3b.yaml).
   n: 0
   mixture:
     use_original_tasks: true
@@ -171,7 +172,7 @@ exp_manager:
   summary_batch_size: 8
   reme:
     base_url: "http://127.0.0.1:8124"
-    workspace_id: "sciworld_3b_grpo"
+    workspace_id: "sciworld_7b_grpo"
     enable_summarizer: false
     enable_context_generator: false
     retrieve_top_k: 3
@@ -215,4 +216,3 @@ attribution_driven_credit_assignment:
 
 thread_pool:
   max_workers: 8
-
