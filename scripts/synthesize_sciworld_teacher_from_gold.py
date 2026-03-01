@@ -14,7 +14,7 @@ Usage:
         --output data/teacher_trajectories/sciworld_gold_qwen7b_synth.jsonl
 """
 
-import argparse, json, os, re, sys
+import argparse, json, os, pickle, re, sys
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -373,6 +373,7 @@ def main():
     mode = "a" if (args.resume and os.path.exists(args.output)) else "w"
     ok = 0
     err = 0
+    all_trajectory_dicts: List[Dict[str, Any]] = []
 
     with open(args.output, mode, encoding="utf-8") as wf:
         for rec in gold:
@@ -477,11 +478,14 @@ def main():
                 out["metadata"]["total_generated_tokens"] = len(acc_lp) if has_lp else 0
                 if out["metadata"]["has_log_prob"]:
                     out["metadata"]["log_prob_scope"] = "thought_only"
+                    out["log_probs"] = acc_lp
+                    out["log_probs_per_turn"] = turn_lp
                     out["thought_log_probs"] = acc_lp
                     out["thought_log_probs_per_turn"] = turn_lp
 
                 wf.write(json.dumps(out, ensure_ascii=False) + "\n")
                 wf.flush()
+                all_trajectory_dicts.append(out)
                 ok += 1
                 print(f"[ok={ok} err={err}] task_id={data_idx} turns={n} reward={reward}")
 
@@ -492,7 +496,15 @@ def main():
                 err += 1
                 print(f"[ok={ok} err={err}] task_id={data_idx} ERROR: {e}", file=sys.stderr)
 
+    # Save pkl alongside jsonl (for training configs that reference .pkl)
+    pkl_path = os.path.splitext(args.output)[0] + ".pkl"
+    if args.resume and os.path.exists(pkl_path):
+        existing_dicts = pickle.load(open(pkl_path, "rb"))
+        all_trajectory_dicts = existing_dicts + all_trajectory_dicts
+    with open(pkl_path, "wb") as pf:
+        pickle.dump(all_trajectory_dicts, pf)
     print(f"\nDone. ok={ok}, err={err}, output={args.output}")
+    print(f"PKL saved: {pkl_path} ({len(all_trajectory_dicts)} trajectories)")
 
     # Optional export
     if args.export_base:
