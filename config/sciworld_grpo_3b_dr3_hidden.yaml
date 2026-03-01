@@ -164,6 +164,9 @@ actor_rollout_ref:
     max_env_len: 4096
     sliding_window_size: 3  # keep last 3 LLM turns full, compress older to action-only
     sparse: true
+    # SciWorld success threshold (raw score scale 0-100).
+    # 0 = EPO-style (done AND score > 0); 70 = agl-envs strict (done AND score > 70).
+    sciworld_success_threshold: 70
     multi_turn:
       completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
       enable: true

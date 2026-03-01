@@ -345,17 +345,22 @@ In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
     def evaluate(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> float:
         """
         Evaluate the performance of the environment.
-        
+
+        Binary reward: 1.0 if (done AND score > threshold), else 0.0.
+        The threshold is read from ``params["sciworld_success_threshold"]``
+        (scale 0-100, matching the raw SciWorld score).
+        Default threshold is 0, which reproduces the original EPO-style
+        ``won = done AND score > 0`` criterion.  Setting it to 70 gives the
+        stricter agl-envs-style criterion (``score > 70``).
+
         Returns:
-            float: Evaluation score (0.0 to 1.0).
+            float: 1.0 (success) or 0.0 (failure).
         """
-        # EPO-style binary reward: only reward task completion.
-        # won = done AND score > 0  (same as EPO's compute_reward)
-        # This gives GRPO clear contrast (0 vs 1) instead of dense partial rewards
-        # that cause all rollouts to converge to similar small values.
         if self.current_score is None:
             return 0.0
-        return 1.0 if (self.is_done and float(self.current_score) > 0) else 0.0
+        params = params or {}
+        threshold = float(params.get("sciworld_success_threshold", 0))
+        return 1.0 if (self.is_done and float(self.current_score) > threshold) else 0.0
 
     def get_info(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """

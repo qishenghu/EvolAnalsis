@@ -38,7 +38,9 @@ class AgentFlow(BaseAgentFlow):
         self.response_template_ids = self.tokenizer.encode("assistant\n")  # ⭐ Encode the assistant response template
         # self.em_client = EMClient(base_url=self.config.experience_maker.base_url)  # ⭐ Initialize the EMClient
         self.sparse = self.config.actor_rollout_ref.rollout.sparse  # add sparse by ANNI 0723
-        # self.experience_template = self.config.hybrid_experience_training.experience_template
+        self.sciworld_success_threshold: float = float(
+            getattr(self.config.actor_rollout_ref.rollout, "sciworld_success_threshold", 0)
+        )
         self.cmt: Union[Linear_CMT, LinearThinkCMT] = None
         self.console_debug_mode: bool = self.config.actor_rollout_ref.rollout.debug_llm_io
         self.exp_worker = ExperienceWorker(config=self.config)
@@ -158,14 +160,19 @@ class AgentFlow(BaseAgentFlow):
             score = grader_res["score"] 
             reason = grader_res["reason"] or "No reason provided."
         else:
-            score = env.evaluate(instance_id, params={"sparse": self.sparse})  # ⭐ Evaluate the score from the environment
+            score = env.evaluate(instance_id, params={
+                "sparse": self.sparse,
+                "sciworld_success_threshold": self.sciworld_success_threshold,
+            })  # ⭐ Evaluate the score from the environment
             reason = "Outcome 1 = success, 0 = failure."
 
         # ---------------------------
         # Success definition
         # ---------------------------
         # Default: treat "perfect score" as success (legacy behavior).
-        # SciWorld override (align with EPO-style `won`): success iff done AND raw score > 0.
+        # SciWorld: success iff done AND raw_score > sciworld_success_threshold.
+        #   threshold=0  → EPO-style `won` (done AND score > 0)
+        #   threshold=70 → agl-envs-style strict criterion
         success_rate = 0.0
         if not err_in_env:
             try:
@@ -182,7 +189,7 @@ class AgentFlow(BaseAgentFlow):
                         raw_score_val = float(env_info.get("score", 0.0) or 0.0)
                     except Exception:
                         raw_score_val = 0.0
-                success_rate = 1.0 if (done_flag and raw_score_val > 0.0) else 0.0
+                success_rate = 1.0 if (done_flag and raw_score_val > self.sciworld_success_threshold) else 0.0
             else:
                 success_rate = 1.0 if float(score) >= 1.0 else 0.0
 
