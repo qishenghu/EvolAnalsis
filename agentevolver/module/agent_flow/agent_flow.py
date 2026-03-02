@@ -167,10 +167,11 @@ class AgentFlow(BaseAgentFlow):
             reason = "Outcome 1 = success, 0 = failure."
 
         # ---------------------------
-        # Success definition
+        # Success definition & SciWorld outcome override
         # ---------------------------
-        # Default: treat "perfect score" as success (legacy behavior).
-        # SciWorld: success iff done AND raw_score > sciworld_success_threshold.
+        # For SciWorld we compute outcome (score) AND success_rate from the
+        # same env_info + threshold, so they are guaranteed consistent
+        # regardless of which grader produced the initial `score` above.
         #   threshold=0  → EPO-style `won` (done AND score > 0)
         #   threshold=70 → agl-envs-style strict criterion
         success_rate = 0.0
@@ -189,7 +190,9 @@ class AgentFlow(BaseAgentFlow):
                         raw_score_val = float(env_info.get("score", 0.0) or 0.0)
                     except Exception:
                         raw_score_val = 0.0
-                success_rate = 1.0 if (done_flag and raw_score_val > self.sciworld_success_threshold) else 0.0
+                is_success = done_flag and raw_score_val > self.sciworld_success_threshold
+                success_rate = 1.0 if is_success else 0.0
+                score = success_rate
             else:
                 success_rate = 1.0 if float(score) >= 1.0 else 0.0
 
