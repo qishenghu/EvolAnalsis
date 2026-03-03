@@ -1768,6 +1768,68 @@ def compute_chord_sft_loss(
     }
 
 
+def uniform_mix_compute_token_loss(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    exp_mask: torch.Tensor,
+    cliprange: float = 0.2,
+    clip_eps: float = 0.2,
+    loss_agg_mode: str = "token-mean",
+) -> dict:
+    """
+    Uniform mixing baseline: teacher data enters PG with standard PPO ratio/clipping.
+    No density ratio correction, no policy shaping — teacher treated identically to on-policy.
+    For teacher (no logprob), old_log_prob is zeros so ratio = exp(log_prob).
+    """
+    negative_approx_kl = log_prob - old_log_prob
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    # On-policy loss (standard PPO)
+    on_pg_losses1 = -advantages * ratio
+    on_pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange, 1 + cliprange)
+    on_pg_losses = torch.maximum(on_pg_losses1, on_pg_losses2)
+    on_policy_mask = (1.0 - exp_mask) * response_mask
+    on_pg_loss = verl_F.masked_mean(on_pg_losses, on_policy_mask)
+    on_clipfrac = verl_F.masked_mean(
+        torch.gt(on_pg_losses2, on_pg_losses1).float(), on_policy_mask
+    )
+
+    # Off-policy loss: same PPO clipping (uniform treatment)
+    off_pg_losses1 = -advantages * ratio
+    off_pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
+    off_pg_losses = torch.maximum(off_pg_losses1, off_pg_losses2)
+    off_policy_mask = exp_mask * response_mask
+    off_pg_loss = verl_F.masked_mean(off_pg_losses, off_policy_mask)
+    off_pg_loss = torch.tensor(0.0, device=log_prob.device) if off_pg_loss.isnan().item() else off_pg_loss
+    off_clipfrac = verl_F.masked_mean(
+        torch.gt(off_pg_losses2, off_pg_losses1).float(), off_policy_mask
+    )
+
+    # Combine
+    exp_mask_float = exp_mask.float()
+    pg_losses = off_pg_losses * exp_mask_float + on_pg_losses * (1.0 - exp_mask_float)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    return {
+        "pg_loss": pg_loss,
+        "pg_losses": pg_losses,
+        "on_pg_loss": on_pg_loss,
+        "off_pg_loss": off_pg_loss,
+        "on_pg_losses": on_pg_losses,
+        "off_pg_losses": off_pg_losses,
+        "on_pg_clipfrac": on_clipfrac,
+        "on_pg_clipfrac_lower": torch.tensor(0.0, device=log_prob.device),
+        "on_pg_cliphit_rate": on_clipfrac,
+        "off_pg_cliphit_rate": off_clipfrac,
+        "self_off_pg_cliphit_rate": off_clipfrac,
+        "teacher_off_pg_cliphit_rate": off_clipfrac,
+        "ppo_kl": ppo_kl,
+    }
+
+
 def repo_compute_token_loss(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,

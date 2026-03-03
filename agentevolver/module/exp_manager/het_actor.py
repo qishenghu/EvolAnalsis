@@ -1287,6 +1287,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 alpha=alpha_arg,
                                 alpha_mode=alpha_mode_arg,
                                 alpha_ema_beta=alpha_ema_beta,
+                                use_relative_ratio=bool(dr3_cfg.get("use_relative_ratio", True)),
                             )
                             # micro-level logs (OK)
                             try:
@@ -1575,6 +1576,22 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                                 metrics[f"dr3_diag/{k}"] = float(v)
                                 except Exception:
                                     pass
+
+                    if (ret_dict is None) and bool(self.config.get("use_uniform_mix", False)) and has_teacher_data:
+                        # ========== Uniform Mixing baseline ==========
+                        # Teacher data enters PG with standard PPO ratio/clipping.
+                        # No density ratio correction, no policy shaping.
+                        from .het_core_algos import uniform_mix_compute_token_loss
+                        ret_dict = uniform_mix_compute_token_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            exp_mask=exp_mask,
+                            cliprange=clip_ratio,
+                            clip_eps=0.2,
+                            loss_agg_mode=loss_agg_mode,
+                        )
 
                     if (ret_dict is None) and use_chord and has_teacher_data:
                         # ========== CHORD 模式 ==========

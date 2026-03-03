@@ -554,6 +554,7 @@ class DR3RatioEstimator:
         alpha: Optional[float] = None,
         alpha_mode: str = "prior_or_micro",  # "prior_or_micro" | "sync_batch_ema" | "sync_batch" | "micro" | "buffer_ema" | "buffer"
         alpha_ema_beta: float = 0.9,
+        use_relative_ratio: bool = True,  # False = use direct p/q (ablation)
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Returns:
@@ -787,11 +788,14 @@ class DR3RatioEstimator:
             # so r_hat ≈ d / (1-d).
             r_hat = d / (1.0 - d)
 
-            # Relative density ratio w_alpha = p / ((1-α)p + αq) = r / ((1-α)r + α)
-            w = r_hat / (one_minus_alpha * r_hat + alpha_used)
-
-            # Base theoretical upper bound for relative ratio
-            base_upper = 1.0 / one_minus_alpha
+            if use_relative_ratio:
+                # Relative density ratio w_alpha = p / ((1-α)p + αq) = r / ((1-α)r + α)
+                w = r_hat / (one_minus_alpha * r_hat + alpha_used)
+                base_upper = 1.0 / one_minus_alpha
+            else:
+                # Direct p/q ratio (ablation: unbounded, higher variance)
+                w = r_hat
+                base_upper = self.clip_max
 
             # Dual-controlled clipping
             # - only meaningful for off-policy samples in practice, but we clip all for safety.
@@ -820,6 +824,7 @@ class DR3RatioEstimator:
                 clipfrac = float((w[off_idx] > clip_upper).float().mean().item())
 
         metrics = {
+            "dr3/use_relative_ratio": 1.0 if use_relative_ratio else 0.0,
             # keep "dr3/alpha" as the alpha actually used for weighting/clipping
             "dr3/alpha": float(alpha_used),
             "dr3/alpha_mode": float(
