@@ -39,13 +39,16 @@ kill_port() {
  # --with-alfworld
 
 python launcher.py \
-  --conf config/sciworld_grpo_3b_luffy.yaml
+  --conf config/sciworld_grpo_7b_800.yaml
+
+#python launcher.py \
+#  --conf config/sciworld_grpo_3b_luffy.yaml
 
 python launcher.py \
- --conf config/sciworld_grpo_3b_dr3_hidden.yaml
+ --conf config/sciworld_grpo_7b_dr3_hidden.yaml
 
-python launcher.py \
- --conf config/sciworld_grpo_3b_chord.yaml
+#python launcher.py \
+# --conf config/sciworld_grpo_3b_chord.yaml
 
 
 # Run GRPO with Experience Replay
