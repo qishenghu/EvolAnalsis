@@ -70,11 +70,13 @@ from agentevolver.module.adv_processor.adca_grpo_pipeline import apply_adca_grpo
 from agentevolver.module.exp_manager.exp_manager import ExperienceManager
 from agentevolver.module.exp_manager.experience_collate import (
     ExperienceMixCollateFn, 
+    FrontierExperienceMixCollateFn,
     TeacherExperienceMixCollateFn,
     LUFFYTeacherRolloutMixer,
     RePOReplayManager,
     RePORolloutMixer,
 )
+from agentevolver.module.exp_manager.cell_repair import compute_frontier_repair_weights
 from agentevolver.module.exp_manager.het_core_algos import (
     repo_compute_grpo_advantage,
     repo_compute_token_loss,
@@ -2493,12 +2495,21 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         ground_truth=gen_batch.non_tensor_batch['extras'][i]['ground_truth']
                                     ) for i in range(len(gen_batch))
                             ]
+                            for task in tasks:
+                                task.metadata = task.metadata if hasattr(task, "metadata") and task.metadata else {}
+                                task.metadata["n_offpolicy_trajectories"] = 0
+                                task.metadata["is_frontier_task"] = False
+                            current_task_id_to_group_id = {
+                                task.task_id: idx for idx, task in enumerate(tasks)
+                            }
                             
                             # ⭐ Experience Replay: 混合 on-policy 和 off-policy tasks
                             exp_replay_config = self.config.exp_manager.get("experience_replay", {})
                             teacher_exp_config = self.config.exp_manager.get("teacher_experience", {})
+                            frontier_replay_config = self.config.exp_manager.get("frontier_replay", {})
                             enable_exp_replay = exp_replay_config.get("enable", False)
                             enable_teacher_exp = teacher_exp_config.get("enable", False) and self.exp_manager.teacher_enabled
+                            enable_frontier_replay = frontier_replay_config.get("enable", False) and self.exp_manager.frontier_enabled
                             
                             # ⭐ LUFFY vs ExGRPO: 检查混合模式
                             # - "rollout_level": LUFFY 风格，每个 task 内混合 on-policy 和 teacher rollouts
@@ -2510,10 +2521,16 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             )
                             
                             experience_tasks = []
+                            frontier_exp_tasks = []
                             teacher_exp_tasks = []  # ⭐ Task 级别：Teacher experience tasks
                             offpolicy_cmt_array = []
+                            frontier_samples = []
+                            frontier_selected_cells_by_task = {}
+                            frontier_onpolicy_cmt_array = []
+                            frontier_offpolicy_cmt_array = []
                             teacher_offpolicy_cmt_array = []  # ⭐ Task 级别：Teacher off-policy trajectories
                             luffy_mixer = None  # ⭐ Rollout 级别：LUFFY mixer
+                            frontier_repair_scale = None
                             
                             if use_luffy_rollout_level:
                                 # ⭐⭐⭐ LUFFY 风格：Rollout 级别混合 ⭐⭐⭐
@@ -2538,6 +2555,41 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 # 不需要修改 tasks 列表，因为我们会在 rollout 后混入 teacher
                                 # 注意：需要修改 rollout 的 n 参数
                                 
+                            elif enable_frontier_replay:
+                                training_progress = self.global_steps / self.total_training_steps
+                                replay_start_ratio = frontier_replay_config.get("replay_start_ratio", 0.0)
+
+                                if training_progress >= replay_start_ratio:
+                                    frontier_mix_collate = FrontierExperienceMixCollateFn(
+                                        exp_manager=self.exp_manager,
+                                        train_task_manager=self.train_task_manager,
+                                        exp_ratio=frontier_replay_config.get("exp_ratio", 0.5),
+                                        replay_start_ratio=replay_start_ratio,
+                                        num_cells_per_task=frontier_replay_config.get("num_cells_per_task", 1),
+                                        continuations_per_cell=frontier_replay_config.get("continuations_per_cell", 1),
+                                        n_rollout=self.config.actor_rollout_ref.rollout.n,
+                                    )
+                                    frontier_exp_tasks, on_policy_tasks = frontier_mix_collate(
+                                        training_tasks=tasks,
+                                        training_progress=training_progress,
+                                        enable_replay=True,
+                                    )
+
+                                    if frontier_exp_tasks:
+                                        frontier_selected_cells_by_task = self.exp_manager.select_frontier_cells_for_tasks(
+                                            tasks=frontier_exp_tasks,
+                                            num_cells_per_task=frontier_replay_config.get("num_cells_per_task", 1),
+                                        )
+                                        frontier_samples = self.exp_manager.sample_frontier_replay_samples_from_cells(
+                                            selected_cells_by_task=frontier_selected_cells_by_task,
+                                            continuations_per_cell=frontier_replay_config.get("continuations_per_cell", 1),
+                                            task_id_to_group_id=current_task_id_to_group_id,
+                                        )
+                                        for task in frontier_exp_tasks:
+                                            task.metadata["n_offpolicy_trajectories"] = sum(
+                                                1 for sample in frontier_samples if sample.task_id == task.task_id
+                                            )
+
                             elif enable_exp_replay or enable_teacher_exp:
                                 # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐
                                 # 计算当前训练进度
@@ -2735,6 +2787,64 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         "luffy710/disabled": luffy_stats.get("disable_teacher_710_disabled", 0),
                                     })
                                 
+                            elif enable_frontier_replay:
+                                self.exp_manager.update_difficulty2task_dict(trajectories)
+                                frontier_task_ids = {task.task_id for task in frontier_exp_tasks}
+                                frontier_onpolicy_samples = self.exp_manager.project_trajectories_to_frontier_samples(
+                                    trajectories=trajectories,
+                                    selected_cells_by_task=frontier_selected_cells_by_task,
+                                    task_id_to_group_id=current_task_id_to_group_id,
+                                    max_samples_per_trajectory=1,
+                                )
+                                matched_cell_ids = {sample.cell_id for sample in frontier_onpolicy_samples}
+
+                                for replay_sample in frontier_samples:
+                                    task_group_id = replay_sample.metadata.get("task_group_id")
+                                    cell_group_id = replay_sample.metadata.get("cell_group_id", replay_sample.group_id)
+                                    cell_has_non_teacher = bool(replay_sample.metadata.get("cell_onpolicy_count", 0) > 0)
+                                    use_cell_group = replay_sample.cell_id in matched_cell_ids or cell_has_non_teacher
+                                    if use_cell_group:
+                                        replay_sample.group_id = int(cell_group_id)
+                                        replay_sample.metadata["frontier_group_mode"] = "cell"
+                                    elif task_group_id is not None:
+                                        replay_sample.group_id = int(task_group_id)
+                                        replay_sample.metadata["frontier_group_mode"] = "task_fallback"
+
+                                if frontier_samples:
+                                    frontier_offpolicy_cmt_array = self.env_manager.convert_cell_to_cmt(
+                                        replay_samples=frontier_samples,
+                                        config=self.config,
+                                        tokenizer=self.tokenizer,
+                                    )
+                                if frontier_onpolicy_samples:
+                                    frontier_onpolicy_cmt_array = self.env_manager.convert_cell_to_cmt(
+                                        replay_samples=frontier_onpolicy_samples,
+                                        config=self.config,
+                                        tokenizer=self.tokenizer,
+                                    )
+
+                                projected_rollout_keys = {
+                                    (sample.task_id, str(sample.metadata.get("rollout_id")))
+                                    for sample in frontier_onpolicy_samples
+                                }
+                                retained_onpolicy_trajectories = []
+                                for traj in trajectories:
+                                    rollout_key = (traj.task_id, str(getattr(traj, "rollout_id", "")))
+                                    if traj.task_id in frontier_task_ids and rollout_key in projected_rollout_keys:
+                                        continue
+                                    retained_onpolicy_trajectories.append(traj)
+
+                                all_trajectories = retained_onpolicy_trajectories.copy()
+                                if frontier_onpolicy_cmt_array:
+                                    all_trajectories.extend(frontier_onpolicy_cmt_array)
+                                if frontier_offpolicy_cmt_array:
+                                    all_trajectories.extend(frontier_offpolicy_cmt_array)
+
+                                logger.info(
+                                    f"[FRC] Merged {len(retained_onpolicy_trajectories)} retained on-policy + "
+                                    f"{len(frontier_onpolicy_cmt_array)} projected on-policy cells + "
+                                    f"{len(frontier_offpolicy_cmt_array)} replay cells"
+                                )
                             elif enable_exp_replay or enable_teacher_exp:
                                 # ⭐⭐⭐ ExGRPO 风格：Task 级别混合（向后兼容）⭐⭐⭐
                                 # 更新 difficulty2task_dict（只用 on-policy 轨迹）
@@ -2766,6 +2876,17 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             # update metrics about experience manager
                             exp_mask_ratio = gen_batch_output.batch["exp_mask"].float().mean()
                             metrics.update({"exp_mask_ratio": exp_mask_ratio.detach().item()})
+                            if enable_frontier_replay:
+                                metrics.update({
+                                    "frc/num_frontier_tasks": len(frontier_exp_tasks),
+                                    "frc/num_frontier_replay_samples": len(frontier_offpolicy_cmt_array),
+                                    "frc/num_frontier_onpolicy_samples": len(frontier_onpolicy_cmt_array),
+                                    "frc/num_frontier_selected_cells": sum(len(v) for v in frontier_selected_cells_by_task.values()),
+                                    "frc/num_frontier_task_fallback_groups": sum(
+                                        1 for sample in frontier_samples
+                                        if sample.metadata.get("frontier_group_mode") == "task_fallback"
+                                    ),
+                                })
                             context_time_cost = [x.metadata["context_time_cost"] for x in trajectories if "context_time_cost" in x.metadata]
                             if context_time_cost:
                                 metrics.update({
@@ -2850,6 +2971,18 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         old_log_prob_metrics = {"actor/entropy_loss": entropy_loss.detach().item()}
                         metrics.update(old_log_prob_metrics)
 
+                        if enable_frontier_replay and "recorded_old_log_probs" in batch.batch:
+                            try:
+                                frontier_repair_scale, frontier_repair_metrics = compute_frontier_repair_weights(
+                                    batch=batch,
+                                    current_old_log_probs=old_log_prob.batch["old_log_probs"],
+                                    frontier_cfg=frontier_replay_config,
+                                )
+                                metrics.update(frontier_repair_metrics)
+                            except Exception as _e:
+                                logger.warning(f"Failed to compute frontier repair weights: {_e}")
+                                frontier_repair_scale = None
+
                         # ⭐ Endogenous replay: split entropy by on/off-policy (LLM tokens only, in multi-turn)
                         # This is critical to analyze entropy collapse / exploration suppression caused by replay.
                         try:
@@ -2879,9 +3012,13 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         except Exception:
                             pass
                         
-                        # ⭐ Experience Replay: 替换 off-policy 数据的 old_log_prob
-                        if enable_exp_replay and "recorded_old_log_probs" in batch.batch:
-                            exp_is_correct = exp_replay_config.get("exp_is_correct", True)
+                        # ⭐ Experience Replay / Frontier Replay: 替换 off-policy 数据的 old_log_prob
+                        if (enable_exp_replay or enable_frontier_replay) and "recorded_old_log_probs" in batch.batch:
+                            exp_is_correct = (
+                                frontier_replay_config.get("exp_is_correct", True)
+                                if enable_frontier_replay
+                                else exp_replay_config.get("exp_is_correct", True)
+                            )
                             if exp_is_correct:
                                 batch = self._replace_recorded_old_log_probs(
                                     batch=batch,
@@ -2893,8 +3030,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
                         
-                        # ⭐ Experience Replay: 保存成功轨迹到内存
-                        if enable_exp_replay:
+                        # ⭐ Experience Replay / Frontier Replay: 保存 on-policy 轨迹元信息
+                        if enable_exp_replay or enable_frontier_replay:
                             n_rollout = self.config.actor_rollout_ref.rollout.n
                             # 只处理 on-policy 轨迹（前 len(trajectories) 个）
                             num_on_policy = len(trajectories)
@@ -2924,12 +3061,18 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     traj.metadata["policy_version"] = self.global_steps
                             
                             # 保存筛选后的轨迹
-                            if filtered_trajectories:
+                            if enable_exp_replay and filtered_trajectories:
                                 self.exp_manager.save_trajectories_to_memory(filtered_trajectories)
                                 logger.info(
                                     f"Saved {len(filtered_trajectories)} trajectories to memory "
                                     f"(skip_uid_set size: {len(self.exp_manager.skip_uid_set)})"
                                 )
+                            if enable_frontier_replay and filtered_trajectories:
+                                built_cells = self.exp_manager.build_frontier_cells_from_trajectories(
+                                    trajectories=filtered_trajectories,
+                                    source="onpolicy_success",
+                                )
+                                metrics["frc/built_cells_from_onpolicy"] = float(built_cells)
                         
                         # ⭐ RePO: 保存所有 on-policy 轨迹到 RePO buffer（不只是成功的）
                         if self.exp_manager.repo_enabled:
@@ -3307,6 +3450,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
+
+                        if frontier_repair_scale is not None and "advantages" in batch.batch:
+                            try:
+                                batch.batch["advantages"] = batch.batch["advantages"] * frontier_repair_scale.to(
+                                    batch.batch["advantages"].device
+                                )
+                            except Exception as _e:
+                                logger.warning(f"Failed to apply frontier repair scaling: {_e}")
 
                         # ⭐ Teacher effect diagnostics: batch-level logging + save per-rollout analysis
                         try:

@@ -162,6 +162,75 @@ class ExperienceMixCollateFn:
         return None
 
 
+class FrontierExperienceMixCollateFn(ExperienceMixCollateFn):
+    """
+    Frontier Replay Cells task-level mixing.
+
+    设计目标：
+    - 保持与 ExGRPO task-level mixing 类似的外层接口
+    - 但 off-policy 数据源不再是 whole trajectory，而是 frontier cell continuations
+    """
+
+    def __init__(
+        self,
+        exp_manager: "ExperienceManager",
+        train_task_manager,
+        exp_ratio: float = 0.5,
+        replay_start_ratio: float = 0.0,
+        num_cells_per_task: int = 1,
+        continuations_per_cell: int = 1,
+        n_rollout: int = 8,
+    ):
+        super().__init__(
+            exp_manager=exp_manager,
+            train_task_manager=train_task_manager,
+            exp_ratio=exp_ratio,
+            replay_start_ratio=replay_start_ratio,
+            offpolicy_trajectories_per_task=max(1, num_cells_per_task * continuations_per_cell),
+            n_rollout=n_rollout,
+        )
+        self.num_cells_per_task = num_cells_per_task
+        self.continuations_per_cell = continuations_per_cell
+
+    def __call__(
+        self,
+        training_tasks: List["Task"],
+        training_progress: float,
+        enable_replay: bool = True,
+    ) -> Tuple[List["Task"], List["Task"]]:
+        batch_size = len(training_tasks)
+
+        if not enable_replay or training_progress < self.replay_start_ratio:
+            return [], training_tasks
+
+        valid_task_ids = {
+            task.task_id
+            for task in training_tasks
+            if task.task_id in self.exp_manager.get_valid_frontier_task_ids()
+        }
+        target_exp_count = int(batch_size * self.exp_ratio)
+        n_exp = min(len(valid_task_ids), target_exp_count)
+        sampled_task_ids = random.sample(list(valid_task_ids), n_exp) if n_exp > 0 else []
+
+        frontier_tasks = []
+        sampled_task_ids_set = set(sampled_task_ids)
+        for task in training_tasks:
+            if task.task_id not in sampled_task_ids_set:
+                continue
+            task.metadata = task.metadata if hasattr(task, "metadata") and task.metadata else {}
+            task.metadata["n_offpolicy_trajectories"] = self.num_cells_per_task * self.continuations_per_cell
+            task.metadata["is_frontier_task"] = True
+            frontier_tasks.append(task)
+
+        on_policy_tasks = [task for task in training_tasks if task.task_id not in sampled_task_ids_set]
+
+        logger.info(
+            f"[FRC] Batch split: frontier={len(frontier_tasks)}, "
+            f"on_policy={len(on_policy_tasks)}, exp_ratio={self.exp_ratio:.2f}"
+        )
+        return frontier_tasks, on_policy_tasks
+
+
 class TeacherExperienceMixCollateFn(ExperienceMixCollateFn):
     """
     扩展的 Experience 混合函数，支持三种数据类型：

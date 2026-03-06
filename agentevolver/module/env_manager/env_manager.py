@@ -23,6 +23,7 @@ from agentevolver.module.agent_flow.base_agent_flow import BaseAgentFlow
 from agentevolver.module.env_manager.env_worker import EnvWorker
 from agentevolver.module.trainer.ae_async_llm_server_manager import BaAsyncLLMServerManager
 from agentevolver.module.task_manager.rewards import grader_manager
+from agentevolver.schema.frontier_cell import FrontierReplaySample
 from agentevolver.schema.task import Task
 from agentevolver.schema.trajectory import Trajectory, Sample
 from agentevolver.utils.step_parser import parse_response_ids_to_steps
@@ -671,6 +672,68 @@ class ParallelEnvManager(object):
         
         return cmt_array
 
+    def convert_cell_to_cmt(
+        self,
+        replay_samples: List[FrontierReplaySample],
+        config: DictConfig,
+        tokenizer,
+    ) -> List:
+        """
+        Convert frontier replay samples into CMT objects.
+
+        与 convert_offpolicy_to_cmt 的区别：
+        - replay 单位是 frontier cell continuation，而不是完整 trajectory
+        - prefix_steps 进入 prompt，suffix_steps 进入 response
+        - group_id 使用 cell_id 的稳定数值映射
+        """
+        from agentevolver.module.context_manager.cmt_linear import Linear_CMT
+        from agentevolver.module.context_manager.cmt_base import ExtendedMessage
+
+        cmt_array = []
+        for sample_idx, replay_sample in enumerate(replay_samples):
+            cmt = Linear_CMT(config, tokenizer)
+            is_frontier_replay = replay_sample.source != "onpolicy_current"
+            cmt.data_id = str(int(replay_sample.group_id))
+            cmt.rollout_id = replay_sample.metadata.get("rollout_id", f"frontier.{sample_idx}")
+            cmt.task_id = replay_sample.task_id
+            cmt.reward = replay_sample.reward
+            cmt.is_terminated = True
+
+            full_steps = list(replay_sample.prefix_steps) + list(replay_sample.suffix_steps)
+            response_start_index = len(replay_sample.prefix_steps)
+            for msg in full_steps:
+                role = msg.get("role", "user")
+                author = msg.get("author", role)
+                if role == "assistant":
+                    author = "llm"
+                elif role == "user":
+                    author = "user"
+                ext_msg = ExtendedMessage(
+                    author=author,
+                    role=role,
+                    content=msg.get("content", ""),
+                    token_generator="auto",
+                    tokenizer=tokenizer,
+                )
+                cmt.full_context.append(ext_msg)
+
+            cmt.metadata["is_experience_replay"] = is_frontier_replay
+            cmt.metadata["is_frontier_replay"] = is_frontier_replay
+            cmt.metadata["is_frontier_projection"] = not is_frontier_replay
+            cmt.metadata["frontier_cell_id"] = replay_sample.cell_id
+            cmt.metadata["frontier_group_id"] = int(replay_sample.group_id)
+            cmt.metadata["frontier_response_start_index"] = response_start_index
+            cmt.metadata["frontier_source"] = replay_sample.source
+            cmt.metadata["old_log_probs"] = replay_sample.metadata.get("old_log_probs") if is_frontier_replay else None
+            cmt.metadata["response_mask"] = replay_sample.metadata.get("response_mask") if is_frontier_replay else None
+            cmt.metadata["is_teacher"] = replay_sample.metadata.get("is_teacher", False)
+            cmt.metadata["frontier_hash"] = replay_sample.metadata.get("frontier_hash")
+            cmt.metadata["frontier_depth"] = replay_sample.metadata.get("frontier_depth")
+            cmt.metadata["cell_success_rate"] = replay_sample.metadata.get("cell_success_rate")
+            cmt_array.append(cmt)
+
+        return cmt_array
+
 
     def get_extra(self, cmt):
         """
@@ -695,6 +758,11 @@ class ParallelEnvManager(object):
             "policy_version": cmt.metadata.get("policy_version"),
             "entropy": cmt.metadata.get("entropy"),
             "task_id": cmt.task_id,  # ⭐ 保存 task_id 用于后续处理
+            "group_id": cmt.metadata.get("frontier_group_id"),
+            "is_frontier_replay": cmt.metadata.get("is_frontier_replay", False),
+            "is_frontier_projection": cmt.metadata.get("is_frontier_projection", False),
+            "frontier_cell_id": cmt.metadata.get("frontier_cell_id"),
+            "frontier_source": cmt.metadata.get("frontier_source"),
             # ⭐ Teacher Experience: 传递 teacher 特有字段
             "is_teacher": cmt.metadata.get("is_teacher", False),
             "has_log_prob": cmt.metadata.get("has_log_prob", False),
@@ -931,7 +999,10 @@ class ParallelEnvManager(object):
         position_ids = torch.cat((prompt_position_ids, response_position_ids), dim=-1)  # ⭐ Concatenate prompt and response position IDs
         loss_mask = torch.cat((prompt_loss_mask, response_loss_mask), dim=-1)  # ⭐ Concatenate prompt and response loss masks
         # shuchang: construct group_id
-        group_ids = torch.tensor([int(s.data_id) for s in samples], dtype=torch.long)  # ⭐ Construct group IDs from sample data
+        group_ids = torch.tensor(
+            [int(s.extras.get("group_id", s.data_id)) for s in samples],
+            dtype=torch.long,
+        )  # ⭐ Construct group IDs from sample data or frontier group ids
         # Validate masks have same shape
         exp_mask = torch.cat((prompt_exp_mask_list, response_exp_mask_list), dim=-1)  # ⭐ Concatenate prompt and response experience masks
 

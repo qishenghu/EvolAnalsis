@@ -1,5 +1,6 @@
 import random
 import re
+import hashlib
 import numpy as np
 import torch
 from loguru import logger
@@ -11,7 +12,8 @@ from itertools import groupby
 from concurrent.futures import as_completed, Future
 from concurrent.futures.thread import ThreadPoolExecutor
 from agentevolver.schema.task import Task
-from agentevolver.schema.trajectory import Trajectory
+from agentevolver.schema.trajectory import Trajectory, Reward
+from agentevolver.schema.frontier_cell import FrontierCell, CellContinuation, FrontierReplaySample
 from agentevolver.client.em_client import EMClient
 
 
@@ -67,6 +69,25 @@ class ExperienceManager(object):
         self.experience_rbound = exp_replay_config.get("experience_rbound", 8)
         self.exp_select_mode = exp_replay_config.get("exp_select_mode", "argmin")
         self.exp_ratio = exp_replay_config.get("exp_ratio", 0.5)
+
+        # ⭐ Frontier Replay Cells (FRC-Lite) 相关属性
+        frontier_config = self.exp_manager_config.get("frontier_replay", {})
+        self.frontier_enabled = frontier_config.get("enable", False)
+        self.frontier_exp_ratio = frontier_config.get("exp_ratio", 0.5)
+        self.frontier_replay_start_ratio = frontier_config.get("replay_start_ratio", 0.0)
+        self.frontier_num_cells_per_task = frontier_config.get("num_cells_per_task", 1)
+        self.frontier_continuations_per_cell = frontier_config.get("continuations_per_cell", 1)
+        self.frontier_max_cells_per_task = frontier_config.get("max_cells_per_task", 32)
+        self.frontier_max_frontiers_per_traj = frontier_config.get("max_frontiers_per_traj", 4)
+        self.frontier_min_assistant_turns = frontier_config.get("min_assistant_turns", 1)
+        self.frontier_include_teacher = frontier_config.get("include_teacher", True)
+        self.frontier_include_successful_onpolicy = frontier_config.get("include_successful_onpolicy", True)
+        self.frontier_store_partial_onpolicy = frontier_config.get("store_partial_onpolicy", False)
+        self.frontier_schedule_mode = frontier_config.get("schedule_mode", "progress")
+        self.frontier_partial_reward_threshold = frontier_config.get("partial_reward_threshold", 0.0)
+        self.frontier_group_id_mod = int(frontier_config.get("group_id_mod", 1000000007))
+        self.frontier_task2cells: Dict[str, List[FrontierCell]] = defaultdict(list)
+        self.frontier_cell_id2cell: Dict[str, FrontierCell] = {}
         
         # ⭐ Teacher Experience Replay 相关属性 (LUFFY)
         teacher_config = self.exp_manager_config.get("teacher_experience", {})
@@ -98,6 +119,19 @@ class ExperienceManager(object):
                 self.load_teacher_trajectories(self.teacher_data_path)
             except Exception as e:
                 logger.warning(f"Failed to load teacher trajectories from {self.teacher_data_path}: {e}")
+
+        if self.frontier_enabled and self.frontier_include_teacher and self.teacher_task2trajectories:
+            try:
+                self.build_frontier_cells_from_trajectories(
+                    trajectories=[
+                        traj
+                        for trajs in self.teacher_task2trajectories.values()
+                        for traj in trajs
+                    ],
+                    source="teacher",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to initialize teacher frontier cells: {e}")
         
         # ⭐ RePO (Replay-Enhanced Policy Optimization) 相关属性
         repo_config = self.exp_manager_config.get("repo", {})
@@ -661,6 +695,357 @@ class ExperienceManager(object):
                     if task_id in self.task2trajectories and len(self.task2trajectories[task_id]) > 0:
                         valid_task_ids.append(task_id)
         return valid_task_ids
+
+    # ==================== Frontier Replay Cells (FRC-Lite) Methods ====================
+
+    def _normalize_frontier_text(self, text: str) -> str:
+        text = (text or "").lower()
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"[^a-z0-9 ,.:;_/-]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) > 256:
+            text = text[:256]
+        return text
+
+    def _frontier_group_id_from_cell_id(self, cell_id: str) -> int:
+        # Stable positive integer used by group_ids in DataProto.
+        digest = hashlib.md5(cell_id.encode("utf-8")).hexdigest()
+        return int(digest[:12], 16) % self.frontier_group_id_mod
+
+    def _get_frontier_candidate_indices(self, steps: List[dict]) -> List[int]:
+        assistant_turns = 0
+        candidate_indices: List[int] = []
+        for idx, msg in enumerate(steps[:-1]):
+            role = str(msg.get("role", ""))
+            if role == "assistant":
+                assistant_turns += 1
+            if role == "user" and assistant_turns >= self.frontier_min_assistant_turns:
+                has_future_assistant = any(
+                    str(fut.get("role", "")) == "assistant" for fut in steps[idx + 1 :]
+                )
+                if has_future_assistant:
+                    candidate_indices.append(idx)
+
+        if len(candidate_indices) <= self.frontier_max_frontiers_per_traj:
+            return candidate_indices
+
+        # Evenly subsample frontier points to avoid exploding cells for long trajectories.
+        selected = np.linspace(
+            0,
+            len(candidate_indices) - 1,
+            num=self.frontier_max_frontiers_per_traj,
+            dtype=int,
+        ).tolist()
+        return [candidate_indices[i] for i in selected]
+
+    def _build_frontier_hash(self, task_id: str, prefix_steps: List[dict]) -> str:
+        last_user = ""
+        last_assistant = ""
+        for msg in reversed(prefix_steps):
+            role = str(msg.get("role", ""))
+            content = str(msg.get("content", ""))
+            if not last_user and role == "user":
+                last_user = self._normalize_frontier_text(content)
+            elif not last_assistant and role == "assistant":
+                last_assistant = self._normalize_frontier_text(content)
+            if last_user and last_assistant:
+                break
+        return f"{task_id}::u::{last_user}::a::{last_assistant}"
+
+    def _prune_frontier_cells_if_needed(self, task_id: str) -> None:
+        cells = self.frontier_task2cells.get(task_id, [])
+        if len(cells) <= self.frontier_max_cells_per_task:
+            return
+
+        cells_sorted = sorted(
+            cells,
+            key=lambda c: (c.stats.visit_count, c.stats.success_rate, c.stats.progress_score_mean),
+        )
+        while len(cells_sorted) > self.frontier_max_cells_per_task:
+            removed = cells_sorted.pop(0)
+            self.frontier_cell_id2cell.pop(removed.cell_id, None)
+        self.frontier_task2cells[task_id] = cells_sorted
+
+    def build_frontier_cells_from_trajectories(
+        self,
+        trajectories: List[Trajectory],
+        source: str,
+    ) -> int:
+        if not self.frontier_enabled:
+            return 0
+
+        built = 0
+        for traj in trajectories:
+            task_id = getattr(traj, "task_id", None) or traj.metadata.get("task_id", "")
+            if not task_id:
+                continue
+
+            success_rate = float(getattr(traj.reward, "success_rate", 0.0)) if traj.reward else 0.0
+            outcome = float(getattr(traj.reward, "outcome", 0.0)) if traj.reward else 0.0
+
+            if source == "teacher":
+                allow = True
+            elif success_rate > 0.0:
+                allow = self.frontier_include_successful_onpolicy
+            else:
+                allow = self.frontier_store_partial_onpolicy and outcome >= self.frontier_partial_reward_threshold
+            if not allow:
+                continue
+
+            steps = traj.steps if hasattr(traj, "steps") else []
+            if not steps or len(steps) < 3:
+                continue
+
+            candidate_indices = self._get_frontier_candidate_indices(steps)
+            if not candidate_indices:
+                continue
+
+            for frontier_idx in candidate_indices:
+                prefix_steps = steps[: frontier_idx + 1]
+                suffix_steps = steps[frontier_idx + 1 :]
+                if not suffix_steps:
+                    continue
+                if not any(str(msg.get("role", "")) == "assistant" for msg in suffix_steps):
+                    continue
+
+                frontier_hash = self._build_frontier_hash(task_id, prefix_steps)
+                cell_id = f"{task_id}::{frontier_hash}"
+                cell = self.frontier_cell_id2cell.get(cell_id)
+                if cell is None:
+                    cell = FrontierCell(
+                        cell_id=cell_id,
+                        task_id=task_id,
+                        frontier_hash=frontier_hash,
+                        frontier_depth=sum(1 for msg in prefix_steps if str(msg.get("role", "")) == "assistant"),
+                        prefix_steps=prefix_steps,
+                        metadata={"created_from": source},
+                    )
+                    self.frontier_cell_id2cell[cell_id] = cell
+                    self.frontier_task2cells[task_id].append(cell)
+
+                continuation = CellContinuation(
+                    continuation_id=f"{cell_id}::{traj.rollout_id}::{frontier_idx}",
+                    task_id=task_id,
+                    cell_id=cell_id,
+                    source=source,
+                    suffix_steps=suffix_steps,
+                    success_label=success_rate,
+                    final_reward=outcome,
+                    progress_score=float(frontier_idx),
+                    old_log_probs=None,
+                    response_mask=None,
+                    metadata={
+                        "rollout_id": getattr(traj, "rollout_id", ""),
+                        "policy_version": traj.metadata.get("policy_version"),
+                        "is_teacher": bool(traj.metadata.get("is_teacher", False) or source == "teacher"),
+                        "raw_old_log_probs": traj.metadata.get("old_log_probs"),
+                        "raw_response_mask": traj.metadata.get("response_mask"),
+                    },
+                )
+                cell.add_continuation(continuation)
+                built += 1
+
+            self._prune_frontier_cells_if_needed(task_id)
+
+        if built > 0:
+            logger.info(
+                f"[FRC] Built {built} frontier continuations from {len(trajectories)} trajectories. "
+                f"tasks_with_cells={len(self.frontier_task2cells)}"
+            )
+        return built
+
+    def get_valid_frontier_task_ids(self) -> List[str]:
+        valid_ids: List[str] = []
+        for task_id, cells in self.frontier_task2cells.items():
+            if task_id in self.skip_uid_set:
+                continue
+            if any(len(cell.suffix_pool) > 0 for cell in cells):
+                valid_ids.append(task_id)
+        return valid_ids
+
+    def select_frontier_cells_for_tasks(
+        self,
+        tasks: List[Task],
+        num_cells_per_task: Optional[int] = None,
+    ) -> Dict[str, List[FrontierCell]]:
+        if not self.frontier_enabled:
+            return {}
+
+        num_cells_per_task = num_cells_per_task or self.frontier_num_cells_per_task
+        selected: Dict[str, List[FrontierCell]] = {}
+
+        for task in tasks:
+            task_id = task.task_id
+            cells = [cell for cell in self.frontier_task2cells.get(task_id, []) if cell.suffix_pool]
+            if not cells:
+                continue
+
+            if self.frontier_schedule_mode == "progress":
+                cells = sorted(
+                    cells,
+                    key=lambda c: (c.stats.utility, c.stats.progress_score_mean, c.stats.visit_count),
+                    reverse=True,
+                )
+                selected_cells = cells[: min(num_cells_per_task, len(cells))]
+            else:
+                selected_cells = random.sample(cells, min(num_cells_per_task, len(cells)))
+
+            if selected_cells:
+                selected[task_id] = selected_cells
+
+        return selected
+
+    def sample_frontier_replay_samples_from_cells(
+        self,
+        selected_cells_by_task: Dict[str, List[FrontierCell]],
+        continuations_per_cell: Optional[int] = None,
+        task_id_to_group_id: Optional[Dict[str, int]] = None,
+    ) -> List[FrontierReplaySample]:
+        if not self.frontier_enabled:
+            return []
+
+        continuations_per_cell = continuations_per_cell or self.frontier_continuations_per_cell
+        replay_samples: List[FrontierReplaySample] = []
+
+        for task_id, selected_cells in selected_cells_by_task.items():
+            task_group_id = task_id_to_group_id.get(task_id) if task_id_to_group_id else None
+            for cell in selected_cells:
+                pool = cell.suffix_pool
+                if len(pool) <= continuations_per_cell:
+                    chosen = list(pool)
+                else:
+                    chosen = random.sample(pool, continuations_per_cell)
+
+                for cont in chosen:
+                    cell_group_id = self._frontier_group_id_from_cell_id(cell.cell_id)
+                    replay_samples.append(
+                        FrontierReplaySample(
+                            task_id=task_id,
+                            cell_id=cell.cell_id,
+                            group_id=cell_group_id,
+                            prefix_steps=cell.prefix_steps,
+                            suffix_steps=cont.suffix_steps,
+                            reward=Reward(
+                                outcome=cont.final_reward,
+                                success_rate=cont.success_label,
+                            ),
+                            source=cont.source,
+                            metadata={
+                                "rollout_id": cont.metadata.get("rollout_id"),
+                                "old_log_probs": cont.old_log_probs,
+                                "response_mask": cont.response_mask,
+                                "progress_score": cont.progress_score,
+                                "frontier_hash": cell.frontier_hash,
+                                "frontier_depth": cell.frontier_depth,
+                                "is_teacher": bool(cont.metadata.get("is_teacher", False)),
+                                "cell_success_rate": cell.stats.success_rate,
+                                "task_group_id": task_group_id,
+                                "cell_group_id": cell_group_id,
+                                "cell_onpolicy_count": cell.stats.onpolicy_count,
+                                "cell_teacher_count": cell.stats.teacher_count,
+                            },
+                        )
+                    )
+
+        return replay_samples
+
+    def project_trajectories_to_frontier_samples(
+        self,
+        trajectories: List[Trajectory],
+        selected_cells_by_task: Dict[str, List[FrontierCell]],
+        task_id_to_group_id: Optional[Dict[str, int]] = None,
+        max_samples_per_trajectory: int = 1,
+    ) -> List[FrontierReplaySample]:
+        if not self.frontier_enabled:
+            return []
+
+        projected_samples: List[FrontierReplaySample] = []
+        for traj in trajectories:
+            task_id = getattr(traj, "task_id", None) or traj.metadata.get("task_id", "")
+            selected_cells = selected_cells_by_task.get(task_id, [])
+            if not task_id or not selected_cells:
+                continue
+
+            steps = traj.steps if hasattr(traj, "steps") else []
+            if not steps or len(steps) < 3:
+                continue
+
+            frontier_candidates = {}
+            for frontier_idx in self._get_frontier_candidate_indices(steps):
+                prefix_steps = steps[: frontier_idx + 1]
+                suffix_steps = steps[frontier_idx + 1 :]
+                if not suffix_steps:
+                    continue
+                if not any(str(msg.get("role", "")) == "assistant" for msg in suffix_steps):
+                    continue
+                frontier_hash = self._build_frontier_hash(task_id, prefix_steps)
+                frontier_candidates[frontier_hash] = (frontier_idx, prefix_steps, suffix_steps)
+
+            if not frontier_candidates:
+                continue
+
+            task_group_id = task_id_to_group_id.get(task_id) if task_id_to_group_id else None
+            matched_count = 0
+            for cell in sorted(selected_cells, key=lambda x: x.frontier_depth, reverse=True):
+                if cell.frontier_hash not in frontier_candidates:
+                    continue
+                frontier_idx, prefix_steps, suffix_steps = frontier_candidates[cell.frontier_hash]
+                cell_group_id = self._frontier_group_id_from_cell_id(cell.cell_id)
+                projected_samples.append(
+                    FrontierReplaySample(
+                        task_id=task_id,
+                        cell_id=cell.cell_id,
+                        group_id=cell_group_id,
+                        prefix_steps=prefix_steps,
+                        suffix_steps=suffix_steps,
+                        reward=Reward(
+                            outcome=float(getattr(traj.reward, "outcome", 0.0)) if traj.reward else 0.0,
+                            success_rate=float(getattr(traj.reward, "success_rate", 0.0)) if traj.reward else 0.0,
+                        ),
+                        source="onpolicy_current",
+                        metadata={
+                            "rollout_id": getattr(traj, "rollout_id", ""),
+                            "old_log_probs": None,
+                            "response_mask": None,
+                            "progress_score": float(frontier_idx),
+                            "frontier_hash": cell.frontier_hash,
+                            "frontier_depth": cell.frontier_depth,
+                            "is_teacher": False,
+                            "cell_success_rate": cell.stats.success_rate,
+                            "task_group_id": task_group_id,
+                            "cell_group_id": cell_group_id,
+                            "cell_onpolicy_count": cell.stats.onpolicy_count,
+                            "cell_teacher_count": cell.stats.teacher_count,
+                            "origin": "current_rollout_projection",
+                        },
+                    )
+                )
+                matched_count += 1
+                if matched_count >= max_samples_per_trajectory:
+                    break
+
+        return projected_samples
+
+    def sample_frontier_replay_samples(
+        self,
+        tasks: List[Task],
+        num_cells_per_task: Optional[int] = None,
+        continuations_per_cell: Optional[int] = None,
+    ) -> List[FrontierReplaySample]:
+        selected_cells = self.select_frontier_cells_for_tasks(
+            tasks=tasks,
+            num_cells_per_task=num_cells_per_task,
+        )
+        replay_samples = self.sample_frontier_replay_samples_from_cells(
+            selected_cells_by_task=selected_cells,
+            continuations_per_cell=continuations_per_cell,
+        )
+        for task in tasks:
+            task.metadata = task.metadata if getattr(task, "metadata", None) else {}
+            task.metadata["n_offpolicy_trajectories"] = sum(
+                1 for sample in replay_samples if sample.task_id == task.task_id
+            )
+        return replay_samples
 
     # ==================== Teacher Experience Replay Methods (LUFFY) ====================
     

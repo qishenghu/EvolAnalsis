@@ -698,6 +698,7 @@ class Linear_CMT(Trajectory, ContextManagerBase):
 
         # ⭐ 检查是否为 experience replay 数据
         is_experience_replay = self.metadata.get("is_experience_replay", False)
+        frontier_response_start_index = self.metadata.get("frontier_response_start_index", None)
 
         exp_worker = ExperienceWorker(self.config)
         for i, ext_msg in enumerate(ext_steps):
@@ -717,11 +718,24 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         attention_mask = []
         loss_mask = []
         split_prompt_reponse_index = -1
-        for ext_msg in ext_steps:
+        for msg_idx, ext_msg in enumerate(ext_steps):
+            frontier_response_started = (
+                frontier_response_start_index is not None and msg_idx >= int(frontier_response_start_index)
+            )
             # find split index, this have to be done before input_ids += ext_msg.token_arr
             # ⭐ Experience Replay: 对于 off-policy 数据，所有 LLM 消息都应该参与 loss 计算
             # 使用 exp_mask 区分 on-policy 和 off-policy，而不是让 loss_mask=0
-            if (split_prompt_reponse_index == -1) and (ext_msg.need_training or (is_experience_replay and ext_msg.role == "assistant")):
+            if (split_prompt_reponse_index == -1) and (
+                (
+                    frontier_response_start_index is not None
+                    and frontier_response_started
+                    and ext_msg.role == "assistant"
+                )
+                or (
+                    frontier_response_start_index is None
+                    and (ext_msg.need_training or (is_experience_replay and ext_msg.role == "assistant"))
+                )
+            ):
                 split_prompt_reponse_index = len(input_ids)
                 # 对于 experience replay，允许 author 为 "llm(do_not_train)"
                 if not is_experience_replay:
@@ -730,7 +744,9 @@ class Linear_CMT(Trajectory, ContextManagerBase):
             attention_mask += [1] * len(ext_msg.token_arr)
             # ⭐ Experience Replay: 对于 off-policy 数据，LLM 消息的 loss_mask 应该为 1（参与 loss 计算）
             # 使用 exp_mask 来区分 on/off-policy，而不是用 loss_mask=0
-            if is_experience_replay and ext_msg.role == "assistant":
+            if is_experience_replay and ext_msg.role == "assistant" and (
+                frontier_response_start_index is None or frontier_response_started
+            ):
                 # Off-policy LLM 消息：loss_mask = 1（参与 off-policy loss 计算）
                 msg_loss_mask = [1] * len(ext_msg.token_arr)
             else:
