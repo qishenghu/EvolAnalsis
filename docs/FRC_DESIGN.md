@@ -37,7 +37,14 @@
   - 其中 `dr3_local` 是 lightweight local-ratio proxy，不是单独训练的 local discriminator
   - 默认 `exp_is_correct=false`，不复用 whole-trajectory 级别 recorded old log prob 对齐
 - 当前 frontier abstraction：
-  - FRC-lite 第一版使用“最近 user/assistant 文本归一化”构造 `frontier_hash`
+  - 当前 `frontier_hash` 使用：
+    - 当前 frontier 对应 `user` 消息中的 observation 主体
+    - 最近 1-2 个 `assistant` 的 `Action:` 行
+  - 会显式剔除：
+    - `Thought`
+    - `Available actions`
+    - `OBJ must be replaced ...` 之类 action hints
+    - 初始 user 消息里的 `Task: ... Current observation:` 包装前缀
   - 还没有实现 inventory / object-state 级显式 abstraction
 
 ---
@@ -343,10 +350,15 @@ FRC 中的理想语义应改为：
 当前实现中的 `frontier_hash` 规则是：
 
 - task 相同
-- 取 prefix 中最近的 `user` 文本与最近的 `assistant` 文本
-- 做大小写归一化、空白压缩、字符裁剪后拼成 hash key
+- 取 prefix 中最近一个 `user` 消息作为当前 frontier observation
+- 从该 `user` 消息中提取 observation 主体，去掉：
+  - `Available actions:`
+  - `OBJ must be replaced ...`
+  - 初始消息中的 `Task:` / `Current observation:` 包装
+- 取 prefix 中最近 1-2 个 `assistant` 消息，但只保留各自的 `Action:` 行
+- 对 observation 与 action 做统一归一化后拼成 hash key
 
-也就是说，当前版本使用的是**text-conditioned frontier abstraction**，而不是显式的 inventory/object-state abstraction。
+也就是说，当前版本使用的是**observation + recent actions conditioned frontier abstraction**，而不是显式的 inventory/object-state abstraction，也不会把 `Thought` 文本直接放进 hash。
 
 这是一种 FRC-lite 的工程折中，优点是：
 

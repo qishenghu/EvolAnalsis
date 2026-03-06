@@ -84,7 +84,8 @@
   - projected on-policy continuation 与 replay continuation 一起进入 GRPO
 
 - 当前版本的 frontier abstraction 是：
-  - 基于最近 `user/assistant` 文本归一化构造 `frontier_hash`
+  - 基于“当前 observation 主体 + 最近 1-2 个 action”构造 `frontier_hash`
+  - 会显式去掉 `Thought` 与 action hints
   - 不是显式 inventory / object-state abstraction
 
 - 当前版本的 `dr3_local` 是 lightweight local-ratio proxy：

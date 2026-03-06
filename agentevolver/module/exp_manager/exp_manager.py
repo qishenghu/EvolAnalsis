@@ -707,6 +707,45 @@ class ExperienceManager(object):
             text = text[:256]
         return text
 
+    def _extract_action_signature(self, content: str) -> str:
+        lines = str(content or "").split("\n")
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped.lower().startswith("action:"):
+                continue
+            after_colon = stripped[len("action:"):].strip()
+            if after_colon:
+                return self._normalize_frontier_text(after_colon)
+            for j in range(i + 1, len(lines)):
+                next_line = lines[j].strip()
+                if next_line:
+                    return self._normalize_frontier_text(next_line)
+            return "action_empty"
+        # Fallback for older / malformed traces that only contain raw action text.
+        tail = lines[-1].strip() if lines else ""
+        return self._normalize_frontier_text(tail) if tail else "action_missing"
+
+    def _strip_action_hints_for_hash(self, content: str) -> str:
+        lines = str(content or "").split("\n")
+        kept: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            lowered = stripped.lower()
+            if lowered.startswith("available actions:") or lowered.startswith("obj candidates:") or lowered.startswith("obj must be replaced"):
+                break
+            kept.append(line)
+        return "\n".join(kept).strip()
+
+    def _extract_observation_signature(self, content: str) -> str:
+        text = self._strip_action_hints_for_hash(content)
+        match = re.search(r"current observation:\s*", text, flags=re.IGNORECASE)
+        if match:
+            text = text[match.end():]
+        else:
+            text = re.sub(r"^\s*task:\s*.*$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+        text = text.strip()
+        return self._normalize_frontier_text(text if text else "observation_missing")
+
     def _frontier_group_id_from_cell_id(self, cell_id: str) -> int:
         # Stable positive integer used by group_ids in DataProto.
         digest = hashlib.md5(cell_id.encode("utf-8")).hexdigest()
@@ -739,18 +778,24 @@ class ExperienceManager(object):
         return [candidate_indices[i] for i in selected]
 
     def _build_frontier_hash(self, task_id: str, prefix_steps: List[dict]) -> str:
-        last_user = ""
-        last_assistant = ""
+        last_observation = ""
+        recent_actions: List[str] = []
         for msg in reversed(prefix_steps):
             role = str(msg.get("role", ""))
             content = str(msg.get("content", ""))
-            if not last_user and role == "user":
-                last_user = self._normalize_frontier_text(content)
-            elif not last_assistant and role == "assistant":
-                last_assistant = self._normalize_frontier_text(content)
-            if last_user and last_assistant:
+            if not last_observation and role == "user":
+                last_observation = self._extract_observation_signature(content)
+            elif role == "assistant" and len(recent_actions) < 2:
+                recent_actions.append(self._extract_action_signature(content))
+            if last_observation and len(recent_actions) >= 2:
                 break
-        return f"{task_id}::u::{last_user}::a::{last_assistant}"
+        while len(recent_actions) < 2:
+            recent_actions.append("action_missing")
+        last_action = recent_actions[0]
+        prev_action = recent_actions[1]
+        if not last_observation:
+            last_observation = "observation_missing"
+        return f"{task_id}::obs::{last_observation}::a1::{last_action}::a2::{prev_action}"
 
     def _prune_frontier_cells_if_needed(self, task_id: str) -> None:
         cells = self.frontier_task2cells.get(task_id, [])

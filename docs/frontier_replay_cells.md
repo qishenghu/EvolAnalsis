@@ -17,7 +17,7 @@
 >   - 当前 on-policy trajectory 会被投影成 frontier-conditioned continuation，再与 replay continuation 一起训练；
 >   - grouping 优先按 `cell_id`，必要时对 teacher-only unmatched cells 回退到 task-level group；
 >   - `dr3_local` 当前是 lightweight local-ratio proxy，而不是单独训练的 local discriminator；
->   - `frontier_hash` 当前使用最近 `user/assistant` 文本归一化，而不是显式 object-state abstraction。
+>   - `frontier_hash` 当前使用“observation 主体 + 最近 1-2 个 action”，不会把 `Thought` 直接纳入 hash，也还不是显式 object-state abstraction。
 
 ## 一、核心结论
 
