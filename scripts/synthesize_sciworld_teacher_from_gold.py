@@ -30,31 +30,31 @@ At each step, you will receive:
 
 Available actions:
 [
-{"action": "open OBJ", "description": "open a container"},
-{"action": "close OBJ", "description": "close a container"},
-{"action": "activate OBJ", "description": "activate a device"},
-{"action": "deactivate OBJ", "description": "deactivate a device"},
-{"action": "connect OBJ to OBJ", "description": "connect electrical components"},
-{"action": "disconnect OBJ", "description": "disconnect electrical components"},
-{"action": "use OBJ [on OBJ]", "description": "use a device/item"},
-{"action": "look around", "description": "describe the current room"},
-{"action": "look at OBJ", "description": "describe an object in detail"},
-{"action": "look in OBJ", "description": "describe a container's contents"},
-{"action": "read OBJ", "description": "read a note or book"},
-{"action": "move OBJ to OBJ", "description": "move an object to a container"},
-{"action": "pick up OBJ", "description": "move an object to the inventory"},
-{"action": "put down OBJ", "description": "drop an inventory item"},
-{"action": "pour OBJ into OBJ", "description": "pour a liquid into a container"},
-{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"},
-{"action": "mix OBJ", "description": "chemically mix a container"},
-{"action": "go to LOC", "description": "move to a new location"},
-{"action": "eat OBJ", "description": "eat a food"},
-{"action": "flush OBJ", "description": "flush a toilet"},
-{"action": "focus on OBJ", "description": "signal intent on a task object"},
-{"action": "wait", "description": "take no action for 10 iterations"},
-{"action": "wait1", "description": "take no action for 1 iteration"},
-{"action": "task", "description": "describe current task"},
-{"action": "inventory", "description": "list your inventory"}
+{{"action": "open OBJ", "description": "open a container"}},
+{{"action": "close OBJ", "description": "close a container"}},
+{{"action": "activate OBJ", "description": "activate a device"}},
+{{"action": "deactivate OBJ", "description": "deactivate a device"}},
+{{"action": "connect OBJ to OBJ", "description": "connect electrical components"}},
+{{"action": "disconnect OBJ", "description": "disconnect electrical components"}},
+{{"action": "use OBJ [on OBJ]", "description": "use a device/item"}},
+{{"action": "look around", "description": "describe the current room"}},
+{{"action": "look at OBJ", "description": "describe an object in detail"}},
+{{"action": "look in OBJ", "description": "describe a container's contents"}},
+{{"action": "read OBJ", "description": "read a note or book"}},
+{{"action": "move OBJ to OBJ", "description": "move an object to a container"}},
+{{"action": "pick up OBJ", "description": "move an object to the inventory"}},
+{{"action": "put down OBJ", "description": "drop an inventory item"}},
+{{"action": "pour OBJ into OBJ", "description": "pour a liquid into a container"}},
+{{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"}},
+{{"action": "mix OBJ", "description": "chemically mix a container"}},
+{{"action": "go to LOC", "description": "move to a new location"}},
+{{"action": "eat OBJ", "description": "eat a food"}},
+{{"action": "flush OBJ", "description": "flush a toilet"}},
+{{"action": "focus on OBJ", "description": "signal intent on a task object"}},
+{{"action": "wait", "description": "take no action for 10 iterations"}},
+{{"action": "wait1", "description": "take no action for 1 iteration"}},
+{{"action": "task", "description": "describe current task"}},
+{{"action": "inventory", "description": "list your inventory"}}
 ]
 
 Important:
@@ -62,13 +62,16 @@ Important:
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
 4. OBJ in the selected action should be replaced with one of the OBJ candidates using the exact string as provided.
-5. If the environment returns "No known action matches that input.", that means your previous action is invalid and you should try more options.
+5. If the task asks you to focus on a specific target, only use FOCUS on that target and not on unrelated objects or containers.
+6. If the environment returns \"No known action matches that input.\", that means your previous action is invalid and you should try more options.
 
-In each turn, you should choose from two answer formats: "THOUGHT" or "ACTION".
-- If you choose "THOUGHT", first analyze the task and current state, then output your action.
-  Format: "Thought:\\nyour thoughts.\\n\\nAction:\\nyour next action"
-- If you choose "ACTION", directly output the action.
-  Format: "Action:\\nyour next action"
+In each turn, you must output your thought/reasoning and then output your action in the following format:
+```
+Thought:
+your thoughts.
+Action:
+your next action
+```
 '''
 
 # ---------------------------------------------------------------------------
@@ -107,25 +110,73 @@ I already checked the counter drawer and it didn't contain orange juice. Since f
 # Hint rendering – matches sciworld_env.py._get_action_hints() format
 # ===================================================================
 
-def render_action_hints(possible_actions: Any, possible_objects: Any) -> str:
+def _clean_focus_item(item: str) -> str:
+    item = (item or "").strip()
+    item = re.sub(r"^(the|a|an)\s+", "", item, flags=re.IGNORECASE)
+    item = re.sub(r"\s+", " ", item)
+    return item.strip()
+
+
+def _extract_focus_items(task_description: str) -> List[str]:
+    raw_items = re.findall(r"focus on\s+([^.,;]+)", task_description or "", flags=re.IGNORECASE)
+    cleaned: List[str] = []
+    skip_generic = {"thing", "object", "item", "it"}
+    for item in raw_items:
+        focus_item = _clean_focus_item(item)
+        if not focus_item:
+            continue
+        if focus_item.lower() in skip_generic:
+            continue
+        if focus_item not in cleaned:
+            cleaned.append(focus_item)
+    return cleaned
+
+
+def build_focus_hint(task_description: str) -> str:
+    focus_items = _extract_focus_items(task_description)
+    if not focus_items:
+        return ""
+    targets = ", ".join(focus_items)
+    return (
+        "Important! You can only use FOCUS actions on these task-required targets: "
+        f"{targets}.\n"
+        "You cannot FOCUS on arbitrary objects. Please only use FOCUS as required by the task description, "
+        "and focus on the target itself rather than its container."
+    )
+
+
+def render_action_hints(possible_actions: Any, possible_objects: Any, task_description: str = "") -> str:
     """Render action hints in the same format as sciworld_env.py._get_action_hints()."""
-    hint = ""
+    parts: List[str] = []
     if possible_actions:
-        hint += f"Available actions: {possible_actions}\n"
+        parts.append(f"Available actions: {possible_actions}")
     if possible_objects:
-        hint += f"OBJ must be replaced with exactly one of the following candidates, using the exact string as provided: {possible_objects}."
-    return hint.strip()
+        parts.append(
+            "OBJ must be replaced with exactly one of the following candidates, "
+            f"using the exact string as provided: {possible_objects}."
+        )
+    focus_hint = build_focus_hint(task_description)
+    if focus_hint:
+        parts.append(focus_hint)
+    return "\n".join(parts).strip()
 
 
 def _get_init_hints(rec: Dict[str, Any]) -> str:
     ih = rec.get("init_hints")
     if not isinstance(ih, dict):
         return ""
-    return render_action_hints(ih.get("possible_actions"), ih.get("possible_objects"))
+    return render_action_hints(
+        ih.get("possible_actions"),
+        ih.get("possible_objects"),
+        rec.get("task_description", ""),
+    )
 
 
 def _get_step_hints(step: Dict[str, Any]) -> str:
-    return render_action_hints(step.get("possible_actions"), step.get("possible_objects"))
+    return render_action_hints(
+        step.get("possible_actions"),
+        step.get("possible_objects"),
+    )
 
 
 # ===================================================================

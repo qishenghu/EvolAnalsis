@@ -127,6 +127,33 @@ def build_focus_hint(task_description: str) -> str:
     )
 
 
+def _iter_jsonl(paths: List[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for path in paths:
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    out.append(json.loads(s))
+                except Exception:
+                    continue
+    return out
+
+
+def load_gold_records(inputs: List[str]) -> Dict[str, Dict[str, Any]]:
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for rec in _iter_jsonl(inputs):
+        data_idx = rec.get("data_idx")
+        if data_idx is None:
+            continue
+        by_id[str(data_idx)] = rec
+    return by_id
+
+
 def _extract_actions_from_hint(hint_block: str) -> Tuple[Any, bool]:
     if CURRENT_ACTIONS_MARKER in hint_block:
         after = hint_block.split(CURRENT_ACTIONS_MARKER, 1)[1].strip()
@@ -155,6 +182,55 @@ def render_hint(available_actions: Any, objs: Any, task_description: str) -> str
     if focus_hint:
         parts.append(focus_hint)
     return "\n".join(parts).strip()
+
+
+def build_init_user_content_from_gold(gold_rec: Dict[str, Any]) -> str:
+    task_desc = gold_rec.get("task_description", "")
+    init_obs = gold_rec.get("initial_observation", "")
+    init_hints = gold_rec.get("init_hints", {}) or {}
+    hint = render_hint(
+        init_hints.get("possible_actions", []),
+        init_hints.get("possible_objects", []),
+        task_desc,
+    )
+    return f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{hint}".rstrip()
+
+
+def build_step_user_content_from_gold(gold_rec: Dict[str, Any], step_idx: int) -> Optional[str]:
+    steps = gold_rec.get("steps", []) or []
+    if step_idx < 0 or step_idx >= len(steps):
+        return None
+    step = steps[step_idx]
+    obs = step.get("observation", "")
+    hint = render_hint(
+        step.get("possible_actions", []),
+        step.get("possible_objects", []),
+        gold_rec.get("task_description", ""),
+    )
+    return f"{obs}\n\n{hint}".rstrip() if hint else str(obs)
+
+
+def align_messages_with_gold(messages: List[Dict[str, Any]], system_prompt: str, gold_rec: Dict[str, Any]) -> Dict[str, int]:
+    stats = {"system_updated": 0, "user_hint_updated": 0}
+    user_turn_idx = 0
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            if m.get("content") != system_prompt:
+                m["content"] = system_prompt
+                stats["system_updated"] += 1
+        elif role == "user":
+            if user_turn_idx == 0:
+                new_c = build_init_user_content_from_gold(gold_rec)
+            else:
+                new_c = build_step_user_content_from_gold(gold_rec, user_turn_idx - 1)
+                if new_c is None:
+                    new_c = m.get("content", "")
+            if m.get("content") != new_c:
+                m["content"] = new_c
+                stats["user_hint_updated"] += 1
+            user_turn_idx += 1
+    return stats
 
 
 def rewrite_user_content_with_new_hint(
@@ -222,7 +298,9 @@ def rewrite_user_content_with_new_hint(
     return content, False
 
 
-def align_messages(messages: List[Dict[str, Any]], system_prompt: str) -> Dict[str, int]:
+def align_messages(messages: List[Dict[str, Any]], system_prompt: str, gold_rec: Optional[Dict[str, Any]] = None) -> Dict[str, int]:
+    if gold_rec is not None:
+        return align_messages_with_gold(messages, system_prompt, gold_rec)
     stats = {"system_updated": 0, "user_hint_updated": 0}
     task_description = _extract_task_description_from_messages(messages)
     for m in messages:
@@ -253,7 +331,7 @@ def dump_pickle(obj: Any, path: str) -> None:
         pickle.dump(obj, f)
 
 
-def align_pkl(input_pkl: str, output_pkl: str, system_prompt: str) -> Dict[str, int]:
+def align_pkl(input_pkl: str, output_pkl: str, system_prompt: str, gold_by_id: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, int]:
     items = load_pickle(input_pkl)
     if not isinstance(items, list):
         raise RuntimeError(f"Expected a list in PKL, got {type(items)}")
@@ -261,14 +339,15 @@ def align_pkl(input_pkl: str, output_pkl: str, system_prompt: str) -> Dict[str, 
     for it in items:
         msgs = it.get("messages")
         if isinstance(msgs, list):
-            s = align_messages(msgs, system_prompt)
+            key = str(it.get("task_id", it.get("data_id", "")))
+            s = align_messages(msgs, system_prompt, (gold_by_id or {}).get(key))
             total_stats["system_updated"] += s["system_updated"]
             total_stats["user_hint_updated"] += s["user_hint_updated"]
     dump_pickle(items, output_pkl)
     return total_stats
 
 
-def align_jsonl(input_jsonl: str, output_jsonl: str, system_prompt: str) -> Dict[str, int]:
+def align_jsonl(input_jsonl: str, output_jsonl: str, system_prompt: str, gold_by_id: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, int]:
     total = 0
     total_stats = {"n_items": 0, "system_updated": 0, "user_hint_updated": 0}
     with open(input_jsonl, "r", encoding="utf-8") as fin, open(output_jsonl, "w", encoding="utf-8") as fout:
@@ -279,7 +358,8 @@ def align_jsonl(input_jsonl: str, output_jsonl: str, system_prompt: str) -> Dict
             obj = json.loads(line)
             msgs = obj.get("messages")
             if isinstance(msgs, list):
-                s = align_messages(msgs, system_prompt)
+                key = str(obj.get("task_id", obj.get("data_id", "")))
+                s = align_messages(msgs, system_prompt, (gold_by_id or {}).get(key))
                 total_stats["system_updated"] += s["system_updated"]
                 total_stats["user_hint_updated"] += s["user_hint_updated"]
             fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
@@ -291,23 +371,27 @@ def align_jsonl(input_jsonl: str, output_jsonl: str, system_prompt: str) -> Dict
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--env_py", default="env_service/environments/sciworld/sciworld_env.py")
-    ap.add_argument("--input_pkl", default="data/teacher_trajectories/sciworld_gold_qwen72b_filtered.pkl")
+    ap.add_argument("--input_pkl", default=None)
     ap.add_argument("--output_pkl", default=None)
     ap.add_argument("--input_jsonl", default=None)
     ap.add_argument("--output_jsonl", default=None)
+    ap.add_argument("--gold_inputs", nargs="+", default=["data/sciworld/gold_trajectories.jsonl"])
     ap.add_argument("--inplace", action="store_true", help="Overwrite outputs in place (with .bak backups).")
     args = ap.parse_args()
 
     system_prompt = extract_system_prompt_from_env_py(args.env_py)
-    if args.inplace:
-        out_pkl = args.input_pkl
-    else:
-        out_pkl = args.output_pkl or (os.path.splitext(args.input_pkl)[0] + "_aligned.pkl")
+    gold_by_id = load_gold_records(args.gold_inputs) if args.gold_inputs else {}
 
-    if args.inplace:
-        shutil.copy2(args.input_pkl, args.input_pkl + ".bak")
-    stats_pkl = align_pkl(args.input_pkl, out_pkl, system_prompt)
-    print("[PKL]", stats_pkl)
+    if args.input_pkl:
+        if args.inplace:
+            out_pkl = args.input_pkl
+        else:
+            out_pkl = args.output_pkl or (os.path.splitext(args.input_pkl)[0] + "_aligned.pkl")
+
+        if args.inplace:
+            shutil.copy2(args.input_pkl, args.input_pkl + ".bak")
+        stats_pkl = align_pkl(args.input_pkl, out_pkl, system_prompt, gold_by_id)
+        print("[PKL]", stats_pkl)
 
     if args.input_jsonl:
         in_jsonl = args.input_jsonl
@@ -316,9 +400,9 @@ def main():
             bak = in_jsonl + ".bak"
             shutil.copy2(in_jsonl, bak)
             # IMPORTANT: never read+write the same JSONL path (would truncate to 0 bytes).
-            stats_jsonl = align_jsonl(bak, in_jsonl, system_prompt)
+            stats_jsonl = align_jsonl(bak, in_jsonl, system_prompt, gold_by_id)
         else:
-            stats_jsonl = align_jsonl(in_jsonl, out_jsonl, system_prompt)
+            stats_jsonl = align_jsonl(in_jsonl, out_jsonl, system_prompt, gold_by_id)
         print("[JSONL]", stats_jsonl)
 
 

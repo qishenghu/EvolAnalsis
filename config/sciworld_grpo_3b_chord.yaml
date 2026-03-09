@@ -244,7 +244,7 @@ exp_manager:
   teacher_experience:
     enable: true
     mix_mode: "rollout_level"
-    data_path: "data/teacher_trajectories/sciworld_gold_qwen72b_800_filtered.pkl"
+    data_path: "data/teacher_trajectories/sciworld_gold_qwen72b_filtered_0309.pkl"
     n_teacher_rollouts_per_task: 1
     max_trajectories_per_task: 6
     select_mode: "random"

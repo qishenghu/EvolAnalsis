@@ -286,7 +286,6 @@ Available actions:
 {{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"}},
 {{"action": "mix OBJ", "description": "chemically mix a container"}},
 {{"action": "go to LOC", "description": "move to a new location"}},
-{{"action": "teleport OBJ", "description": "teleport directly to a reachable location"}},
 {{"action": "eat OBJ", "description": "eat a food"}},
 {{"action": "flush OBJ", "description": "flush a toilet"}},
 {{"action": "focus on OBJ", "description": "signal intent on a task object"}},
