@@ -74,6 +74,12 @@ class SciworldEnv(BaseEnv):
         self.is_done = False
         self.current_reward = 0.0
         self.current_score = 0.0
+        self.current_possible_actions: List[str] = []
+        self.current_possible_objects: List[str] = []
+        self.current_valid_action_object_combinations: List[str] = []
+        self.last_action_correction: Optional[Dict[str, Any]] = None
+
+        self.action_correction_enable = os.environ.get("SCIWORLD_ACTION_CORRECTION", "1").lower() not in {"0", "false", "no"}
 
     # ---------------------------
     # Internal HTTP helpers
@@ -101,6 +107,82 @@ class SciworldEnv(BaseEnv):
             raise RuntimeError(f"ScienceWorld HTTP /create returned invalid data: {data}")
         self.remote_env_id = int(data["id"])
         print(f"Created ScienceWorld environment {self.remote_env_id}")
+
+    @staticmethod
+    def _normalize_action_text(action: str) -> str:
+        text = (action or "").strip().lower()
+        text = text.replace("</s>", " ")
+        text = text.replace("`", " ")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def _canonicalize_action_text(self, action: str) -> str:
+        text = self._normalize_action_text(action)
+        text = re.sub(r"^go to\s+", "go ", text)
+        text = re.sub(r"^focus\s+(?!on\b)", "focus on ", text)
+        text = re.sub(r"^pickup\s+", "pick up ", text)
+        text = re.sub(r"^pick-up\s+", "pick up ", text)
+        text = re.sub(r"^pour\s+(.+?)\s+into\s+(.+)$", r"pour \1 in \2", text)
+        text = re.sub(r"^dunk\s+(.+?)\s+into\s+(.+)$", r"dunk \1 in \2", text)
+        text = re.sub(r"^move\s+(.+?)\s+(?:into|in)\s+(.+)$", r"move \1 to \2", text)
+        text = re.sub(r"^put\s+(.+?)\s+(?:into|in)\s+(.+)$", r"move \1 to \2", text)
+        text = re.sub(r"\b(the|an|a)\s+", "", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def _clean_focus_item(item: str) -> str:
+        item = (item or "").strip()
+        item = re.sub(r"^(the|a|an)\s+", "", item, flags=re.IGNORECASE)
+        item = re.sub(r"\s+", " ", item)
+        return item.strip()
+
+    def _extract_focus_items(self) -> List[str]:
+        task_desc = self.current_task_description or ""
+        raw_items = re.findall(r"focus on\s+([^.,;]+)", task_desc, flags=re.IGNORECASE)
+        cleaned: List[str] = []
+        skip_generic = {"thing", "object", "item", "it"}
+        for item in raw_items:
+            focus_item = self._clean_focus_item(item)
+            if not focus_item:
+                continue
+            if focus_item.lower() in skip_generic:
+                continue
+            if focus_item not in cleaned:
+                cleaned.append(focus_item)
+        return cleaned
+
+    def _get_focus_hint(self) -> str:
+        focus_items = self._extract_focus_items()
+        if not focus_items:
+            return ""
+        focus_targets = ", ".join(focus_items)
+        return (
+            "Important! You can only use FOCUS actions on these task-required targets: "
+            f"{focus_targets}.\n"
+            "You cannot FOCUS on arbitrary objects. Please only use FOCUS as required by the task description, "
+            "and focus on the target itself rather than its container."
+        )
+
+    def _maybe_correct_action(self, action: str) -> str:
+        self.last_action_correction = None
+        if (not self.action_correction_enable) or (not self.current_valid_action_object_combinations):
+            return action
+
+        canonical = self._canonicalize_action_text(action)
+
+        for valid_action in self.current_valid_action_object_combinations:
+            valid_canonical = self._canonicalize_action_text(valid_action)
+            if canonical == valid_canonical:
+                self.last_action_correction = {
+                    "raw_action": action,
+                    "corrected_action": valid_action,
+                    "score": 1.0,
+                    "mode": "rule_canonical_exact",
+                }
+                return valid_action
+
+        return action
         
     def get_init_state(self, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -204,6 +286,7 @@ Available actions:
 {{"action": "dunk OBJ into OBJ", "description": "dunk a container into a liquid"}},
 {{"action": "mix OBJ", "description": "chemically mix a container"}},
 {{"action": "go to LOC", "description": "move to a new location"}},
+{{"action": "teleport OBJ", "description": "teleport directly to a reachable location"}},
 {{"action": "eat OBJ", "description": "eat a food"}},
 {{"action": "flush OBJ", "description": "flush a toilet"}},
 {{"action": "focus on OBJ", "description": "signal intent on a task object"}},
@@ -218,7 +301,8 @@ Important:
 2. Plan your experiment steps logically.
 3. Pay attention to the objects and locations available.
 4. OBJ in the selected action should be replaced with one of the OBJ candidates using the exact string as provided.
-5. If the environment returns \"No known action matches that input.\", that means your previous action is invalid and you should try more options.
+5. If the task asks you to focus on a specific target, only use FOCUS on that target and not on unrelated objects or containers.
+6. If the environment returns \"No known action matches that input.\", that means your previous action is invalid and you should try more options.
 
 In each turn, you must output your thought/reasoning and then output your action in the following format:
 ```
@@ -247,17 +331,20 @@ your next action
         # try:
         hints = self._get("/action_hint", {"id": self.remote_env_id})
         if isinstance(hints, dict):
-            valid_objs = hints.get("possible_objects", [])
-
-            possible_actions = hints.get("possible_actions", [])
-            # Keep only object candidates to reduce token usage.
-            # Valid action templates already exist in the system prompt.
+            self.current_possible_objects = hints.get("possible_objects", []) or []
+            self.current_possible_actions = hints.get("possible_actions", []) or []
+            self.current_valid_action_object_combinations = (
+                hints.get("valid_action_object_combinations", []) or []
+            )
             hint_str = ""
-            # if possible_actions:
-            hint_str += f"Available actions: {possible_actions}\n"
-            hint_str += f"OBJ must be replaced with exactly one of the following candidates, using the exact string as provided: {valid_objs}."
-            # if possible_objects:
-            #    hint_str += f"Nearby objects: {possible_objects}"
+            hint_str += f"Available actions: {self.current_possible_actions}\n"
+            hint_str += (
+                "OBJ must be replaced with exactly one of the following candidates, "
+                f"using the exact string as provided: {self.current_possible_objects}."
+            )
+            focus_hint = self._get_focus_hint()
+            if focus_hint:
+                hint_str += f"\n{focus_hint}"
             return hint_str
         # except:
             # pass
@@ -307,10 +394,12 @@ your next action
                 "instance_id": self.instance_id,
             }
 
+        corrected_action = self._maybe_correct_action(parsed_action)
+
         # 调用 AgentGym 的 /step 接口
         step_payload = {
             "id": self.remote_env_id,
-            "action": parsed_action,
+            "action": corrected_action,
         }
         step_result = self._post("/step", step_payload)
 
@@ -340,6 +429,9 @@ your next action
             "is_terminated": self.is_done,
             "info": {
                 "score": self.current_score,
+                "parsed_action": parsed_action,
+                "executed_action": corrected_action,
+                "action_correction": self.last_action_correction,
             },
             "instance_id": self.instance_id,
         }

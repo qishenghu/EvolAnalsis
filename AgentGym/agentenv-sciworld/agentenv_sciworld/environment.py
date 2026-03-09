@@ -154,6 +154,7 @@ class SciWorldEnv:
             return {
                 "possible_actions": self.env[idx].getPossibleActions(),
                 "possible_objects": self.env[idx].getPossibleObjects(),
+                "valid_action_object_combinations": self.env[idx].getValidActionObjectCombinations(),
             }
         except Exception as e:
             return {"error": str(e)}
