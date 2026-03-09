@@ -3,6 +3,7 @@
 import os
 import re
 import json
+import hashlib
 import random
 from collections import defaultdict
 from ast import literal_eval
@@ -177,17 +178,29 @@ def get_product_per_page(top_n_products, page):
     return top_n_products[(page - 1) * PRODUCT_WINDOW:page * PRODUCT_WINDOW]
 
 
+def deterministic_price_for_product(asin, pricing):
+    if not pricing:
+        return 100.0
+    if len(pricing) == 1:
+        return pricing[0]
+
+    low, high = pricing[:2]
+    if high <= low:
+        return low
+
+    key = f'{asin}|{low:.8f}|{high:.8f}'
+    digest = hashlib.sha256(key.encode('utf-8')).digest()
+    fraction = int.from_bytes(digest[:8], 'big') / float((1 << 64) - 1)
+    return low + (high - low) * fraction
+
+
 def generate_product_prices(all_products):
     product_prices = dict()
     for product in all_products:
         asin = product['asin']
         pricing = product['pricing']
-        if not pricing:
-            price = 100.0
-        elif len(pricing) == 1:
-            price = pricing[0]
-        else:
-            price = random.uniform(*pricing[:2])
+        # Keep task generation deterministic across server restarts.
+        price = deterministic_price_for_product(asin, pricing)
         product_prices[asin] = price
     return product_prices
 
