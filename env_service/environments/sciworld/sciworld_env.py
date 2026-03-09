@@ -139,7 +139,11 @@ class SciworldEnv(BaseEnv):
 
     def _extract_focus_items(self) -> List[str]:
         task_desc = self.current_task_description or ""
-        raw_items = re.findall(r"focus on\s+([^.,;]+)", task_desc, flags=re.IGNORECASE)
+        raw_items = re.findall(
+            r"focus on\s+(\b\w+\b(?:\s+\b\w+\b)*)",
+            task_desc,
+            flags=re.IGNORECASE,
+        )
         cleaned: List[str] = []
         skip_generic = {"thing", "object", "item", "it"}
         for item in raw_items:
