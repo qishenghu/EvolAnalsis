@@ -101,3 +101,19 @@ def get_state(env_idx: int):
 def reset(reset_query: ResetQuery):
     print(reset_query)
     return webshop_env_server.reset(reset_query.env_idx, reset_query.session_id)
+
+
+@app.post("/delete", response_model=DeleteResponse)
+def delete(delete_query: DeleteQuery):
+    print("/delete")
+    print(delete_query.env_idx)
+    success = webshop_env_server.delete(delete_query.env_idx)
+    return DeleteResponse(success=success)
+
+
+@app.post("/close", response_model=DeleteResponse)
+def close(delete_query: DeleteQuery):
+    print("/close")
+    print(delete_query.env_idx)
+    success = webshop_env_server.delete(delete_query.env_idx)
+    return DeleteResponse(success=success)

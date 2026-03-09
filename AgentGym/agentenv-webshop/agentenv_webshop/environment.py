@@ -2,6 +2,7 @@
 WebshopEnvServer
 """
 
+import gc
 from typing import Optional
 
 import gym
@@ -27,6 +28,8 @@ class WebshopEnvServer:
 
         random.seed(time.time())
         idx = random.randint(0, 48950076)
+        while idx in self.env:
+            idx = random.randint(0, 48950076)
         print(f"-------Env {idx} created--------")
         if len(self.env) == self.sz:
             self.now = self.now + 1
@@ -94,10 +97,32 @@ class WebshopEnvServer:
 
     def reset(self, env_idx, session_id: Optional[int]):
         return self.env[env_idx].reset(session=session_id)
+
+    def delete(self, env_idx: int) -> bool:
+        env = self.env.pop(env_idx, None)
+        if env is None:
+            return False
+
+        try:
+            env.close()
+        except Exception as e:
+            print(f"Failed to close WebShop env {env_idx}: {e}")
+
+        try:
+            self.ls.remove(env_idx)
+        except ValueError:
+            pass
+
+        gc.collect()
+        print(f"-------Env {env_idx} deleted--------")
+        return True
     
     def __del__(self):
         for idx in self.ls:
-            self.env[idx].close()
+            env = self.env.get(idx)
+            if env is None:
+                continue
+            env.close()
             print(f"-------Env {idx} closed--------")
 
 

@@ -43,8 +43,15 @@ bash webshop.sh
 ## 任务 ID 格式
 
 - `task_id` 对应 `session_id`
-- 每个 session 对应一个随机生成的购物指令
-- 默认使用 500 个 session
+- 支持两种格式：纯数字（如 `5238`）或带前缀格式（如 `webshop_5238`）
+- 若未显式指定 `session_id`，则由 AgentGym WebShop server 随机采样任务
+
+## 数据划分
+
+- `train` 使用 `env_service/environments/webshop/webshop_train.json`
+- `val` / `dev` / `test` 使用 `env_service/environments/webshop/webshop_test.json`
+- 若本地缺少 `webshop_train.json`，环境会回退为从默认 `1000` 商品数据动态推导 train goal 索引，并排除 test task
+- 如需覆盖默认 train 候选池，也可在 `get_query_list(..., params={"total_sessions": N})` 中显式传入 `total_sessions`
 
 ## 动作格式
 
@@ -88,4 +95,5 @@ WebShop 支持两种动作类型：
 1. WebShop 服务器启动时间较长，需要加载商品数据库
 2. 确保有足够的内存（建议 8GB+）
 3. 首次启动可能需要下载数据
+4. `env_service` 关闭实例时会调用 WebShop server 的删除接口，避免训练过程中远端 env 实例持续堆积
 

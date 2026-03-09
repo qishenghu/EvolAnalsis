@@ -7,14 +7,29 @@ WebShop 是一个模拟在线购物的环境，agent 需要根据用户指令
 搜索、浏览和购买符合要求的商品。
 """
 
+import json
 import os
 import re
+from math import prod
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from env_service.base import BaseEnv
 from env_service.registry import Registry
+
+AGENTGYM_WEBSHOP_DATA_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "AgentGym",
+        "agentenv-webshop",
+        "webshop",
+        "data",
+    )
+)
 
 
 @Registry.register("webshop")
@@ -33,7 +48,7 @@ class WebshopEnv(BaseEnv):
     
     # WebShop 使用 session_id 来标识不同的购物任务
     # 每个 session 对应一个随机生成的购物指令
-    NUM_SESSIONS = 500  # 默认使用 500 个不同的 session
+    NUM_SESSIONS = 500  # Fallback only; prefer explicit split files or params.
     
     def __init__(self, task_id: str = None, instance_id: str = None, params: Dict[str, Any] = None):
         """
@@ -65,6 +80,132 @@ class WebshopEnv(BaseEnv):
         self.current_available_actions = {"has_search_bar": False, "clickables": []}
         self.is_done = False
         self.current_reward = 0.0
+
+    @staticmethod
+    def _parse_session_id(value: Any) -> Optional[int]:
+        """Accept raw ints as well as ids like ``webshop_5238``."""
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value
+
+        text = str(value).strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+
+        match = re.match(r"^webshop_(\d+)$", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _get_eval_split_path() -> str:
+        return os.path.join(os.path.dirname(__file__), "webshop_test.json")
+
+    @staticmethod
+    def _get_train_split_path() -> str:
+        return os.path.join(os.path.dirname(__file__), "webshop_train.json")
+
+    @staticmethod
+    def _get_default_product_file() -> str:
+        return os.path.join(AGENTGYM_WEBSHOP_DATA_DIR, "items_shuffle_1000.json")
+
+    @staticmethod
+    def _get_default_attribute_file() -> str:
+        return os.path.join(AGENTGYM_WEBSHOP_DATA_DIR, "items_ins_v2_1000.json")
+
+    @classmethod
+    def _load_eval_indices(cls) -> List[int]:
+        test_path = cls._get_eval_split_path()
+        return cls._load_split_indices_from_file(test_path, split_name="eval")
+
+    @classmethod
+    def _load_train_indices(cls) -> Optional[List[int]]:
+        train_path = cls._get_train_split_path()
+        if not os.path.exists(train_path):
+            return None
+        return cls._load_split_indices_from_file(train_path, split_name="train")
+
+    @classmethod
+    def _load_split_indices_from_file(cls, path: str, split_name: str) -> List[int]:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"WebShop {split_name} split not found: {path}")
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        idxs: List[int] = []
+        for item in data:
+            item_id = str(item.get("item_id", ""))
+            session_id = cls._parse_session_id(item_id)
+            if session_id is None:
+                raise ValueError(f"Unexpected WebShop {split_name} item_id: {item_id}")
+            idxs.append(session_id)
+        return idxs
+
+    @classmethod
+    def _infer_total_sessions(cls, params: Optional[Dict[str, Any]] = None) -> int:
+        params = params or {}
+        explicit_total = params.get("total_sessions")
+        if explicit_total is not None:
+            return int(explicit_total)
+
+        inferred_from_data = cls._infer_total_sessions_from_default_data()
+        if inferred_from_data is not None:
+            return inferred_from_data
+
+        eval_idxs = cls._load_eval_indices()
+        # Without a canonical train split file, use the smallest range that
+        # fully covers all known eval ids while guaranteeing no overlap.
+        return max(eval_idxs) + 1 if eval_idxs else cls.NUM_SESSIONS
+
+    @classmethod
+    def _infer_total_sessions_from_default_data(cls) -> Optional[int]:
+        product_file = cls._get_default_product_file()
+        attribute_file = cls._get_default_attribute_file()
+        if not (os.path.exists(product_file) and os.path.exists(attribute_file)):
+            return None
+
+        with open(product_file, "r", encoding="utf-8") as f:
+            products = json.load(f)
+        with open(attribute_file, "r", encoding="utf-8") as f:
+            attributes = json.load(f)
+
+        total_goals = 0
+        seen_asins = set()
+        for product in products[:1000]:
+            asin = product.get("asin")
+            if asin == "nan" or not asin or len(str(asin)) > 10 or asin in seen_asins:
+                continue
+            seen_asins.add(asin)
+
+            attr_entry = attributes.get(asin)
+            if not attr_entry:
+                continue
+
+            instruction = attr_entry.get("instruction")
+            instruction_attributes = attr_entry.get("instruction_attributes")
+            if instruction is None or not instruction_attributes:
+                continue
+
+            option_sizes: List[int] = []
+            customization_options = product.get("customization_options") or {}
+            for option_contents in customization_options.values():
+                if option_contents is None:
+                    continue
+                valid_values = [
+                    option_content.get("value", "").strip().replace("/", " | ").lower()
+                    for option_content in option_contents
+                    if option_content.get("value")
+                ]
+                if valid_values:
+                    option_sizes.append(len(valid_values))
+
+            total_goals += prod(option_sizes) if option_sizes else 1
+
+        return total_goals
 
     # ---------------------------
     # Internal HTTP helpers
@@ -112,12 +253,9 @@ class WebshopEnv(BaseEnv):
         
         # Determine session_id
         if self.task_id is not None:
-            try:
-                session_id = int(self.task_id)
-            except ValueError:
-                session_id = None  # Use random session
+            session_id = self._parse_session_id(self.task_id)
         else:
-            session_id = params.get("session_id", None)
+            session_id = self._parse_session_id(params.get("session_id", None))
         
         # 确保远端 env 已创建
         self._ensure_remote_env()
@@ -174,31 +312,27 @@ class WebshopEnv(BaseEnv):
     
     def _get_system_prompt(self) -> str:
         """Get the system prompt for WebShop environment."""
-        return '''You are a shopping assistant agent navigating an online store to find and purchase items for the user.
+        return '''You are web shopping.
+I will give you instructions about what to do.
+You have to follow the instructions.
+Every round I will give you an observation and a list of available actions, you have to respond an action based on the state and instruction.
+You can use search action if search is available.
+You can click one of the buttons in clickables.
+An click or search action should be of the following structure:
+search[keywords]
+click[value]
 
-Your task is to:
-1. Search for items using the search bar
-2. Browse through search results
-3. Click on items to view details
-4. Select required options (size, color, etc.)
-5. Add the item to cart when you find the right one
-6. Complete the purchase
-
-Available action types:
-- search[query]: Search for items (only when search bar is available)
-- click[element]: Click on a clickable element (product, option, button, etc.)
-
-You should choose from two actions: "THOUGHT" or "ACTION".
-- If you choose "THOUGHT", first analyze the current page and plan, then output your action.
-  Format: "Thought:\nyour thoughts.\n\nAction:\nyour next action"
-- If you choose "ACTION", directly output the action.
-  Format: "Action:\nyour next action"
-
-Important:
-1. Read the shopping instruction carefully.
-2. Pay attention to all requirements (color, size, price, features).
-3. Use search[] to find items and click[] to interact.
-4. Click "Buy Now" when you find the perfect match.'''
+If the action is not valid, perform nothing.
+Keywords in search are up to you, but the value in click must be a value in the list of available actions.
+Remember that your keywords in search should be carefully designed.
+In each turn, you must output your thought/reasoning and then output your action in the following format:
+```
+Thought:
+your thoughts.
+Action: 
+click[something] (or search[keywords])
+```
+'''
 
     def _format_available_actions(self) -> str:
         """Format available actions for display."""
@@ -211,10 +345,10 @@ Important:
         clickables = actions.get("clickables", [])
         if clickables:
             # Show first 20 clickables to avoid too long output
-            display_clickables = clickables[:20]
+            display_clickables = clickables
             parts.append(f"Clickable elements: {display_clickables}")
-            if len(clickables) > 20:
-                parts.append(f"... and {len(clickables) - 20} more")
+            # if len(clickables) > 20:
+            #     parts.append(f"... and {len(clickables) - 20} more")
         
         return "\n".join(parts) if parts else "No actions available."
     
@@ -249,7 +383,7 @@ Important:
         
         if parsed_action is None:
             action_desc = self._format_available_actions()
-            invalid_obs = "Invalid action format. Please use 'Action: search[query]' or 'Action: click[element]' format."
+            invalid_obs = "Invalid action format. Please use the format: 'Thought:\n your thoughts.\n\nAction:\n search[query]' or 'Thought:\n your thoughts.\n\nAction:\n click[element]'."
             invalid_obs += f"\n\n{action_desc}"
             
             return {
@@ -338,10 +472,26 @@ Important:
         """
         Close the environment and release resources.
         """
-        # WebShop doesn't have a /close endpoint in the original implementation
-        # Just reset local state
-        self.remote_env_id = None
-        print(f"WebShop environment released.")
+        if self.remote_env_id is not None:
+            try:
+                print(f"Deleting WebShop environment {self.remote_env_id}")
+                delete_payload = {"env_idx": self.remote_env_id}
+                delete_result = self._post("/delete", delete_payload)
+                if isinstance(delete_result, dict) and not delete_result.get("success", False):
+                    print(
+                        f"Warning: Failed to delete WebShop environment {self.remote_env_id}: {delete_result}",
+                    )
+            except Exception as e:
+                print(f"Error deleting WebShop environment {self.remote_env_id}: {e}")
+            finally:
+                self.remote_env_id = None
+                self.current_session_id = None
+                self.current_observation = None
+                self.current_instruction = None
+                self.current_available_actions = {"has_search_bar": False, "clickables": []}
+                self.is_done = False
+                self.current_reward = 0.0
+        print("WebShop environment released.")
     
     @staticmethod
     def get_query_list(split: str = "train", params: Dict[str, Any] = None) -> List[str]:
@@ -357,18 +507,22 @@ Important:
         """
         params = params or {}
         
-        # WebShop has around 12k user instructions
-        # We use session_id as task_id
-        total_sessions = params.get("total_sessions", WebshopEnv.NUM_SESSIONS)
-        
-        if split == "train":
-            # Use 80% for training
-            task_ids = [str(i) for i in range(int(total_sessions * 0.8))]
-        else:  # val, dev, test
-            # Use 20% for testing
-            task_ids = [str(i) for i in range(int(total_sessions * 0.8), total_sessions)]
-        
-        return task_ids
+        eval_idxs = WebshopEnv._load_eval_indices()
+        eval_set = set(eval_idxs)
+
+        if split in ("val", "dev", "test"):
+            return [str(i) for i in eval_idxs]
+
+        cached_train_idxs = WebshopEnv._load_train_indices()
+        if cached_train_idxs is not None:
+            return [str(i) for i in cached_train_idxs]
+
+        total_sessions = WebshopEnv._infer_total_sessions(params)
+        if total_sessions <= 0:
+            return []
+
+        train_ids = [str(i) for i in range(total_sessions) if i not in eval_set]
+        return train_ids
     
     def _parse_action_from_llm_output(self, llm_output: str) -> Optional[str]:
         """

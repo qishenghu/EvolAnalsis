@@ -172,7 +172,7 @@ def _extract_actions_from_hint(hint_block: str) -> Tuple[Any, bool]:
     return [], False
 
 
-def render_hint(available_actions: Any, objs: Any, task_description: str) -> str:
+def render_hint(available_actions: Any, objs: Any, task_description: str, include_focus_hint: bool = False) -> str:
     parts: List[str] = []
     if available_actions not in (None, "", []):
         parts.append(f"Available actions: {repr(available_actions) if not isinstance(available_actions, str) else available_actions}")
@@ -182,7 +182,7 @@ def render_hint(available_actions: Any, objs: Any, task_description: str) -> str
             "OBJ must be replaced with exactly one of the following candidates, "
             f"using the exact string as provided: {obj_repr}."
         )
-    focus_hint = build_focus_hint(task_description)
+    focus_hint = build_focus_hint(task_description) if include_focus_hint else ""
     if focus_hint:
         parts.append(focus_hint)
     return "\n".join(parts).strip()
@@ -196,6 +196,7 @@ def build_init_user_content_from_gold(gold_rec: Dict[str, Any]) -> str:
         init_hints.get("possible_actions", []),
         init_hints.get("possible_objects", []),
         task_desc,
+        include_focus_hint=True,
     )
     return f"Task: {task_desc}\n\nCurrent observation:\n{init_obs}\n\n{hint}".rstrip()
 
@@ -210,6 +211,7 @@ def build_step_user_content_from_gold(gold_rec: Dict[str, Any], step_idx: int) -
         step.get("possible_actions", []),
         step.get("possible_objects", []),
         gold_rec.get("task_description", ""),
+        include_focus_hint=False,
     )
     return f"{obs}\n\n{hint}".rstrip() if hint else str(obs)
 
@@ -292,10 +294,12 @@ def rewrite_user_content_with_new_hint(
         else:
             objs, ok = _extract_objects_from_legacy_hint(hint_block)
 
+        include_focus_hint = bool(re.search(r"Task:\s*.*?\n\s*\nCurrent observation:\n", content, flags=re.S))
         new_hint = render_hint(
             available_actions if actions_ok else (available_actions or ""),
             objs if ok else (objs or ""),
             task_description,
+            include_focus_hint=include_focus_hint,
         )
         return f"{before}\n\n{new_hint}".rstrip(), True
 

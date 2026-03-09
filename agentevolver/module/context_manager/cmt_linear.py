@@ -416,15 +416,21 @@ class Linear_CMT(Trajectory, ContextManagerBase):
     def _strip_action_hints(content: str) -> str:
         """Remove action hint blocks from an env observation, keeping only
         the actual observation text.  Recognises markers produced by
-        ``sciworld_env._get_action_hints`` (``Available actions:``,
-        ``OBJ candidates:``, ``OBJ must be replaced``).
+        ``sciworld_env._get_action_hints`` as well as WebShop action lists
+        (``You can use:``, ``Clickable elements:``).
         """
         lines = content.split("\n")
         kept: list[str] = []
+        hint_prefixes = (
+            "available actions:",
+            "obj candidates:",
+            "obj must be replaced",
+            "you can use:",
+            "clickable elements:",
+        )
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith(("Available actions:", "OBJ candidates:",
-                                   "OBJ must be replaced")):
+            if stripped.lower().startswith(hint_prefixes):
                 break
             kept.append(line)
         result = "\n".join(kept).strip()

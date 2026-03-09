@@ -149,7 +149,12 @@ def build_focus_hint(task_description: str) -> str:
     )
 
 
-def render_action_hints(possible_actions: Any, possible_objects: Any, task_description: str = "") -> str:
+def render_action_hints(
+    possible_actions: Any,
+    possible_objects: Any,
+    task_description: str = "",
+    include_focus_hint: bool = False,
+) -> str:
     """Render action hints in the same format as sciworld_env.py._get_action_hints()."""
     parts: List[str] = []
     if possible_actions:
@@ -159,7 +164,7 @@ def render_action_hints(possible_actions: Any, possible_objects: Any, task_descr
             "OBJ must be replaced with exactly one of the following candidates, "
             f"using the exact string as provided: {possible_objects}."
         )
-    focus_hint = build_focus_hint(task_description)
+    focus_hint = build_focus_hint(task_description) if include_focus_hint else ""
     if focus_hint:
         parts.append(focus_hint)
     return "\n".join(parts).strip()
@@ -173,6 +178,7 @@ def _get_init_hints(rec: Dict[str, Any]) -> str:
         ih.get("possible_actions"),
         ih.get("possible_objects"),
         rec.get("task_description", ""),
+        include_focus_hint=True,
     )
 
 

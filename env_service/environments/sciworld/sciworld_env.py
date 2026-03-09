@@ -235,8 +235,9 @@ class SciworldEnv(BaseEnv):
         self.current_reward = reset_result.get("reward", 0.0)
         self.current_score = reset_result.get("score", 0.0)
         
-        # Get action hints
-        action_hints = self._get_action_hints()
+        # Keep the task-level FOCUS restriction only in the initial prompt,
+        # matching agl-envs more closely and avoiding repeated hint bloat.
+        action_hints = self._get_action_hints(include_focus_hint=True)
         
         # Format initial state as messages
         init_messages = [
@@ -329,7 +330,7 @@ your next action
 # - If you choose "ACTION", directly output the action.
 #   Format: "Action:\nyour next action"
 
-    def _get_action_hints(self) -> str:
+    def _get_action_hints(self, include_focus_hint: bool = False) -> str:
         """Get action hints from the server."""
         # try:
         hints = self._get("/action_hint", {"id": self.remote_env_id})
@@ -345,7 +346,7 @@ your next action
                 "OBJ must be replaced with exactly one of the following candidates, "
                 f"using the exact string as provided: {self.current_possible_objects}."
             )
-            focus_hint = self._get_focus_hint()
+            focus_hint = self._get_focus_hint() if include_focus_hint else ""
             if focus_hint:
                 hint_str += f"\n{focus_hint}"
             return hint_str
