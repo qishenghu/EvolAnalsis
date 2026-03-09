@@ -39,6 +39,9 @@ kill_port() {
  # --with-alfworld
 
 python launcher.py \
+ --conf config/sciworld_grpo_7b_800_50.yaml
+
+python launcher.py \
   --conf config/sciworld_grpo_7b_800.yaml
 
 #python launcher.py \
@@ -46,6 +49,9 @@ python launcher.py \
 
 python launcher.py \
  --conf config/sciworld_grpo_7b_dr3_hidden.yaml
+
+python launcher.py \
+ --conf config/sciworld_grpo_7b_dr3_hidden_70.yaml
 
 #python launcher.py \
 # --conf config/sciworld_grpo_3b_chord.yaml
