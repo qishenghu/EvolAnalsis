@@ -33,6 +33,25 @@ class SimpleCompletionCallback(CompletionCallback):
             return []
         return [TokenAndProb(token) for token in content]
 
+    def _should_use_react_tags(self) -> bool:
+        env_params = getattr(self.config.env_service, "env_params", None)
+        if env_params is None:
+            return False
+        return str(getattr(env_params, "action_format", "react") or "react").lower() == "react_tags"
+
+    def _maybe_close_action_tag(self, content: str, stop_reason: Any) -> str:
+        if not self._should_use_react_tags():
+            return content
+        if stop_reason != "</action>":
+            return content
+        if "<action>" not in content or "</action>" in content:
+            return content
+        had_trailing_newline = content.endswith("\n")
+        content = content.rstrip()
+        if had_trailing_newline:
+            return f"{content}</action>"
+        return f"{content}\n</action>"
+
     async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
         choice = completions.choices[0]
         message = choice.message.model_dump(exclude_unset=True, exclude_none=True)
@@ -41,6 +60,9 @@ class SimpleCompletionCallback(CompletionCallback):
             message["content"] = ""
 
         finish_reason = getattr(choice, "finish_reason", None)
+        stop_reason = getattr(choice, "stop_reason", None)
+        original_content = message["content"]
+        message["content"] = self._maybe_close_action_tag(message["content"], stop_reason)
         if message["content"] == "" or finish_reason != "stop":
             logger.warning(str(finish_reason))
             logger.bind(bad_case=True).error('empty content or non-stop finish reason')
@@ -54,8 +76,10 @@ class SimpleCompletionCallback(CompletionCallback):
             "role": message["role"],
             "request_id": completions.id,
             "content": message["content"],
+            "finish_reason": finish_reason,
+            "stop_reason": stop_reason,
         }
-        tokens = self._extract_tokens(choice)
+        tokens = [] if message["content"] != original_content else self._extract_tokens(choice)
         if tokens:
             t["tokens"] = tokens
         messages.append(t)

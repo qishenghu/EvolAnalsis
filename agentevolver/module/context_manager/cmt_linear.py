@@ -302,6 +302,11 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         """
         # save basic
         assert isinstance(llm_output, dict)
+        llm_output = dict(llm_output)
+        original_content = llm_output.get("content", "")
+        llm_output['content'] = self._normalize_llm_output_content(llm_output)
+        if 'tokens' in llm_output and llm_output['content'] != original_content:
+            llm_output.pop('tokens', None)
         token_generator = "manual" if 'tokens' in llm_output else "auto"
         ext_msg = ExtendedMessage(
             author="llm",
@@ -339,6 +344,20 @@ class Linear_CMT(Trajectory, ContextManagerBase):
             token_arr_method2 = get_token_inc_from_vllm_response(input_msg_ref)  # ⭐ Generate token increments using the VLLM response
             ext_msg.token_arr = token_arr_method2  # ⭐ Assign the generated token array to the ExtendedMessage
         return ext_msg
+
+    def _normalize_llm_output_content(self, llm_output):
+        content = llm_output.get("content", "")
+        if self._get_action_format() != "react_tags":
+            return content
+        if llm_output.get("stop_reason") != "</action>":
+            return content
+        if "<action>" not in content or "</action>" in content:
+            return content
+        had_trailing_newline = content.endswith("\n")
+        content = content.rstrip()
+        if had_trailing_newline:
+            return f"{content}</action>"
+        return f"{content}\n</action>"
 
 
     def save_llm_output_do_not_register_full_context(self, llm_output, input_msg_ref):

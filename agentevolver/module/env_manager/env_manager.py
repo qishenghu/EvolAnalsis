@@ -10,7 +10,7 @@ import random
 import re
 import os
 from loguru import logger
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from tensordict import TensorDict
 from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
@@ -192,8 +192,14 @@ class ParallelEnvManager(object):
     def _cfg_to_list(value):
         if value is None:
             return None
-        if isinstance(value, (list, tuple)):
-            return list(value)
+        if isinstance(value, ListConfig):
+            value = OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, tuple):
+            value = list(value)
+        if isinstance(value, list):
+            if len(value) == 1 and isinstance(value[0], (list, tuple, ListConfig)):
+                return ParallelEnvManager._cfg_to_list(value[0])
+            return value
         return [value]
 
     def step_status_printer(self, tmux):
