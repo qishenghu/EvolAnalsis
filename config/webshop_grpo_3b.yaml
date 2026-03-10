@@ -9,26 +9,20 @@ defaults:
   - _self_
 
 # ============================================================================
-# WebShop GRPO Training Configuration (3B)
+# WebShop GRPO Training Configuration (7B)
 # ============================================================================
-# This configuration mirrors the existing AlfWorld/SciWorld GRPO setup but uses
-# EnvService to proxy the AgentGym WebShop server.
+# This configuration mirrors `config/webshop_grpo_3b.yaml` but switches the
+# base model to Qwen2.5-7B-Instruct.
 #
 # Assumptions:
 # - AgentGym WebShop server is running at 127.0.0.1:36003
-#   (launch from `AgentGym/agentenv-webshop`)
 # - EnvService for WebShop is running at 127.0.0.1:8083
-#   (launch: `bash env_service/launch_script/webshop.sh`)
-#
-# Dataset / split note:
-# - train split comes from `env_service/environments/webshop/webshop_train.json`
-#   (6710 task ids under the default 1000-product setup)
-# - val/dev/test split comes from `env_service/environments/webshop/webshop_test.json`
-#   (200 task ids)
+# - train split = 6710 task ids from `webshop_train.json`
+# - val/dev/test split = 200 task ids from `webshop_test.json`
 # ============================================================================
 
 trainer:
-  experiment_name: webshop_3b_grpo_bz8
+  experiment_name: webshop_3b_grpo_bz8_1600
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -82,24 +76,24 @@ actor_rollout_ref:
     prompt_length: 25068
     response_length: 512
     max_model_len: 25580
-    temperature: 0.9
+    temperature: 0.6
     log_prob_micro_batch_size_per_gpu: 1
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
     gpu_memory_utilization: 0.5
     n: 8
+    stop_sequences: ["</action>"]
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
       n: 1
+      stop_sequences: ["</action>"]
     max_env_worker: 32
     context_template: "linear"
     context_template_train_sp_action: false
     max_env_len: 4096
-    sliding_window_size: 3  # keep last 3 LLM turns full, compress older ones to action-only
+    sliding_window_size: 3  # keep last 5 LLM turns full, compress older ones to action-only
     sparse: true
-    # WebShop only yields non-zero reward on purchase/termination; keep enough
-    # turns for search -> browse -> option select -> buy flow.
     multi_turn:
       completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
       enable: true
@@ -127,13 +121,21 @@ data:
   val_files: null
   val_batch_size: 8
   val_type: "val"
-  max_train_tasks: 800
+  max_train_tasks: 1600
   shuffle: true
   seed: 2026
 
 env_service:
   env_type: "webshop"
   env_url: "http://127.0.0.1:8083"
+  env_params:
+    action_format: "react_tags"
+    enable_action_sanitizer: true
+    invalid_action_penalty: -0.1
+    invalid_action_penalty_cap: -0.1
+    max_consecutive_invalid_actions: 1
+    terminate_on_invalid_action: true
+    invalid_action_final_reward: -0.1
 
 task_manager:
   n: 0
@@ -171,7 +173,7 @@ exp_manager:
   summary_batch_size: 8
   reme:
     base_url: "http://127.0.0.1:8124"
-    workspace_id: "webshop_3b_grpo"
+    workspace_id: "webshop_7b_grpo"
     enable_summarizer: false
     enable_context_generator: false
     retrieve_top_k: 3
