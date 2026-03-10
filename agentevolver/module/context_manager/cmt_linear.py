@@ -356,7 +356,7 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         had_trailing_newline = content.endswith("\n")
         content = content.rstrip()
         if had_trailing_newline:
-            return f"{content}</action>"
+            return f"{content}\n</action>"
         return f"{content}\n</action>"
 
 
