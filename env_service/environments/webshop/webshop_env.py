@@ -581,21 +581,6 @@ In each turn, you must output your thought/reasoning and then output your action
             return None
         
         llm_output_clean = llm_output.strip()
-        if self.enable_action_sanitizer:
-            action_matches = list(
-                re.finditer(
-                    r"(search|click)\s*\[([^\]\n]+)\]",
-                    llm_output_clean,
-                    flags=re.IGNORECASE,
-                )
-            )
-            if action_matches:
-                last_match = action_matches[-1]
-                action_type = last_match.group(1).lower()
-                action_arg = last_match.group(2).strip()
-                if action_arg:
-                    return f"{action_type}[{action_arg}]"
-
         if self._use_react_tags():
             action_tag_match = re.search(
                 r"<action>(.*?)</action>",
@@ -615,6 +600,22 @@ In each turn, you must output your thought/reasoning and then output your action
                 action_str = open_action_tag_match.group(1).strip().split("\n")[0].strip()
                 if action_str:
                     return action_str
+            return None
+
+        if self.enable_action_sanitizer:
+            action_matches = list(
+                re.finditer(
+                    r"(search|click)\s*\[([^\]\n]+)\]",
+                    llm_output_clean,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if action_matches:
+                last_match = action_matches[-1]
+                action_type = last_match.group(1).lower()
+                action_arg = last_match.group(2).strip()
+                if action_arg:
+                    return f"{action_type}[{action_arg}]"
         
         # Strategy 1: Extract "Action:" segment
         action_parts = llm_output_clean.rsplit("Action:", 1)

@@ -432,10 +432,14 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         return content.split("\n")[-1].strip() if content.strip() else "(no action)"
 
     @staticmethod
-    def _extract_action_tag(content: str) -> str:
-        """Extract the action from an LLM output that uses react_tags format."""
+    def _extract_action_tag(content: str) -> str | None:
+        """Extract an action tag from a react_tags LLM output.
+
+        Only accepts a well-formed ``<action>...</action>`` block or an
+        open ``<action>...`` block truncated by the stop sequence.
+        """
         if not isinstance(content, str):
-            return "<action>\n(empty)\n</action>"
+            return None
         match = re.search(r"<action>(.*?)</action>", content, flags=re.IGNORECASE | re.DOTALL)
         if match:
             action = match.group(1).strip()
@@ -446,8 +450,7 @@ class Linear_CMT(Trajectory, ContextManagerBase):
             action = open_tag_match.group(1).strip()
             if action:
                 return f"<action>\n{action}\n</action>"
-        last_line = content.split("\n")[-1].strip() if content.strip() else "(empty)"
-        return f"<action>\n{last_line}\n</action>"
+        return None
 
     def _get_action_format(self) -> str:
         env_params = getattr(self.config.env_service, "env_params", None)
@@ -457,7 +460,8 @@ class Linear_CMT(Trajectory, ContextManagerBase):
 
     def _compress_llm_message(self, content: str) -> str:
         if self._get_action_format() == "react_tags":
-            return self._extract_action_tag(content)
+            extracted = self._extract_action_tag(content)
+            return extracted if extracted is not None else content
         return self._extract_action_line(content)
 
     @staticmethod
@@ -598,6 +602,9 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         enable_action_sanitizer = True
         if env_params is not None:
             enable_action_sanitizer = bool(getattr(env_params, "enable_action_sanitizer", True))
+
+        if env_type == "webshop" and self._get_action_format() == "react_tags":
+            return latest_content
 
         if env_type == "webshop" and enable_action_sanitizer:
             sanitized_action = self._extract_last_webshop_action(latest_content)
