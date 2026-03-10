@@ -648,9 +648,20 @@ In each turn, you must output your thought/reasoning and then output your action
             target = click_match.group(1).strip()
             clickables = [str(item) for item in self.current_available_actions.get("clickables", [])]
             target_lower = target.lower()
-            canonical_target = next((item for item in clickables if item.lower() == target_lower), None)
+            canonical_target = None
+            for item in clickables:
+                item_lower = item.lower()
+                if item_lower == target_lower:
+                    canonical_target = item
+                    break
+                wrapped_match = re.fullmatch(r"click\[([^\]]+)\]", item, flags=re.IGNORECASE)
+                if wrapped_match and wrapped_match.group(1).strip().lower() == target_lower:
+                    canonical_target = item
+                    break
             if canonical_target is None:
                 return False, f"Invalid action. '{target}' is not a clickable element on this page.", None
+            if re.fullmatch(r"click\[([^\]]+)\]", canonical_target, flags=re.IGNORECASE):
+                return True, "", canonical_target
             return True, "", f"click[{canonical_target}]"
 
         return False, "Invalid action. Only search[...] and click[...] are allowed.", None
