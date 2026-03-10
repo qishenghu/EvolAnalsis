@@ -114,6 +114,17 @@ def parse_args() -> argparse.Namespace:
         help="Upper bound on rollout plans attempted per task.",
     )
     parser.add_argument("--sleep_sec", type=float, default=0.0)
+    parser.add_argument(
+        "--abort_on_service_error",
+        action="store_true",
+        default=True,
+        help="Abort immediately when env_service/WebShop becomes unavailable.",
+    )
+    parser.add_argument(
+        "--no_abort_on_service_error",
+        action="store_false",
+        dest="abort_on_service_error",
+    )
     return parser.parse_args()
 
 
@@ -198,6 +209,21 @@ def deterministic_price_for_product(asin: str, pricing: Sequence[float]) -> floa
     digest = hashlib.sha256(key.encode("utf-8")).digest()
     fraction = int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
     return low + (high - low) * fraction
+
+
+def is_fatal_service_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    fatal_markers = (
+        "connection refused",
+        "max retries exceeded",
+        "failed to establish a new connection",
+        "remote end closed connection",
+        "remotedisconnected",
+        "connection aborted",
+        "connection reset by peer",
+        "read timed out",
+    )
+    return any(marker in text for marker in fatal_markers)
 
 
 def load_completed_task_ids(path: str) -> set[str]:
@@ -755,6 +781,8 @@ def collect_task_rollouts(
         try:
             result = run_rollout_plan(client, task_id, goal, plan, args)
         except Exception as exc:
+            if args.abort_on_service_error and is_fatal_service_error(exc):
+                raise RuntimeError(f"fatal_service_error task_id={task_id}: {exc}") from exc
             result = {
                 "success": False,
                 "error": str(exc),

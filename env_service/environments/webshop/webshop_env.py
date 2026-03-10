@@ -80,6 +80,47 @@ class WebshopEnv(BaseEnv):
         self.current_available_actions = {"has_search_bar": False, "clickables": []}
         self.is_done = False
         self.current_reward = 0.0
+        self.action_format = str(self.params.get("action_format", "react"))
+        self.enable_action_sanitizer = bool(self.params.get("enable_action_sanitizer", True))
+        self.invalid_action_penalty = float(self.params.get("invalid_action_penalty", -0.1))
+        self.max_consecutive_invalid_actions = int(
+            self.params.get("max_consecutive_invalid_actions", 2)
+        )
+        self.consecutive_invalid_actions = 0
+        self.total_invalid_actions = 0
+        self.invalid_action_penalty_total = 0.0
+
+    def _use_react_tags(self) -> bool:
+        return self.action_format == "react_tags"
+
+    def _get_action_format_example(self) -> str:
+        if self._use_react_tags():
+            return (
+                "<think>\n"
+                "your thoughts.\n"
+                "</think>\n"
+                "<action>\n"
+                "click[something] (or search[keywords])\n"
+                "</action>"
+            )
+        return (
+            "Thought:\n"
+            "your thoughts.\n"
+            "Action: \n"
+            "click[something] (or search[keywords])"
+        )
+
+    def _get_invalid_action_format_message(self) -> str:
+        if self._use_react_tags():
+            return (
+                "Invalid action format. Please use the format: '<think>\\n your thoughts.\\n</think>\\n"
+                "<action>\\n search[query]\\n</action>' or '<think>\\n your thoughts.\\n</think>\\n"
+                "<action>\\n click[element]\\n</action>'."
+            )
+        return (
+            "Invalid action format. Please use the format: 'Thought:\\n your thoughts.\\n\\n"
+            "Action:\\n search[query]' or 'Thought:\\n your thoughts.\\n\\nAction:\\n click[element]'."
+        )
 
     @staticmethod
     def _parse_session_id(value: Any) -> Optional[int]:
@@ -283,6 +324,9 @@ class WebshopEnv(BaseEnv):
         
         self.is_done = False
         self.current_reward = 0.0
+        self.consecutive_invalid_actions = 0
+        self.total_invalid_actions = 0
+        self.invalid_action_penalty_total = 0.0
         
         # Format available actions for display
         action_desc = self._format_available_actions()
@@ -312,7 +356,7 @@ class WebshopEnv(BaseEnv):
     
     def _get_system_prompt(self) -> str:
         """Get the system prompt for WebShop environment."""
-        return '''You are web shopping.
+        return f'''You are web shopping.
 I will give you instructions about what to do.
 You have to follow the instructions.
 Every round I will give you an observation and a list of available actions, you have to respond an action based on the state and instruction.
@@ -327,10 +371,7 @@ Keywords in search are up to you, but the value in click must be a value in the 
 Remember that your keywords in search should be carefully designed.
 In each turn, you must output your thought/reasoning and then output your action in the following format:
 ```
-Thought:
-your thoughts.
-Action: 
-click[something] (or search[keywords])
+{self._get_action_format_example()}
 ```
 '''
 
@@ -380,22 +421,9 @@ click[something] (or search[keywords])
         
         # Parse "Action:" from LLM output
         parsed_action = self._parse_action_from_llm_output(action_str)
-        
-        if parsed_action is None:
-            action_desc = self._format_available_actions()
-            invalid_obs = "Invalid action format. Please use the format: 'Thought:\n your thoughts.\n\nAction:\n search[query]' or 'Thought:\n your thoughts.\n\nAction:\n click[element]'."
-            invalid_obs += f"\n\n{action_desc}"
-            
-            return {
-                "state": [{"role": "user", "content": invalid_obs}],
-                "reward": 0.0,
-                "is_terminated": False,
-                "info": {
-                    "available_actions": self.current_available_actions,
-                    "invalid_action": True,
-                },
-                "instance_id": self.instance_id,
-            }
+        is_valid_action, invalid_reason, parsed_action = self._validate_parsed_action(parsed_action)
+        if not is_valid_action:
+            return self._build_invalid_action_response(invalid_reason)
 
         # 调用 WebShop 的 /step 接口
         step_payload = {
@@ -417,6 +445,7 @@ click[something] (or search[keywords])
             self.current_observation = step_result[0] if len(step_result) > 0 else ""
             self.current_reward = step_result[1] if len(step_result) > 1 else 0.0
             self.is_done = step_result[2] if len(step_result) > 2 else False
+        self.consecutive_invalid_actions = 0
         
         # Get updated available actions
         try:
@@ -451,7 +480,7 @@ click[something] (or search[keywords])
         Returns:
             float: Evaluation score (0.0 to 1.0).
         """
-        return float(self.current_reward)
+        return float(self.current_reward + self.invalid_action_penalty_total)
     
     def get_info(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -466,6 +495,11 @@ click[something] (or search[keywords])
             "available_actions": self.current_available_actions,
             "done": self.is_done,
             "reward": self.current_reward,
+            "success_rate": 1.0 if float(self.current_reward) >= 1.0 else 0.0,
+            "consecutive_invalid_actions": self.consecutive_invalid_actions,
+            "total_invalid_actions": self.total_invalid_actions,
+            "invalid_action_penalty_total": self.invalid_action_penalty_total,
+            "action_format": self.action_format,
         }
     
     def close(self):
@@ -491,6 +525,9 @@ click[something] (or search[keywords])
                 self.current_available_actions = {"has_search_bar": False, "clickables": []}
                 self.is_done = False
                 self.current_reward = 0.0
+                self.consecutive_invalid_actions = 0
+                self.total_invalid_actions = 0
+                self.invalid_action_penalty_total = 0.0
         print("WebShop environment released.")
     
     @staticmethod
@@ -540,6 +577,31 @@ click[something] (or search[keywords])
             return None
         
         llm_output_clean = llm_output.strip()
+        if self.enable_action_sanitizer:
+            action_matches = list(
+                re.finditer(
+                    r"(search|click)\s*\[([^\]\n]+)\]",
+                    llm_output_clean,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if action_matches:
+                last_match = action_matches[-1]
+                action_type = last_match.group(1).lower()
+                action_arg = last_match.group(2).strip()
+                if action_arg:
+                    return f"{action_type}[{action_arg}]"
+
+        if self._use_react_tags():
+            action_tag_match = re.search(
+                r"<action>(.*?)</action>",
+                llm_output_clean,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if action_tag_match:
+                action_str = action_tag_match.group(1).strip().split("\n")[0].strip()
+                if action_str:
+                    return action_str
         
         # Strategy 1: Extract "Action:" segment
         action_parts = llm_output_clean.rsplit("Action:", 1)
@@ -562,10 +624,63 @@ click[something] (or search[keywords])
             return f"click[{click_match.group(1)}]"
         
         # Strategy 3: If no "Action:" found and not recognized pattern
-        if not re.match(r"^(Thought|Action):", llm_output_clean, re.IGNORECASE):
+        if not re.match(r"^(Thought|Action):", llm_output_clean, re.IGNORECASE) and not re.match(r"^<(think|action)>", llm_output_clean, re.IGNORECASE):
             # Check if it looks like a valid action
             if llm_output_clean.startswith(("search[", "click[")):
                 return llm_output_clean.split('\n')[0].strip()
         
         return None
+
+    def _validate_parsed_action(self, parsed_action: Optional[str]) -> tuple[bool, str, Optional[str]]:
+        if parsed_action is None:
+            return False, self._get_invalid_action_format_message(), None
+
+        search_match = re.fullmatch(r"search\[([^\]]+)\]", parsed_action, flags=re.IGNORECASE)
+        if search_match:
+            if not self.current_available_actions.get("has_search_bar", False):
+                return False, "Invalid action. Search is not available on this page.", None
+            if not search_match.group(1).strip():
+                return False, "Invalid action. Search query cannot be empty.", None
+            return True, "", f"search[{search_match.group(1).strip()}]"
+
+        click_match = re.fullmatch(r"click\[([^\]]+)\]", parsed_action, flags=re.IGNORECASE)
+        if click_match:
+            target = click_match.group(1).strip()
+            clickables = [str(item) for item in self.current_available_actions.get("clickables", [])]
+            target_lower = target.lower()
+            canonical_target = next((item for item in clickables if item.lower() == target_lower), None)
+            if canonical_target is None:
+                return False, f"Invalid action. '{target}' is not a clickable element on this page.", None
+            return True, "", f"click[{canonical_target}]"
+
+        return False, "Invalid action. Only search[...] and click[...] are allowed.", None
+
+    def _build_invalid_action_response(self, invalid_reason: str) -> Dict[str, Any]:
+        self.total_invalid_actions += 1
+        self.consecutive_invalid_actions += 1
+        self.invalid_action_penalty_total += self.invalid_action_penalty
+        should_terminate = self.consecutive_invalid_actions >= self.max_consecutive_invalid_actions
+        self.is_done = should_terminate
+
+        action_desc = self._format_available_actions()
+        invalid_obs = invalid_reason
+        invalid_obs += f"\n\n{action_desc}"
+        if should_terminate:
+            invalid_obs += (
+                f"\n\nEpisode terminated after {self.consecutive_invalid_actions} consecutive invalid actions."
+            )
+
+        return {
+            "state": [{"role": "user", "content": invalid_obs}],
+            "reward": self.invalid_action_penalty,
+            "is_terminated": should_terminate,
+            "info": {
+                "available_actions": self.current_available_actions,
+                "invalid_action": True,
+                "consecutive_invalid_actions": self.consecutive_invalid_actions,
+                "total_invalid_actions": self.total_invalid_actions,
+                "invalid_action_penalty_total": self.invalid_action_penalty_total,
+            },
+            "instance_id": self.instance_id,
+        }
 

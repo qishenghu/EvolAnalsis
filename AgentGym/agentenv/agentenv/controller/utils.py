@@ -171,6 +171,50 @@ class BaseAdapter:
         return f"Thought:\n{action_with_thought.thought}\n\nAction:\n{action_with_thought.action}"
 
     @staticmethod
+    def parse_react_tags(text: str) -> ActionWithTought:
+        """
+        ReAct tags format:
+        ```
+        <think>
+        I think ...
+        </think>
+        <action>
+        action
+        </action>
+        ```
+        """
+        text = text.replace("`", "")
+        invalid_format_flg = False
+
+        think_match = re.search(r"<think>(.*?)</think>", text, flags=re.IGNORECASE | re.DOTALL)
+        action_match = re.search(r"<action>(.*?)</action>", text, flags=re.IGNORECASE | re.DOTALL)
+
+        thought = think_match.group(1).strip() if think_match else ""
+        action = action_match.group(1).strip() if action_match else ""
+
+        if not think_match or not action_match:
+            invalid_format_flg = True
+            fallback_action = re.search(r"(search|click)\s*\[[^\]\n]+\]", text, flags=re.IGNORECASE)
+            if fallback_action and not action:
+                action = fallback_action.group(0).strip()
+
+        if invalid_format_flg:
+            print(
+                "The text is not in the correct react_tags format. Parsing result may not be accurate."
+            )
+            print("###RAW TEXT:\n", text)
+            print("\n###PARSED THOUGHT:\n", thought)
+            print("\n###PARSED ACTION:\n", action)
+        return ActionWithTought(thought, action)
+
+    @staticmethod
+    def to_react_tags(action_with_thought: ActionWithTought) -> str:
+        return (
+            f"<think>\n{action_with_thought.thought}\n</think>\n"
+            f"<action>\n{action_with_thought.action}\n</action>"
+        )
+
+    @staticmethod
     def parse_function_calling(text: str) -> ActionWithTought:
         """
         Function Calling format:
@@ -205,6 +249,8 @@ class BaseAdapter:
     def action_parser(cls, action: str, action_format: ActionFormat) -> str:
         if action_format == ActionFormat.REACT:
             return cls.parse_react(action).action
+        elif action_format == ActionFormat.REACT_TAGS:
+            return cls.parse_react_tags(action).action
         elif action_format == ActionFormat.FUNCTION_CALLING:
             return cls.parse_function_calling(action).action
         elif action_format == ActionFormat.CODE_AS_ACTION:

@@ -176,6 +176,14 @@ class ParallelEnvManager(object):
         else:
             return llm_chat
 
+    @staticmethod
+    def _cfg_to_list(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
     def step_status_printer(self, tmux):
         """
         Prints the current status of the steps in the parallel environment, including the number of threads in different step ranges and the token generation rate.
@@ -251,11 +259,16 @@ class ParallelEnvManager(object):
                     max_completion_tokens=self.rollout_config.response_length,
                     temperature=self.rollout_config.temperature,
                     top_p=self.rollout_config.top_p)
+                stop_sequences = self._cfg_to_list(self.rollout_config.get("stop_sequences", None))
+                if stop_sequences:
+                    sampling_params["stop"] = stop_sequences
 
                 if mode == "validate":
                     sampling_params["temperature"] = self.rollout_config.val_kwargs.temperature
                     sampling_params["top_k"] = self.rollout_config.val_kwargs.top_k
                     sampling_params["top_p"] = self.rollout_config.val_kwargs.top_p
+                    val_stop_sequences = self._cfg_to_list(self.rollout_config.val_kwargs.get("stop_sequences", None))
+                    sampling_params["stop"] = val_stop_sequences if val_stop_sequences else stop_sequences
 
                 llm_chat_fn = self.get_llm_chat_fn(sampling_params)
                 reward_caculator=grader_manager.get_calculator(task.evaluator, task=task)

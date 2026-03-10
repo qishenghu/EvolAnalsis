@@ -22,6 +22,7 @@ TokenizedConversationOutput = TypedDict(
 
 class ActionFormat(Enum):
     REACT = "react"
+    REACT_TAGS = "react_tags"
     FUNCTION_CALLING = "function_calling"
     CODE_AS_ACTION = "code_as_action"
 

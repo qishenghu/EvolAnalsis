@@ -76,21 +76,23 @@ actor_rollout_ref:
     prompt_length: 25068
     response_length: 512
     max_model_len: 25580
-    temperature: 0.9
+    temperature: 0.5
     log_prob_micro_batch_size_per_gpu: 1
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
     gpu_memory_utilization: 0.5
     n: 8
+    stop_sequences: ["</action>"]
     log_prob_max_token_len_per_gpu: 25580
     val_kwargs:
       n: 1
+      stop_sequences: ["</action>"]
     max_env_worker: 32
     context_template: "linear"
     context_template_train_sp_action: false
     max_env_len: 4096
-    sliding_window_size: 3  # keep last 3 LLM turns full, compress older ones to action-only
+    sliding_window_size: 5  # keep last 5 LLM turns full, compress older ones to action-only
     sparse: true
     multi_turn:
       completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
@@ -126,6 +128,11 @@ data:
 env_service:
   env_type: "webshop"
   env_url: "http://127.0.0.1:8083"
+  env_params:
+    action_format: "react_tags"
+    enable_action_sanitizer: true
+    invalid_action_penalty: -0.1
+    max_consecutive_invalid_actions: 2
 
 task_manager:
   n: 0

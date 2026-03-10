@@ -413,6 +413,52 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         return content.split("\n")[-1].strip() if content.strip() else "(no action)"
 
     @staticmethod
+    def _extract_action_tag(content: str) -> str:
+        """Extract the action from an LLM output that uses react_tags format."""
+        if not isinstance(content, str):
+            return "<action>\n(empty)\n</action>"
+        match = re.search(r"<action>(.*?)</action>", content, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            action = match.group(1).strip()
+            if action:
+                return f"<action>\n{action}\n</action>"
+        last_line = content.split("\n")[-1].strip() if content.strip() else "(empty)"
+        return f"<action>\n{last_line}\n</action>"
+
+    def _get_action_format(self) -> str:
+        env_params = getattr(self.config.env_service, "env_params", None)
+        if env_params is None:
+            return "react"
+        return str(getattr(env_params, "action_format", "react") or "react").lower()
+
+    def _compress_llm_message(self, content: str) -> str:
+        if self._get_action_format() == "react_tags":
+            return self._extract_action_tag(content)
+        return self._extract_action_line(content)
+
+    @staticmethod
+    def _extract_last_webshop_action(content: str) -> str | None:
+        """Extract the last well-formed WebShop action from free-form output."""
+        if not isinstance(content, str):
+            return None
+        text = content.strip()
+        if not text:
+            return None
+
+        matches = list(
+            re.finditer(r"(search|click)\s*\[([^\]\n]+)\]", text, flags=re.IGNORECASE)
+        )
+        if not matches:
+            return None
+
+        last_match = matches[-1]
+        action_type = last_match.group(1).lower()
+        action_arg = last_match.group(2).strip()
+        if not action_arg:
+            return None
+        return f"{action_type}[{action_arg}]"
+
+    @staticmethod
     def _strip_action_hints(content: str) -> str:
         """Remove action hint blocks from an env observation, keeping only
         the actual observation text.  Recognises markers produced by
@@ -492,7 +538,7 @@ class Linear_CMT(Trajectory, ContextManagerBase):
                 continue
 
             if msg.author == "llm":
-                self._retoken(msg, self._extract_action_line(msg.content))
+                self._retoken(msg, self._compress_llm_message(msg.content))
             elif msg.author == "env":
                 stripped = self._strip_action_hints(msg.content)
                 if len(stripped) < len(msg._content_for_future):
@@ -523,6 +569,16 @@ class Linear_CMT(Trajectory, ContextManagerBase):
             - Returns the raw content if no valid code blocks are found
         """
         latest_content = self.full_context[-1].content
+        env_type = str(getattr(self.config.env_service, "env_type", "") or "").lower()
+        env_params = getattr(self.config.env_service, "env_params", None)
+        enable_action_sanitizer = True
+        if env_params is not None:
+            enable_action_sanitizer = bool(getattr(env_params, "enable_action_sanitizer", True))
+
+        if env_type == "webshop" and enable_action_sanitizer:
+            sanitized_action = self._extract_last_webshop_action(latest_content)
+            if sanitized_action is not None:
+                return sanitized_action
         return latest_content
 
     def filter_context_via_author(self, author: str) -> List[ExtendedMessage]:

@@ -1,7 +1,7 @@
 from typing import Optional
 import uuid
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from loguru import logger
 from agentevolver.client.env_client import EnvClient
 from agentevolver.module.agent_flow.base_agent_flow import BaseAgentFlow
@@ -38,6 +38,13 @@ class EnvWorker(object):
         self.thread_index: int = thread_index  # Set the thread index
         self.tokenizer = tokenizer  # Store the tokenizer
 
+    def _get_env_create_params(self) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"is_open_query": self.is_open_query}
+        env_params = getattr(self.config.env_service, "env_params", None)
+        if env_params:
+            params.update(OmegaConf.to_container(env_params, resolve=True))
+        return params
+
     def execute(self, data_id: str, rollout_id: str, traj_exp_config: TrajExpConfig, agent_flow: BaseAgentFlow, tmux:dict,stop:list[bool], system_prompt: Optional[str] = None, **kwargs) -> Trajectory:
         """
         Executes the task in the environment, generates a trajectory, and returns it.
@@ -60,7 +67,7 @@ class EnvWorker(object):
             init_response = self.env.create_instance(env_type=self.env_type,
                                                     task_id=self.task_id,
                                                     instance_id=self.instance_id,
-                                                    params={'is_open_query': self.is_open_query})
+                                                    params=self._get_env_create_params())
 
             init_messages: list[dict] = init_response["state"]
             assert isinstance(init_messages, list) and len(init_messages) in [2, 3], f"init_messages must be list and its length must be 2 or 3, got {len(init_messages)}"

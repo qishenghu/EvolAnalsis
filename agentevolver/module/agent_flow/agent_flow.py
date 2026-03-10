@@ -194,7 +194,13 @@ class AgentFlow(BaseAgentFlow):
                 success_rate = 1.0 if is_success else 0.0
                 score = success_rate
             else:
-                success_rate = 1.0 if float(score) >= 1.0 else 0.0
+                if isinstance(env_info, dict) and "success_rate" in env_info:
+                    try:
+                        success_rate = float(env_info.get("success_rate", 0.0) or 0.0)
+                    except Exception:
+                        success_rate = 1.0 if float(score) >= 1.0 else 0.0
+                else:
+                    success_rate = 1.0 if float(score) >= 1.0 else 0.0
 
         self.cmt.reward = Reward(outcome=score, success_rate=success_rate, madness=self.cmt.compute_madness(), description=reason)  # ⭐ Set the reward for the context
         self.cmt.reward = self.cmt.reward_patch(self.cmt.reward)
