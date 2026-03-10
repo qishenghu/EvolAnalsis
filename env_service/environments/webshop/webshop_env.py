@@ -83,6 +83,10 @@ class WebshopEnv(BaseEnv):
         self.action_format = str(self.params.get("action_format", "react"))
         self.enable_action_sanitizer = bool(self.params.get("enable_action_sanitizer", True))
         self.invalid_action_penalty = float(self.params.get("invalid_action_penalty", -0.05))
+        invalid_action_penalty_cap = self.params.get("invalid_action_penalty_cap", None)
+        self.invalid_action_penalty_cap = (
+            float(invalid_action_penalty_cap) if invalid_action_penalty_cap is not None else None
+        )
         self.max_consecutive_invalid_actions = int(
             self.params.get("max_consecutive_invalid_actions", 2)
         )
@@ -678,7 +682,14 @@ In each turn, you must output your thought/reasoning and then output your action
     def _build_invalid_action_response(self, invalid_reason: str) -> Dict[str, Any]:
         self.total_invalid_actions += 1
         self.consecutive_invalid_actions += 1
+        previous_penalty_total = self.invalid_action_penalty_total
         self.invalid_action_penalty_total += self.invalid_action_penalty
+        if self.invalid_action_penalty_cap is not None:
+            self.invalid_action_penalty_total = max(
+                self.invalid_action_penalty_total,
+                self.invalid_action_penalty_cap,
+            )
+        applied_penalty = self.invalid_action_penalty_total - previous_penalty_total
         should_terminate = self.consecutive_invalid_actions >= self.max_consecutive_invalid_actions
         self.is_done = should_terminate
 
@@ -692,7 +703,7 @@ In each turn, you must output your thought/reasoning and then output your action
 
         return {
             "state": [{"role": "user", "content": invalid_obs}],
-            "reward": self.invalid_action_penalty,
+            "reward": applied_penalty,
             "is_terminated": should_terminate,
             "info": {
                 "available_actions": self.current_available_actions,
@@ -700,6 +711,7 @@ In each turn, you must output your thought/reasoning and then output your action
                 "consecutive_invalid_actions": self.consecutive_invalid_actions,
                 "total_invalid_actions": self.total_invalid_actions,
                 "invalid_action_penalty_total": self.invalid_action_penalty_total,
+                "invalid_action_penalty_applied": applied_penalty,
             },
             "instance_id": self.instance_id,
         }

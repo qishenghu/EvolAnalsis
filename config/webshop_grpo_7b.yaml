@@ -131,7 +131,8 @@ env_service:
   env_params:
     action_format: "react_tags"
     enable_action_sanitizer: true
-    invalid_action_penalty: -0.1
+    invalid_action_penalty: -0.05
+    invalid_action_penalty_cap: -0.1
     max_consecutive_invalid_actions: 2
 
 task_manager:
