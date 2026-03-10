@@ -82,7 +82,7 @@ class WebshopEnv(BaseEnv):
         self.current_reward = 0.0
         self.action_format = str(self.params.get("action_format", "react"))
         self.enable_action_sanitizer = bool(self.params.get("enable_action_sanitizer", True))
-        self.invalid_action_penalty = float(self.params.get("invalid_action_penalty", -0.1))
+        self.invalid_action_penalty = float(self.params.get("invalid_action_penalty", -0.05))
         self.max_consecutive_invalid_actions = int(
             self.params.get("max_consecutive_invalid_actions", 2)
         )
