@@ -87,12 +87,22 @@ class WebshopEnv(BaseEnv):
         self.invalid_action_penalty_cap = (
             float(invalid_action_penalty_cap) if invalid_action_penalty_cap is not None else None
         )
+        self.terminate_on_invalid_action = bool(
+            self.params.get("terminate_on_invalid_action", False)
+        )
+        invalid_action_final_reward = self.params.get("invalid_action_final_reward", None)
+        self.invalid_action_final_reward = (
+            float(invalid_action_final_reward)
+            if invalid_action_final_reward is not None
+            else None
+        )
         self.max_consecutive_invalid_actions = int(
             self.params.get("max_consecutive_invalid_actions", 2)
         )
         self.consecutive_invalid_actions = 0
         self.total_invalid_actions = 0
         self.invalid_action_penalty_total = 0.0
+        self.has_invalid_action = False
 
     def _use_react_tags(self) -> bool:
         return self.action_format == "react_tags"
@@ -331,6 +341,7 @@ class WebshopEnv(BaseEnv):
         self.consecutive_invalid_actions = 0
         self.total_invalid_actions = 0
         self.invalid_action_penalty_total = 0.0
+        self.has_invalid_action = False
         
         # Format available actions for display
         action_desc = self._format_available_actions()
@@ -484,6 +495,10 @@ In each turn, you must output your thought/reasoning and then output your action
         Returns:
             float: Evaluation score (0.0 to 1.0).
         """
+        if self.terminate_on_invalid_action and self.invalid_action_final_reward is not None:
+            if self.has_invalid_action:
+                return float(self.invalid_action_final_reward)
+            return float(self.current_reward)
         return float(self.current_reward + self.invalid_action_penalty_total)
     
     def get_info(self, messages: Dict[str, Any] = None, params: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -502,7 +517,9 @@ In each turn, you must output your thought/reasoning and then output your action
             "success_rate": 1.0 if float(self.current_reward) >= 1.0 else 0.0,
             "consecutive_invalid_actions": self.consecutive_invalid_actions,
             "total_invalid_actions": self.total_invalid_actions,
+            "has_invalid_action": self.has_invalid_action,
             "invalid_action_penalty_total": self.invalid_action_penalty_total,
+            "invalid_action_final_reward": self.invalid_action_final_reward,
             "action_format": self.action_format,
         }
     
@@ -532,6 +549,7 @@ In each turn, you must output your thought/reasoning and then output your action
                 self.consecutive_invalid_actions = 0
                 self.total_invalid_actions = 0
                 self.invalid_action_penalty_total = 0.0
+                self.has_invalid_action = False
         print("WebShop environment released.")
     
     @staticmethod
@@ -683,24 +701,36 @@ In each turn, you must output your thought/reasoning and then output your action
     def _build_invalid_action_response(self, invalid_reason: str) -> Dict[str, Any]:
         self.total_invalid_actions += 1
         self.consecutive_invalid_actions += 1
-        previous_penalty_total = self.invalid_action_penalty_total
-        self.invalid_action_penalty_total += self.invalid_action_penalty
-        if self.invalid_action_penalty_cap is not None:
-            self.invalid_action_penalty_total = max(
-                self.invalid_action_penalty_total,
-                self.invalid_action_penalty_cap,
-            )
-        applied_penalty = self.invalid_action_penalty_total - previous_penalty_total
-        should_terminate = self.consecutive_invalid_actions >= self.max_consecutive_invalid_actions
+        self.has_invalid_action = True
+
+        if self.terminate_on_invalid_action and self.invalid_action_final_reward is not None:
+            self.invalid_action_penalty_total = float(self.invalid_action_final_reward)
+            applied_penalty = float(self.invalid_action_final_reward)
+        else:
+            previous_penalty_total = self.invalid_action_penalty_total
+            self.invalid_action_penalty_total += self.invalid_action_penalty
+            if self.invalid_action_penalty_cap is not None:
+                self.invalid_action_penalty_total = max(
+                    self.invalid_action_penalty_total,
+                    self.invalid_action_penalty_cap,
+                )
+            applied_penalty = self.invalid_action_penalty_total - previous_penalty_total
+
+        should_terminate = self.terminate_on_invalid_action or (
+            self.consecutive_invalid_actions >= self.max_consecutive_invalid_actions
+        )
         self.is_done = should_terminate
 
         action_desc = self._format_available_actions()
         invalid_obs = invalid_reason
         invalid_obs += f"\n\n{action_desc}"
         if should_terminate:
-            invalid_obs += (
-                f"\n\nEpisode terminated after {self.consecutive_invalid_actions} consecutive invalid actions."
-            )
+            if self.terminate_on_invalid_action:
+                invalid_obs += "\n\nEpisode terminated after the first invalid action."
+            else:
+                invalid_obs += (
+                    f"\n\nEpisode terminated after {self.consecutive_invalid_actions} consecutive invalid actions."
+                )
 
         return {
             "state": [{"role": "user", "content": invalid_obs}],
