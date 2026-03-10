@@ -136,7 +136,13 @@ class ParallelEnvManager(object):
                     logger.exception(f"rollout_server.{i} error: {e.args}")
                     time.sleep(i + 1)
 
-            return input_messages[-1]
+            last_message = input_messages[-1]
+            if last_message.get("role") != "assistant":
+                raise RuntimeError(
+                    "Chat completion callback did not append an assistant message. "
+                    f"last_role={last_message.get('role')}, sampling_params={updated_sampling_params}"
+                )
+            return last_message
 
         def llm_chat_remote(messages: List[Dict[str, str]],
                            custom_sampling_params: dict = None,
@@ -169,7 +175,13 @@ class ParallelEnvManager(object):
                 except Exception as e:
                     logger.exception(f"rollout_server.{i} error: {e.args}")
                     time.sleep(2**i)
-            return output_message[-1]
+            last_message = output_message[-1]
+            if last_message.get("role") != "assistant":
+                raise RuntimeError(
+                    "Remote chat completion did not return an assistant message. "
+                    f"last_role={last_message.get('role')}, sampling_params={updated_sampling_params}"
+                )
+            return last_message
 
         if self.llm_mode == "remote":
             return llm_chat_remote

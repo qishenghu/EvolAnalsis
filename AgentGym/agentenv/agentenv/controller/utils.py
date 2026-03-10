@@ -192,6 +192,11 @@ class BaseAdapter:
         thought = think_match.group(1).strip() if think_match else ""
         action = action_match.group(1).strip() if action_match else ""
 
+        if not action:
+            open_action_match = re.search(r"<action>(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+            if open_action_match:
+                action = open_action_match.group(1).strip()
+
         if not think_match or not action_match:
             invalid_format_flg = True
             fallback_action = re.search(r"(search|click)\s*\[[^\]\n]+\]", text, flags=re.IGNORECASE)

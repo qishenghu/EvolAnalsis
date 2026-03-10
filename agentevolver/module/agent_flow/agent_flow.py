@@ -111,6 +111,10 @@ class AgentFlow(BaseAgentFlow):
 
             # 5. 🤖 call llm
             llm_output = self.llm_chat_fn(step_input_message_arr, request_id=request_id)  # ⭐ Call the LLM to generate the next response
+            if llm_output.get("role") != "assistant":
+                raise RuntimeError(
+                    f"Expected assistant response from llm_chat_fn, got role={llm_output.get('role')}"
+                )
             if (stop is not None) and stop[thread_index]:  # Check if the thread should stop (because other threads have completed, making this thread useless)
                 self.cmt.discarded = True
                 break

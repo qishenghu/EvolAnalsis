@@ -422,6 +422,11 @@ class Linear_CMT(Trajectory, ContextManagerBase):
             action = match.group(1).strip()
             if action:
                 return f"<action>\n{action}\n</action>"
+        open_tag_match = re.search(r"<action>(.*)$", content, flags=re.IGNORECASE | re.DOTALL)
+        if open_tag_match:
+            action = open_tag_match.group(1).strip()
+            if action:
+                return f"<action>\n{action}\n</action>"
         last_line = content.split("\n")[-1].strip() if content.strip() else "(empty)"
         return f"<action>\n{last_line}\n</action>"
 

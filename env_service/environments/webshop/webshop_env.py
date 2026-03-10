@@ -602,6 +602,15 @@ In each turn, you must output your thought/reasoning and then output your action
                 action_str = action_tag_match.group(1).strip().split("\n")[0].strip()
                 if action_str:
                     return action_str
+            open_action_tag_match = re.search(
+                r"<action>(.*)$",
+                llm_output_clean,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if open_action_tag_match:
+                action_str = open_action_tag_match.group(1).strip().split("\n")[0].strip()
+                if action_str:
+                    return action_str
         
         # Strategy 1: Extract "Action:" segment
         action_parts = llm_output_clean.rsplit("Action:", 1)

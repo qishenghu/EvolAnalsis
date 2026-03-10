@@ -23,18 +23,41 @@ class SimpleCompletionCallback(CompletionCallback):
         super().__init__(config, scheduler)
         logger.info("=" * 10 + "SimpleCompletionCallback is inited~" + "=" * 10)
 
+    @staticmethod
+    def _extract_tokens(choice) -> List[TokenAndProb]:
+        logprobs = getattr(choice, "logprobs", None)
+        if logprobs is None:
+            return []
+        content = getattr(logprobs, "content", None)
+        if not content:
+            return []
+        return [TokenAndProb(token) for token in content]
+
     async def __call__(self, messages: List[Dict[str, str]], completions: ChatCompletion, info: Dict[str, Any]):
-        message = completions.choices[0].message.model_dump(exclude_unset=True, exclude_none=True)
+        choice = completions.choices[0]
+        message = choice.message.model_dump(exclude_unset=True, exclude_none=True)
+        message["role"] = message.get("role", "assistant")
         if "content" not in message:
-            message["content"] = "vllm failed"
+            message["content"] = ""
 
-        if message['content'] == '' or completions.choices[0].finish_reason != 'stop':
-            logger.warning(str(completions.choices[0].finish_reason))
+        finish_reason = getattr(choice, "finish_reason", None)
+        if message["content"] == "" or finish_reason != "stop":
+            logger.warning(str(finish_reason))
             logger.bind(bad_case=True).error('empty content or non-stop finish reason')
-            logger.bind(bad_case=True).error(str(completions.choices[0]))
-            message['content'] == 'im_end'  # fill a token when vllm failed
+            logger.bind(bad_case=True).error(str(choice))
+            if message["content"] == "":
+                # Preserve the assistant turn so the caller never falls back
+                # to the previous user message when stop handling is unusual.
+                message["content"] = "im_end"
 
-        t = {"role": message["role"], "request_id":completions.id, "content": message['content'], "tokens": [TokenAndProb(t) for t in completions.choices[0].logprobs.content]}
+        t = {
+            "role": message["role"],
+            "request_id": completions.id,
+            "content": message["content"],
+        }
+        tokens = self._extract_tokens(choice)
+        if tokens:
+            t["tokens"] = tokens
         messages.append(t)
 
     def postprocess(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], n: int) -> DataProto:
