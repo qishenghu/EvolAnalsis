@@ -166,6 +166,8 @@ data:
 env_service:
   env_type: "alfworld"
   env_url: "http://127.0.0.1:8081"
+  env_params:
+    action_format: "react"
 
 # ============================================================================
 # Task Manager Configuration

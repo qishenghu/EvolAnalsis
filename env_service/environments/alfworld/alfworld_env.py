@@ -72,6 +72,7 @@ class AlfworldEnv(BaseEnv):
         self.current_available_actions = []
         self.is_done = False
         self.current_reward = 0.0
+        self.action_format = str(self.params.get("action_format", "react"))
 
     # ---------------------------
     # Internal HTTP helpers
@@ -148,7 +149,7 @@ class AlfworldEnv(BaseEnv):
         init_messages = [
             {
                 "role": "system",
-                "content": 'Interact with a household to solve a task. Imagine you are an intelligent agent in a household environment and your target is to perform actions to complete the task goal. At the beginning of your interactions, you will be given the detailed description of the current environment and your goal to accomplish. For each of your turn, you will be given a list of actions which you can choose one to perform in this turn. You should choose from two actions: "THOUGHT" or "ACTION". If you choose "THOUGHT", you should first think about the current condition and plan for your future actions, and then output your action in this turn. Your output must strictly follow this format:"Thought:\nyour thoughts.\n\nAction:\nyour next action"; If you choose "ACTION", you should directly output the action in this turn. Your output must strictly follow this format:"Action:\nyour next action". After your each turn, the environment will give you immediate feedback based on which you plan your next few steps. if the envrionment output "Nothing happened", that means the previous action is invalid and you should try more options.\n Reminder: \n1. the action must be chosen from the given available actions. Any actions except provided available actions will be regarded as illegal. \n2. Think when necessary, try to act directly more in the process.'
+                "content": self._get_system_prompt()
             },
             {
                 "role": "assistant",
@@ -166,6 +167,37 @@ class AlfworldEnv(BaseEnv):
             "task_type": reset_result.get("task_type", ""),
             "available_actions": self.current_available_actions,
         }
+
+    def _use_react_tags(self) -> bool:
+        return self.action_format == "react_tags"
+
+    def _get_action_format_example(self) -> str:
+        if self._use_react_tags():
+            return "<think>\nyour thoughts.\n</think>\n<action>\nyour next action\n</action>"
+        return "Thought:\nyour thoughts.\n\nAction:\nyour next action"
+
+    def _get_action_only_format_example(self) -> str:
+        if self._use_react_tags():
+            return "<action>\nyour next action\n</action>"
+        return "Action:\nyour next action"
+
+    def _get_system_prompt(self) -> str:
+        return (
+            'Interact with a household to solve a task. Imagine you are an intelligent agent in a household '
+            'environment and your target is to perform actions to complete the task goal. At the beginning '
+            'of your interactions, you will be given the detailed description of the current environment and '
+            'your goal to accomplish. For each of your turn, you will be given a list of actions which you '
+            'can choose one to perform in this turn. You should choose from two actions: "THOUGHT" or "ACTION". '
+            'If you choose "THOUGHT", you should first think about the current condition and plan for your '
+            'future actions, and then output your action in this turn. Your output must strictly follow this '
+            f'format:"{self._get_action_format_example()}"; If you choose "ACTION", you should directly output '
+            f'the action in this turn. Your output must strictly follow this format:"{self._get_action_only_format_example()}". '
+            'After your each turn, the environment will give you immediate feedback based on which you plan '
+            'your next few steps. if the envrionment output "Nothing happened", that means the previous action '
+            'is invalid and you should try more options.\n Reminder: \n1. the action must be chosen from the '
+            'given available actions. Any actions except provided available actions will be regarded as illegal. '
+            '\n2. Think when necessary, try to act directly more in the process.'
+        )
     
     def step(self, action: Dict[str, Any], params: Dict[str, Any] = None) -> Dict[str, Any]:
         """
@@ -398,6 +430,27 @@ class AlfworldEnv(BaseEnv):
             return None
         
         llm_output_clean = llm_output.strip()
+
+        if self._use_react_tags():
+            action_tag_match = re.search(
+                r"<action>(.*?)</action>",
+                llm_output_clean,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if action_tag_match:
+                action_str = action_tag_match.group(1).strip()
+                if action_str:
+                    return action_str
+            open_action_tag_match = re.search(
+                r"<action>(.*)$",
+                llm_output_clean,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if open_action_tag_match:
+                action_str = open_action_tag_match.group(1).strip()
+                if action_str:
+                    return action_str
+            return None
         
         # Strategy 1: Try to extract "Action:" segment (most common case)
         # Split by "Action:" from the right (rsplit) to get the last action if multiple exist
