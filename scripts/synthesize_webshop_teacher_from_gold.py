@@ -32,9 +32,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from env_service.environments.webshop.webshop_env import WebshopEnv
 
-
-WEBSHOP_SYSTEM_PROMPT = WebshopEnv(task_id="0", instance_id="dummy")._get_system_prompt()
-
 SYNTH_SYSTEM_PROMPT = """You will be given a WebShop shopping instruction, previous interactions, the current observation, and the next action that will be taken.
 
 Your job: write ONLY the Thought that causally justifies taking that action right now.
@@ -137,19 +134,28 @@ def load_completed(output_path: str, resume_policy: str) -> set[str]:
             if rollout_id is None:
                 continue
             rollout_id = str(rollout_id)
+            source_rollout_id = str(obj.get("metadata", {}).get("source_rollout_id", "") or "")
+            normalized_rollout_id = (
+                source_rollout_id
+                if source_rollout_id
+                else rollout_id[:-6] if rollout_id.endswith("_synth") else rollout_id
+            )
             if resume_policy == "any":
-                done.add(rollout_id)
+                done.add(normalized_rollout_id)
             elif resume_policy == "success":
                 if obj.get("success") is True:
-                    done.add(rollout_id)
+                    done.add(normalized_rollout_id)
             else:
                 if "error" not in obj:
-                    done.add(rollout_id)
+                    done.add(normalized_rollout_id)
     return done
 
 
 def _strip_thought_markers(text: str) -> str:
     t = (text or "").strip()
+    tag_match = re.search(r"<think>(.*?)</think>", t, flags=re.I | re.S)
+    if tag_match:
+        return tag_match.group(1).strip()
     m = re.search(r"Thought:\s*(.*?)(\n\s*\n\s*Action:|\Z)", t, flags=re.I | re.S)
     if m:
         return m.group(1).strip()
@@ -159,6 +165,23 @@ def _strip_thought_markers(text: str) -> str:
     if m2:
         return t[: m2.start()].strip()
     return t
+
+
+def _get_system_prompt(action_format: str) -> str:
+    env = WebshopEnv(
+        task_id="0",
+        instance_id="dummy",
+        params={"action_format": action_format},
+    )
+    return env._get_system_prompt()
+
+
+def _render_assistant_turn(thought: str, action: str, action_format: str) -> str:
+    thought = (thought or "").strip()
+    action = (action or "").strip()
+    if action_format == "react_tags":
+        return f"<think>\n{thought}\n</think>\n<action>\n{action}\n</action>"
+    return f"Thought:\n{thought}\n\nAction:\n{action}"
 
 
 def _build_synth_context(
@@ -218,11 +241,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--inputs",
         nargs="+",
-        default=["analysis_outputs/webshop_gold_train_verified.jsonl"],
+        default=["analysis_outputs/webshop_gold_train_multisearch_full_chunked.jsonl"],
     )
     p.add_argument(
         "--output",
-        default="data/teacher_trajectories/webshop_gold_qwen7b_synth.jsonl",
+        default="data/teacher_trajectories/qwen72b/webshop_qwen72b_synth.jsonl",
     )
     p.add_argument("--export_base", type=str, default=None)
     p.add_argument("--export_threshold", type=float, default=1.0)
@@ -243,6 +266,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--history_steps", type=int, default=8)
     p.add_argument("--task_subset", type=int, default=None)
     p.add_argument("--task_seed", type=int, default=2026)
+    p.add_argument("--action_format", choices=["react", "react_tags"], default="react_tags")
     return p.parse_args()
 
 
@@ -271,6 +295,7 @@ def main() -> None:
 
     total_steps = sum(len(r.get("action_sequence", []) or []) for r in gold)
     print(f"Gold records to process: {len(gold)}, total steps: {total_steps}")
+    system_prompt = _get_system_prompt(args.action_format)
 
     from agentevolver.module.teacher import create_teacher_llm
 
@@ -325,7 +350,7 @@ def main() -> None:
 
             try:
                 messages: List[Dict[str, str]] = [
-                    {"role": "system", "content": WEBSHOP_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {
                         "role": "assistant",
                         "content": "OK. I'll help you find and purchase the item according to your requirements.",
@@ -363,7 +388,7 @@ def main() -> None:
                     messages.append(
                         {
                             "role": "assistant",
-                            "content": f"Thought:\n{thought}\n\nAction:\n{action}",
+                            "content": _render_assistant_turn(thought, action, args.action_format),
                         }
                     )
                     thoughts_so_far.append(thought)
@@ -398,6 +423,7 @@ def main() -> None:
                 out["metadata"]["num_turns"] = n
                 out["metadata"]["total_generated_tokens"] = len(acc_lp) if has_lp else 0
                 out["metadata"]["reward_source"] = "verified_webshop_replay"
+                out["metadata"]["action_format"] = args.action_format
                 if out["metadata"]["has_log_prob"]:
                     out["metadata"]["log_prob_scope"] = "thought_only"
                     out["log_probs"] = acc_lp
