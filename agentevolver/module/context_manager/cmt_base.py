@@ -1,6 +1,87 @@
 from agentevolver.schema.trajectory import Reward, Trajectory
 from typing import List, Dict
 import uuid as uuid_gen
+from loguru import logger
+
+
+THINKING_MODE_NONE = "none"
+THINKING_MODE_PROMPT_GUIDED = "prompt_guided"     # Qwen 2.5: prompt-based <think> hints
+THINKING_MODE_NATIVE_QWEN3 = "native_qwen3"       # Qwen 3: native thinking with /no_think control
+
+VALID_THINKING_MODES = {THINKING_MODE_NONE, THINKING_MODE_PROMPT_GUIDED, THINKING_MODE_NATIVE_QWEN3}
+
+
+def resolve_thinking_mode(config) -> str:
+    """
+    Resolve the thinking mode from config, supporting both the new `thinking_mode` field
+    and the legacy `use_qwen3` / `force_think` fields for backward compatibility.
+
+    Priority:
+        1. config.actor_rollout_ref.rollout.thinking_mode (new unified field)
+        2. Legacy fallback: use_qwen3=true -> "native_qwen3", force_think=true -> "prompt_guided", else -> "none"
+
+    Returns:
+        One of: "none", "prompt_guided", "native_qwen3"
+    """
+    rollout_cfg = config.actor_rollout_ref.rollout
+
+    # New unified config takes priority
+    thinking_mode = getattr(rollout_cfg, "thinking_mode", None)
+    if thinking_mode is not None:
+        if thinking_mode not in VALID_THINKING_MODES:
+            raise ValueError(
+                f"Invalid thinking_mode='{thinking_mode}'. "
+                f"Must be one of: {sorted(VALID_THINKING_MODES)}"
+            )
+        return thinking_mode
+
+    # Legacy backward compatibility
+    use_qwen3 = getattr(rollout_cfg, "use_qwen3", False)
+    force_think = getattr(rollout_cfg, "force_think", False)
+
+    if use_qwen3:
+        return THINKING_MODE_NATIVE_QWEN3
+    elif force_think:
+        return THINKING_MODE_PROMPT_GUIDED
+    else:
+        return THINKING_MODE_NONE
+
+
+def extract_assistant_header_tokens(tokenizer) -> List[int]:
+    """
+    Dynamically extract the assistant role header tokens from the tokenizer's chat template.
+    Works for both Qwen 2.5 (<|im_start|>assistant\\n) and Qwen 3 (same format).
+    This replaces the hardcoded tokenizer.encode("<|im_start|>assistant\\n").
+    """
+    try:
+        user_only = [{"role": "user", "content": "test"}]
+        user_tokens = tokenizer.apply_chat_template(
+            user_only, tokenize=True, add_generation_prompt=False
+        )
+
+        with_assistant = [{"role": "user", "content": "test"}, {"role": "assistant", "content": "x"}]
+        full_tokens = tokenizer.apply_chat_template(
+            with_assistant, tokenize=True, add_generation_prompt=False
+        )
+
+        # Find 'x' token position to isolate the assistant header
+        x_tokens = tokenizer.encode("x", add_special_tokens=False)
+        user_len = len(user_tokens)
+
+        # The assistant header is between the end of user-only tokens and the 'x' content
+        for i in range(user_len, len(full_tokens) - len(x_tokens) + 1):
+            if full_tokens[i:i + len(x_tokens)] == x_tokens:
+                header = full_tokens[user_len:i]
+                if header:
+                    return header
+                break
+
+        # Fallback: try the hardcoded Qwen format
+        logger.warning("Dynamic assistant header extraction found empty header, using Qwen fallback")
+        return tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    except Exception as e:
+        logger.warning(f"Failed to dynamically extract assistant header tokens: {e}, using Qwen fallback")
+        return tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
 
 
 class ContextManagerBase:

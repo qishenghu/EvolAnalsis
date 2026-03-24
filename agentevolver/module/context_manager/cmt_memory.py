@@ -6,6 +6,7 @@ from typing import List
 from best_logger import print_dict, print_listofdict
 from agentevolver.module.context_manager.cmt_linear import ExtendedMessage, Linear_CMT
 from agentevolver.module.context_manager.cmt_linear import find_sublist_indices, replace_token_ids
+from agentevolver.module.context_manager.cmt_base import extract_assistant_header_tokens
 from agentevolver.schema.trajectory import Sample
 from agentevolver.utils.markdown_parser import read_markdown_and_extract_sections
 # next_step_prompt_init = """
@@ -251,7 +252,7 @@ class MemoryCMT(MemoryCoreCMT):
         max_model_len: int = self.config.actor_rollout_ref.rollout.max_model_len
         self.max_seq_length: int = max_model_len - max_response_length  # ⭐ Calculate the maximum sequence length for the context window
         self.max_env_output_length: int = self.config.actor_rollout_ref.rollout.max_env_len
-        self.blackout_token_combo = tokenizer.encode("<|im_start|>assistant\n")
+        self.blackout_token_combo = extract_assistant_header_tokens(tokenizer)
 
         self.terminal_rewards_dict = {}
         self.reward = None

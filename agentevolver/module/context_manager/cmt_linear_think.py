@@ -5,6 +5,13 @@ from agentevolver.schema.trajectory import Sample
 from best_logger import print_dict, print_listofdict
 from agentevolver.module.context_manager.cmt_linear import ExtendedMessage, Linear_CMT
 from agentevolver.module.context_manager.cmt_linear import find_sublist_indices, replace_token_ids
+from agentevolver.module.context_manager.cmt_base import (
+    extract_assistant_header_tokens,
+    resolve_thinking_mode,
+    THINKING_MODE_NONE,
+    THINKING_MODE_PROMPT_GUIDED,
+    THINKING_MODE_NATIVE_QWEN3,
+)
 from best_logger import register_logger, print_dict, print_nested, NestedJsonItem, SeqItem
 from textwrap import dedent
 
@@ -49,7 +56,7 @@ class LinearThinkCMT(Linear_CMT):
 
 
         self.max_env_output_length: int = self.config.actor_rollout_ref.rollout.max_env_len
-        self.blackout_token_combo = tokenizer.encode("<|im_start|>assistant\n")
+        self.blackout_token_combo = extract_assistant_header_tokens(tokenizer)
 
         self.terminal_rewards_dict = {}
         self.latest_llm_interaction_socket: List[ExtendedMessage] = None
@@ -59,21 +66,29 @@ class LinearThinkCMT(Linear_CMT):
         self.is_terminated = False
         self.reward = None
         self.context_time_cost = 0
-        self.force_think = config.actor_rollout_ref.rollout.force_think
-        self.env_feedin_preference = config.env_service.env_feedin_preference
-        if not self.force_think:
-            # think_hint_for_qwen3 =
+
+        # Unified thinking mode: "none", "prompt_guided" (Qwen 2.5), "native_qwen3" (Qwen 3)
+        # Backward compatible with legacy force_think / use_qwen3 flags
+        self.thinking_mode = resolve_thinking_mode(config)
+        # Keep legacy attribute for any external code that reads it
+        self.force_think = (self.thinking_mode == THINKING_MODE_PROMPT_GUIDED)
+
+        self.env_feedin_preference = getattr(config.env_service, "env_feedin_preference", "code")
+
+        if self.thinking_mode == THINKING_MODE_NATIVE_QWEN3:
+            # Qwen 3: gentle hint on the last message; /no_think handled elsewhere
             self.think_hint: str = "\n\nThink about the next step before answering. Your thought (<think>...</think>) should be as short and concise as possible."
-        else:
+        elif self.thinking_mode == THINKING_MODE_PROMPT_GUIDED:
+            # Qwen 2.5: explicit prompt-based forcing of <think> tags
             if self.env_feedin_preference == "box":
-                force_think_prompt = dedent("""
+                self.think_hint: str = dedent("""
                     Additional requirements: Think before action! You must think step by step before your next action, and you must use <think>...</think> to wrap your thinking process before finally produce your answer with \\box{}.
                     For example:
                     <think>...your thinking process...</think>
                     \\box{...your final answer...}
                 """)
             elif self.env_feedin_preference == "code":
-                force_think_prompt = dedent("""
+                self.think_hint: str = dedent("""
                     Additional requirements: Think before action! You must think step by step before your next action, and you must use <think>...</think> to wrap your thinking process before finally produce the next-step action.
                     For example:
                     <think>...your thinking process...</think>
@@ -83,8 +98,9 @@ class LinearThinkCMT(Linear_CMT):
                 """)
             else:
                 raise ValueError(f"Unsupported env_feedin_preference: {self.env_feedin_preference}")
-            # think_hint_for_qwen2 =
-            self.think_hint: str = force_think_prompt
+        else:
+            # thinking_mode == "none": no think hint
+            self.think_hint: str = ""
 
     def _get_seq_length(self, messages: List[dict]) -> int:
         """
@@ -170,12 +186,14 @@ class LinearThinkCMT(Linear_CMT):
                     )
             elif ext_msg.author in ["env", "initialization"]:
                 if self.config.actor_rollout_ref.rollout.train_history_infer_token:
-                    # If it's initialization or environment feedback, add /no_think tag
+                    # For non-last messages: add /no_think only for native_qwen3 mode
+                    # For last message: add think_hint (mode-dependent)
                     if not is_last:
+                        suffix = "\n/no_think" if self.thinking_mode == THINKING_MODE_NATIVE_QWEN3 else ""
                         self.latest_llm_interaction_socket[index] = ExtendedMessage(
                             author=ext_msg.author,
                             role=ext_msg.role,
-                            content=ext_msg.content_for_future + "\n/no_think",
+                            content=ext_msg.content_for_future + suffix,
                             token_generator='auto',
                             tokenizer=self.tokenizer,
                         )

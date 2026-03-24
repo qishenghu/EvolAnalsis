@@ -11,6 +11,7 @@ from agentevolver.schema.trajectory import Reward, Trajectory
 from best_logger import register_logger, print_dict, print_listofdict
 from agentevolver.module.context_manager.cmt_linear import Linear_CMT, ExtendedMessage
 from agentevolver.module.context_manager.cmt_linear_think import LinearThinkCMT
+from agentevolver.module.context_manager.cmt_base import resolve_thinking_mode, THINKING_MODE_NATIVE_QWEN3
 from agentevolver.module.context_manager.cmt_context_clip import SelfContextClipCMT
 from agentevolver.module.agent_flow.reward_calculator import RewardCalculator
 from typing import Any, Dict, List, Union, Optional
@@ -69,8 +70,10 @@ class AgentFlow(BaseAgentFlow):
             Linear_CMT: The context manager after the execution.
         """
         self.cmt = context_manager
-        # disable think for qwen3
-        add_nothink = self.config.actor_rollout_ref.rollout.use_qwen3 # if qwen3, add /no_think
+        # For Qwen 3 native thinking: add /no_think to suppress thinking in historical turns
+        # Uses unified thinking_mode config (backward compatible with legacy use_qwen3)
+        thinking_mode = resolve_thinking_mode(self.config)
+        add_nothink = (thinking_mode == THINKING_MODE_NATIVE_QWEN3)
 
         # 1. 🚀 Initialize messages
         traj_exp_config.query = query

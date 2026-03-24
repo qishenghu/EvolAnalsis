@@ -7,7 +7,7 @@ from typing import List, Union
 from agentevolver.schema.trajectory import Sample, Reward
 from agentevolver.schema.trajectory import Sample, Trajectory
 from agentevolver.utils.compute_madness import repetition_penalty_reward_scalar
-from agentevolver.module.context_manager.cmt_base import ExtendedMessage, ContextManagerBase
+from agentevolver.module.context_manager.cmt_base import ExtendedMessage, ContextManagerBase, extract_assistant_header_tokens
 from agentevolver.module.context_manager.cmt_base import find_sublist_indices, replace_token_ids
 from best_logger import register_logger, print_listofdict, print_dict, print_nested, NestedJsonItem, SeqItem
 from agentevolver.module.exp_manager.exp_manager import ExperienceWorker, TrajExpConfig
@@ -50,7 +50,7 @@ class Linear_CMT(Trajectory, ContextManagerBase):
         self.sliding_window_size: int = getattr(
             self.config.actor_rollout_ref.rollout, "sliding_window_size", -1
         )
-        self.blackout_token_combo = tokenizer.encode("<|im_start|>assistant\n")
+        self.blackout_token_combo = extract_assistant_header_tokens(tokenizer)
         self.generated_token_cnt = 0
 
         self.terminal_rewards_dict = {}

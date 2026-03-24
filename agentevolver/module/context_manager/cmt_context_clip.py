@@ -8,6 +8,7 @@ from typing import List, Callable
 from agentevolver.schema.trajectory import Sample
 from best_logger import print_dict, print_listofdict
 from agentevolver.module.context_manager.cmt_linear_think import ExtendedMessage, Linear_CMT, LinearThinkCMT
+from agentevolver.module.context_manager.cmt_base import resolve_thinking_mode, THINKING_MODE_PROMPT_GUIDED, THINKING_MODE_NATIVE_QWEN3
 from agentevolver.module.context_manager.cmt_linear import find_sublist_indices, replace_token_ids
 from best_logger import register_logger, print_dict, print_nested, NestedJsonItem, SeqItem
 from textwrap import dedent
@@ -66,7 +67,9 @@ class SelfContextClipCMT(LinearThinkCMT):
         self.latest_env_response_id = ""
         self.latest_env_response_content = ""
         self.console_debug_mode = False
-        self.force_think = config.actor_rollout_ref.rollout.force_think
+        # Unified thinking mode (backward compatible with legacy force_think)
+        self.thinking_mode = resolve_thinking_mode(config)
+        self.force_think = (self.thinking_mode == THINKING_MODE_PROMPT_GUIDED)
         self.env_feedin_preference = config.env_service.env_feedin_preference
         self.train_sp_action = config.actor_rollout_ref.rollout.context_template_train_sp_action
         self.clipped_before = False

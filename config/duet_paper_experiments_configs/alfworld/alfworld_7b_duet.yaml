@@ -1,0 +1,249 @@
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+trainer:
+  experiment_name: alfworld_7b_duet
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  save_freq: 100
+  test_freq: 50
+  val_before_train: false
+  validation_data_dir: experiments/alfworld/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/alfworld/${trainer.experiment_name}/rollout_log
+  logger:
+  - console
+  - wandb
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  grpo:
+    teacher_baseline_separation:
+      enable: true
+      teacher_baseline: all_mean
+      non_teacher_baseline: non_teacher_mean
+      std_source: non_teacher
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: strict
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: additive
+actor_rollout_ref:
+  model:
+    path: /data/code/exp/models/Qwen/Qwen2.5-7B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 5.0e-07
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    use_dr3: true
+    use_chord: false
+    use_uniform_mix: false
+    teacher_use_log_prob: false
+    teacher_policy_shaping_enable: false
+    teacher_use_clip: false
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+    dr3:
+      enable: true
+      apply_to: teacher_no_logprob
+      feature_mode: v3_aug
+      gap_gate_enable: true
+      hidden_proj_dim: 64
+      hidden_proj_dropout: 0.2
+      disc_weight_decay: 0.005
+      disc_label_smoothing: 0.05
+      disc_temperature: 1.2
+      disc_age_weight_decay: 0.02
+      apply_warmup_steps: 10
+      apply_min_buf_size: 512
+      disc_train_min_buf_size: 256
+      alpha_mode: sync_batch_ema
+      alpha_ema_beta: 0.9
+      disc_hidden: 64
+      disc_lr: 0.0003
+      disc_steps_per_call: 2
+      buffer_size: 1024
+      train_batch_size: 128
+      ess_window: 32
+      sync_across_ranks: true
+      sync_every_n_calls: 1
+      broadcast_params: true
+      broadcast_every_n_calls: 1
+      clip_max: 10.0
+      ppo_clip_eps: 0.2
+      ratio_shaping_mode: auto
+      ratio_shaping_beta: 0.1
+      ratio_shaping_auto_acc_min: 0.8
+      ratio_shaping_auto_buf_min: 512
+      ratio_shaping_auto_ess_min: 16.0
+      dual_enable: true
+      ess_target_ratio: 0.5
+      dual_lr: 0.05
+      dual_init: 0.0
+  rollout:
+    use_qwen3: false
+    thinking_mode: none
+    enable_request_id: false
+    prompt_length: 20480
+    response_length: 2048
+    max_model_len: 25580
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 2
+    name: vllm
+    mode: async
+    gpu_memory_utilization: 0.5
+    n: 8
+    log_prob_max_token_len_per_gpu: 25580
+    stop_sequences:
+    - </action>
+    val_kwargs:
+      n: 1
+      stop_sequences:
+      - </action>
+    max_env_worker: 32
+    context_template: linear
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ''
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+data:
+  train_batch_size: 8
+  max_prompt_length: 4000
+  max_response_length: 21580
+  filter_overlong_prompts: true
+  truncation: error
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  val_type: val
+  max_train_tasks: 800
+  shuffle: true
+  seed: 2026
+env_service:
+  env_type: alfworld
+  env_url: http://127.0.0.1:8081
+  env_params:
+    action_format: react_tags
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/alfworld.json
+exp_manager:
+  train_rollout_mode: woexp
+  val_rollout_mode: woexp
+  rollout_ratio: 0
+  train_sample_mode: alldiscard
+  train_sample_keepratio: 0.0
+  experience_template: '
+
+
+    Some Related Experience to help you to complete the task:<EXP>{}</EXP>
+
+
+    '
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: http://127.0.0.1:8124
+    workspace_id: alfworld_7b_duet
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  experience_replay:
+    enable: false
+  teacher_experience:
+    enable: true
+    mix_mode: rollout_level
+    data_path: data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered_react_tags.pkl
+    n_teacher_rollouts_per_task: 1
+    max_trajectories_per_task: 6
+    select_mode: random
+    use_log_prob: false
+    policy_shaping:
+      enable: false
+      mode: p_div_p_beta
+      beta: 0.1
+    adaptive_weight:
+      enable: true
+      mode: gap_linear
+      gate_level: group
+      epsilon: 0.0
+      tau: 0.5
+      min: 0.0
+      max: 1.0
+      ema:
+        enable: true
+        beta: 0.95
+  state_channel:
+    enable: true
+    beta: 0.5
+    beta_decay: true
+    beta_decay_target: 0.5
+    match_mode: hash
+    step_level:
+      enable: false
+      eta: 0.1
+attribution_driven_credit_assignment:
+  enable: false
+thread_pool:
+  max_workers: 8

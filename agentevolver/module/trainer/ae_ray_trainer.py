@@ -3214,7 +3214,115 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             metrics.update(kl_metrics)
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-                        
+
+                        # ============================================================================
+                        # ⭐ DUET State Channel: Progress-Based Reward Shaping
+                        # Injects β·P(τ) into token_level_rewards BEFORE advantage computation.
+                        # P(τ) = mean Φ(s_t) measures how closely the trajectory follows expert states.
+                        # ============================================================================
+                        _sc_cfg = self.config.exp_manager.get("state_channel", {})
+                        _use_state_channel = _sc_cfg.get("enable", False)
+
+                        if _use_state_channel:
+                            from agentevolver.module.exp_manager.state_progress import (
+                                ExpertProgressMap, extract_observations_from_batch_messages,
+                            )
+
+                            # Lazy-init: build ProgressMap once from teacher trajectories
+                            if not hasattr(self, '_sc_progress_map'):
+                                if self.exp_manager.teacher_enabled:
+                                    self._sc_progress_map = ExpertProgressMap(
+                                        teacher_task2trajectories=self.exp_manager.teacher_task2trajectories,
+                                        env_type=str(self.config.env_service.env_type),
+                                        match_mode=_sc_cfg.get("match_mode", "hash"),
+                                    )
+                                else:
+                                    logger.warning(
+                                        "[State Channel] Enabled but teacher_experience not loaded. "
+                                        "Disabling State Channel for this run."
+                                    )
+                                    self._sc_progress_map = None
+
+                            if self._sc_progress_map is not None:
+                                _sc_beta = float(_sc_cfg.get("beta", 0.5))
+
+                                # Dynamic β decay: β_t = β_0 · max(0, 1 - mean_reward / target)
+                                if _sc_cfg.get("beta_decay", False):
+                                    _sc_current_mean = batch.batch["token_level_rewards"].sum(dim=-1).mean().item()
+                                    _sc_target = float(_sc_cfg.get("beta_decay_target", 0.5))
+                                    if _sc_target > 0:
+                                        _sc_beta *= max(0.0, 1.0 - _sc_current_mean / _sc_target)
+
+                                _sc_env_type = str(self.config.env_service.env_type)
+                                _sc_task_ids = batch.non_tensor_batch.get("task_ids", None)
+                                _sc_messages = batch.non_tensor_batch.get("messages", None)
+                                _sc_bs = batch.batch["token_level_rewards"].shape[0]
+
+                                _sc_progress_vals = []
+                                _sc_coverage_vals = []
+                                _sc_shaped_cnt = 0
+
+                                if _sc_task_ids is not None and _sc_messages is not None:
+                                    for _sc_idx in range(_sc_bs):
+                                        _sc_tid = str(_sc_task_ids[_sc_idx])
+                                        _sc_msg = _sc_messages[_sc_idx]
+
+                                        _sc_obs = extract_observations_from_batch_messages(
+                                            _sc_msg, _sc_env_type
+                                        )
+
+                                        if not self._sc_progress_map.has_task(_sc_tid) or not _sc_obs:
+                                            _sc_progress_vals.append(0.0)
+                                            _sc_coverage_vals.append(0.0)
+                                            continue
+
+                                        _sc_P = self._sc_progress_map.compute_trajectory_progress(
+                                            _sc_tid, _sc_obs
+                                        )
+                                        _sc_progress_vals.append(_sc_P)
+
+                                        _sc_stats = self._sc_progress_map.get_coverage_stats(
+                                            _sc_tid, _sc_obs
+                                        )
+                                        _sc_coverage_vals.append(_sc_stats["coverage"])
+
+                                        _sc_bonus = _sc_beta * _sc_P
+                                        if abs(_sc_bonus) < 1e-8:
+                                            continue
+
+                                        # Find reward position and add shaped bonus
+                                        _sc_row = batch.batch["token_level_rewards"][_sc_idx]
+                                        _sc_nz = (_sc_row != 0).nonzero(as_tuple=True)[0]
+
+                                        if len(_sc_nz) > 0:
+                                            batch.batch["token_level_rewards"][_sc_idx, _sc_nz[-1]] += _sc_bonus
+                                            _sc_shaped_cnt += 1
+                                        else:
+                                            # R=0: place bonus at last valid response token
+                                            _sc_rmask = batch.batch.get("response_mask", None)
+                                            if _sc_rmask is None:
+                                                _sc_rmask = compute_response_mask(batch)
+                                            _sc_valid = (_sc_rmask[_sc_idx] > 0).nonzero(as_tuple=True)[0]
+                                            if len(_sc_valid) > 0:
+                                                batch.batch["token_level_rewards"][_sc_idx, _sc_valid[-1]] = _sc_bonus
+                                                _sc_shaped_cnt += 1
+
+                                # Log State Channel metrics
+                                if _sc_progress_vals:
+                                    import numpy as _sc_np
+                                    _sc_p = _sc_np.array(_sc_progress_vals)
+                                    _sc_c = _sc_np.array(_sc_coverage_vals)
+                                    metrics.update({
+                                        "state_channel/beta_effective": _sc_beta,
+                                        "state_channel/progress_mean": float(_sc_p.mean()),
+                                        "state_channel/progress_std": float(_sc_p.std()),
+                                        "state_channel/progress_max": float(_sc_p.max()),
+                                        "state_channel/progress_nonzero_ratio": float((_sc_p > 0).mean()),
+                                        "state_channel/coverage_mean": float(_sc_c.mean()),
+                                        "state_channel/shaped_count": _sc_shaped_cnt,
+                                        "state_channel/shaped_ratio": _sc_shaped_cnt / max(_sc_bs, 1),
+                                    })
+
                         # ============================================================================
                         # 🔍 DEBUG: Detailed reward tensor analysis to diagnose negative rewards
                         # ============================================================================
@@ -3307,6 +3415,62 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
+
+                        # ============================================================================
+                        # ⭐ DUET State Channel: Step-Level Advantage Enhancement (optional)
+                        # A_final(i,t) = A'_i + η·[Φ(s_{t+1}) - Φ(s_t)]
+                        # Applied AFTER GRPO advantage, directly adjusting per-token advantages.
+                        # ============================================================================
+                        _sc_step_cfg = _sc_cfg.get("step_level", {}) if _use_state_channel else {}
+                        _use_step_level = _sc_step_cfg.get("enable", False) and _use_state_channel
+
+                        if _use_step_level and hasattr(self, '_sc_progress_map') and self._sc_progress_map is not None:
+                            from agentevolver.module.exp_manager.state_progress import (
+                                extract_observations_from_batch_messages,
+                            )
+                            _sl_eta = float(_sc_step_cfg.get("eta", 0.1))
+                            _sl_step_ids = batch.batch.get("step_ids", None)
+                            _sl_task_ids = batch.non_tensor_batch.get("task_ids", None)
+                            _sl_messages = batch.non_tensor_batch.get("messages", None)
+
+                            if _sl_step_ids is not None and _sl_task_ids is not None and _sl_messages is not None:
+                                _sl_advantages = batch.batch["advantages"]
+                                _sl_delta_count = 0
+                                _sl_env_type = str(self.config.env_service.env_type)
+                                _sl_bs = _sl_advantages.shape[0]
+
+                                for _sl_idx in range(_sl_bs):
+                                    _sl_tid = str(_sl_task_ids[_sl_idx])
+                                    if not self._sc_progress_map.has_task(_sl_tid):
+                                        continue
+
+                                    _sl_obs = extract_observations_from_batch_messages(
+                                        _sl_messages[_sl_idx], _sl_env_type
+                                    )
+                                    if not _sl_obs:
+                                        continue
+
+                                    _, _sl_deltas = self._sc_progress_map.compute_step_deltas(
+                                        _sl_tid, _sl_obs
+                                    )
+                                    if not _sl_deltas:
+                                        continue
+
+                                    _sl_sids = _sl_step_ids[_sl_idx]  # (resp_len,)
+                                    _sl_max_step = int(_sl_sids.max().item()) if (_sl_sids >= 0).any() else -1
+
+                                    for _sl_k in range(min(_sl_max_step + 1, len(_sl_deltas))):
+                                        _sl_d = _sl_deltas[_sl_k]
+                                        if abs(_sl_d) < 1e-8:
+                                            continue
+                                        _sl_mask = (_sl_sids == _sl_k)
+                                        _sl_advantages[_sl_idx][_sl_mask] += _sl_eta * _sl_d
+                                        _sl_delta_count += 1
+
+                                metrics.update({
+                                    "state_channel/step_level_delta_count": _sl_delta_count,
+                                    "state_channel/step_level_eta": _sl_eta,
+                                })
 
                         # ⭐ Teacher effect diagnostics: batch-level logging + save per-rollout analysis
                         try:

@@ -13,6 +13,7 @@ from agentevolver.module.task_manager.strategies.deduplication.embedding import 
 from agentevolver.module.task_manager.strategies.deduplication.prompts import prompt_state_summary
 from agentevolver.schema.trajectory import Trajectory
 from agentevolver.utils.utils import convert_tool_to_user_message, clip_state_content_correctly
+from agentevolver.module.context_manager.cmt_base import resolve_thinking_mode, THINKING_MODE_NATIVE_QWEN3
 
 
 # I want an extensible AgentFlow rather than patch.
@@ -84,8 +85,8 @@ Now decide the single best next action.""".strip()
             assert len(trajectory.steps)>2
             assert trajectory.steps[0]['role'] == 'system'
             
-            # if use qwen3, add /no_think
-            if self.config.actor_rollout_ref.rollout.use_qwen3:
+            # For Qwen 3 native thinking: add /no_think to suppress thinking in prompt
+            if resolve_thinking_mode(self.config) == THINKING_MODE_NATIVE_QWEN3:
                 trajectory.steps[-1]["content"] += " /no_think"
 
             prompt_text = self.tokenizer.apply_chat_template(trajectory.steps, 
