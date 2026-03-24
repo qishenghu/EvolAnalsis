@@ -322,7 +322,7 @@ class AlfworldEnv(BaseEnv):
             Dict[str, Any]: Environment information.
         """
         return {
-            "env_id": self.env_id,
+            "env_id": self.remote_env_id,
             "task_id": self.task_id,
             "game_index": self.current_game_index,
             "observation": self.current_observation,
