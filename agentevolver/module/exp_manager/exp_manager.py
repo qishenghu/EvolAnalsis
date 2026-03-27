@@ -94,10 +94,12 @@ class ExperienceManager(object):
         
         # 如果配置了 data_path，尝试加载 Teacher 轨迹
         if self.teacher_enabled and self.teacher_data_path:
-            try:
-                self.load_teacher_trajectories(self.teacher_data_path)
-            except Exception as e:
-                logger.warning(f"Failed to load teacher trajectories from {self.teacher_data_path}: {e}")
+            loaded = self.load_teacher_trajectories(self.teacher_data_path)
+            if loaded == 0:
+                raise FileNotFoundError(
+                    f"[ExperienceManager] teacher_experience.enable=true but loaded 0 trajectories "
+                    f"from '{self.teacher_data_path}'. Check that the file exists and contains valid data."
+                )
         
         # ⭐ RePO (Replay-Enhanced Policy Optimization) 相关属性
         repo_config = self.exp_manager_config.get("repo", {})

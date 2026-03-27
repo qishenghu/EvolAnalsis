@@ -1604,6 +1604,13 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         batch_token_level_rewards: Optional[torch.Tensor] = None,  # (bs, response_len)
         batch_uid: Optional[np.ndarray] = None,                   # (bs,)
         batch_diag_metrics: Optional[Dict[str, Any]] = None,       # aggregated metrics for this step
+        # DUET per-sample State Channel data (Tier 3)
+        batch_sc_progress: Optional[torch.Tensor] = None,          # (bs,) progress P(τ)
+        batch_sc_bonus: Optional[torch.Tensor] = None,             # (bs,) β·P(τ)
+        batch_sc_coverage: Optional[torch.Tensor] = None,          # (bs,) coverage ratio
+        batch_sc_matched_states: Optional[torch.Tensor] = None,    # (bs,) matched state count
+        batch_sc_reward_pre_shaping: Optional[torch.Tensor] = None,  # (bs,) reward before SC shaping
+        batch_sl_per_sample_deltas: Optional[dict] = None,         # {idx: [deltas]} step-level deltas
     ):
         """
         保存 Trajectory 信息用于后续分析。
@@ -1902,6 +1909,31 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                     extra_diag["reward_sum"] = float(r[rm].sum()) if rm.any() else float(r.sum())
                 if uid_list is not None and bidx < len(uid_list):
                     extra_diag["uid"] = uid_list[bidx]
+
+                # ---- Tier 3: DUET per-sample State Channel fields ----
+                if batch_sc_progress is not None and bidx < batch_sc_progress.shape[0]:
+                    extra_diag["sc_progress"] = float(batch_sc_progress[bidx].item())
+                if batch_sc_bonus is not None and bidx < batch_sc_bonus.shape[0]:
+                    extra_diag["sc_bonus"] = float(batch_sc_bonus[bidx].item())
+                if batch_sc_coverage is not None and bidx < batch_sc_coverage.shape[0]:
+                    extra_diag["sc_coverage"] = float(batch_sc_coverage[bidx].item())
+                if batch_sc_matched_states is not None and bidx < batch_sc_matched_states.shape[0]:
+                    extra_diag["sc_matched_states"] = int(batch_sc_matched_states[bidx].item())
+                if batch_sc_reward_pre_shaping is not None and bidx < batch_sc_reward_pre_shaping.shape[0]:
+                    extra_diag["reward_original"] = float(batch_sc_reward_pre_shaping[bidx].item())
+                    # reward_components decomposition: original + sc_bonus + step_delta_sum
+                    _rc_sc_bonus = float(batch_sc_bonus[bidx].item()) if batch_sc_bonus is not None and bidx < batch_sc_bonus.shape[0] else 0.0
+                    _rc_step_delta_sum = 0.0
+                    if batch_sl_per_sample_deltas is not None and bidx in batch_sl_per_sample_deltas:
+                        _rc_step_delta_sum = float(sum(batch_sl_per_sample_deltas[bidx]))
+                    extra_diag["reward_components"] = {
+                        "original": float(batch_sc_reward_pre_shaping[bidx].item()),
+                        "sc_bonus": _rc_sc_bonus,
+                        "step_delta_sum": _rc_step_delta_sum,
+                    }
+                # Step-level deltas per sample
+                if batch_sl_per_sample_deltas is not None and bidx in batch_sl_per_sample_deltas:
+                    extra_diag["sc_step_deltas"] = batch_sl_per_sample_deltas[bidx]
 
                 traj_data = {
                     "data_id": data_id,
@@ -3247,8 +3279,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 _sc_beta = float(_sc_cfg.get("beta", 0.5))
 
                                 # Dynamic β decay: β_t = β_0 · max(0, 1 - mean_reward / target)
+                                # Use per-sequence reward (sum over tokens) normalized to avoid
+                                # length-dependence when rewards are dense.
                                 if _sc_cfg.get("beta_decay", False):
-                                    _sc_current_mean = batch.batch["token_level_rewards"].sum(dim=-1).mean().item()
+                                    _sc_rmask_decay = batch.batch.get("response_mask", None)
+                                    if _sc_rmask_decay is None:
+                                        _sc_rmask_decay = compute_response_mask(batch)
+                                    _sc_resp_len = _sc_rmask_decay.sum(dim=-1).clamp(min=1.0)
+                                    _sc_current_mean = (batch.batch["token_level_rewards"].sum(dim=-1) / _sc_resp_len).mean().item()
                                     _sc_target = float(_sc_cfg.get("beta_decay_target", 0.5))
                                     if _sc_target > 0:
                                         _sc_beta *= max(0.0, 1.0 - _sc_current_mean / _sc_target)
@@ -3258,8 +3296,13 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 _sc_messages = batch.non_tensor_batch.get("messages", None)
                                 _sc_bs = batch.batch["token_level_rewards"].shape[0]
 
+                                # Tier 1: Capture pre-shaping reward for decomposition
+                                _sc_reward_pre_shaping = batch.batch["token_level_rewards"].sum(dim=-1).clone()  # (bs,)
+
                                 _sc_progress_vals = []
                                 _sc_coverage_vals = []
+                                _sc_bonus_vals = []
+                                _sc_matched_states_vals = []
                                 _sc_shaped_cnt = 0
 
                                 if _sc_task_ids is not None and _sc_messages is not None:
@@ -3274,6 +3317,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         if not self._sc_progress_map.has_task(_sc_tid) or not _sc_obs:
                                             _sc_progress_vals.append(0.0)
                                             _sc_coverage_vals.append(0.0)
+                                            _sc_bonus_vals.append(0.0)
+                                            _sc_matched_states_vals.append(0)
                                             continue
 
                                         _sc_P = self._sc_progress_map.compute_trajectory_progress(
@@ -3285,33 +3330,45 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             _sc_tid, _sc_obs
                                         )
                                         _sc_coverage_vals.append(_sc_stats["coverage"])
+                                        _sc_matched_states_vals.append(int(_sc_stats.get("matched", 0)))
 
                                         _sc_bonus = _sc_beta * _sc_P
+                                        _sc_bonus_vals.append(float(_sc_bonus))
                                         if abs(_sc_bonus) < 1e-8:
                                             continue
 
-                                        # Find reward position and add shaped bonus
-                                        _sc_row = batch.batch["token_level_rewards"][_sc_idx]
-                                        _sc_nz = (_sc_row != 0).nonzero(as_tuple=True)[0]
-
-                                        if len(_sc_nz) > 0:
-                                            batch.batch["token_level_rewards"][_sc_idx, _sc_nz[-1]] += _sc_bonus
+                                        # Distribute progress bonus across all valid response tokens.
+                                        # For GRPO (sequence-level advantage), placement doesn't change
+                                        # the advantage, but uniform distribution is cleaner for
+                                        # token-level loss aggregation and step-level enhancements.
+                                        _sc_rmask = batch.batch.get("response_mask", None)
+                                        if _sc_rmask is None:
+                                            _sc_rmask = compute_response_mask(batch)
+                                        _sc_valid = (_sc_rmask[_sc_idx] > 0).nonzero(as_tuple=True)[0]
+                                        if len(_sc_valid) > 0:
+                                            _sc_n_valid = len(_sc_valid)
+                                            batch.batch["token_level_rewards"][_sc_idx, _sc_valid] += _sc_bonus / _sc_n_valid
                                             _sc_shaped_cnt += 1
-                                        else:
-                                            # R=0: place bonus at last valid response token
-                                            _sc_rmask = batch.batch.get("response_mask", None)
-                                            if _sc_rmask is None:
-                                                _sc_rmask = compute_response_mask(batch)
-                                            _sc_valid = (_sc_rmask[_sc_idx] > 0).nonzero(as_tuple=True)[0]
-                                            if len(_sc_valid) > 0:
-                                                batch.batch["token_level_rewards"][_sc_idx, _sc_valid[-1]] = _sc_bonus
-                                                _sc_shaped_cnt += 1
+
+                                # Store per-sample SC data in batch for trajectory saving (Tier 3)
+                                import numpy as _sc_np
+                                if _sc_progress_vals:
+                                    batch.batch["_sc_progress"] = torch.tensor(_sc_progress_vals, dtype=torch.float32)
+                                    batch.batch["_sc_bonus"] = torch.tensor(_sc_bonus_vals, dtype=torch.float32)
+                                    batch.batch["_sc_coverage"] = torch.tensor(_sc_coverage_vals, dtype=torch.float32)
+                                    batch.batch["_sc_matched_states"] = torch.tensor(_sc_matched_states_vals, dtype=torch.int32)
+                                    batch.batch["_sc_reward_pre_shaping"] = _sc_reward_pre_shaping  # (bs,) for trajectory decomposition
+
+                                # Tier 1: Reward decomposition — pre vs post shaping
+                                _sc_reward_post_shaping = batch.batch["token_level_rewards"].sum(dim=-1)  # (bs,)
+                                _sc_bonus_total = (_sc_reward_post_shaping - _sc_reward_pre_shaping)
+                                _sc_pre_abs = _sc_reward_pre_shaping.abs().mean().item()
 
                                 # Log State Channel metrics
                                 if _sc_progress_vals:
-                                    import numpy as _sc_np
                                     _sc_p = _sc_np.array(_sc_progress_vals)
                                     _sc_c = _sc_np.array(_sc_coverage_vals)
+                                    _sc_b = _sc_np.array(_sc_bonus_vals)
                                     metrics.update({
                                         "state_channel/beta_effective": _sc_beta,
                                         "state_channel/progress_mean": float(_sc_p.mean()),
@@ -3321,6 +3378,16 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         "state_channel/coverage_mean": float(_sc_c.mean()),
                                         "state_channel/shaped_count": _sc_shaped_cnt,
                                         "state_channel/shaped_ratio": _sc_shaped_cnt / max(_sc_bs, 1),
+                                        # Tier 1: Reward decomposition
+                                        "state_channel/reward_pre_shaping_mean": float(_sc_reward_pre_shaping.mean().item()),
+                                        "state_channel/bonus_total_mean": float(_sc_bonus_total.mean().item()),
+                                        "state_channel/bonus_total_std": float(_sc_bonus_total.std().item()) if _sc_bs > 1 else 0.0,
+                                        "state_channel/bonus_vs_reward_ratio": float(_sc_bonus_total.abs().mean().item() / max(_sc_pre_abs, 1e-8)),
+                                        "state_channel/bonus_per_sample_mean": float(_sc_b.mean()),
+                                        "state_channel/bonus_per_sample_max": float(_sc_b.max()),
+                                        # Tier 2: Coverage dynamics
+                                        "state_channel/coverage_nonzero_ratio": float((_sc_c > 0).mean()),
+                                        "state_channel/unique_states_matched_total": int(_sc_np.array(_sc_matched_states_vals).sum()),
                                     })
 
                         # ============================================================================
@@ -3395,6 +3462,86 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 "dapo/filter_ratio": num_filtered / len(keep_mask),
                             })
 
+                        # ============================================================================
+                        # ⭐ DUET State Channel: Step-Level Reward Enhancement (optional)
+                        # Inject per-step progress deltas η·[Φ(s_{t+1}) - Φ(s_t)] into
+                        # token_level_rewards BEFORE advantage computation, so they participate
+                        # in GRPO normalization and produce properly scaled advantages.
+                        # ============================================================================
+                        _sc_step_cfg = _sc_cfg.get("step_level", {}) if _use_state_channel else {}
+                        _use_step_level = _sc_step_cfg.get("enable", False) and _use_state_channel
+
+                        if _use_step_level and hasattr(self, '_sc_progress_map') and self._sc_progress_map is not None:
+                            from agentevolver.module.exp_manager.state_progress import (
+                                extract_observations_from_batch_messages as _sl_extract_obs,
+                            )
+                            _sl_eta = float(_sc_step_cfg.get("eta", 0.1))
+                            _sl_step_ids = batch.batch.get("step_ids", None)
+                            _sl_task_ids = batch.non_tensor_batch.get("task_ids", None)
+                            _sl_messages = batch.non_tensor_batch.get("messages", None)
+
+                            if _sl_step_ids is not None and _sl_task_ids is not None and _sl_messages is not None:
+                                _sl_rewards = batch.batch["token_level_rewards"]
+                                _sl_delta_count = 0
+                                _sl_env_type = str(self.config.env_service.env_type)
+                                _sl_bs = _sl_rewards.shape[0]
+                                _sl_all_deltas = []  # Tier 2: collect all delta values for statistics
+                                _sl_per_sample_deltas = {}  # Tier 3: per-sample deltas for trajectory saving
+
+                                for _sl_idx in range(_sl_bs):
+                                    _sl_tid = str(_sl_task_ids[_sl_idx])
+                                    if not self._sc_progress_map.has_task(_sl_tid):
+                                        continue
+
+                                    _sl_obs = _sl_extract_obs(
+                                        _sl_messages[_sl_idx], _sl_env_type
+                                    )
+                                    if not _sl_obs:
+                                        continue
+
+                                    _, _sl_deltas = self._sc_progress_map.compute_step_deltas(
+                                        _sl_tid, _sl_obs
+                                    )
+                                    if not _sl_deltas:
+                                        continue
+
+                                    _sl_per_sample_deltas[_sl_idx] = [float(d) for d in _sl_deltas]
+                                    _sl_sids = _sl_step_ids[_sl_idx]  # (resp_len,)
+                                    _sl_max_step = int(_sl_sids.max().item()) if (_sl_sids >= 0).any() else -1
+
+                                    for _sl_k in range(min(_sl_max_step + 1, len(_sl_deltas))):
+                                        _sl_d = _sl_deltas[_sl_k]
+                                        _sl_all_deltas.append(float(_sl_d))
+                                        if abs(_sl_d) < 1e-8:
+                                            continue
+                                        _sl_mask = (_sl_sids == _sl_k)
+                                        _sl_n_tokens = _sl_mask.sum().item()
+                                        if _sl_n_tokens > 0:
+                                            _sl_rewards[_sl_idx][_sl_mask] += _sl_eta * _sl_d / _sl_n_tokens
+                                            _sl_delta_count += 1
+
+                                # Store per-sample step deltas for trajectory saving (Tier 3)
+                                batch.batch["_sl_per_sample_deltas"] = _sl_per_sample_deltas
+
+                                # Tier 2: Step-level delta statistics
+                                _sl_delta_metrics = {
+                                    "state_channel/step_level_delta_count": _sl_delta_count,
+                                    "state_channel/step_level_eta": _sl_eta,
+                                }
+                                if _sl_all_deltas:
+                                    import numpy as _sl_np
+                                    _sl_d_arr = _sl_np.array(_sl_all_deltas)
+                                    _sl_delta_metrics.update({
+                                        "state_channel/step_delta_abs_mean": float(_sl_np.abs(_sl_d_arr).mean()),
+                                        "state_channel/step_delta_positive_ratio": float((_sl_d_arr > 1e-8).mean()),
+                                        "state_channel/step_delta_negative_ratio": float((_sl_d_arr < -1e-8).mean()),
+                                        "state_channel/step_delta_mean": float(_sl_d_arr.mean()),
+                                        "state_channel/step_delta_std": float(_sl_d_arr.std()),
+                                        "state_channel/step_delta_max": float(_sl_d_arr.max()),
+                                        "state_channel/step_delta_min": float(_sl_d_arr.min()),
+                                    })
+                                metrics.update(_sl_delta_metrics)
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
                         if os.environ.get("DEBUG_ARG","").find("disable_adv_std")!=-1:
@@ -3416,61 +3563,101 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             config=self.config.algorithm,
                         )
 
+                        # (Step-level enhancement moved to before compute_advantage — see above)
+
                         # ============================================================================
-                        # ⭐ DUET State Channel: Step-Level Advantage Enhancement (optional)
-                        # A_final(i,t) = A'_i + η·[Φ(s_{t+1}) - Φ(s_t)]
-                        # Applied AFTER GRPO advantage, directly adjusting per-token advantages.
+                        # Tier 1+2: DUET Post-Advantage Attribution Metrics
+                        # These metrics decompose the effective training signal AFTER GRPO
+                        # normalization and all DUET modifications (State Channel + step-level).
                         # ============================================================================
-                        _sc_step_cfg = _sc_cfg.get("step_level", {}) if _use_state_channel else {}
-                        _use_step_level = _sc_step_cfg.get("enable", False) and _use_state_channel
+                        try:
+                            _pa_adv = batch.batch.get("advantages", None)
+                            _pa_rm = batch.batch.get("response_mask", None)
+                            if _pa_rm is None:
+                                _pa_rm = compute_response_mask(batch)
+                            _pa_tm = batch.batch.get("teacher_mask", None)
+                            _pa_em = batch.batch.get("exp_mask", None)
+                            _pa_resp_len = _pa_adv.shape[-1] if _pa_adv is not None else 0
 
-                        if _use_step_level and hasattr(self, '_sc_progress_map') and self._sc_progress_map is not None:
-                            from agentevolver.module.exp_manager.state_progress import (
-                                extract_observations_from_batch_messages,
-                            )
-                            _sl_eta = float(_sc_step_cfg.get("eta", 0.1))
-                            _sl_step_ids = batch.batch.get("step_ids", None)
-                            _sl_task_ids = batch.non_tensor_batch.get("task_ids", None)
-                            _sl_messages = batch.non_tensor_batch.get("messages", None)
+                            if _pa_adv is not None and _pa_rm is not None:
+                                # Align masks to response_len
+                                if _pa_rm.shape[-1] != _pa_resp_len and _pa_rm.shape[-1] > _pa_resp_len:
+                                    _pa_rm = _pa_rm[:, -_pa_resp_len:]
+                                if _pa_tm is not None and _pa_tm.shape[-1] != _pa_resp_len:
+                                    _pa_tm = _pa_tm[:, -_pa_resp_len:] if _pa_tm.shape[-1] > _pa_resp_len else _pa_tm
+                                if _pa_em is not None and _pa_em.shape[-1] != _pa_resp_len:
+                                    _pa_em = _pa_em[:, -_pa_resp_len:] if _pa_em.shape[-1] > _pa_resp_len else _pa_em
 
-                            if _sl_step_ids is not None and _sl_task_ids is not None and _sl_messages is not None:
-                                _sl_advantages = batch.batch["advantages"]
-                                _sl_delta_count = 0
-                                _sl_env_type = str(self.config.env_service.env_type)
-                                _sl_bs = _sl_advantages.shape[0]
+                                # Sample-level flags
+                                _pa_is_teacher = (_pa_tm.sum(dim=-1) > 0) if _pa_tm is not None else torch.zeros(_pa_adv.shape[0], dtype=torch.bool, device=_pa_adv.device)
+                                _pa_is_off = (_pa_em.sum(dim=-1) > 0) if _pa_em is not None else torch.zeros(_pa_adv.shape[0], dtype=torch.bool, device=_pa_adv.device)
+                                _pa_is_on = ~_pa_is_off
 
-                                for _sl_idx in range(_sl_bs):
-                                    _sl_tid = str(_sl_task_ids[_sl_idx])
-                                    if not self._sc_progress_map.has_task(_sl_tid):
-                                        continue
+                                # Per-sample advantage scalar: mean over valid tokens
+                                _pa_denom = _pa_rm.sum(dim=-1).clamp_min(1.0)
+                                _pa_adv_scalar = (_pa_adv * _pa_rm).sum(dim=-1) / _pa_denom  # (bs,)
 
-                                    _sl_obs = extract_observations_from_batch_messages(
-                                        _sl_messages[_sl_idx], _sl_env_type
+                                # Tier 1: Advantage decomposition by source
+                                if _pa_is_teacher.any():
+                                    _pa_t_adv = _pa_adv_scalar[_pa_is_teacher]
+                                    metrics["duet/adv_teacher_effective_mean"] = float(_pa_t_adv.mean().item())
+                                    metrics["duet/adv_teacher_effective_std"] = float(_pa_t_adv.std().item()) if _pa_t_adv.numel() > 1 else 0.0
+                                    metrics["duet/adv_teacher_effective_abs_mean"] = float(_pa_t_adv.abs().mean().item())
+                                if _pa_is_on.any():
+                                    _pa_o_adv = _pa_adv_scalar[_pa_is_on]
+                                    metrics["duet/adv_onpolicy_effective_mean"] = float(_pa_o_adv.mean().item())
+                                    metrics["duet/adv_onpolicy_effective_std"] = float(_pa_o_adv.std().item()) if _pa_o_adv.numel() > 1 else 0.0
+                                    metrics["duet/adv_onpolicy_effective_abs_mean"] = float(_pa_o_adv.abs().mean().item())
+
+                                # Tier 1: Teacher gradient share — how much of the total |advantage| comes from teacher
+                                if _pa_is_teacher.any() and _pa_is_on.any():
+                                    _pa_t_abs = _pa_adv_scalar[_pa_is_teacher].abs().sum().item()
+                                    _pa_o_abs = _pa_adv_scalar[_pa_is_on].abs().sum().item()
+                                    metrics["duet/teacher_gradient_share"] = float(_pa_t_abs / max(_pa_t_abs + _pa_o_abs, 1e-8))
+
+                                # Tier 2: Response length by source
+                                _pa_resp_lens = _pa_rm.sum(dim=-1)  # (bs,)
+                                if _pa_is_teacher.any():
+                                    _pa_trl = _pa_resp_lens[_pa_is_teacher].float()
+                                    metrics["diag/response_len_teacher_mean"] = float(_pa_trl.mean().item())
+                                    metrics["diag/response_len_teacher_std"] = float(_pa_trl.std().item()) if _pa_trl.numel() > 1 else 0.0
+                                if _pa_is_on.any():
+                                    _pa_orl = _pa_resp_lens[_pa_is_on].float()
+                                    metrics["diag/response_len_onpolicy_mean"] = float(_pa_orl.mean().item())
+                                    metrics["diag/response_len_onpolicy_std"] = float(_pa_orl.std().item()) if _pa_orl.numel() > 1 else 0.0
+                                if _pa_is_teacher.any() and _pa_is_on.any():
+                                    metrics["diag/response_len_ratio_teacher_vs_on"] = float(
+                                        _pa_resp_lens[_pa_is_teacher].float().mean().item() /
+                                        max(_pa_resp_lens[_pa_is_on].float().mean().item(), 1.0)
                                     )
-                                    if not _sl_obs:
-                                        continue
 
-                                    _, _sl_deltas = self._sc_progress_map.compute_step_deltas(
-                                        _sl_tid, _sl_obs
-                                    )
-                                    if not _sl_deltas:
-                                        continue
-
-                                    _sl_sids = _sl_step_ids[_sl_idx]  # (resp_len,)
-                                    _sl_max_step = int(_sl_sids.max().item()) if (_sl_sids >= 0).any() else -1
-
-                                    for _sl_k in range(min(_sl_max_step + 1, len(_sl_deltas))):
-                                        _sl_d = _sl_deltas[_sl_k]
-                                        if abs(_sl_d) < 1e-8:
-                                            continue
-                                        _sl_mask = (_sl_sids == _sl_k)
-                                        _sl_advantages[_sl_idx][_sl_mask] += _sl_eta * _sl_d
-                                        _sl_delta_count += 1
-
-                                metrics.update({
-                                    "state_channel/step_level_delta_count": _sl_delta_count,
-                                    "state_channel/step_level_eta": _sl_eta,
-                                })
+                                # Tier 3: Group-level mixed statistics
+                                _pa_uids = batch.non_tensor_batch.get("uid", None)
+                                if _pa_uids is not None:
+                                    _pa_id2has_teacher = {}
+                                    _pa_id2has_on = {}
+                                    _pa_id2rewards = {}
+                                    _pa_r_sums = batch.batch["token_level_rewards"].sum(dim=-1).detach().cpu()
+                                    for _pa_i, _pa_gid in enumerate(list(_pa_uids)):
+                                        _pa_gid = str(_pa_gid)
+                                        if _pa_gid not in _pa_id2has_teacher:
+                                            _pa_id2has_teacher[_pa_gid] = False
+                                            _pa_id2has_on[_pa_gid] = False
+                                            _pa_id2rewards[_pa_gid] = []
+                                        if _pa_is_teacher[_pa_i]:
+                                            _pa_id2has_teacher[_pa_gid] = True
+                                        else:
+                                            _pa_id2has_on[_pa_gid] = True
+                                        _pa_id2rewards[_pa_gid].append(float(_pa_r_sums[_pa_i]))
+                                    _pa_n_groups = len(_pa_id2has_teacher)
+                                    _pa_n_mixed = sum(1 for g in _pa_id2has_teacher if _pa_id2has_teacher[g] and _pa_id2has_on[g])
+                                    _pa_group_vars = [float(np.var(rs)) for rs in _pa_id2rewards.values() if len(rs) > 1]
+                                    metrics["duet/group_mixed_ratio"] = float(_pa_n_mixed / max(_pa_n_groups, 1))
+                                    metrics["duet/group_total_count"] = float(_pa_n_groups)
+                                    if _pa_group_vars:
+                                        metrics["duet/group_reward_variance_mean"] = float(np.mean(_pa_group_vars))
+                        except Exception as _pa_e:
+                            logger.warning(f"Failed to compute DUET post-advantage metrics: {_pa_e}")
 
                         # ⭐ Teacher effect diagnostics: batch-level logging + save per-rollout analysis
                         try:
@@ -3680,6 +3867,13 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         batch_token_level_rewards=batch.batch.get("token_level_rewards", None),
                                         batch_uid=batch.non_tensor_batch.get("uid", None),
                                         batch_diag_metrics=diag_metrics,
+                                        # DUET per-sample State Channel data (Tier 3)
+                                        batch_sc_progress=batch.batch.get("_sc_progress", None),
+                                        batch_sc_bonus=batch.batch.get("_sc_bonus", None),
+                                        batch_sc_coverage=batch.batch.get("_sc_coverage", None),
+                                        batch_sc_matched_states=batch.batch.get("_sc_matched_states", None),
+                                        batch_sc_reward_pre_shaping=batch.batch.get("_sc_reward_pre_shaping", None),
+                                        batch_sl_per_sample_deltas=batch.batch.get("_sl_per_sample_deltas", None),
                                     )
                                 except Exception as e:
                                     logger.warning(f"Failed to save trajectories for analysis: {e}")

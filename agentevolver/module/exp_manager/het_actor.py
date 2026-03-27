@@ -1483,6 +1483,42 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 old_lp_new = old_log_prob.clone()
                                 if apply_mask.any():
                                     old_lp_new[apply_mask] = log_prob.detach()[apply_mask] - log_w[apply_mask]
+
+                                # ---- Tier 1: DR3 Correction Attribution ----
+                                # Log how much DR3 actually shifts old_log_prob (the effective correction)
+                                try:
+                                    _dr3_logw_applied = log_w[apply_mask] if apply_mask.any() else log_w[:0]
+                                    _dr3_shift = (old_lp_new - old_log_prob)  # will be 0 for non-applied
+                                    _dr3_shift_applied = _dr3_shift[apply_mask] if apply_mask.any() else _dr3_shift[:0]
+                                    metrics["dr3/applied_sample_count"] = float(apply_mask.sum().item())
+                                    metrics["dr3/total_sample_count"] = float(apply_mask.numel())
+                                    if _dr3_logw_applied.numel() > 0:
+                                        metrics["dr3/logw_applied_mean"] = float(_dr3_logw_applied.mean().item())
+                                        metrics["dr3/logw_applied_std"] = float(_dr3_logw_applied.std().item()) if _dr3_logw_applied.numel() > 1 else 0.0
+                                        metrics["dr3/logw_applied_abs_mean"] = float(_dr3_logw_applied.abs().mean().item())
+                                        metrics["dr3/logw_applied_max"] = float(_dr3_logw_applied.abs().max().item())
+                                    if _dr3_shift_applied.numel() > 0:
+                                        # Per-token shift magnitude (mean across response tokens per sample, then mean across samples)
+                                        _dr3_shift_per_sample = _dr3_shift_applied.abs().mean(dim=-1)  # (n_applied,)
+                                        metrics["dr3/old_logp_shift_mean"] = float(_dr3_shift_per_sample.mean().item())
+                                        metrics["dr3/old_logp_shift_max"] = float(_dr3_shift_per_sample.max().item())
+
+                                    # ---- Tier 2: Policy-Teacher KL Divergence ----
+                                    # KL(π_current || π_old) for teacher samples ≈ mean(log_prob - old_log_prob)
+                                    # This measures how far the current policy has diverged from the teacher's reference point
+                                    if teacher_sample.any() and response_mask is not None:
+                                        _kl_lp = log_prob[teacher_sample]  # (n_teacher, resp_len)
+                                        _kl_olp = old_log_prob[teacher_sample]  # after DR3 correction
+                                        _kl_rm = response_mask[teacher_sample]
+                                        _kl_diff = (_kl_lp - _kl_olp) * _kl_rm
+                                        _kl_denom = _kl_rm.sum(dim=-1).clamp_min(1.0)
+                                        _kl_per_sample = _kl_diff.sum(dim=-1) / _kl_denom  # (n_teacher,)
+                                        metrics["duet/kl_teacher_sample_mean"] = float(_kl_per_sample.mean().item())
+                                        metrics["duet/kl_teacher_sample_std"] = float(_kl_per_sample.std().item()) if _kl_per_sample.numel() > 1 else 0.0
+                                        metrics["duet/kl_teacher_sample_abs_mean"] = float(_kl_per_sample.abs().mean().item())
+                                except Exception:
+                                    pass
+
                                 old_log_prob = old_lp_new
 
                                 ret_dict = repo_compute_token_loss(
