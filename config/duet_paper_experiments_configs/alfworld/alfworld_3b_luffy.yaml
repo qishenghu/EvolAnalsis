@@ -61,7 +61,9 @@ actor_rollout_ref:
     use_chord: false
     use_uniform_mix: false
     teacher_use_log_prob: false
-    teacher_policy_shaping_enable: false
+    teacher_policy_shaping_enable: true
+    teacher_policy_shaping_mode: p_div_p_beta
+    teacher_policy_shaping_beta: 0.1
     teacher_use_clip: false
     use_dapo: false
     fsdp_config:
