@@ -1479,6 +1479,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 if dr3_apply_to in ("all_offpolicy", "all_off", "offpolicy", "all"):
                                     apply_mask = (exp_mask.sum(dim=-1) > 0)
 
+                                # Floor w_hat to prevent teacher samples from being completely muted
+                                dr3_w_min = float(dr3_cfg.get("w_min", 0.1))
+                                w_hat = w_hat.clamp(min=dr3_w_min)
                                 log_w = torch.log(w_hat.clamp_min(1e-6)).unsqueeze(-1)  # (bs,1)
                                 old_lp_new = old_log_prob.clone()
                                 if apply_mask.any():

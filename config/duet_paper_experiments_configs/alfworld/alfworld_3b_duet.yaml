@@ -51,7 +51,7 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 1
     ppo_mini_batch_size: 8
     use_kl_loss: true
-    kl_loss_coef: 0.001
+    kl_loss_coef: 0.005
     kl_loss_type: low_var_kl
     entropy_coeff: 0
     off_cliprange_high: 0.6
@@ -75,8 +75,8 @@ actor_rollout_ref:
       hidden_proj_dim: 64
       hidden_proj_dropout: 0.2
       disc_weight_decay: 0.005
-      disc_label_smoothing: 0.05
-      disc_temperature: 1.2
+      disc_label_smoothing: 0.1
+      disc_temperature: 2.5
       disc_age_weight_decay: 0.02
       apply_warmup_steps: 10
       apply_min_buf_size: 512
@@ -93,7 +93,7 @@ actor_rollout_ref:
       sync_every_n_calls: 1
       broadcast_params: true
       broadcast_every_n_calls: 1
-      clip_max: 10.0
+      clip_max: 5.0
       ppo_clip_eps: 0.2
       ratio_shaping_mode: auto
       ratio_shaping_beta: 0.1
@@ -236,13 +236,13 @@ exp_manager:
         beta: 0.95
   state_channel:
     enable: true
-    beta: 0.5
+    beta: 0.2
     beta_decay: true
-    beta_decay_target: 0.5
+    beta_decay_target: 0.3
     match_mode: hash
     step_level:
-      enable: false
-      eta: 0.1
+      enable: true
+      eta: 0.05
 attribution_driven_credit_assignment:
   enable: false
 thread_pool:
