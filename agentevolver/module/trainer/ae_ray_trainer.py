@@ -3507,7 +3507,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             _sl_delta_count += 1
 
                                 # Store per-sample step deltas for trajectory saving (Tier 3)
-                                batch.batch["_sl_per_sample_deltas"] = _sl_per_sample_deltas
+                                # Use non_tensor_batch for non-tensor data to avoid FSDP serialization issues
+                                batch.non_tensor_batch["_sl_per_sample_deltas"] = _sl_per_sample_deltas
 
                                 # Tier 2: Step-level delta statistics
                                 _sl_delta_metrics = {
@@ -3859,7 +3860,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         batch_sc_coverage=batch.batch.get("_sc_coverage", None),
                                         batch_sc_matched_states=batch.batch.get("_sc_matched_states", None),
                                         batch_sc_reward_pre_shaping=batch.batch.get("_sc_reward_pre_shaping", None),
-                                        batch_sl_per_sample_deltas=batch.batch.get("_sl_per_sample_deltas", None),
+                                        batch_sl_per_sample_deltas=batch.non_tensor_batch.get("_sl_per_sample_deltas", None),
                                     )
                                 except Exception as e:
                                     logger.warning(f"Failed to save trajectories for analysis: {e}")
@@ -3916,6 +3917,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             # ⭐ CHORD: 传递 global_step 用于 μ 三阶段调度（Warmup → Decay → 稳定）
                             batch.meta_info["global_step"] = self.global_steps
+                            # Clean up DUET temporary keys before sending to actor (avoid serialization issues)
+                            for _tmp_key in ["_sc_progress", "_sc_bonus", "_sc_coverage", "_sc_matched_states", "_sc_reward_pre_shaping"]:
+                                batch.batch.pop(_tmp_key, None)
+                            batch.non_tensor_batch.pop("_sl_per_sample_deltas", None)
                             actor_output = self.actor_rollout_wg.update_actor(batch)  # ⭐ Update the actor with the new batch
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
