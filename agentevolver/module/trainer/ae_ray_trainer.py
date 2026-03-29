@@ -3464,6 +3464,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                             if _sl_step_ids is not None and _sl_task_ids is not None and _sl_messages is not None:
                                 _sl_rewards = batch.batch["token_level_rewards"]
+                                _sl_resp_len = _sl_rewards.shape[-1]
+                                # step_ids may be full sequence length; slice to response portion
+                                if _sl_step_ids.shape[-1] > _sl_resp_len:
+                                    _sl_step_ids = _sl_step_ids[:, -_sl_resp_len:]
                                 _sl_delta_count = 0
                                 _sl_env_type = str(self.config.env_service.env_type)
                                 _sl_bs = _sl_rewards.shape[0]
