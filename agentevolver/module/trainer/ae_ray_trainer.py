@@ -3277,6 +3277,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                             if self._sc_progress_map is not None:
                                 _sc_beta = float(_sc_cfg.get("beta", 0.5))
+                                _sc_exclude_teacher = _sc_cfg.get("exclude_teacher", True)
 
                                 # Dynamic β decay: β_t = β_0 · max(0, 1 - mean_reward / target)
                                 # Use per-sequence reward (sum over tokens) normalized to avoid
@@ -3295,6 +3296,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 _sc_task_ids = batch.non_tensor_batch.get("task_ids", None)
                                 _sc_messages = batch.non_tensor_batch.get("messages", None)
                                 _sc_bs = batch.batch["token_level_rewards"].shape[0]
+
+                                # Teacher exclusion: SC should help on-policy exploration, not inflate
+                                # already-successful teacher rewards (which fights DR3's natural fade-out)
+                                _sc_teacher_mask = batch.batch.get("teacher_mask", None)
+                                _sc_is_teacher = (
+                                    (_sc_teacher_mask.sum(dim=-1) > 0)
+                                    if (_sc_teacher_mask is not None and _sc_teacher_mask.dim() == 2)
+                                    else None
+                                )
 
                                 # Tier 1: Capture pre-shaping reward for decomposition
                                 _sc_reward_pre_shaping = batch.batch["token_level_rewards"].sum(dim=-1).clone()  # (bs,)
@@ -3333,14 +3343,23 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         _sc_matched_states_vals.append(int(_sc_stats.get("matched", 0)))
 
                                         _sc_bonus = _sc_beta * _sc_P
+
+                                        # Exclude teacher samples from bonus injection:
+                                        # Teacher trajectories have high progress by definition (~0.85)
+                                        # and don't need SC shaping. Injecting bonus inflates their
+                                        # rewards and widens the GRPO advantage gap unnecessarily.
+                                        if (_sc_exclude_teacher
+                                                and _sc_is_teacher is not None
+                                                and _sc_idx < len(_sc_is_teacher)
+                                                and _sc_is_teacher[_sc_idx].item()):
+                                            _sc_bonus_vals.append(0.0)
+                                            continue
+
                                         _sc_bonus_vals.append(float(_sc_bonus))
                                         if abs(_sc_bonus) < 1e-8:
                                             continue
 
                                         # Distribute progress bonus across all valid response tokens.
-                                        # For GRPO (sequence-level advantage), placement doesn't change
-                                        # the advantage, but uniform distribution is cleaner for
-                                        # token-level loss aggregation and step-level enhancements.
                                         _sc_rmask = batch.batch.get("response_mask", None)
                                         if _sc_rmask is None:
                                             _sc_rmask = compute_response_mask(batch)
@@ -3389,6 +3408,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         "state_channel/coverage_nonzero_ratio": float((_sc_c > 0).mean()),
                                         "state_channel/unique_states_matched_total": int(_sc_np.array(_sc_matched_states_vals).sum()),
                                     })
+                                    # Teacher exclusion diagnostics
+                                    if _sc_exclude_teacher and _sc_is_teacher is not None and len(_sc_progress_vals) == _sc_bs:
+                                        _sc_p_t = [_sc_progress_vals[j] for j in range(min(_sc_bs, len(_sc_is_teacher))) if _sc_is_teacher[j].item()]
+                                        _sc_p_o = [_sc_progress_vals[j] for j in range(min(_sc_bs, len(_sc_is_teacher))) if not _sc_is_teacher[j].item()]
+                                        if _sc_p_t:
+                                            metrics["state_channel/progress_teacher_mean"] = float(_sc_np.mean(_sc_p_t))
+                                        if _sc_p_o:
+                                            metrics["state_channel/progress_onpolicy_mean"] = float(_sc_np.mean(_sc_p_o))
+                                        metrics["state_channel/teacher_excluded_count"] = len(_sc_p_t)
 
                         # ============================================================================
                         # 🔍 DEBUG: Compact reward tensor summary (SC distributes bonus across tokens)
@@ -3473,8 +3501,20 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 _sl_bs = _sl_rewards.shape[0]
                                 _sl_all_deltas = []  # Tier 2: collect all delta values for statistics
                                 _sl_per_sample_deltas = {}  # Tier 3: per-sample deltas for trajectory saving
+                                # Teacher exclusion for step-level (same rationale as trajectory-level)
+                                _sl_exclude_teacher = _sc_cfg.get("exclude_teacher", True) if _use_state_channel else False
+                                _sl_teacher_mask = batch.batch.get("teacher_mask", None)
+                                _sl_is_teacher = (
+                                    (_sl_teacher_mask.sum(dim=-1) > 0)
+                                    if (_sl_teacher_mask is not None and _sl_teacher_mask.dim() == 2)
+                                    else None
+                                )
 
                                 for _sl_idx in range(_sl_bs):
+                                    # Skip teacher samples from step-level delta injection
+                                    if (_sl_exclude_teacher and _sl_is_teacher is not None
+                                            and _sl_idx < len(_sl_is_teacher) and _sl_is_teacher[_sl_idx].item()):
+                                        continue
                                     _sl_tid = str(_sl_task_ids[_sl_idx])
                                     if not self._sc_progress_map.has_task(_sl_tid):
                                         continue
