@@ -76,7 +76,7 @@ actor_rollout_ref:
       hidden_proj_dropout: 0.2
       disc_weight_decay: 0.005
       disc_label_smoothing: 0.1
-      disc_temperature: 2.5
+      disc_temperature: 1.5
       disc_age_weight_decay: 0.02
       apply_warmup_steps: 10
       apply_min_buf_size: 512
