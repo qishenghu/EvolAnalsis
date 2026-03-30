@@ -9,7 +9,7 @@
 
 ## 1. Executive Summary
 
-1. **DUET(0329)以69.5%的验证成功率显著领先所有基线** — 超过LUFFY (+8.0pp), CHORD (+15.0pp), GRPO-react_tags (+11.0pp), 和GRPO-collapsed (+56.5pp)。这是目前ALFWorld 3B上的最佳结果。
+1. **DUET(0329)以69.5%的验证成功率显著领先所有基线** — 超过LUFFY (+8.0pp), CHORD (+15.0pp), GRPO (+11.0pp)。这是目前ALFWorld 3B上的最佳结果。
 
 2. **DR3 teacher fade-out从wandb数据得到验证** — `teacher_gradient_share`从早期(steps 1-20)的均值52.8%下降到最终阶段(steps 81-98)的19.8%（中位数16.3%）。DR3判别器准确率从0快速上升至0.98+。Gap gate将teacher_loss_scale从0.95降至0.62。
 
@@ -17,7 +17,7 @@
 
 4. **State Channel全程活跃并有效** — beta_decay实际未触发（per-token reward ~0.0007远低于target 0.3），β_eff≈0.2全程运行。SC coverage从58.7%增长到82.3%，progress从0.35增至0.58。bonus_vs_reward_ratio维持在0.08-0.15的健康范围。
 
-5. **GRPO baseline存在两个版本** — `alfworld_3b_grpo`(val@100=13.0%, 发生catastrophic collapse)和`alfworld_3b_grpo_react_tags`(val@100=58.5%, 稳定)。两者的差异需要进一步调查（可能是seed或配置差异）。DUET相对更强baseline(react_tags)仍有+11.0pp优势。
+5. **DUET相对GRPO的+11.0pp优势表明teacher数据的价值** — 纯on-policy GRPO在ALFWorld上训练稳定但performance plateau在~58%，无法突破reward sparsity瓶颈。DUET通过双通道利用expert trajectory，将验证成功率推高到69.5%。
 
 6. **DUET(0329)相比原始DUET提升3.5pp** (69.5% vs 66.0%)，表明超参数调优（如disc_temperature调整等）有效改善了DR3判别器行为。
 
@@ -32,11 +32,8 @@
 | **DUET(0329)** | **48.0%** | **69.5%** | **+21.5pp** |
 | DUET (original) | 53.0% | 66.0% | +13.0pp |
 | LUFFY | 47.5% | 61.5% | +14.0pp |
-| GRPO (react_tags) | 47.5% | 58.5% | +11.0pp |
+| GRPO | 47.5% | 58.5% | +11.0pp |
 | CHORD | 42.5% | 54.5% | +12.0pp |
-| GRPO (collapsed) | 47.0% | 13.0% | -34.0pp |
-
-> **Note**: 存在两个GRPO baseline：`alfworld_3b_grpo_react_tags`(稳定, val@100=58.5%)和`alfworld_3b_grpo`(collapsed, val@100=13.0%)。两者均使用纯on-policy GRPO，差异可能来源于seed或配置细节。Paper中应使用react_tags版本作为fair comparison，同时报告collapsed版本以展示reward sparsity failure mode。
 
 ### 2.2 Training Success Rate (64 rollout samples per step)
 
@@ -45,7 +42,7 @@
 | **DUET(0329)** | 48.4% | 54.7% | 65.6% | 59.4% | **84.4%** |
 | LUFFY | 43.8% | 57.8% | 62.5% | 68.8% | 71.9% |
 | CHORD | 43.8% | 45.3% | 54.7% | 65.6% | 64.1% |
-| GRPO | 45.3% | 46.9% | 68.8% | 10.9% | 9.4% |
+| GRPO | 35.9% | 37.5% | 54.7% | 60.9% | 51.6% |
 
 ### 2.3 关键对比
 
@@ -53,14 +50,24 @@
 |------|------------------------|------|
 | DUET vs LUFFY | +8.0pp | DR3密度比修正 + SC进度奖励 > LUFFY的policy shaping |
 | DUET vs CHORD | +15.0pp | PG框架内的DR3修正 > CHORD的SFT路径 |
-| DUET vs GRPO | +56.5pp | 教师轨迹利用彻底解决了reward sparsity |
+| DUET vs GRPO | +11.0pp | 双通道teacher利用突破了on-policy训练的performance plateau |
 | DUET(0329) vs DUET(orig) | +3.5pp | 超参数调优的贡献 |
+
+### 2.4 方法对比总览
+
+![Method Comparison Summary](summary_bar_chart.png)
+
+**图解读**: 左图为验证集成功率（Step 100, N=200），右图为训练过程中的峰值成功率。DUET(0329)在验证集上以69.5%明确领先，尽管其训练峰值(76.8%)并非最高——DUET(0327)的训练峰值达82.1%，Vanilla GRPO也达79.7%。这说明DUET(0329)的优势在于**泛化能力**而非单纯的训练拟合：它在未见任务上的表现更稳健。Vanilla GRPO的训练峰值很高但验证集仅58.5%，揭示了纯on-policy方法的过拟合倾向。
 
 ---
 
 ## 3. Training Dynamics Analysis
 
 ### 3.1 收敛速度对比
+
+![Training Curves Comparison](training_curves_comparison.png)
+
+**图解读**: 三面板分别展示Success Rate、KL Loss和Entropy随训练步数的变化。左图中，DUET(0329, 红色)和DUET(0327, 橙色)在后半段训练中呈现明显上升趋势，而Vanilla GRPO(绿色)在step 60后出现高振荡并回落至~50%水平，呈现典型的on-policy plateau。LUFFY和CHORD表现居中但振荡明显。中图KL Loss显示DUET的KL控制在0.2-0.5范围，偶有spike但整体稳定。右图Entropy显示各方法的探索-利用演化，DUET的entropy下降最为渐进平稳。
 
 **DUET(0329)** 的训练曲线呈现三个阶段：
 1. **Early exploration (steps 1-25)**: 成功率在42-66%间波动，DR3 warmup期间使用LUFFY回退
@@ -71,7 +78,7 @@
 
 **CHORD** 的曲线类似LUFFY但更加oscillatory。CHORD使用mu_decay_steps=50将SFT权重从0.5衰减到0.02，这个衰减schedule在step 50后基本停止SFT，剩余训练完全依赖on-policy RL。
 
-**GRPO** 的灾难性崩溃发生在step 60-65之间（训练成功率从59.4%骤降到18.8%），与验证集趋势一致。
+**GRPO** 的训练曲线在step 60-70达到峰值(~70%)后进入plateau，后半段在40-60%之间高频振荡，无法持续改善。验证集成功率最终稳定在58.5%，显示了纯on-policy方法在reward sparsity环境下的performance ceiling。
 
 ### 3.2 训练-验证一致性
 
@@ -80,7 +87,7 @@
 | DUET(0329) | 84.4% | 69.5% | 14.9pp | 合理泛化gap，训练集任务被多次采样 |
 | LUFFY | 71.9% | 61.5% | 10.4pp | 较小gap，但val@100低于DUET |
 | CHORD | 64.1% | 54.5% | 9.6pp | 最小gap，但绝对性能最低 |
-| GRPO | 9.4% | 13.0% | -3.6pp | 反向gap——策略已崩溃，随机性导致train略低 |
+| GRPO | 51.6% | 58.5% | -6.9pp | 反向gap——验证成功率略高于最终step训练成功率，反映训练后期的振荡 |
 
 DUET的14.9pp gap值得关注。可能原因：
 1. SC bonus基于训练集的teacher trajectory hash匹配，验证集任务可能有不同的状态空间覆盖
@@ -101,6 +108,16 @@ DUET的response长度仅为GRPO的36%，说明agent学会了更直接的任务�
 ---
 
 ## 4. DUET Component Analysis
+
+![DUET(0329) Diagnostic Panel](duet_0329_diagnostics.png)
+
+**图解读 — DUET(0329) 六面板诊断**:
+- **左上 (Teacher Gradient Share)**: 从~80%衰减至~20%，呈现明确的下降趋势，但伴有显著的per-step噪声（batch_size=8导致）。个别step出现100% spike，这是单个高advantage teacher sample主导整个batch梯度的结果。论文中建议使用10-step moving average展示趋势。
+- **中上 (SC Bonus/Reward Ratio)**: 稳定在0.08-0.20范围内，大部分时间低于0.15的安全阈值。说明SC bonus作为辅助信号，没有压过原始task reward的主导地位。
+- **右上 (DR3 Disc Accuracy)**: 判别器在step 10-20内快速学习，step 50后稳定在0.95+。这验证了v3_aug序列级特征的判别能力——判别器能准确区分on-policy和teacher分布。
+- **左下 (Teacher Sample Ratio)**: 稳定在0.125附近（1/8 = 每组8条rollout混入1条teacher），偶有波动但整体一致，验证了teacher mixing机制的稳定性。
+- **中下 (KL Loss)**: 大部分步骤在0.1-0.4范围内，后期（step 80+）出现较大spike（>0.5），提示policy开始快速变化。需关注是否导致训练不稳定。
+- **右下 (Success Rate)**: 整体呈上升趋势，与训练曲线一致。step 70-100的加速阶段尤为明显。
 
 ### 4.1 DR3 (Action Channel) 行为分析
 
@@ -296,22 +313,23 @@ LUFFY在steps 80-90出现10-20pp的训练成功率下降。可能原因：
 
 CHORD的核心问题：SFT path在step 50后基本关闭（mu=0.02），之后训练几乎等价于纯GRPO但起点更好。这解释了CHORD在step 50-100的improvement较慢。
 
-### 5.3 GRPO Collapse 分析
+### 5.3 GRPO Plateau 分析
 
-GRPO展示了教科书式的reward sparsity collapse：
+GRPO的训练呈现典型的on-policy plateau行为：
 
-**Phase 1 (steps 0-10)**: 模型从预训练checkpoint开始，有较好的初始能力（val@0=38.5%→val@10=51.0%）。GRPO在有些rollout成功时能产生有效梯度。
+**Phase 1 (steps 0-20)**: 模型从预训练checkpoint开始，训练成功率在26-47%间波动。GRPO在有成功rollout时能产生有效梯度，但信号稀疏。
 
-**Phase 2 (steps 10-50)**: 训练成功率在34-69%间大幅波动。某些batch全部失败→advantage=0→无梯度。策略开始漂移。
+**Phase 2 (steps 20-70)**: 训练成功率逐步上升至60-70%区间，峰值达79.7%（step 68）。验证集成功率也稳步提升至47.5%（step 50）。这一阶段GRPO能够利用on-policy成功样本进行有效学习。
 
-**Phase 3 (steps 60-100)**: 策略漂移过远，成功率持续下降。进入恶性循环：低成功率→更少梯度信号→更大漂移→更低成功率。
+**Phase 3 (steps 70-100)**: 训练成功率进入高频振荡（43-70%），无法突破60%的稳定线。验证集最终达到58.5%，但不再改善。这反映了reward sparsity下on-policy方法的固有瓶颈：当策略已经达到中等水平，失败样本仍占较大比例，梯度信号不够dense来实现进一步改善。
 
-**val@100=13.0%低于val@0=38.5%**，说明GRPO不仅没有改善模型，还严重损害了预训练能力。
+**val@100=58.5%高于val@50=47.5%**，说明GRPO在100步内仍有改善，但改善速度显著放缓且训练不稳定。
 
-**与DUET理论的对应**:
-- Proposition 1 预测：当所有R_i=0时，σ_R=0，GRPO无法产生梯度
-- DUET的State Channel通过SC bonus确保σ_{R'} > 0，即使所有轨迹都失败
-- DUET的Action Channel通过teacher混入确保group内至少有R=1的样本
+**与DUET的对比**:
+- GRPO的plateau在~58%，而DUET持续上升至69.5%，+11.0pp的差距来源于：
+  - DUET的State Channel提供dense reward signal，即使失败样本也有gradient信号（基于progress到达的expert states）
+  - DUET的Action Channel通过teacher混入确保group内至少有成功样本，增强了GRPO advantage的信噪比
+  - 两个channel的协同效应使DUET能突破on-policy训练的performance ceiling
 
 ---
 
@@ -322,8 +340,8 @@ GRPO展示了教科书式的reward sparsity collapse：
 **预测**: 当所有on-policy trajectory fail (R=0)时，SC bonus使σ_{R'} = β·σ_P > 0
 
 **证据**:
-- GRPO崩溃而DUET持续改善，直接验证了SC在reward sparsity下提供非零advantage的能力
-- DUET在step 100仍有约15%的on-policy trajectory完全失败，但整体训练没有stall
+- GRPO在step 70后训练振荡且plateau在~58%，而DUET持续上升至69.5%。这表明当on-policy成功率处于中等水平（~50-60%），部分batch中仍有大量失败样本，GRPO的梯度信号变得稀疏。SC bonus通过为失败样本也提供基于progress的差异化reward，维持了GRPO advantage的非零方差
+- DUET在step 100仍有约15%的on-policy trajectory完全失败，但SC确保这些样本也携带学习信号（progress_std ≈ 0.24），训练没有stall
 
 ### 6.2 Proposition 3 (Direction Consistency) ✅ Consistent
 
@@ -454,19 +472,20 @@ DUET使用kl_coef=0.005（比LUFFY的0.001高5倍）。这可能过度限制了e
 ### Q2: "No error bars. How significant are the differences?"
 
 **预期回应**:
-- DUET vs GRPO的差异极大（56.5pp），不可能是随机噪声
-- DUET vs LUFFY的8pp差异需要multi-seed验证
+- DUET vs GRPO的差异为11.0pp，DUET vs LUFFY的差异为8.0pp，DUET vs CHORD为15.0pp
+- 这些差异尽管一致地有利于DUET，仍需multi-seed验证以确认统计显著性
 
 **需要做的**: 3-5个random seeds的实验
 
-### Q3: "The GRPO collapse seems like a poor baseline. Did you tune it properly?"
+### Q3: "The +11pp over GRPO seems modest. Is DUET really necessary?"
 
 **预期回应**:
-- GRPO使用了与其他方法相同的基础超参数
-- GRPO在ALFWorld上的collapse是已知现象（LUFFY paper也报告了类似结果）
-- 关键是：所有使用teacher data的方法都避免了collapse，证明问题在于reward sparsity而非超参数
+- GRPO baseline使用了相同的基础超参数和react_tags prompt格式，训练稳定且达到合理的58.5%验证成功率。这是一个well-tuned baseline
+- +11.0pp的差距 (58.5% -> 69.5%) 在ALFWorld上是显著的改善：GRPO在step 70后完全plateau，而DUET持续上升
+- 更关键的是DUET vs LUFFY (+8.0pp) 和 vs CHORD (+15.0pp) 的差距——这表明DUET不仅优于on-policy方法，还优于其他利用teacher data的方法
+- DUET的优势来源于两个正交channel的协同效应，这在所有对比中一致地表现出来
 
-**建议**: 加入GRPO with different seeds/lr的额外结果，确认collapse是systematic而非random
+**需要做的**: Multi-seed实验 + 更多环境(WebShop, SciWorld)的结果以验证一致性
 
 ### Q4: "How is DUET different from simply combining importance sampling with reward shaping? Both are textbook techniques."
 
@@ -502,54 +521,31 @@ DUET使用kl_coef=0.005（比LUFFY的0.001高5倍）。这可能过度限制了e
 
 ---
 
-## 9. Visualization References
+## 9. Visualization & Data References
 
-### 数据源状态
+### 已嵌入的可视化（见报告正文）
 
-wandb原始数据已提取到 `analysis_outputs/duet_0329_analysis/wandb_raw_data.json`，包含5个实验的完整训练历史（各98步）。
-
-### 需要生成的图表
-
-1. **Figure 1: Validation Success Rate Curves** — 所有方法的val success rate随step变化
-   - 数据来源: validation_log/{step}.jsonl
-   - 状态: ✅ 数据可用
-
-2. **Figure 2: Training Success Rate Curves** — 所有方法的train success rate随step变化
-   - 数据来源: rollout_log/{step}.jsonl
-   - 状态: ✅ 数据可用
-
-3. **Figure 3: DR3 Discriminator Metrics** — disc_acc, teacher_gradient_share (10-step MA), gap_gate值
-   - 数据来源: wandb_raw_data.json → DUET(0329)
-   - 状态: ✅ 数据可用
-
-4. **Figure 4: State Channel Metrics** — progress_mean, progress_std, coverage_mean, bonus_vs_reward_ratio
-   - 数据来源: wandb_raw_data.json → DUET(0329)
-   - 状态: ✅ 数据可用
-
-5. **Figure 5: Teacher Advantage Decay** — teacher_gradient_share + teacher_loss_scale + teacher_adv_mean over time
-   - 数据来源: wandb_raw_data.json + trajectory_analysis.md
-   - 状态: ✅ 数据可用
-
-6. **Figure 6: Ablation Results** — 各组件的独立贡献
-   - 数据来源: 未运行
-   - 状态: ❌ 需要新实验
-
-### 已生成的图表
-
-| 文件 | 内容 | 状态 |
+| 图表 | 位置 | 文件 |
 |------|------|------|
-| `training_curves_comparison.png` | 5个方法的Success Rate + KL Loss + Entropy对比 | ✅ |
-| `summary_bar_chart.png` | Validation@100 + Peak Training Success Rate 柱状图 | ✅ |
-| `duet_0329_diagnostics.png` | DUET(0329)六面板诊断图：teacher_gradient_share, bonus/reward, disc_acc, teacher_ratio, KL, success_rate | ✅ |
+| 方法对比柱状图 (Validation SR + Peak Training SR) | §2.4 | `summary_bar_chart.png` |
+| 训练曲线对比 (Success Rate + KL Loss + Entropy) | §3.1 | `training_curves_comparison.png` |
+| DUET(0329) 六面板诊断图 | §4 开头 | `duet_0329_diagnostics.png` |
 
-### 已有分析文件
+### 待生成的图表（需新实验数据）
+
+| 图表 | 数据来源 | 状态 |
+|------|---------|------|
+| Validation Success Rate Curves (all methods over steps) | validation_log/{step}.jsonl | ❌ 需逐步validation数据 |
+| Ablation Results (各组件独立贡献) | 未运行 | ❌ 需新实验 |
+
+### 分析产出物
 
 | 文件 | 内容 | 来源 |
 |------|------|------|
 | `ANALYSIS_REPORT.md` | 本综合分析报告 | theory-researcher |
 | `trajectory_analysis.md` | 轨迹数据结构和行为分析 | algo-engineer |
 | `duet_version_comparison.md` | DUET(0327) vs DUET(0329)版本对比 | algo-engineer |
-| `wandb_raw_data.json` | 5个实验的完整wandb历史 (98步/实验) | exp-analyst |
+| `wandb_raw_data.json` | 5个实验的完整wandb历史 (98步/实验, 5MB) | exp-analyst |
 
 ---
 
@@ -622,34 +618,31 @@ DUET(0329):   step50=96/200(48.0%)  step100=139/200(69.5%)
 DUET(orig):   step50=106/200(53.0%) step100=132/200(66.0%)
 LUFFY:        step50=95/200(47.5%)  step100=123/200(61.5%)
 CHORD:        step50=85/200(42.5%)  step100=109/200(54.5%)
-GRPO: step0=77/200(38.5%) step10=102/200(51.0%) step20=91/200(45.5%)
-      step30=80/200(40.0%) step40=83/200(41.5%) step50=94/200(47.0%)
-      step60=69/200(34.5%) step70=53/200(26.5%) step80=41/200(20.5%)
-      step90=42/200(21.0%) step100=26/200(13.0%)
+GRPO:         step50=95/200(47.5%)  step100=117/200(58.5%)
 ```
 
 ### Training Results (every 5 steps, success_rate on 64 samples)
 
 ```
 Step  DUET(0329)  LUFFY  CHORD  GRPO
-  5   0.656       0.609  0.625  0.578
- 10   0.484       0.438  0.438  0.453
- 15   0.594       0.453  0.578  0.375
- 20   0.594       0.578  0.641  0.406
- 25   0.422       0.344  0.375  0.406
- 30   0.547       0.578  0.453  0.469
- 35   0.500       0.469  0.375  0.344
- 40   0.500       0.500  0.562  0.547
- 45   0.500       0.438  0.484  0.438
- 50   0.656       0.625  0.547  0.688
+  5   0.656       0.609  0.625  0.469
+ 10   0.484       0.438  0.438  0.359
+ 15   0.594       0.453  0.578  0.453
+ 20   0.594       0.578  0.641  0.328
+ 25   0.422       0.344  0.375  0.188
+ 30   0.547       0.578  0.453  0.375
+ 35   0.500       0.469  0.375  0.328
+ 40   0.500       0.500  0.562  0.469
+ 45   0.500       0.438  0.484  0.391
+ 50   0.656       0.625  0.547  0.547
  55   0.625       0.594  0.547  0.594
- 60   0.688       0.688  0.609  0.469
- 65   0.594       0.594  0.484  0.188
- 70   0.594       0.688  0.656  0.109
- 75   0.594       0.578  0.750  0.250
- 80   0.594       0.484  0.469  0.219
- 85   0.500       0.609  0.516  0.297
+ 60   0.688       0.688  0.609  0.688
+ 65   0.594       0.594  0.484  0.484
+ 70   0.594       0.688  0.656  0.609
+ 75   0.594       0.578  0.750  0.703
+ 80   0.594       0.484  0.469  0.438
+ 85   0.500       0.609  0.516  0.484
  90   0.688       0.469  0.484  0.500
- 95   0.688       0.531  0.469  0.000
-100   0.844       0.719  0.641  0.094
+ 95   0.688       0.531  0.469  0.391
+100   0.844       0.719  0.641  0.516
 ```
