@@ -1,169 +1,228 @@
 <p align="center">
  <img src="docs/img/logo.png" alt="AgentEvolver Logo" width="70%">
 </p>
-<h2 align="center">AgentEvolver: Towards Efficient Self-Evolving Agent System</h2>
-
-<!-- --- -->
+<h2 align="center">DUET: Dual-Channel Expert Trajectory Utilization for Off-Policy Integrated GRPO</h2>
 
 <p align="center">
-  <!-- <a href="https://arxiv.org/abs/0000"><img src="https://img.shields.io/badge/cs.MA-0000-B31C1C?logo=arxiv&logoColor=B31C1C" alt="arxiv"/></a> -->
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python Version"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-black" alt="License"></a>
-  <a href="https://modelscope.github.io/AgentEvolver/"><img src="https://img.shields.io/badge/docs-online-blue?logo=markdown" alt="Documentation"></a>
   <a href="https://arxiv.org/abs/2511.10395"><img src="https://img.shields.io/badge/arXiv-2511.10395-b31b1b.svg" alt="arXiv"></a>
-  <a href="https://deepwiki.com/modelscope/AgentEvolver"><img src="https://deepwiki.com/badge.svg" alt="deepwiki"></a>
-  <a href="https://github.com/modelscope/AgentEvolver"><img src="https://img.shields.io/github/stars/modelscope/AgentEvolver?style=social" alt="GitHub Stars"></a>
 </p>
 
+**DUET** (DUal Expert Trajectory utilization) is a principled off-policy integrated GRPO algorithm for training LLM agents in interactive environments. It introduces two orthogonal channels — **Action Channel** and **State Channel** — that synergistically leverage expert demonstrations to accelerate on-policy learning while preserving asymptotic exploration capability.
 
-<!-- <p align="center">
-  <strong>AgentEvolver: An Efficient Self-Evolving Agent System</strong><br>
-</p> -->
+Built on the [AgentEvolver](https://github.com/modelscope/AgentEvolver) framework with [veRL](https://github.com/volcengine/verl) distributed RL backend.
 
-**AgentEvolver** is an end-to-end, self-evolving training framework that unifies self-questioning, self-navigating, and self-attributing into a cohesive system. It empowers agents to autonomously
-improve their capabilities, aiming for efficient, cost-effective, and continuous capability evolution.
+## Key Idea
 
+Off-policy teacher data accelerates early RL training but can hurt asymptotic performance if not properly controlled. Existing approaches use heuristic schedules (CHORD's manually-tuned &mu; decay) or lack principled off-policy correction (LUFFY). DUET addresses both issues:
 
-## 📰 News
-- **[2025-12]** 📢 New preprint [CuES](https://www.arxiv.org/abs/2512.01311) on an extended self-questioning method released with [code](research/CuES/README.md).
-- **[2025-11]** 📄 [The AgentEvolver Technical Report is now available](https://arxiv.org/abs/2511.10395), detailing the framework’s architecture, methodology, and key findings.
-- **[2025-11]** 🧩 AgentEvolver v1 has been released now!
+| Component | Role | Mechanism |
+|-----------|------|-----------|
+| **Action Channel (DR3)** | Off-policy correction | Density-ratio discriminator estimates `w(τ) = π_θ(τ) / π_teacher(τ)`, corrects importance weights. Provides **data-driven teacher fade-out** — teacher influence naturally decreases as the policy improves. |
+| **State Channel (SC)** | Dense reward shaping | Expert progress map `Φ(s)` measures how far on-policy trajectories follow expert states. Adds `β·P(τ)` as shaped reward to combat reward sparsity. **Only applied to on-policy samples** — teacher trajectories don't need shaping. |
 
+The two channels form a **closed-form teacher curriculum**: DR3 controls *gradient weight* (importance sampling), SC improves *reward quality* (dense shaping). Both naturally let the teacher guide early training and fade out for autonomous exploration in later stages — without hand-crafted schedules.
 
-## ✨ Why AgentEvolver
+## Algorithm Comparison
 
+| | GRPO | LUFFY | CHORD | **DUET** |
+|---|---|---|---|---|
+| Teacher data | None | Mixed into rollouts | SFT loss on teacher | Mixed + DR3 correction |
+| Off-policy correction | N/A | Policy shaping (heuristic) | None (SFT avoids PG) | **DR3 density ratio** (principled) |
+| Teacher fade-out | N/A | None | Manual &mu; schedule | **Data-driven** (closed-form) |
+| Dense reward | No | No | No | **State Channel** |
+| Reward shaping target | N/A | N/A | N/A | **On-policy only** (excludes teacher) |
 
+## Architecture
 
-🧠 AgentEvolver provides three **Self-Evolving Mechanisms** from Environment to Policy:
+```
+                    ┌─────────────────────────────────────────────┐
+                    │          DUET Training Loop                 │
+                    │                                             │
+  ┌─────────┐      │  ┌──────────────┐    ┌──────────────────┐   │
+  │ Teacher  │──────┼─▶│  LUFFY Mixer │───▶│  token_level_    │   │
+  │  Data    │      │  │ (rollout-lvl)│    │  rewards         │   │
+  └─────────┘      │  └──────────────┘    └────────┬─────────┘   │
+                    │                              │              │
+                    │  ┌──────────────┐            │              │
+                    │  │State Channel │    β·P(τ)  │ on-policy    │
+                    │  │ Progress Map │───────────▶│ samples only │
+                    │  └──────────────┘            │              │
+                    │                              ▼              │
+                    │                     ┌────────────────┐      │
+                    │                     │compute_advantage│      │
+                    │                     │   (GRPO)       │      │
+                    │                     └────────┬───────┘      │
+                    │                              │              │
+                    │  ┌──────────────┐            ▼              │
+                    │  │Action Channel│   ┌────────────────┐      │
+                    │  │  DR3 Density │──▶│  PPO Update    │      │
+                    │  │  Ratio Repair│   │ (corrected     │      │
+                    │  └──────────────┘   │  old_log_prob) │      │
+                    │                     └────────────────┘      │
+                    └─────────────────────────────────────────────┘
+```
 
-- **Automatic Task Generation (Self-Questioning)** – Explore the environment and autonomously create diverse tasks, eliminating costly manual dataset construction.
-- **Experience-guided Exploration (Self-Navigating)** – Summarize and reuse cross-task experience, guiding higher-quality rollouts and improving exploration efficiency.
-- **Attribution-based Credit Assignment (Self-Attributing)** – Process long trajectories to uncover the causal contribution of intermediate steps, enabling fine-grained and efficient policy optimization.
+## Quick Start
 
-<p align="center">
- <img src="docs/img/flowchart.png" alt="AgentEvolver Flowchart" width="80%">
-</p>
-
-
-
-
-## 🔧 Architecture Design
-AgentEvolver adopts a service-oriented dataflow architecture, seamlessly integrating environment sandboxes, LLMs, and experience management into modular services.
-
-<p align="center">
- <img src="docs/img/system.png" alt="system framework" width="80%">
-</p>
-
-
-- **Environment Compatibility** – Standardized interfaces for seamless integration with a wide range of external environments and tool APIs.
-- **Flexible Context Manager** – Built-in utilities for managing multi-turn contexts and complex interaction logic, supporting diverse deployment scenarios.
-- **Modular & Extensible Architecture** – Decoupled components allow easy customization, secondary development, and future algorithm upgrades.
-
-
-## 🌟 Benchmark Performance
-
-Performance comparison on the AppWorld and BFCL-v3 benchmarks. AgentEvolver achieves superior results while using substantially fewer parameters than larger baseline models.
-
-<p align="center">
- <img src="docs/img/performance.png" alt="Benchmark Performance" width="80%">
-</p>
-
-Performance on two benchmarks. Columns show avg@8 and best@8 for each benchmark, plus their averages (Avg.). All values are in percent (%). **Bolded numbers** highlight the best results.
-
-| **Model** | **Params** | **AppWorld** | | **BFCL v3** | | **Avg.** | |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| | | avg@8 | best@8 | avg@8 | best@8 | avg@8 | best@8 |
-| Qwen2.5-7B | 7B | 1.8 | 5.6 | 29.8 | 42.4 | 15.8 | 24.0 |
-| +Questioning | 7B | 23.2 | 40.3 | 49.0 | 60.6 | 36.1 | 50.5 |
-| +Questioning&Navigating | 7B | 26.3 | 43.1 | 53.3 | 61.0 | 39.8 | 52.1 |
-| +Questioning&Attributing | 7B | 25.7 | 43.7 | 56.8 | 65.3 | 41.3 | 54.5 |
-| **AgentEvolver (overall)** | **7B** | **32.4** | **51.2** | **57.9** | **69.0** | **45.2** | **60.1** |
-| | | | | | | | |
-| Qwen2.5-14B | 14B | 18.0 | 31.4 | 41.6 | 54.1 | 29.8 | 42.8 |
-| +Questioning | 14B | 44.3 | 65.5 | 60.3 | 72.1 | 52.3 | 68.8 |
-| +Questioning&Navigating | 14B | 45.4 | 65.3 | 62.8 | 74.5 | 54.1 | 69.9 |
-| +Questioning&Attributing | 14B | 47.8 | 65.6 | 64.9 | 76.3 | 56.4 | 71.0 |
-| **AgentEvolver (overall)** | **14B** | **48.7** | **69.4** | **66.5** | **76.7** | **57.6** | **73.1** |
-
-
-## 🚀 Quick Start
-### Step 1. Basic Dependency Installation
-
-Make sure you have **conda** and **cuda toolkit** installed.
-
-Then, set up the training environment by running the script
+### 1. Environment Setup
 
 ```bash
+# Install dependencies
 bash install.sh
-```
 
+# Set up ALFWorld environment
+cd env_service/environments/alfworld && bash setup.sh && cd ../../..
 
-### Step 2. Setup Env-Service (Appworld as example)
-The script below sets up an environment for appworld.
-
-```bash
-cd env_service/environments/appworld && bash setup.sh
-```
-
-### Step 3. Setup ReMe (Optional)
-Set up the ReMe for experience management by running the script:
-```bash
-bash external/reme/install_reme.sh
-```
-For more detailed installation, please refer to [ReMe](https://github.com/agentscope-ai/ReMe).
-
-### Step 4. Begin Training! 🚀 🚀
-Copy the `example.env` file to `.env` and modify the parameters, including your **API key**, **conda path**.
-
-Using AgentEvolver launcher to start environment, log dashboard and training process altogether.
-
-```bash
+# Activate
 conda activate agentevolver
-
-# option 1: minimal example without ReMe (using built-in datasets within environments)
-python launcher.py --conf examples/basic.yaml --with-appworld
-
-# option 2: full example with ReMe (questioning + navigating + attributing)
-python launcher.py --conf examples/overall.yaml --with-appworld --with-reme
 ```
 
-## 🧩 Advanced Usage
+### 2. Prepare Teacher Data
 
-### 🔧 Manual Execution
+Teacher trajectories should be collected from a strong model (e.g., Qwen-72B) and stored as pickle files:
 
-For users requiring fine-grained control over the training pipeline, we provide standalone execution scripts: 
+```bash
+# ALFWorld: convert to react_tags format if needed
+python scripts/convert_alfworld_react_to_tags.py
 
-- `bash examples/run_basic.sh` - Execute basic RL pipeline with GRPO using built-in datasets within environments.
-- `bash examples/run_overall.sh` - Run the complete self-evolving AgentEvolver pipeline with fully customizable configurations.
+# Data locations:
+# ALFWorld: data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered_react_tags.pkl
+# WebShop:  data/teacher_trajectories/qwen72b/webshop_qwen72b_filtered.pkl
+```
 
-Refer to the  **[QuickStart](docs/tutorial/quick_start.md)** for detailed usage instructions and configuration parameters.
+### 3. Run Experiments
 
-### 📄 Documentation
+```bash
+# ALFWorld 3B: DUET vs baselines (LUFFY, CHORD, GRPO)
+bash run_launcher.sh
 
-For detailed usage and customization, please refer to the following guidelines:
+# WebShop 3B: DUET vs baselines
+bash run_launcher_webshop_duet_paper.sh
+```
 
-- **[Environment Service](docs/guidelines/env_service.md)** - Set up and manage environment instances, integrate custom environments
-- **[Task Manager](docs/guidelines/task_manager.md)** - Explore environments, generate synthetic tasks, and curate training data for agent evolution
-- **[Experience Manager](docs/guidelines/exp_manager.md)** - Configure experience pool management and self-navigating mechanisms
-- **[Advantage Processor](docs/guidelines/adv_processor.md)** - Implement self-attributing mechanisms with ADCA-GRPO for fine-grained credit assignment
+Or run individual experiments:
 
-For API documentation and more details, visit our [documentation site](docs/index.md).
+```bash
+# DUET
+python launcher.py --conf config/duet_paper_experiments_configs/alfworld/alfworld_3b_duet.yaml
 
-## 🔮 Upcoming
-- **Evolution in multi-agent scenarios** – Investigate autonomous co-evolution strategies for agents operating within shared, interactive environments.
-- **Cross-stage collaborative self-evolution** – Explore methods that couple questioning, navigating, and attributing into coordinated loops for mutual enhancement.
+# LUFFY baseline
+python launcher.py --conf config/duet_paper_experiments_configs/alfworld/alfworld_3b_luffy.yaml
 
-<!-- ## 🌟 Contact Us -->
+# CHORD baseline
+python launcher.py --conf config/duet_paper_experiments_configs/alfworld/alfworld_3b_chord.yaml
+```
 
-## 🙏 Acknowledgements
-This project builds upon the excellent work of several open-source projects:
+### 4. Monitor on wandb
 
-- [ReMe](https://github.com/agentscope-ai/ReMe) - for experience summarization and management;
-- [veRL](https://github.com/volcengine/verl) - for distributed RL training;
-- [mkdocs](https://github.com/mkdocs/mkdocs) - for documentation.
+Key metrics to track during DUET training:
 
-## 📚 Citation
-If you find this work useful, please consider citing:
+| Metric | What it tells you |
+|--------|-------------------|
+| `critic/success_onpolicy/mean` | On-policy success rate (primary metric) |
+| `duet/teacher_gradient_share` | Teacher influence fraction (should naturally decrease) |
+| `state_channel/bonus_vs_reward_ratio` | SC bonus relative to task reward (should be <15%) |
+| `dr3/disc_acc` | DR3 discriminator accuracy |
+| `state_channel/progress_onpolicy_mean` | On-policy expert state coverage |
+| `actor/kl_loss` | Policy divergence from reference |
+
+## Configuration
+
+### DUET-specific settings
+
+```yaml
+actor_rollout_ref:
+  actor:
+    use_dr3: true                    # Enable Action Channel
+    kl_loss_coef: 0.005              # KL regularization strength
+    dr3:
+      enable: true
+      disc_temperature: 1.5          # Discriminator softness (higher = softer ratios)
+      disc_label_smoothing: 0.1      # Prevent over-confident discriminator
+      w_min: 0.01                    # Minimum density ratio (numerical safety)
+      gap_gate_enable: true          # Reward-gap based teacher gating
+
+exp_manager:
+  teacher_experience:
+    enable: true
+    mix_mode: rollout_level          # LUFFY-style rollout mixing
+    n_teacher_rollouts_per_task: 1   # 1 teacher per 7 on-policy per group
+    data_path: data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered_react_tags.pkl
+
+  state_channel:
+    enable: true                     # Enable State Channel
+    exclude_teacher: true            # Only shape on-policy rewards (key design choice)
+    beta: 0.2                        # Progress bonus coefficient
+    beta_decay: true                 # Decay beta as performance improves
+    beta_decay_target: 0.3           # Target reward for full decay
+    step_level:
+      enable: true                   # Per-step progress deltas
+      eta: 0.05                      # Step-level coefficient
+```
+
+### Baseline configurations
+
+All configs are in `config/duet_paper_experiments_configs/`:
+
+```
+alfworld/
+  alfworld_3b_duet.yaml          # DUET (ours)
+  alfworld_3b_luffy.yaml         # LUFFY baseline
+  alfworld_3b_chord.yaml         # CHORD baseline
+  alfworld_3b_onpolicy.yaml      # Vanilla GRPO
+  alfworld_3b_state_channel.yaml # Ablation: SC only
+  alfworld_3b_action_channel.yaml # Ablation: DR3 only
+webshop/
+  (same structure)
+```
+
+## Supported Environments
+
+| Environment | Reward | Action Format | Tasks |
+|-------------|--------|---------------|-------|
+| ALFWorld | Binary {0,1} | react_tags | Household tasks |
+| WebShop | Continuous + penalty | search/click | E-commerce shopping |
+| ScienceWorld | Continuous [0,1] | Text commands | Science experiments |
+| AppWorld | Binary | Python code | Multi-app API calls |
+| BFCL | Binary | tool_call JSON | Function calling |
+
+## Project Structure
+
+```
+├── agentevolver/
+│   ├── module/
+│   │   ├── trainer/
+│   │   │   └── ae_ray_trainer.py      # Core training loop (State Channel, advantage computation)
+│   │   ├── exp_manager/
+│   │   │   ├── het_actor.py           # Actor with DR3 integration (Action Channel)
+│   │   │   ├── het_core_algos.py      # Loss functions (GRPO/LUFFY/CHORD/DR3)
+│   │   │   ├── state_progress.py      # Expert progress map (State Channel)
+│   │   │   ├── dr3_ratio.py           # Density ratio estimator
+│   │   │   ├── exp_manager.py         # Experience management + teacher loading
+│   │   │   └── experience_collate.py  # LUFFY mixing logic
+│   │   ├── env_manager/               # Parallel environment orchestration
+│   │   └── task_manager/              # Task lifecycle + data loading
+│   └── schema/                        # Data models (Trajectory, Sample, Task)
+├── env_service/                       # FastAPI environment service
+│   └── environments/                  # ALFWorld, WebShop, SciWorld, etc.
+├── config/                            # Hydra YAML configs
+│   └── duet_paper_experiments_configs/ # All DUET paper experiment configs
+├── scripts/                           # Data collection & processing
+├── data/teacher_trajectories/         # Expert demonstration data
+├── launcher.py                        # Main launcher (config + services + training)
+└── run_launcher*.sh                   # Experiment launch scripts
+```
+
+## Acknowledgements
+
+Built upon:
+- [AgentEvolver](https://github.com/modelscope/AgentEvolver) — self-evolving agent training framework
+- [veRL](https://github.com/volcengine/verl) — distributed RL training
+- [vLLM](https://github.com/vllm-project/vllm) — fast LLM inference
+
+## Citation
 
 ```bibtex
 @misc{AgentEvolver2025,
@@ -176,8 +235,3 @@ If you find this work useful, please consider citing:
   url           = {https://arxiv.org/abs/2511.10395}
 }
 ```
-
-
-## ✨ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/AgentEvolver&type=date&legend=top-left)](https://www.star-history.com/#modelscope/AgentEvolver&type=date&legend=top-left)
