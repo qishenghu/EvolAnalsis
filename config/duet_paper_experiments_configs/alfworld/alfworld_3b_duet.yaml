@@ -9,7 +9,7 @@ defaults:
   - _self_
 
 trainer:
-  experiment_name: alfworld_3b_duet_0328
+  experiment_name: alfworld_3b_duet_0329
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1

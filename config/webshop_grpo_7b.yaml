@@ -22,7 +22,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: webshop_7b_grpo_bz8_1600
+  experiment_name: webshop_7b_grpo_bz8_1600_wo_tags
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -129,7 +129,7 @@ env_service:
   env_type: "webshop"
   env_url: "http://127.0.0.1:8083"
   env_params:
-    action_format: "react_tags"
+    action_format: "react"  #"react_tags"
     enable_action_sanitizer: true
     invalid_action_penalty: -0.1
     invalid_action_penalty_cap: -0.1

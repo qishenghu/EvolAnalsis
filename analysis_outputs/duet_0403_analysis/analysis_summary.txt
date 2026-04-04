@@ -1,0 +1,20 @@
+# DUET 0403 Collapse Analysis Summary
+# Generated: 2026-04-02
+# Wandb run: j2rle81i
+
+## Validation Score (step 50)
+- Average reward: 0.6456
+- Average success: 0.305 (30.5%)
+
+## Key Metrics at Collapse
+- critic/success_onpolicy/mean: 0.4423 -> 0.3454 (-0.0969)
+- actor/kl_loss: 1.2351 -> 1.0990 (-0.1362)
+- duet/teacher_gradient_share: 0.3031 -> 0.1602 (-0.1429)
+- diag/adv_teacher_sample_mean: 0.1288 -> 0.1381 (+0.0093)
+- diag/adv_onpolicy_sample_mean: -0.0092 -> -0.0164 (-0.0073)
+- dr3/w_off_mean: 0.8371 -> 0.9428 (+0.1058)
+- dr3/disc_acc: 0.9579 -> 0.8974 (-0.0605)
+- state_channel/bonus_vs_reward_ratio: 0.0836 -> 0.0827 (-0.0009)
+- actor/pg_loss: -0.1550 -> -0.0679 (+0.0871)
+- actor/off_pg_loss: -0.1836 -> -0.1278 (+0.0558)
+- diag/teacher_sample_ratio: 0.1086 -> 0.1069 (-0.0017)

@@ -119,7 +119,7 @@ data:
   val_files: null
   val_batch_size: 8
   val_type: val
-  max_train_tasks: 1600
+  max_train_tasks: 800
   shuffle: true
   seed: 2026
 env_service:
@@ -198,7 +198,7 @@ exp_manager:
     beta: 0.5
     beta_decay: true
     beta_decay_target: 0.5
-    match_mode: hash
+    match_mode: stage
     step_level:
       enable: false
       eta: 0.1

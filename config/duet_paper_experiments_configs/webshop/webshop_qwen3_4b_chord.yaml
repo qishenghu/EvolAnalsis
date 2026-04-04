@@ -125,7 +125,7 @@ data:
   val_files: null
   val_batch_size: 8
   val_type: val
-  max_train_tasks: 1600
+  max_train_tasks: 800
   shuffle: true
   seed: 2026
 env_service:

@@ -22,7 +22,7 @@ defaults:
 # ============================================================================
 
 trainer:
-  experiment_name: webshop_3b_grpo_bz8_1600
+  experiment_name: webshop_3b_grpo_bz8_800
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -121,7 +121,7 @@ data:
   val_files: null
   val_batch_size: 8
   val_type: "val"
-  max_train_tasks: 1600
+  max_train_tasks: 800
   shuffle: true
   seed: 2026
 

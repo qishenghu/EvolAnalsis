@@ -62,6 +62,9 @@ class SciworldEnv(BaseEnv):
         # )
         self.simplification_str = "easy"
 
+        # Action format: "react" (Thought:\n...\nAction:\n...) or "react_tags" (<think>...</think>\n<action>...</action>)
+        self.action_format = str(self.params.get("action_format", "react"))
+
         # 远端 ScienceWorld server 上的 env id
         self.remote_env_id: Optional[int] = None
         self.current_data_idx = None
@@ -262,6 +265,14 @@ class SciworldEnv(BaseEnv):
             "task_description": self.current_task_description,
         }
     
+    def _use_react_tags(self) -> bool:
+        return self.action_format == "react_tags"
+
+    def _get_action_format_example(self) -> str:
+        if self._use_react_tags():
+            return "<think>\nyour thoughts.\n</think>\n<action>\nyour next action\n</action>"
+        return "Thought:\nyour thoughts.\nAction:\nyour next action"
+
     def _get_system_prompt(self) -> str:
         """Get the system prompt for ScienceWorld environment."""
         return '''You are a scientific experiment assistant in a text-based simulation environment. Your task is to perform scientific experiments by interacting with objects in the environment.
@@ -310,12 +321,9 @@ Important:
 
 In each turn, you must output your thought/reasoning and then output your action in the following format:
 ```
-Thought:
-your thoughts.
-Action:
-your next action
+{format_example}
 ```
-'''
+'''.format(format_example=self._get_action_format_example())
 
 # In each turn, you must output your thought/reasoning and then output your action in the following format:
 # ```
@@ -385,7 +393,10 @@ your next action
         
         if parsed_action is None:
             action_hints = self._get_action_hints()
-            invalid_obs = "Invalid action format. Please use 'Action: your_action' format."
+            if self._use_react_tags():
+                invalid_obs = "Invalid action format. Please use '<action>your_action</action>' format."
+            else:
+                invalid_obs = "Invalid action format. Please use 'Action: your_action' format."
             invalid_obs += f"\n\n{action_hints}"
             
             return {
@@ -554,31 +565,57 @@ your next action
             return None
         
         llm_output_clean = llm_output.strip()
-        
+
         # Remove </s> token if present
         if llm_output_clean.endswith("</s>"):
             llm_output_clean = llm_output_clean[:-4].strip()
-        
+
+        # react_tags format: <action>...</action>
+        if self._use_react_tags():
+            action_tag_match = re.search(
+                r"<action>(.*?)</action>",
+                llm_output_clean,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if action_tag_match:
+                action_str = action_tag_match.group(1).strip()
+                # Take first line (action should be single line)
+                action_str = action_str.split('\n')[0].strip()
+                if action_str:
+                    return action_str
+            # Fallback: unclosed <action> tag
+            open_tag_match = re.search(
+                r"<action>(.*)$",
+                llm_output_clean,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if open_tag_match:
+                action_str = open_tag_match.group(1).strip().split('\n')[0].strip()
+                if action_str:
+                    return action_str
+            return None
+
+        # react format: Thought:\n...\nAction:\n...
         # Strategy 1: Extract "Action:" segment
         action_parts = llm_output_clean.rsplit("Action:", 1)
-        
+
         if len(action_parts) == 2:
             action_str = action_parts[1].strip()
             action_str = re.sub(r"^Action:\s*", "", action_str, flags=re.IGNORECASE).strip()
             # Take first line/sentence
             action_str = action_str.split('\n')[0].strip()
-            
+
             if action_str:
                 return action_str
-        
+
         # Strategy 2: If no "Action:" found, check if it's a direct action
         if not re.match(r"^(Thought|Action):", llm_output_clean, re.IGNORECASE):
             # Looks like a direct action
             return llm_output_clean.split('\n')[0].strip()
-        
+
         # Strategy 3: If only "Thought:" without "Action:", return None
         if "Thought:" in llm_output_clean and "Action:" not in llm_output_clean:
             return None
-        
+
         return None
 

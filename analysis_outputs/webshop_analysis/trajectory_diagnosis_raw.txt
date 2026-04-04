@@ -1,0 +1,549 @@
+================================================================================
+1. REWARD DISTRIBUTION ANALYSIS
+================================================================================
+
+--- Step 1 ---
+  DUET: n=64, mean=0.3324, std=0.4154, min=-0.1000, max=1.0000
+    reward=0: 4 (6.2%)
+    reward<0: 23 (35.9%)
+    reward in (0, 0.5): 8 (12.5%)
+    reward in [0.5, 1.0): 21 (32.8%)
+    reward=1.0: 8 (12.5%)
+  LUFFY: n=64, mean=0.2491, std=0.4245, min=-0.1000, max=1.0000
+    reward=0: 6 (9.4%)
+    reward<0: 30 (46.9%)
+    reward in (0, 0.5): 7 (10.9%)
+    reward in [0.5, 1.0): 12 (18.8%)
+    reward=1.0: 9 (14.1%)
+  GRPO: n=64, mean=0.1788, std=0.3568, min=-0.1000, max=1.0000
+    reward=0: 11 (17.2%)
+    reward<0: 29 (45.3%)
+    reward in (0, 0.5): 8 (12.5%)
+    reward in [0.5, 1.0): 15 (23.4%)
+    reward=1.0: 1 (1.6%)
+
+--- Step 10 ---
+  DUET: n=64, mean=0.1765, std=0.3299, min=-0.1000, max=1.0000
+    reward=0: 12 (18.8%)
+    reward<0: 23 (35.9%)
+    reward in (0, 0.5): 20 (31.2%)
+    reward in [0.5, 1.0): 3 (4.7%)
+    reward=1.0: 6 (9.4%)
+  LUFFY: n=64, mean=0.1792, std=0.3315, min=-0.1000, max=1.0000
+    reward=0: 19 (29.7%)
+    reward<0: 19 (29.7%)
+    reward in (0, 0.5): 16 (25.0%)
+    reward in [0.5, 1.0): 4 (6.2%)
+    reward=1.0: 6 (9.4%)
+  GRPO: n=64, mean=0.1042, std=0.2342, min=-0.1000, max=0.7143
+    reward=0: 8 (12.5%)
+    reward<0: 27 (42.2%)
+    reward in (0, 0.5): 22 (34.4%)
+    reward in [0.5, 1.0): 7 (10.9%)
+    reward=1.0: 0 (0.0%)
+
+--- Step 25 ---
+  DUET: n=64, mean=0.6091, std=0.3881, min=-0.1000, max=1.0000
+    reward=0: 3 (4.7%)
+    reward<0: 5 (7.8%)
+    reward in (0, 0.5): 15 (23.4%)
+    reward in [0.5, 1.0): 19 (29.7%)
+    reward=1.0: 22 (34.4%)
+  LUFFY: n=64, mean=0.5050, std=0.3373, min=-0.1000, max=1.0000
+    reward=0: 4 (6.2%)
+    reward<0: 5 (7.8%)
+    reward in (0, 0.5): 19 (29.7%)
+    reward in [0.5, 1.0): 27 (42.2%)
+    reward=1.0: 9 (14.1%)
+  GRPO: n=64, mean=0.4873, std=0.3100, min=-0.1000, max=0.9000
+    reward=0: 4 (6.2%)
+    reward<0: 6 (9.4%)
+    reward in (0, 0.5): 14 (21.9%)
+    reward in [0.5, 1.0): 40 (62.5%)
+    reward=1.0: 0 (0.0%)
+
+--- Step 50 ---
+  DUET: n=64, mean=0.7726, std=0.3614, min=-0.1000, max=1.0000
+    reward=0: 1 (1.6%)
+    reward<0: 8 (12.5%)
+    reward in (0, 0.5): 0 (0.0%)
+    reward in [0.5, 1.0): 26 (40.6%)
+    reward=1.0: 29 (45.3%)
+  LUFFY: n=64, mean=0.6909, std=0.2966, min=-0.1000, max=1.0000
+    reward=0: 1 (1.6%)
+    reward<0: 6 (9.4%)
+    reward in (0, 0.5): 0 (0.0%)
+    reward in [0.5, 1.0): 45 (70.3%)
+    reward=1.0: 12 (18.8%)
+  GRPO: n=64, mean=0.6015, std=0.3117, min=-0.1000, max=0.8571
+    reward=0: 1 (1.6%)
+    reward<0: 9 (14.1%)
+    reward in (0, 0.5): 1 (1.6%)
+    reward in [0.5, 1.0): 53 (82.8%)
+    reward=1.0: 0 (0.0%)
+
+--- Step 75 ---
+  DUET: n=64, mean=0.6644, std=0.3117, min=-0.1000, max=1.0000
+    reward=0: 0 (0.0%)
+    reward<0: 7 (10.9%)
+    reward in (0, 0.5): 3 (4.7%)
+    reward in [0.5, 1.0): 43 (67.2%)
+    reward=1.0: 11 (17.2%)
+  LUFFY: n=64, mean=0.8583, std=0.1917, min=-0.1000, max=1.0000
+    reward=0: 0 (0.0%)
+    reward<0: 1 (1.6%)
+    reward in (0, 0.5): 0 (0.0%)
+    reward in [0.5, 1.0): 30 (46.9%)
+    reward=1.0: 33 (51.6%)
+  GRPO: n=64, mean=0.2179, std=0.3684, min=-0.1000, max=0.8571
+    reward=0: 0 (0.0%)
+    reward<0: 36 (56.2%)
+    reward in (0, 0.5): 1 (1.6%)
+    reward in [0.5, 1.0): 27 (42.2%)
+    reward=1.0: 0 (0.0%)
+
+--- Step 100 ---
+  DUET: n=64, mean=0.7968, std=0.2472, min=-0.1000, max=1.0000
+    reward=0: 0 (0.0%)
+    reward<0: 1 (1.6%)
+    reward in (0, 0.5): 7 (10.9%)
+    reward in [0.5, 1.0): 26 (40.6%)
+    reward=1.0: 30 (46.9%)
+  LUFFY: n=64, mean=0.8099, std=0.2635, min=0.0875, max=1.0000
+    reward=0: 0 (0.0%)
+    reward<0: 0 (0.0%)
+    reward in (0, 0.5): 8 (12.5%)
+    reward in [0.5, 1.0): 20 (31.2%)
+    reward=1.0: 36 (56.2%)
+  GRPO: n=64, mean=0.2977, std=0.3642, min=-0.1000, max=0.8889
+    reward=0: 13 (20.3%)
+    reward<0: 18 (28.1%)
+    reward in (0, 0.5): 9 (14.1%)
+    reward in [0.5, 1.0): 24 (37.5%)
+    reward=1.0: 0 (0.0%)
+
+================================================================================
+2. TEACHER VS ON-POLICY SAMPLES IN DUET
+================================================================================
+
+Step 1: 7 teacher, 57 on-policy
+  Teacher: mean=1.0000, r=0: 0, r=1: 7
+  On-policy: mean=0.2505, r=0: 4, r=1: 1
+
+Step 10: 6 teacher, 58 on-policy
+  Teacher: mean=1.0000, r=0: 0, r=1: 6
+  On-policy: mean=0.0913, r=0: 12, r=1: 0
+
+Step 25: 8 teacher, 56 on-policy
+  Teacher: mean=1.0000, r=0: 0, r=1: 8
+  On-policy: mean=0.5533, r=0: 3, r=1: 14
+
+Step 50: 8 teacher, 56 on-policy
+  Teacher: mean=1.0000, r=0: 0, r=1: 8
+  On-policy: mean=0.7401, r=0: 1, r=1: 21
+
+Step 75: 5 teacher, 59 on-policy
+  Teacher: mean=1.0000, r=0: 0, r=1: 5
+  On-policy: mean=0.6359, r=0: 0, r=1: 6
+
+Step 100: 6 teacher, 58 on-policy
+  Teacher: mean=1.0000, r=0: 0, r=1: 6
+  On-policy: mean=0.7758, r=0: 0, r=1: 24
+
+================================================================================
+3. SC (STATE CHANNEL) EFFECTIVENESS ON WEBSHOP
+================================================================================
+
+Step 1 (on-policy only, n=57):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/57
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/57
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/57
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/331 non-zero (0.0%)
+
+Step 5 (on-policy only, n=56):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/56
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/56
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/56
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/727 non-zero (0.0%)
+
+Step 10 (on-policy only, n=58):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/58
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/58
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/58
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/606 non-zero (0.0%)
+
+Step 25 (on-policy only, n=56):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/56
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/56
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/56
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/161 non-zero (0.0%)
+
+Step 50 (on-policy only, n=56):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/56
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/56
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/56
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/285 non-zero (0.0%)
+
+Step 75 (on-policy only, n=59):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/59
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/59
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/59
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/105 non-zero (0.0%)
+
+Step 100 (on-policy only, n=58):
+  sc_progress: mean=0.000000, max=0.000000, >0: 0/58
+  sc_bonus:    mean=0.000000, max=0.000000, >0: 0/58
+  sc_coverage: mean=0.000000, max=0.000000, >0: 0/58
+  sc_matched_states: mean=0.00, max=0.00
+  step_deltas: 0/120 non-zero (0.0%)
+
+================================================================================
+4. BATCH DIAG TRENDS
+================================================================================
+
+diag/reward_onpolicy_mean:
+  DUET: s1=0.2505, s10=0.0913, s25=0.5533, s50=0.7401, s75=0.6359, s100=0.7758
+  LUFFY: s1=0.1569, s10=0.0943, s25=0.4343, s50=0.6467, s75=0.8463, s100=0.7903
+  GRPO: s1=0.1788, s10=0.1042, s25=0.4873, s50=0.6015, s75=0.2179, s100=0.2977
+
+diag/reward_teacher_mean:
+  DUET: s1=1.0000, s10=1.0000, s25=1.0000, s50=1.0000, s75=1.0000, s100=1.0000
+  LUFFY: s1=1.0000, s10=1.0000, s25=1.0000, s50=1.0000, s75=1.0000, s100=1.0000
+  GRPO: s1=N/A, s10=N/A, s25=N/A, s50=N/A, s75=N/A, s100=N/A
+
+diag/teacher_sample_ratio:
+  DUET: s1=0.1094, s10=0.0938, s25=0.1250, s50=0.1250, s75=0.0781, s100=0.0938
+  LUFFY: s1=0.1094, s10=0.0938, s25=0.1250, s50=0.1250, s75=0.0781, s100=0.0938
+  GRPO: s1=0.0000, s10=0.0000, s25=0.0000, s50=0.0000, s75=0.0000, s100=0.0000
+
+diag/adv_onpolicy_token_mean:
+  DUET: s1=-0.0089, s10=-0.0132, s25=-0.0030, s50=-0.0045, s75=-0.0243, s100=-0.0055
+  LUFFY: s1=-0.0074, s10=-0.0170, s25=-0.0083, s50=-0.0105, s75=-0.0089, s100=-0.0021
+  GRPO: s1=-0.0124, s10=-0.0054, s25=-0.0169, s50=-0.0968, s75=-0.0428, s100=-0.0283
+
+diag/adv_teacher_token_mean:
+  DUET: s1=2.0193, s10=6.4100, s25=40549.5234, s50=0.7365, s75=1.0273, s100=0.6885
+  LUFFY: s1=5.4416, s10=4.3371, s25=40550.1875, s50=90449.9141, s75=3.6186, s100=2.9533
+  GRPO: s1=N/A, s10=N/A, s25=N/A, s50=N/A, s75=N/A, s100=N/A
+
+diag/onpolicy_adv_pos_ratio:
+  DUET: s1=0.4386, s10=0.4310, s25=0.6607, s50=0.5893, s75=0.7119, s100=0.5172
+  LUFFY: s1=0.3860, s10=0.3276, s25=0.6071, s50=0.6607, s75=0.6949, s100=0.3621
+  GRPO: s1=0.4062, s10=0.5000, s25=0.5938, s50=0.8281, s75=0.4375, s100=0.5156
+
+diag/teacher_adv_pos_ratio:
+  DUET: s1=1.0000, s10=1.0000, s25=1.0000, s50=0.8750, s75=1.0000, s100=0.8333
+  LUFFY: s1=1.0000, s10=1.0000, s25=1.0000, s50=1.0000, s75=1.0000, s100=0.8333
+  GRPO: s1=N/A, s10=N/A, s25=N/A, s50=N/A, s75=N/A, s100=N/A
+
+diag/entropy_onpolicy_token_mean:
+  DUET: s1=0.4873, s10=0.2606, s25=0.4042, s50=0.3733, s75=0.4129, s100=0.4251
+  LUFFY: s1=0.3891, s10=0.2624, s25=0.4679, s50=0.4572, s75=0.3412, s100=0.4063
+  GRPO: s1=0.3365, s10=0.3347, s25=0.4945, s50=0.4791, s75=0.3594, s100=0.3591
+
+diag/entropy_teacher_token_mean:
+  DUET: s1=0.2539, s10=0.2248, s25=0.2775, s50=0.3015, s75=0.2578, s100=0.2588
+  LUFFY: s1=0.2539, s10=0.2471, s25=0.2918, s50=0.2546, s75=0.2194, s100=0.2406
+  GRPO: s1=N/A, s10=N/A, s25=N/A, s50=N/A, s75=N/A, s100=N/A
+
+diag/group_teacher_minus_on_reward_mean:
+  DUET: s1=0.7389, s10=0.9471, s25=0.4467, s50=0.2599, s75=0.3274, s100=0.1805
+  LUFFY: s1=0.8053, s10=0.9508, s25=0.5657, s50=0.3533, s75=0.1352, s100=0.1816
+  GRPO: s1=N/A, s10=N/A, s25=N/A, s50=N/A, s75=N/A, s100=N/A
+
+================================================================================
+5. TEACHER TRAJECTORY ANALYSIS
+================================================================================
+
+WebShop teacher data:
+  Type: <class 'list'>
+  Count: 26178
+  Sample keys: ['task_id', 'data_id', 'rollout_id', 'teacher_model', 'metadata', 'messages', 'reward', 'success', 'is_terminated']
+  Rewards: mean=1.0000, std=0.0000, min=1.0000, max=1.0000
+    r=0: 0, r<0: 0, r in (0,0.5): 0, r in [0.5,1): 0, r=1: 26178
+  Message count: mean=17.7, std=3.4, min=9, max=27
+
+ALFWorld teacher data:
+  Type: <class 'list'>
+  Count: 19497
+  Sample keys: ['task_id', 'data_id', 'rollout_id', 'messages', 'reward', 'success', 'is_terminated', 'teacher_model', 'metadata', 'log_probs', 'log_probs_per_turn']
+  Rewards: mean=1.0000, std=0.0000, min=1.0000, max=1.0000
+    r=0: 0, r<0: 0, r in (0,0.5): 0, r in [0.5,1): 0, r=1: 19497
+  Message count: mean=26.5, std=14.6, min=8, max=62
+
+================================================================================
+6. RESPONSE PATTERN & LENGTH ANALYSIS
+================================================================================
+
+--- Step 1 ---
+
+  DUET: n=64
+    Response length: mean=988, std=309
+    Action distribution: {'click': 428, 'search': 141, 'buy': 38}
+    Actions/traj: mean=9.5, std=9.1
+
+  LUFFY: n=64
+    Response length: mean=1122, std=427
+    Action distribution: {'click': 634, 'search': 188, 'buy': 29}
+    Actions/traj: mean=13.3, std=11.2
+
+  GRPO: n=64
+    Response length: mean=1196, std=447
+    Action distribution: {'click': 742, 'search': 224, 'buy': 31}
+    Actions/traj: mean=15.6, std=11.6
+
+--- Step 50 ---
+
+  DUET: n=64
+    Response length: mean=849, std=531
+    Action distribution: {'click': 360, 'search': 98, 'buy': 68}
+    Actions/traj: mean=8.2, std=5.1
+
+  LUFFY: n=64
+    Response length: mean=821, std=526
+    Action distribution: {'click': 227, 'search': 86, 'buy': 64}
+    Actions/traj: mean=5.9, std=4.0
+
+  GRPO: n=64
+    Response length: mean=1645, std=1487
+    Action distribution: {'click': 237, 'buy': 80, 'search': 68}
+    Actions/traj: mean=6.0, std=4.4
+
+--- Step 100 ---
+
+  DUET: n=64
+    Response length: mean=714, std=301
+    Action distribution: {'click': 259, 'search': 70, 'buy': 64}
+    Actions/traj: mean=6.1, std=1.2
+
+  LUFFY: n=64
+    Response length: mean=502, std=272
+    Action distribution: {'click': 286, 'search': 70, 'buy': 64}
+    Actions/traj: mean=6.6, std=0.9
+
+  GRPO: n=64
+    Response length: mean=2251, std=901
+    Action distribution: {'click': 218, 'search': 84, 'buy': 74}
+    Actions/traj: mean=5.9, std=2.8
+
+================================================================================
+7. VALIDATION FAILURE ANALYSIS (step 100)
+================================================================================
+
+DUET validation (n=200):
+  Reward: mean=0.7251, std=0.2996
+    r=0: 9 (4.5%)
+    r in (0,0.5): 25 (12.5%)
+    r in [0.5,1): 99 (49.5%)
+    r=1: 65 (32.5%)
+  Failure categories: {'high_partial': 99, 'success': 67, 'low_partial': 25, 'bought_wrong_product': 8, 'browsed_no_buy': 1}
+
+LUFFY validation (n=200):
+  Reward: mean=0.7528, std=0.3214
+    r=0: 7 (3.5%)
+    r in (0,0.5): 20 (10.0%)
+    r in [0.5,1): 69 (34.5%)
+    r=1: 99 (49.5%)
+  Failure categories: {'success': 104, 'high_partial': 69, 'low_partial': 20, 'bought_wrong_product': 7}
+
+--- DUET Failure Samples ---
+Total zero-reward failures: 9
+
+  Failure 1:
+    First 200 chars: assistant
+<action>
+search[Find me machine wash men's tuxedo shirts with cotton heather, needle sleeve, classic fit with color: dark heather | white, and fit type: women, and size: small, and price low
+    Last 200 chars:  shirt and does not match the required fit type, color, and size. I need to select the correct fit type, color, and size before proceeding to purchase.
+</think>
+<action>
+click[black | white]</action>
+
+    Category: browsed_no_buy
+
+  Failure 2:
+    First 200 chars: assistant
+<action>
+search[Find me men's fashion sneakers with lace closure, rubber outsole, rubber sole with color: black | white, and size: 8.5, and price lower than 50.00 dollars]</action>
+user
+Inst
+    Last 200 chars: P] Description [SEP] Features [SEP] Reviews [SEP] Buy Now
+
+Clickable elements: ['back to search', '< prev', 'description', 'features', 'reviews', 'buy now']
+assistant
+<action>click[buy now]
+</action>
+
+    Category: bought_wrong_product
+
+  Failure 3:
+    First 200 chars: assistant
+<action>
+search[Find me long lasting, lead free candles with soy wax, and price lower than 50.00 dollars]</action>
+user
+Instruction: [SEP] Find me long lasting, lead free candles with soy wa
+    Last 200 chars: -lasting, lead-free candle with soy wax, and the price is $17.93, which is within the budget. Clicking "Buy Now" will finalize the purchase of this product.
+</think>
+<action>
+click[Buy Now]
+</action>
+
+    Category: bought_wrong_product
+
+  Failure 4:
+    First 200 chars: assistant
+<action>
+search[Find me slim fit men's suits & sport coats with button closure, classic fit with color: fuchsia, and size: medium, and price lower than 90.00 dollars]
+</action>
+user
+Instruct
+    Last 200 chars:  'description', 'features', 'reviews', 'buy now', 'a-blue', 'a-green', 'b-black', 'b-gray', 'c-gray', 'medium', 'large', 'x-large', 'xx-large', '3x-large']
+assistant
+<action>
+click[Buy Now]
+</action>
+
+    Category: bought_wrong_product
+
+  Failure 5:
+    First 200 chars: assistant
+<action>
+search[Find me slim fit men's suits & sport coats with button closure, classic fit with color: green, and size: medium, and price lower than 90.00 dollars]
+</action>
+user
+Instructio
+    Last 200 chars: t meets all the specified criteria. Clicking "Buy Now" will finalize the purchase of the green, medium-sized, and classic fit men's suit with button closure.
+</think>
+<action>
+click[Buy Now]</action>
+
+    Category: bought_wrong_product
+
+--- LUFFY Failure Samples ---
+Total zero-reward failures: 7
+
+  Failure 1:
+    First 200 chars: assistant
+<action>
+search[men's fashion sneakers with lace closure, rubber outsole, rubber sole with color: black | white, and size: 8.5, and price lower than 50.00 dollars]
+</action>
+user
+Instruction
+    Last 200 chars: ', '7 wide', '7.5', '7.5 wide', '8', '8 wide', '8.5', '8.5 wide', '9', '9 wide', '10', '11', '11 wide', 'taupe metallic combi', 'black combi', 'navy combi']
+assistant
+<action>
+click[Buy Now]</action>
+
+    Category: bought_wrong_product
+
+  Failure 2:
+    First 200 chars: assistant
+<action>
+search[long lasting lead free candles with soy wax price lower than 50.00 dollars]</action>
+user
+Instruction: [SEP] Find me long lasting, lead free candles with soy wax, and price l
+    Last 200 chars: P] Description [SEP] Features [SEP] Reviews [SEP] Buy Now
+
+Clickable elements: ['back to search', '< prev', 'description', 'features', 'reviews', 'buy now']
+assistant
+<action>
+click[buy now]</action>
+
+    Category: bought_wrong_product
+
+  Failure 3:
+    First 200 chars: assistant
+<action>
+search[men's dress shirts polyester heathers heathers cotton cotton heather needle sleeve classic fit navy women medium price lower than 30.00]
+</action>
+user
+Instruction: [SEP] Fin
+    Last 200 chars: dium', 'large', 'x-large', 'xx-large', 'black', 'burgundy', 'charcoal heather', 'light heather grey', 'lilac', 'navy', 'oatmeal heather', 'olive', 'white']
+assistant
+<action>
+click[buy now]
+</action>
+
+    Category: bought_wrong_product
+
+  Failure 4:
+    First 200 chars: assistant
+<action>
+search[men's suits & sport coats with button closure, classic fit with color: green, and size: medium, and price lower than 90.00 dollars]
+</action>
+user
+Instruction: [SEP] Find me 
+    Last 200 chars: , 'description', 'features', 'reviews', 'buy now', 'a-blue', 'a-green', 'b-black', 'b-gray', 'c-gray', 'medium', 'large', 'x-large', 'xx-large', '3x-large']
+assistant
+<action>
+click[Buy Now]</action>
+
+    Category: bought_wrong_product
+
+  Failure 5:
+    First 200 chars: assistant
+<action>
+search[men's shorts with drawstring closure for tumble dry with color: navy blue, and size: x-large, and price lower than 50.00 dollars]
+</action>
+user
+Instruction: [SEP] Find me ma
+    Last 200 chars: scription', 'features', 'reviews', 'buy now', 'black', 'blue', 'red', 'small', 'medium', 'large', 'x-large', 'xx-large', '3x-large', '4x-large', '5x-large']
+assistant
+<action>
+click[Buy Now]</action>
+
+    Category: bought_wrong_product
+
+================================================================================
+8. PARTIAL REWARD DEEP DIVE: DUET vs LUFFY vs GRPO AT STEP 100
+================================================================================
+
+DUET on-policy rewards at step 100:
+  [-0.5, -0.1): 0 (0.0%)
+  [-0.1, 0.0): 1 (1.7%)
+  [0.0, 0.1): 0 (0.0%)
+  [0.1, 0.2): 0 (0.0%)
+  [0.2, 0.3): 0 (0.0%)
+  [0.3, 0.4): 2 (3.4%)
+  [0.4, 0.5): 5 (8.6%)
+  [0.5, 0.6): 14 (24.1%)
+  [0.6, 0.7): 0 (0.0%)
+  [0.7, 0.8): 2 (3.4%)
+  [0.8, 0.9): 8 (13.8%)
+  [0.9, 1.0): 2 (3.4%)
+  [1.0, 1.1): 24 (41.4%)
+
+LUFFY on-policy rewards at step 100:
+  [-0.5, -0.1): 0 (0.0%)
+  [-0.1, 0.0): 0 (0.0%)
+  [0.0, 0.1): 1 (1.7%)
+  [0.1, 0.2): 1 (1.7%)
+  [0.2, 0.3): 0 (0.0%)
+  [0.3, 0.4): 5 (8.6%)
+  [0.4, 0.5): 1 (1.7%)
+  [0.5, 0.6): 14 (24.1%)
+  [0.6, 0.7): 0 (0.0%)
+  [0.7, 0.8): 0 (0.0%)
+  [0.8, 0.9): 1 (1.7%)
+  [0.9, 1.0): 5 (8.6%)
+  [1.0, 1.1): 30 (51.7%)
+
+GRPO on-policy rewards at step 100:
+  [-0.5, -0.1): 0 (0.0%)
+  [-0.1, 0.0): 18 (28.1%)
+  [0.0, 0.1): 13 (20.3%)
+  [0.1, 0.2): 0 (0.0%)
+  [0.2, 0.3): 0 (0.0%)
+  [0.3, 0.4): 5 (7.8%)
+  [0.4, 0.5): 4 (6.2%)
+  [0.5, 0.6): 2 (3.1%)
+  [0.6, 0.7): 5 (7.8%)
+  [0.7, 0.8): 14 (21.9%)
+  [0.8, 0.9): 3 (4.7%)
+  [0.9, 1.0): 0 (0.0%)
+  [1.0, 1.1): 0 (0.0%)
