@@ -266,6 +266,260 @@ def webshop_attribute_aware_potential(obs: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# SciWorld task-type-aware stage progress (match_mode="sciworld_stage")
+# ---------------------------------------------------------------------------
+
+# Per-task-type priority tables: signal_category -> Phi(s) in [0, 1]
+# Calibrated against empirical median temporal positions from 792 teacher trajectories.
+SCIWORLD_TASK_PRIORITIES: Dict[str, Dict[str, float]] = {
+    "conductivity": {
+        "noop": 0.00, "nav_door": 0.05, "nav_arrive": 0.10, "nav_workshop": 0.15,
+        "room_desc": 0.10, "kitchen_desc": 0.10, "workshop_desc": 0.25,
+        "open_container": 0.15, "pickup_thermometer": 0.20, "focus_thermometer": 0.25,
+        "pickup": 0.30, "focus": 0.35, "move_object": 0.40,
+        "substance_examined": 0.40, "place_apparatus": 0.40,
+        "deactivate": 0.50, "substance_state": 0.50,
+        "connect": 0.60, "activate": 0.70, "temperature_reading": 0.75,
+        "wait": 0.80, "read_recipe": 0.10, "mix_result": 0.10,
+        "final_placement": 1.00,
+    },
+    "temperature_measurement": {
+        "noop": 0.00, "nav_door": 0.05, "nav_arrive": 0.10, "nav_workshop": 0.10,
+        "room_desc": 0.10, "kitchen_desc": 0.15, "workshop_desc": 0.10,
+        "open_container": 0.15, "pickup_thermometer": 0.25, "focus_thermometer": 0.35,
+        "pickup": 0.40, "focus": 0.50, "move_object": 0.55,
+        "substance_examined": 0.60, "substance_state": 0.60,
+        "place_apparatus": 0.55, "activate": 0.10, "deactivate": 0.10,
+        "connect": 0.10, "wait": 0.10,
+        "temperature_reading": 0.80, "read_recipe": 0.10, "mix_result": 0.10,
+        "final_placement": 1.00,
+    },
+    "phase_change": {
+        "noop": 0.00, "nav_door": 0.03, "nav_arrive": 0.06, "nav_workshop": 0.06,
+        "room_desc": 0.08, "kitchen_desc": 0.10, "workshop_desc": 0.08,
+        "pickup_thermometer": 0.15, "pickup": 0.18, "open_container": 0.20,
+        "focus_thermometer": 0.22, "focus": 0.25, "move_object": 0.30,
+        "place_apparatus": 0.40, "activate": 0.50,
+        "substance_examined": 0.55, "deactivate": 0.55,
+        "temperature_reading": 0.60, "wait": 0.65,
+        "substance_state": 0.75, "connect": 0.10,
+        "read_recipe": 0.10, "mix_result": 0.10,
+        "final_placement": 0.90,
+    },
+    "find_entity": {
+        "noop": 0.00, "nav_door": 0.10, "nav_arrive": 0.15, "nav_workshop": 0.15,
+        "room_desc": 0.20, "kitchen_desc": 0.20, "workshop_desc": 0.20,
+        "open_container": 0.20, "pickup_thermometer": 0.10, "focus_thermometer": 0.10,
+        "substance_examined": 0.30, "substance_state": 0.30,
+        "focus": 0.45, "pickup": 0.55, "move_object": 0.65,
+        "place_apparatus": 0.10, "activate": 0.10, "deactivate": 0.10,
+        "connect": 0.10, "wait": 0.10, "temperature_reading": 0.10,
+        "read_recipe": 0.10, "mix_result": 0.10,
+        "final_placement": 1.00,
+    },
+    "life_stages": {
+        "noop": 0.00, "nav_door": 0.15, "nav_arrive": 0.30, "nav_workshop": 0.30,
+        "room_desc": 0.35, "kitchen_desc": 0.35, "workshop_desc": 0.35,
+        "open_container": 0.10, "pickup_thermometer": 0.10, "focus_thermometer": 0.10,
+        "pickup": 0.10, "move_object": 0.10, "substance_examined": 0.10,
+        "substance_state": 0.10, "place_apparatus": 0.10, "activate": 0.10,
+        "deactivate": 0.10, "connect": 0.10, "wait": 0.10,
+        "temperature_reading": 0.10, "read_recipe": 0.10, "mix_result": 0.10,
+        "focus": 1.00,
+        "final_placement": 1.00,
+    },
+    "chemistry": {
+        "noop": 0.00, "nav_door": 0.05, "nav_arrive": 0.10, "nav_workshop": 0.10,
+        "room_desc": 0.10, "kitchen_desc": 0.15, "workshop_desc": 0.10,
+        "open_container": 0.20, "pickup_thermometer": 0.10, "focus_thermometer": 0.10,
+        "pickup": 0.25, "move_object": 0.45,
+        "read_recipe": 0.35, "substance_examined": 0.50, "substance_state": 0.60,
+        "place_apparatus": 0.40, "activate": 0.10, "deactivate": 0.10,
+        "connect": 0.10, "wait": 0.10, "temperature_reading": 0.10,
+        "mix_result": 0.85, "focus": 0.90,
+        "final_placement": 1.00,
+    },
+    "circuit": {
+        "noop": 0.00, "nav_door": 0.05, "nav_arrive": 0.10, "nav_workshop": 0.15,
+        "room_desc": 0.10, "kitchen_desc": 0.10, "workshop_desc": 0.20,
+        "open_container": 0.10, "pickup_thermometer": 0.10, "focus_thermometer": 0.10,
+        "pickup": 0.20, "focus": 0.30, "move_object": 0.25,
+        "substance_examined": 0.10, "substance_state": 0.10,
+        "place_apparatus": 0.10, "activate": 0.80, "deactivate": 0.10,
+        "connect": 0.65, "wait": 0.90, "temperature_reading": 0.10,
+        "read_recipe": 0.10, "mix_result": 0.10,
+        "final_placement": 1.00,
+    },
+    "generic": {
+        "noop": 0.00, "nav_door": 0.05, "nav_arrive": 0.10, "nav_workshop": 0.10,
+        "room_desc": 0.10, "kitchen_desc": 0.10, "workshop_desc": 0.10,
+        "pickup": 0.20, "pickup_thermometer": 0.20, "open_container": 0.22,
+        "focus": 0.30, "focus_thermometer": 0.30, "move_object": 0.35,
+        "read_recipe": 0.40, "place_apparatus": 0.45,
+        "deactivate": 0.50, "activate": 0.55, "substance_examined": 0.55,
+        "connect": 0.60, "temperature_reading": 0.65,
+        "substance_state": 0.70, "wait": 0.75, "mix_result": 0.85,
+        "final_placement": 1.00,
+    },
+}
+
+
+def detect_sciworld_task_type(task_desc: str) -> str:
+    """Detect SciWorld task type from the task description string.
+
+    Covers all 11 task types in the 792-trajectory teacher dataset.
+    Returns one of: conductivity, temperature_measurement, phase_change,
+    find_entity, life_stages, chemistry, circuit, generic.
+    """
+    td = task_desc.lower()
+    if "electrically conductive" in td:
+        return "conductivity"
+    if re.search(r"measure.*temperature", td):
+        return "temperature_measurement"
+    if "melting point" in td:
+        return "phase_change"
+    if re.search(r"\bmelt\b", td):
+        return "phase_change"
+    if re.search(r"\bboil\b", td):
+        return "phase_change"
+    if re.search(r"\bfreeze\b", td):
+        return "phase_change"
+    if "change" in td and "state of matter" in td:
+        return "phase_change"
+    if re.search(r"find a\(n\)", td):
+        return "find_entity"
+    if "find a living" in td or "find a non-living" in td or "find a plant" in td:
+        return "find_entity"
+    if "life span" in td or "life stage" in td or "longest life" in td:
+        return "life_stages"
+    if "chemistry" in td or "recipe" in td or "create the substance" in td:
+        return "chemistry"
+    if "turn on" in td:
+        return "circuit"
+    return "generic"
+
+
+def classify_sciworld_obs_signal(obs_text: str) -> str:
+    """Classify a SciWorld observation into one of 24 semantic signal categories.
+
+    Pattern matching order: more specific patterns first, then general ones.
+    Returns 'noop' for errors, invalid actions, and unrecognized observations.
+    """
+    obs = obs_text.strip()
+    if not obs:
+        return "noop"
+    obs_lower = obs.lower()
+    first_line = obs.split("\n")[0].lower()
+
+    # --- Room description (MUST be checked early — long text may contain
+    #     temperature readings, substance names, etc. from listed objects) ---
+    if "this room is called" in first_line or "this outside location" in first_line:
+        if "workshop" in first_line:
+            return "workshop_desc"
+        if "kitchen" in first_line:
+            return "kitchen_desc"
+        return "room_desc"
+
+    # --- Completion: placing object in colored answer box ---
+    if re.search(
+        r"you move the .* to the (red|blue|green|orange|purple|yellow) box",
+        obs_lower,
+    ):
+        return "final_placement"
+    if "disconnecting" in first_line and "box" in obs_lower:
+        return "final_placement"
+
+    # --- Chemistry ---
+    if "mix to produce" in obs_lower:
+        return "mix_result"
+    if "recipe reads" in obs_lower or "the recipe" in obs_lower:
+        return "read_recipe"
+
+    # --- Experiment monitoring ---
+    if "you decide to wait" in first_line:
+        return "wait"
+    if re.match(r"^(solid|liquid|gas)\s", first_line):
+        return "substance_state"
+    # Temperature reading: check first_line to avoid false positives from
+    # room descriptions that list objects with temperature info
+    if re.search(r"\d+\s*degrees\s*celsius", first_line):
+        return "temperature_reading"
+
+    # --- Circuit ---
+    if "connected to" in first_line or "is now connected" in first_line:
+        return "connect"
+
+    # --- Apparatus activation ---
+    if "is now activated" in first_line:
+        return "activate"
+    if "is now deactivated" in first_line:
+        return "deactivate"
+
+    # --- Substance examination ---
+    if re.match(r"^a substance called ", first_line):
+        return "substance_examined"
+
+    # --- Experiment setup: place on apparatus ---
+    if re.search(
+        r"you move the .* to the (stove|blast furnace|freezer|sink|oven|bunsen burner)",
+        obs_lower,
+    ):
+        return "place_apparatus"
+
+    # --- Focus ---
+    if "you focus on" in first_line:
+        if "thermometer" in first_line:
+            return "focus_thermometer"
+        return "focus"
+
+    # --- Container operations ---
+    if re.search(
+        r"(cupboard|fridge|freezer|blast furnace|oven|closet) is now open",
+        first_line,
+    ):
+        return "open_container"
+
+    # --- Pickup to inventory ---
+    if "you move the" in first_line and "to the inventory" in obs_lower:
+        if "thermometer" in first_line:
+            return "pickup_thermometer"
+        return "pickup"
+
+    # --- Move object (generic) ---
+    if "you move the" in first_line or "you move a" in first_line:
+        return "move_object"
+
+    # --- Navigation ---
+    if "you move to" in first_line:
+        if "workshop" in first_line:
+            return "nav_workshop"
+        return "nav_arrive"
+    if "the door is already open" in first_line:
+        return "nav_door"
+    if "is now open" in first_line:
+        return "nav_door"
+
+    # --- Pour action ---
+    if "you pour" in first_line:
+        return "move_object"
+
+    # --- Fallback: check full text for temperature reading (e.g., multi-line
+    #     thermometer output where first line is the object name) ---
+    if re.search(r"\d+\s*degrees\s*celsius", obs_lower):
+        return "temperature_reading"
+
+    # --- Everything else: errors, invalid format, "already" states, etc. ---
+    return "noop"
+
+
+def sciworld_stage_potential(obs: str, task_type: str = "generic") -> float:
+    """Return Phi(s) for a SciWorld observation using task-type-aware stage classification."""
+    signal = classify_sciworld_obs_signal(obs)
+    table = SCIWORLD_TASK_PRIORITIES.get(task_type, SCIWORLD_TASK_PRIORITIES["generic"])
+    return table.get(signal, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # Observation normalization
 # ---------------------------------------------------------------------------
 
@@ -384,6 +638,8 @@ class ExpertProgressMap:
         self.progress_maps: Dict[str, Dict[str, float]] = {}
         # For stage mode: just track which task_ids have teacher data
         self._task_ids: set = set()
+        # For sciworld_stage mode: task_id -> task_type string
+        self._task_type_map: Dict[str, str] = {}
 
         if match_mode in ("stage", "attribute_aware"):
             self._task_ids = set(teacher_task2trajectories.keys())
@@ -391,6 +647,27 @@ class ExpertProgressMap:
                 f"[State Channel] {match_mode} mode: "
                 f"{len(self._task_ids)} tasks registered "
                 f"(env_type={env_type})"
+            )
+            return
+
+        if match_mode == "sciworld_stage":
+            self._task_ids = set(teacher_task2trajectories.keys())
+            type_counts: Dict[str, int] = {}
+            for task_id, trajectories in teacher_task2trajectories.items():
+                # Extract task description from the first user message (step[2])
+                task_desc = ""
+                for traj in trajectories:
+                    steps = traj.steps if hasattr(traj, "steps") else []
+                    if len(steps) >= 3:
+                        task_desc = steps[2].get("content", "")
+                        break
+                task_type = detect_sciworld_task_type(task_desc)
+                self._task_type_map[task_id] = task_type
+                type_counts[task_type] = type_counts.get(task_type, 0) + 1
+            logger.info(
+                f"[State Channel] sciworld_stage mode: "
+                f"{len(self._task_ids)} tasks registered. "
+                f"Task types: {type_counts}"
             )
             return
 
@@ -428,9 +705,24 @@ class ExpertProgressMap:
     # Core lookups
     # ------------------------------------------------------------------
 
+    def register_task_type(self, task_id: str, task_desc: str) -> None:
+        """Register the task type for an on-policy task not in teacher data.
+
+        Only relevant for sciworld_stage mode. If the task_id is already
+        registered, this is a no-op.
+        """
+        if self.match_mode != "sciworld_stage":
+            return
+        if task_id not in self._task_type_map:
+            self._task_type_map[task_id] = detect_sciworld_task_type(task_desc)
+
     def has_task(self, task_id: str) -> bool:
         if self.match_mode in ("stage", "attribute_aware"):
             return task_id in self._task_ids
+        if self.match_mode == "sciworld_stage":
+            # sciworld_stage can classify any observation universally;
+            # return True even for on-policy tasks not in teacher set
+            return True
         return task_id in self.progress_maps
 
     def get_potential(self, task_id: str, observation: str) -> float:
@@ -443,6 +735,9 @@ class ExpertProgressMap:
             if task_id not in self._task_ids:
                 return 0.0
             return webshop_attribute_aware_potential(observation)
+        if self.match_mode == "sciworld_stage":
+            task_type = self._task_type_map.get(task_id, "generic")
+            return sciworld_stage_potential(observation, task_type)
         pmap = self.progress_maps.get(task_id)
         if pmap is None:
             return 0.0
@@ -478,8 +773,8 @@ class ExpertProgressMap:
             return {"coverage": 0.0, "matched": 0, "total": 0,
                     "mean_potential": 0.0, "max_potential": 0.0}
         potentials = [self.get_potential(task_id, obs) for obs in observations]
-        if self.match_mode in ("stage", "attribute_aware"):
-            # Stage/attribute_aware mode: every observation is classified
+        if self.match_mode in ("stage", "attribute_aware", "sciworld_stage"):
+            # Stage/attribute_aware/sciworld_stage mode: every observation is classified
             matched = len(observations) if self.has_task(task_id) else 0
         else:
             pmap = self.progress_maps.get(task_id, {})
@@ -500,6 +795,13 @@ class ExpertProgressMap:
                 "num_tasks": len(self._task_ids),
                 "total_keys": 4,  # number of page types
                 "match_mode": self.match_mode,
+            }
+        if self.match_mode == "sciworld_stage":
+            return {
+                "num_tasks": len(self._task_ids),
+                "total_keys": 24,  # number of signal categories
+                "match_mode": self.match_mode,
+                "task_types": len(set(self._task_type_map.values())),
             }
         return {
             "num_tasks": len(self.progress_maps),
