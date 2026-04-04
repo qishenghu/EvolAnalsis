@@ -1524,21 +1524,61 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
 
                                 old_log_prob = old_lp_new
 
-                                ret_dict = repo_compute_token_loss(
-                                    old_log_prob=old_log_prob,
-                                    log_prob=log_prob,
-                                    advantages=advantages_used,
-                                    response_mask=response_mask,
-                                    exp_mask=exp_mask,
-                                    cliprange=clip_ratio,
-                                    clip_eps=dr3_clip_eps,
-                                    use_importance_clipping=True,
-                                    off_ratio_shaping_enable=False,  # set below
-                                    off_ratio_shaping_beta=dr3_ratio_shaping_beta,
-                                    loss_agg_mode=loss_agg_mode,
-                                )
+                                # ⭐ Hybrid mode: DR3 w_hat (between-trajectory) × LUFFY p/(p+β) (within-trajectory)
+                                # DR3 provides trajectory-level importance weighting via w_hat.
+                                # Policy shaping provides token-level credit assignment via p/(p+β).
+                                # These are orthogonal: discriminator sees aggregate stats, shaping sees per-token probs.
+                                dr3_use_policy_shaping = bool(dr3_cfg.get("use_policy_shaping", False))
+                                if dr3_use_policy_shaping:
+                                    # Compose: teacher_loss_scale = existing_scale × w_hat
+                                    _hybrid_w = w_hat.unsqueeze(-1)  # (bs, 1) → broadcast to token dim
+                                    _hybrid_scale = _hybrid_w
+                                    if teacher_loss_scale is not None:
+                                        _hybrid_scale = teacher_loss_scale * _hybrid_w
+                                    _hybrid_beta = float(dr3_cfg.get("policy_shaping_beta", 0.1))
+
+                                    ret_dict = het_compute_teacher_aware_loss(
+                                        old_log_prob=old_log_prob,
+                                        log_prob=log_prob,
+                                        advantages=advantages_used,
+                                        response_mask=response_mask,
+                                        exp_mask=exp_mask,
+                                        teacher_mask=teacher_mask,
+                                        cliprange=clip_ratio,
+                                        cliprange_low=clip_ratio_low,
+                                        cliprange_high=clip_ratio_high,
+                                        off_cliprange_high=off_cliprange_high,
+                                        clip_ratio_c=clip_ratio_c,
+                                        loss_agg_mode=loss_agg_mode,
+                                        teacher_use_log_prob=False,
+                                        teacher_policy_shaping_enable=True,
+                                        teacher_policy_shaping_mode="p_div_p_beta",
+                                        teacher_policy_shaping_beta=_hybrid_beta,
+                                        teacher_use_clip=False,
+                                        teacher_loss_scale=_hybrid_scale,
+                                    )
+                                    metrics["dr3/hybrid_policy_shaping"] = 1.0
+                                    metrics["dr3/hybrid_beta"] = _hybrid_beta
+                                else:
+                                    ret_dict = repo_compute_token_loss(
+                                        old_log_prob=old_log_prob,
+                                        log_prob=log_prob,
+                                        advantages=advantages_used,
+                                        response_mask=response_mask,
+                                        exp_mask=exp_mask,
+                                        cliprange=clip_ratio,
+                                        clip_eps=dr3_clip_eps,
+                                        use_importance_clipping=True,
+                                        off_ratio_shaping_enable=False,  # set below
+                                        off_ratio_shaping_beta=dr3_ratio_shaping_beta,
+                                        loss_agg_mode=loss_agg_mode,
+                                    )
                                 # Decide shaping enable (step/always/off/auto)
-                                shaping_enable = False
+                                # Skip ratio_shaping recomputation in hybrid mode — already using LUFFY's loss
+                                if dr3_use_policy_shaping:
+                                    shaping_enable = False  # not applicable in hybrid mode
+                                else:
+                                    shaping_enable = False
                                 if dr3_ratio_shaping_mode in ("always", "on", "true", "1"):
                                     shaping_enable = True
                                 elif dr3_ratio_shaping_mode in ("off", "false", "0", "none"):

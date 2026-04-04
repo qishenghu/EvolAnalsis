@@ -524,6 +524,13 @@ def compute_grpo_outcome_advantage_teacher_baseline_separated(
             adv_i = scores[i] - base
             if norm_adv_by_std_in_grpo:
                 adv_i = adv_i / (id2_std[gid] + epsilon)
+            # Clip teacher advantages to prevent magnitude explosion when
+            # non_teacher_std collapses on continuous-reward environments.
+            # PPO clipping handles gradient bounds, but extreme advantages
+            # (e.g., -700,000) can still distort teacher_gradient_share metrics
+            # and interact poorly with DR3 w_hat.
+            if is_teacher[i]:
+                adv_i = torch.clamp(adv_i, min=-5.0, max=5.0)
             adv[i] = adv_i
 
         adv = adv.unsqueeze(-1) * response_mask
@@ -3283,11 +3290,17 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 # Use per-sequence reward (sum over tokens) normalized to avoid
                                 # length-dependence when rewards are dense.
                                 if _sc_cfg.get("beta_decay", False):
-                                    _sc_rmask_decay = batch.batch.get("response_mask", None)
-                                    if _sc_rmask_decay is None:
-                                        _sc_rmask_decay = compute_response_mask(batch)
-                                    _sc_resp_len = _sc_rmask_decay.sum(dim=-1).clamp(min=1.0)
-                                    _sc_current_mean = (batch.batch["token_level_rewards"].sum(dim=-1) / _sc_resp_len).mean().item()
+                                    _sc_decay_metric = _sc_cfg.get("beta_decay_metric", "success_rate")
+                                    if _sc_decay_metric == "success_rate":
+                                        # Use binary success rate: fraction of sequences with positive total reward
+                                        _sc_current_mean = (batch.batch["token_level_rewards"].sum(dim=-1) > 0).float().mean().item()
+                                    else:
+                                        # Legacy: per-token normalized reward (kept for backward compatibility)
+                                        _sc_rmask_decay = batch.batch.get("response_mask", None)
+                                        if _sc_rmask_decay is None:
+                                            _sc_rmask_decay = compute_response_mask(batch)
+                                        _sc_resp_len = _sc_rmask_decay.sum(dim=-1).clamp(min=1.0)
+                                        _sc_current_mean = (batch.batch["token_level_rewards"].sum(dim=-1) / _sc_resp_len).mean().item()
                                     _sc_target = float(_sc_cfg.get("beta_decay_target", 0.5))
                                     if _sc_target > 0:
                                         _sc_beta *= max(0.0, 1.0 - _sc_current_mean / _sc_target)
@@ -3308,6 +3321,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                                 # Tier 1: Capture pre-shaping reward for decomposition
                                 _sc_reward_pre_shaping = batch.batch["token_level_rewards"].sum(dim=-1).clone()  # (bs,)
+                                # Save full token-level rewards before SC injection for GRPO decoupling
+                                _sc_tlr_before_shaping = batch.batch["token_level_rewards"].clone()  # (bs, seq_len)
 
                                 _sc_progress_vals = []
                                 _sc_coverage_vals = []
@@ -3377,6 +3392,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     batch.batch["_sc_coverage"] = torch.tensor(_sc_coverage_vals, dtype=torch.float32)
                                     batch.batch["_sc_matched_states"] = torch.tensor(_sc_matched_states_vals, dtype=torch.int32)
                                     batch.batch["_sc_reward_pre_shaping"] = _sc_reward_pre_shaping  # (bs,) for trajectory decomposition
+                                    batch.batch["_sc_tlr_before_shaping"] = _sc_tlr_before_shaping  # (bs, seq_len) for GRPO decoupling
 
                                 # Tier 1: Reward decomposition — pre vs post shaping
                                 _sc_reward_post_shaping = batch.batch["token_level_rewards"].sum(dim=-1)  # (bs,)
@@ -3543,7 +3559,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         _sl_mask = (_sl_sids == _sl_k)
                                         _sl_n_tokens = _sl_mask.sum().item()
                                         if _sl_n_tokens > 0:
-                                            _sl_rewards[_sl_idx][_sl_mask] += _sl_eta * _sl_d / _sl_n_tokens
+                                            _sl_delta_val = _sl_eta * _sl_d / _sl_n_tokens
+                                            _sl_rewards[_sl_idx][_sl_mask] += _sl_delta_val
+                                            # Also apply step deltas to pre-shaping snapshot so they
+                                            # participate in GRPO when grpo_decouple is enabled.
+                                            # Step deltas are true potential-based reward shaping
+                                            # (Ng et al. 1999) and preserve the optimal policy.
+                                            if "_sc_tlr_before_shaping" in batch.batch:
+                                                batch.batch["_sc_tlr_before_shaping"][_sl_idx][_sl_mask] += _sl_delta_val
                                             _sl_delta_count += 1
 
                                 # Store per-sample step deltas for trajectory saving (Tier 3)
@@ -3569,6 +3592,21 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     })
                                 metrics.update(_sl_delta_metrics)
 
+                        # ============================================================================
+                        # SC-GRPO Decoupling: Use pre-SC rewards for GRPO advantage computation.
+                        # SC bonus is asymmetric (on-policy only, teacher excluded), which can
+                        # push on-policy scores above teacher reward (e.g., 1.08 > 1.0) and
+                        # invert teacher advantage signs on continuous-reward environments.
+                        # Solution: GRPO compares task rewards fairly, SC bonus is injected
+                        # into advantages post-GRPO as a separate shaping signal.
+                        # ============================================================================
+                        _sc_grpo_decouple = _sc_cfg.get("grpo_decouple", True) if _sc_cfg and _sc_cfg.get("enable", False) else False
+                        _sc_saved_tlr = None
+                        if _sc_grpo_decouple and "_sc_tlr_before_shaping" in batch.batch:
+                            # Temporarily swap in pre-SC token_level_rewards for GRPO
+                            _sc_saved_tlr = batch.batch["token_level_rewards"]
+                            batch.batch["token_level_rewards"] = batch.batch["_sc_tlr_before_shaping"]
+
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
                         if os.environ.get("DEBUG_ARG","").find("disable_adv_std")!=-1:
@@ -3589,6 +3627,46 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm,
                         )
+
+                        # ============================================================================
+                        # SC Post-GRPO Injection: Add SC bonus to on-policy advantages.
+                        # This preserves PBRS guarantee: SC shapes learning signal without
+                        # distorting the fair teacher-vs-onpolicy GRPO comparison.
+                        # ============================================================================
+                        if _sc_grpo_decouple and _sc_saved_tlr is not None:
+                            # Restore original (SC-included) token_level_rewards for PPO loss / logging
+                            batch.batch["token_level_rewards"] = _sc_saved_tlr
+
+                            # Inject SC bonus into advantages for on-policy samples
+                            _sc_adv = batch.batch["advantages"]
+                            _sc_resp_len_adv = _sc_adv.shape[-1]
+                            _sc_tm = batch.batch.get("teacher_mask", None)
+                            if _sc_tm is not None:
+                                if _sc_tm.shape[-1] > _sc_resp_len_adv:
+                                    _sc_tm = _sc_tm[:, -_sc_resp_len_adv:]
+                                _sc_is_t = (_sc_tm.sum(dim=-1) > 0)
+                            else:
+                                _sc_is_t = torch.zeros(_sc_adv.shape[0], dtype=torch.bool, device=_sc_adv.device)
+
+                            _sc_rmask = batch.batch.get("response_mask", None)
+                            if _sc_rmask is not None and _sc_rmask.shape[-1] > _sc_resp_len_adv:
+                                _sc_rmask = _sc_rmask[:, -_sc_resp_len_adv:]
+
+                            _sc_bonus_tensor = batch.batch.get("_sc_bonus", None)
+                            if _sc_bonus_tensor is not None:
+                                _sc_injected_count = 0
+                                for _sc_j in range(_sc_adv.shape[0]):
+                                    if not _sc_is_t[_sc_j] and _sc_bonus_tensor[_sc_j].item() > 1e-8:
+                                        # Add SC bonus to each valid token's advantage (same value
+                                        # per token, matching GRPO's broadcast structure).
+                                        # SC bonus magnitude β·P(τ) ≈ 0.02-0.17 is comparable to
+                                        # GRPO advantages (~1.0), providing meaningful but not
+                                        # overwhelming reward shaping signal.
+                                        _sc_bonus_val = _sc_bonus_tensor[_sc_j].item()
+                                        _sc_adv[_sc_j] += _sc_bonus_val * (_sc_rmask[_sc_j] if _sc_rmask is not None else 1.0)
+                                        _sc_injected_count += 1
+
+                            logger.info(f"SC-GRPO decoupled: SC bonus injected into advantages for {int((~_sc_is_t).sum().item())} on-policy samples")
 
                         # (Step-level enhancement moved to before compute_advantage — see above)
 
@@ -3958,7 +4036,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             # ⭐ CHORD: 传递 global_step 用于 μ 三阶段调度（Warmup → Decay → 稳定）
                             batch.meta_info["global_step"] = self.global_steps
                             # Clean up DUET temporary keys before sending to actor (avoid serialization issues)
-                            for _tmp_key in ["_sc_progress", "_sc_bonus", "_sc_coverage", "_sc_matched_states", "_sc_reward_pre_shaping"]:
+                            for _tmp_key in ["_sc_progress", "_sc_bonus", "_sc_coverage", "_sc_matched_states", "_sc_reward_pre_shaping", "_sc_tlr_before_shaping"]:
                                 batch.batch.pop(_tmp_key, None)
                             batch.non_tensor_batch.pop("_sl_per_sample_deltas", None)
                             actor_output = self.actor_rollout_wg.update_actor(batch)  # ⭐ Update the actor with the new batch
