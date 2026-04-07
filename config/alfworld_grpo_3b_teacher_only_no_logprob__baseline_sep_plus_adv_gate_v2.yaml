@@ -1,0 +1,303 @@
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+# ============================================================================
+# AlfWorld GRPO Training Configuration with Teacher Experience Replay (LUFFY)
+# 7.1 + 7.4-A ablation:
+# - 7.1: GRPO baseline/adv teacher-separation
+# - 7.4-A: advantage-aware teacher token gate (gate by advantage instead of logprob)
+#
+# Rationale: 7.3 (logprob-based gate) didn't improve over 7.1 because:
+#   1. logprob is not a reliable proxy for "task learned"
+#   2. 7.1 turns teacher into positive anchor; 7.3 weakens it unnecessarily
+#
+# 7.4-A directly aligns with gradient value: keep high-advantage teacher tokens,
+# reduce low/negative-advantage ones. This should be more precise.
+# ============================================================================
+
+trainer:
+  experiment_name: alfworld_3b_grpo_teacher72b_only_bz8_mix1_no_logprob_random__baseline_sep_plus_adv_gate_v1
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  save_freq: 100
+  test_freq: 25
+  val_before_train: false
+  validation_data_dir: "experiments/alfworld/${trainer.experiment_name}/validation_log"
+  rollout_data_dir: "experiments/alfworld/${trainer.experiment_name}/rollout_log"
+  logger: ["console", "wandb"]
+
+# ============================================================================
+# Algorithm Configuration
+# ============================================================================
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  # 7.1 (enable): teacher-separated GRPO baseline
+  grpo:
+    teacher_baseline_separation:
+      enable: true
+      teacher_baseline: "all_mean"
+      non_teacher_baseline: "non_teacher_mean"
+      std_source: "non_teacher"
+
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: "strict"
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: "additive"
+
+# ============================================================================
+# Model Configuration - Qwen/Qwen2.5-3B-Instruct
+# ============================================================================
+actor_rollout_ref:
+  model:
+    path: /data/code/exp/models/Qwen/Qwen2.5-3B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1e-6
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+
+    # ⭐ Off-policy Policy Shaping Configuration (Self-generated Experience)
+    off_policy_shaping_mode: "exgrpo_policy_shaping"
+    off_policy_shaping_beta: 0.1
+
+    # ⭐ Teacher Experience Loss Configuration (LUFFY)
+    teacher_use_log_prob: ${exp_manager.teacher_experience.use_log_prob}
+    teacher_policy_shaping_enable: ${exp_manager.teacher_experience.policy_shaping.enable}
+    teacher_policy_shaping_mode: ${exp_manager.teacher_experience.policy_shaping.mode}
+    teacher_policy_shaping_beta: ${exp_manager.teacher_experience.policy_shaping.beta}
+    teacher_use_clip: false
+
+    # ⭐ 7.3 token gate (DISABLED for this 7.4-A ablation)
+    teacher_token_gate_enable: false
+
+    # ⭐ 7.4-A: advantage-aware teacher token gate (ENABLED)
+    # Gate teacher gradients based on advantage value:
+    # - High advantage → keep teacher signal (valuable gradient)
+    # - Low/negative advantage → reduce teacher signal (harmful/noisy gradient)
+    # w_t = sigmoid((adv - thr) / T) clamped to [min, max]
+    teacher_adv_gate_enable: ${exp_manager.teacher_experience.adv_gate.enable}
+    teacher_adv_gate_mode: ${exp_manager.teacher_experience.adv_gate.mode}
+    teacher_adv_gate_threshold_adv: ${exp_manager.teacher_experience.adv_gate.threshold_adv}
+    teacher_adv_gate_temperature: ${exp_manager.teacher_experience.adv_gate.temperature}
+    teacher_adv_gate_min: ${exp_manager.teacher_experience.adv_gate.min}
+    teacher_adv_gate_max: ${exp_manager.teacher_experience.adv_gate.max}
+    teacher_adv_gate_stop_grad: ${exp_manager.teacher_experience.adv_gate.stop_grad}
+
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: false
+    enable_request_id: false
+    prompt_length: 20480
+    response_length: 2048
+    max_model_len: 25580
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: vllm
+    mode: async
+    gpu_memory_utilization: 0.5
+    n: 8
+    log_prob_max_token_len_per_gpu: 25580
+    val_kwargs:
+      n: 1
+    max_env_worker: 32
+    context_template: "linear"
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ""
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
+
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  train_batch_size: 8
+  max_prompt_length: 4000
+  max_response_length: 21580
+  filter_overlong_prompts: true
+  truncation: "error"
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  val_type: "val"
+  max_train_tasks: 800
+  shuffle: true
+
+# ============================================================================
+# Environment Service Configuration - AlfWorld
+# ============================================================================
+env_service:
+  env_type: "alfworld"
+  env_url: "http://127.0.0.1:8081"
+
+# ============================================================================
+# Task Manager Configuration
+# ============================================================================
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/alfworld.json
+
+# ============================================================================
+# Experience Manager Configuration (Teacher Experience only)
+# ============================================================================
+exp_manager:
+  train_rollout_mode: "woexp"
+  val_rollout_mode: "woexp"
+  rollout_ratio: 0
+  train_sample_mode: "alldiscard"
+  train_sample_keepratio: 0.0
+  experience_template: "\n\nSome Related Experience to help you to complete the task:<EXP>{}</EXP>\n\n"
+
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: "http://127.0.0.1:8124"
+    workspace_id: "alfworld_3b_grpo_teacher_only"
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+
+  experience_replay:
+    enable: false
+    replay_start_ratio: 0.1
+    exp_ratio: 0.0
+    offpolicy_trajectories_per_task: 1
+    experience_lbound: 2
+    experience_rbound: 8
+    exp_select_mode: "argmin"
+    use_current_policy_entropy: true
+    exp_is_correct: true
+    max_trajectories_per_task: 5
+
+  teacher_experience:
+    enable: true
+    mix_mode: "rollout_level"
+    data_path: "data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered.pkl"
+    n_teacher_rollouts_per_task: 1
+    max_trajectories_per_task: 6
+    select_mode: "random"
+    use_log_prob: false
+    policy_shaping:
+      enable: true
+      mode: "p_div_p_beta"
+      beta: 0.1
+
+    # 7.2 (disabled in this ablation)
+    adaptive_weight:
+      enable: false
+
+    # 7.3 (disabled in this ablation - using 7.4-A instead)
+    token_gate:
+      enable: false
+
+    # ⭐ 7.4-A: advantage-aware teacher token gate (ENABLED)
+    # Key insight: instead of using logprob (which is an indirect proxy for "task learned"),
+    # directly use advantage value to gate teacher tokens.
+    # This is more aligned with what we actually want: keep high-value teacher updates,
+    # reduce low/harmful teacher updates.
+    #
+    # Data analysis (7.1 baseline):
+    # - Teacher adv distribution: early=1.11, mid=0.87, late=0.67
+    # - ALL teacher advantages are POSITIVE (because teacher reward=1, on-policy<1)
+    #
+    # ⚠️ LESSON from v1 experiment (threshold=0.4, temperature=0.2):
+    # - Late 段表现更好 (+4.2%)，但 Mid 段下滑 (-5%)
+    # - 原因：threshold=0.4 导致 mid 阶段 gate_w≈0.91，削弱了 ~9% teacher signal
+    # - Mid 阶段是"快速学习期"，需要保护
+    #
+    # v2 IMPROVED CONFIG:
+    # - threshold_adv=0.55: 提高 threshold，只在 late 阶段开始削弱
+    # - temperature=0.1: 更陡峭的过渡，减少 mid 阶段影响
+    # - min=0.5: 保证最低 50% teacher signal
+    #
+    # Expected gate_w distribution (v2):
+    # - Early (adv~1.11): gate_w ≈ 0.996 (0.4% 削弱)
+    # - Mid (adv~0.87): gate_w ≈ 0.961 (3.9% 削弱) ← 比 v1 的 8.7% 好很多！
+    # - Late (adv~0.67): gate_w ≈ 0.769 (23.1% 削弱) ← 适度削弱
+    adv_gate:
+      enable: true
+      mode: "sigmoid"              # "sigmoid" | "hard"
+      threshold_adv: 0.55          # ⭐ v2: 提高到 late 阶段 adv 区间
+      temperature: 0.1             # ⭐ v2: 更陡峭过渡，保护 mid 阶段
+      min: 0.5                     # ⭐ CRITICAL: guarantee 50% teacher signal even for lowest adv
+      max: 1.0                     # keep full gradient for high adv
+      stop_grad: true              # treat gate as schedule, not learnable
+
+# ============================================================================
+# Attribution-Driven Credit Assignment (ADCA-GRPO) Configuration
+# ============================================================================
+attribution_driven_credit_assignment:
+  enable: false
+
+# ============================================================================
+# Thread Pool Configuration
+# ============================================================================
+thread_pool:
+  max_workers: 64
+  enable_memory_protection: true
+  memory_threshold: 0.9
+  cool_down_time: 30

@@ -29,22 +29,22 @@ echo ""
 echo "[4/4] Running DUET (sciworld_3b_duet)..."
 echo "============================================"
 python launcher.py \
-  --conf config/duet_paper_experiments_configs/sciworld/sciworld_3b_duet.yaml
+  --conf config/duet_paper_experiments_configs/sciworld/sciworld_3b_duet_0406.yaml
 
 
 echo ""
 echo "[2/4] Running LUFFY (sciworld_3b_luffy)..."
 echo "============================================"
-python launcher.py \
-  --conf config/duet_paper_experiments_configs/sciworld/sciworld_3b_luffy.yaml
+#python launcher.py \
+#  --conf config/duet_paper_experiments_configs/sciworld/sciworld_3b_luffy.yaml
 
 
 
 echo ""
 echo "[3/4] Running CHORD (sciworld_3b_chord)..."
 echo "============================================"
-python launcher.py \
-  --conf config/duet_paper_experiments_configs/sciworld/sciworld_3b_chord.yaml
+#python launcher.py \
+#  --conf config/duet_paper_experiments_configs/sciworld/sciworld_3b_chord.yaml
 
 echo ""
 echo "============================================"

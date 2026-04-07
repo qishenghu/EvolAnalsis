@@ -174,28 +174,63 @@ run_experiment() {
 #     "WebShop 3B CHORD"
 
 # ==========================================
-#  0405 Experiments: Attribute-Aware SC + Bug Fixes
+#  0409 Mechanism-Level Improvements (COMPLETED — cap/bell had dead-config bug)
+#  EMA confirmed effective. Cap/Bell were actually p/(p+β) due to het_actor.py:1567 hardcode.
 # ==========================================
 
-# DUET 0405: DR3 (disc_temp=1.0) + attribute_aware SC
+# ==========================================
+#  0410 Bug-Fixed Mechanism Experiments
+#  het_actor.py now reads dr3.policy_shaping_mode from config.
+#  3 experiments: cap-only, bell-only, EMA+cap combo
+# ==========================================
+
+# (DONE) Capped monotonic — underperforms vanilla p/(p+β), not recommended
+#run_experiment \
+#    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_0410_cap.yaml \
+#    "WebShop 3B DUET 0410 Capped (bug-fixed)"
+
+# (SKIP) Bell curve — fixed p_target=0.08 is unprincipled
+#run_experiment \
+#    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_0410_bell.yaml \
+#    "WebShop 3B DUET 0410 Bell (bug-fixed)"
+
+# (SKIP) EMA + Capped — cap component shown harmful
+#run_experiment \
+#    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_0410_ema_cap.yaml \
+#    "WebShop 3B DUET 0410 EMA+Capped (bug-fixed)"
+
+# ==========================================
+#  0410 Principled Token Weighting (base: EMA w_hat)
+#  Both derived from information theory, both use .detach()
+# ==========================================
+
+# Bernoulli variance: f(p) = p(1-p), from Fisher information. Peak at p=0.5. Zero hyperparams.
 run_experiment \
-    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_0405.yaml \
-    "WebShop 3B DUET 0405"
+    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_0410_bv.yaml \
+    "WebShop 3B DUET 0410 Bernoulli Variance (EMA)"
 
-# DUET Hybrid 0405: DR3 w_hat × LUFFY p/(p+β) + attribute_aware SC
+# ZPD: f(p) = p(1-p)/(p+β), Zone-of-Proximal-Development. Peak at p≈0.23. Reuses β.
 run_experiment \
-    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_hybrid_0405.yaml \
-    "WebShop 3B DUET_Hybrid 0405"
+    config/duet_paper_experiments_configs/webshop/webshop_3b_duet_0410_zpd.yaml \
+    "WebShop 3B DUET 0410 ZPD (EMA)"
 
-# LUFFY+SC 0405: LUFFY p/(p+β) + attribute_aware SC
+# ==========================================
+#  CHORD baselines (bug-fixed: φ=p(1-p), ICLR 2026 paper-aligned)
+#  Old run used wrong φ=p/(p+δ). Both variants now correct.
+# ==========================================
+
+# CHORD-µ: dynamic µ decay (0.9→0.05 over 25 steps), NO token weighting
 run_experiment \
-    config/duet_paper_experiments_configs/webshop/webshop_3b_luffy_sc_0405.yaml \
-    "WebShop 3B LUFFY+SC 0405"
+    config/duet_paper_experiments_configs/webshop/webshop_3b_chord_mu_0410.yaml \
+    "WebShop 3B CHORD-mu 0410 (paper-aligned)"
 
-
+# CHORD-ϕ: fixed µ=0.1, WITH token weighting φ(p)=p(1-p)
+run_experiment \
+    config/duet_paper_experiments_configs/webshop/webshop_3b_chord_phi_0410.yaml \
+    "WebShop 3B CHORD-phi 0410 (paper-aligned)"
 
 # 清理
 echo ""
-echo "All WebShop 3B 0405 experiments completed!"
+echo "All WebShop 3B experiments completed!"
 kill_port $WEBSHOP_PORT
 pkill -f "webshop --host" 2>/dev/null || true

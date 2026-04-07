@@ -254,6 +254,9 @@ def het_compute_teacher_aware_loss(
     teacher_policy_shaping_enable: bool = True,  # 是否启用 policy shaping
     teacher_policy_shaping_mode: str = "p_div_p_beta",  # Policy shaping 模式
     teacher_policy_shaping_beta: float = 0.1,  # Policy shaping 参数 β
+    # ⭐ Confidence-gated shaping params (used by "capped_monotonic" and "bell_curve" modes)
+    teacher_policy_shaping_bell_p_target: float = 0.08,  # bell_curve: center; capped_monotonic: weight cap
+    teacher_policy_shaping_bell_sigma: float = 1.5,      # bell_curve: width in log-prob space
     teacher_use_clip: bool = False,  # Teacher 轨迹是否使用 clipping
     teacher_loss_scale: Optional[torch.Tensor] = None,  # ⭐ 2.2: scale teacher loss (0..1), broadcastable to (bs, resp_len)
     # ⭐ 7.7: TER sequence-level β schedule (soft-min teacher confidence)
@@ -513,6 +516,8 @@ def het_compute_teacher_aware_loss(
             teacher_ratio,
             mode=teacher_policy_shaping_mode,
             beta=beta_for_shaping,
+            bell_p_target=teacher_policy_shaping_bell_p_target,
+            bell_sigma=teacher_policy_shaping_bell_sigma,
         )
 
     # ⭐ 7.6 AG-PM: Advantage-Gated Probability Margin
@@ -747,32 +752,83 @@ def het_compute_teacher_aware_loss(
     }
 
 
-def _apply_policy_shaping(ratio: torch.Tensor, mode: str, beta=0.1) -> torch.Tensor:
+def _apply_policy_shaping(ratio: torch.Tensor, mode: str, beta=0.1,
+                          bell_p_target: float = 0.08,
+                          bell_sigma: float = 1.5) -> torch.Tensor:
     """
     应用 Policy Shaping。
-    
+
     Args:
-        ratio: 原始 ratio
+        ratio: 原始 ratio (student probability p = exp(log_prob))
         mode: shaping 模式
             - "p_div_p_beta": LUFFY 的 f(x) = x / (x + β)，放大低概率信号
+            - "capped_monotonic": min(p / (p + β), cap) where cap ∈ (0,1];
+              stops weight growth at confident tokens. beta = β, bell_p_target reused as cap.
+            - "bell_curve": Gaussian in log-p space centered at p_target;
+              peaks at the learning frontier, decays for too-easy AND too-hard tokens.
+            - "bernoulli_variance": f(p) = p(1-p), derived from Fisher information.
+              Peak at p=0.5, zero hyperparameters. Detached (stop-gradient).
+            - "zpd": f(p) = p(1-p)/(p+β), Zone-of-Proximal-Development.
+              Peak at p≈0.23 (β=0.1). Detached (stop-gradient).
             - "sqrt": f(x) = sqrt(x)
             - "no_shaping": 不使用 shaping
         beta: β 参数（float 或 broadcastable tensor，例如 shape=(bs,1)）
-    
+        bell_p_target: For bell_curve: center of the bell in probability space.
+                       For capped_monotonic: the weight cap ∈ (0,1]. Default 0.08.
+        bell_sigma: For bell_curve: width in log-probability space. Default 1.5.
+
     Returns:
         shaped_ratio: 处理后的 ratio
     """
+    import math
     if mode == "p_div_p_beta":
         # LUFFY 的 policy shaping: f(x) = x / (x + β)
         # 放大低概率信号，抑制高概率信号
         return ratio / (ratio + beta)
+    elif mode == "capped_monotonic":
+        # Capped monotonic: same as p/(p+β) but capped at a maximum weight.
+        # Fixes the monotonicity problem: already-learned tokens (p≈0.9) don't get
+        # more weight than frontier tokens (p near the cap point).
+        # cap = bell_p_target (reused param, default 0.6)
+        cap = float(bell_p_target) if not torch.is_tensor(bell_p_target) else bell_p_target
+        base = ratio / (ratio + beta)
+        return torch.clamp(base, max=cap)
+    elif mode == "bell_curve":
+        # Bell-curve gate: Gaussian in log-probability space.
+        # Peak weight at p_target (the learning frontier), decays symmetrically
+        # for impossible tokens (p≪p_target) and already-learned tokens (p≫p_target).
+        # weight = exp(-(log(p) - log(p_target))^2 / (2σ^2))
+        _p_target = float(bell_p_target) if not torch.is_tensor(bell_p_target) else bell_p_target
+        _sigma = float(bell_sigma)
+        log_p = torch.log(ratio.clamp_min(1e-10))
+        log_target = math.log(max(float(_p_target), 1e-10))
+        exponent = -((log_p - log_target) ** 2) / (2.0 * _sigma * _sigma)
+        return torch.exp(exponent)
+    elif mode == "bernoulli_variance":
+        # Bernoulli variance: f(p) = p(1-p).
+        # Derived from Fisher information: optimal sampling weight ∝ 1/I(p) = p(1-p).
+        # Peak at p=0.5 (maximum uncertainty). Zero hyperparameters.
+        # Detached to prevent gradient coupling — acts as a pure weighting coefficient.
+        p = ratio.clamp(0, 1)
+        w = p * (1.0 - p)
+        return w.detach()
+    elif mode == "zpd":
+        # Zone-of-Proximal-Development: f(p) = p(1-p)/(p+β).
+        # Combines LUFFY's low-p suppression with (1-p) high-p suppression.
+        # Peak at p ≈ sqrt(β² + β) - β (≈0.23 for β=0.1).
+        # Detached to prevent gradient coupling.
+        p = ratio.clamp(0, 1)
+        _beta = beta if torch.is_tensor(beta) else float(beta)
+        w = p * (1.0 - p) / (p + _beta)
+        return w.detach()
     elif mode == "sqrt":
         return torch.sqrt(ratio + 1e-8)
     elif mode == "no_shaping":
         return ratio
     else:
         raise ValueError(f"Unknown policy_shaping_mode: {mode}. "
-                        f"Supported: 'p_div_p_beta', 'sqrt', 'no_shaping'")
+                        f"Supported: 'p_div_p_beta', 'capped_monotonic', 'bell_curve', "
+                        f"'bernoulli_variance', 'zpd', 'sqrt', 'no_shaping'")
 
 
 def bam_compute_token_on_off_policy_loss(
@@ -1639,33 +1695,28 @@ def chord_mu_scheduler(
 
 def compute_chord_token_weights(
     log_prob: torch.Tensor,
-    delta: float = 0.1,
 ) -> torch.Tensor:
     """
-    计算 CHORD 的 token-wise 加权 φ(d)。
-    
-    公式：φ(d) = d / (d + δ)
-    其中 d = exp(log_prob) = π_θ(y_i | x, y_{<i})
-    
+    计算 CHORD 的 token-wise 加权 φ(p) (ICLR 2026, Eq. 5)。
+
+    公式：φ(p_t) = p_t * (1 - p_t)
+    其中 p_t = exp(log_prob) = π_θ(y_i | x, y_{<i})
+
+    Bernoulli variance：峰值在 p=0.5，同时抑制高概率（已学会）和低概率（不可学）token。
+
     Args:
         log_prob: 当前策略对 expert token 的 log 概率，shape (bs, seq_len)
-        delta: 平滑参数（论文默认 0.1）
-        
+
     Returns:
-        torch.Tensor: Token-wise 权重 φ(d)，shape (bs, seq_len)
-        
+        torch.Tensor: Token-wise 权重 φ(p)，shape (bs, seq_len)
+
     Example:
         >>> log_prob = torch.tensor([[-0.1, -1.0, -5.0]])  # 概率: [0.90, 0.37, 0.007]
-        >>> compute_chord_token_weights(log_prob, delta=0.1)
-        tensor([[0.900, 0.787, 0.065]])  # 高概率 token 权重高，低概率 token 权重低
+        >>> compute_chord_token_weights(log_prob)
+        tensor([[0.090, 0.233, 0.007]])  # 中间概率 token 权重最高
     """
-    # d = exp(log_prob) = π_θ(y_i | x, y_{<i})
-    # Clamp log_prob to avoid numerical issues
-    d = torch.exp(log_prob.clamp(max=0))
-    
-    # φ(d) = d / (d + δ)
-    phi = d / (d + delta)
-    
+    p = torch.exp(log_prob.clamp(max=0))
+    phi = p * (1.0 - p)
     return phi
 
 
@@ -1673,26 +1724,25 @@ def compute_chord_sft_loss(
     log_prob: torch.Tensor,
     response_mask: torch.Tensor,
     exp_mask: torch.Tensor,
-    delta: float = 0.1,
     use_token_weighting: bool = True,
     loss_agg_mode: str = "token-mean",
 ) -> dict:
     """
-    计算 CHORD 的加权 SFT Loss。
-    
-    公式：L_sft = -∑_i φ(d_i) * log π_θ(y_i | x, y_{<i})
-    
+    计算 CHORD 的加权 SFT Loss (ICLR 2026, Eq. 6)。
+
+    公式：L_sft = -∑_i φ(p_i) * log π_θ(y_i | x, y_{<i})
+    其中 φ(p) = p * (1 - p) (Bernoulli variance)
+
     ⭐ 关键设计：
     1. 只对 expert 数据 (exp_mask=1) 计算 SFT loss
-    2. 使用 φ(d) 加权，避免强制学习已掌握或无法学习的 token
+    2. 使用 φ(p)=p(1-p) 加权，同时抑制已掌握和不可学的 token
     3. 与 GRPO loss 分开计算，通过 μ(t) 动态加权合并
     
     Args:
         log_prob: 当前策略的 log 概率，shape (bs, seq_len)
         response_mask: Response 部分的 mask，shape (bs, seq_len)
         exp_mask: Expert 数据的 mask，shape (bs, seq_len)，1=expert, 0=on-policy
-        delta: φ(d) 的平滑参数
-        use_token_weighting: 是否使用 token-wise 加权
+        use_token_weighting: 是否使用 φ(p)=p(1-p) token-wise 加权
         loss_agg_mode: Loss 聚合模式
         
     Returns:
@@ -1708,8 +1758,8 @@ def compute_chord_sft_loss(
     sft_losses = -log_prob
     
     if use_token_weighting:
-        # 计算 token-wise 权重 φ(d)
-        phi = compute_chord_token_weights(log_prob, delta=delta)
+        # 计算 token-wise 权重 φ(p) = p(1-p)
+        phi = compute_chord_token_weights(log_prob)
         
         # 加权 SFT loss
         weighted_sft_losses = phi * sft_losses

@@ -387,6 +387,15 @@ class DR3RatioEstimator:
         self._w_off_hist: list[torch.Tensor] = []   # list of 1D CPU tensors
         self._alpha_ema: Optional[float] = None
 
+        # ------------------------------------------------------------------
+        # ⭐ EMA w_hat: Polyak-averaged discriminator for stable w_hat inference.
+        # The live discriminator (_disc) trains every call; w_hat is computed from
+        # a separate EMA-smoothed copy (_disc_ema) to decouple the feedback loops.
+        # w_hat_ema_alpha=0.0 disables EMA (use live disc, backward-compatible).
+        # ------------------------------------------------------------------
+        self.w_hat_ema_alpha: float = 0.0  # set via config; 0 = disabled
+        self._disc_ema: Optional[DR3Discriminator] = None
+
     @staticmethod
     def _clip_alpha(alpha: float, eps: float) -> float:
         # Avoid extreme alpha causing 1/(1-alpha) blow-ups and unstable weights.
@@ -441,6 +450,25 @@ class DR3RatioEstimator:
                         dist.broadcast(p.data, src=0)
             except Exception:
                 pass
+        # Initialize EMA copy of discriminator (if enabled)
+        if self.w_hat_ema_alpha > 0:
+            import copy
+            self._disc_ema = copy.deepcopy(self._disc)
+
+    def _update_disc_ema(self) -> None:
+        """Polyak-average live disc params into _disc_ema: ema = α·live + (1-α)·ema."""
+        if self._disc_ema is None or self._disc is None or self.w_hat_ema_alpha <= 0:
+            return
+        alpha = float(self.w_hat_ema_alpha)
+        with torch.no_grad():
+            for p_ema, p_live in zip(self._disc_ema.parameters(), self._disc.parameters()):
+                p_ema.data.mul_(1.0 - alpha).add_(p_live.data, alpha=alpha)
+
+    def _get_disc_for_inference(self) -> "DR3Discriminator":
+        """Return the discriminator used for w_hat computation (EMA if enabled, else live)."""
+        if self._disc_ema is not None and self.w_hat_ema_alpha > 0:
+            return self._disc_ema
+        return self._disc  # type: ignore[return-value]
 
     def _get_rank_world(self) -> tuple[int, int]:
         try:
@@ -728,11 +756,19 @@ class DR3RatioEstimator:
             self._broadcast_model_params()
             bcast_metrics["dr3/bcast_happened"] = 1.0
 
+        # ⭐ EMA w_hat: Polyak-average live disc into _disc_ema after each training step.
+        # This decouples discriminator training from w_hat inference — the policy sees
+        # a smoothed density ratio, reducing coupled oscillation with GRPO/SC.
+        if disc_trained_steps > 0:
+            self._update_disc_ema()
+
         # A1: increment global step counter (once per call, after buffer push)
         self._global_step += 1
 
         with torch.no_grad():
-            logits = self._disc(feats)
+            # Use EMA discriminator for inference if enabled (decouples training from w_hat)
+            disc_for_inference = self._get_disc_for_inference()
+            logits = disc_for_inference(feats)
             # B1: Temperature scaling for discriminator output
             # T > 1 → softer probabilities, reduces over-confidence
             if self.disc_temperature != 1.0:
@@ -859,6 +895,9 @@ class DR3RatioEstimator:
             "dr3/ess_off_window": float(ess),
             "dr3/ess_window_len": float(len(self._w_off_hist)),
             "dr3/dual_lambda": float(self.dual.lam),
+            # ⭐ EMA w_hat metrics
+            "dr3/w_hat_ema_alpha": float(self.w_hat_ema_alpha),
+            "dr3/w_hat_ema_enabled": 1.0 if (self._disc_ema is not None and self.w_hat_ema_alpha > 0) else 0.0,
         }
         metrics.update(sync_metrics)
         metrics.update(bcast_metrics)

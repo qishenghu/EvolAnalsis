@@ -3285,6 +3285,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             if self._sc_progress_map is not None:
                                 _sc_beta = float(_sc_cfg.get("beta", 0.5))
                                 _sc_exclude_teacher = _sc_cfg.get("exclude_teacher", True)
+                                _sc_agg_mode = str(_sc_cfg.get("progress_agg", "mean"))
 
                                 # Dynamic β decay: β_t = β_0 · max(0, 1 - mean_reward / target)
                                 # Use per-sequence reward (sum over tokens) normalized to avoid
@@ -3347,7 +3348,8 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                             continue
 
                                         _sc_P = self._sc_progress_map.compute_trajectory_progress(
-                                            _sc_tid, _sc_obs
+                                            _sc_tid, _sc_obs,
+                                            agg_mode=_sc_agg_mode,
                                         )
                                         _sc_progress_vals.append(_sc_P)
 

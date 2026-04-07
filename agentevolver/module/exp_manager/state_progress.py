@@ -744,13 +744,29 @@ class ExpertProgressMap:
         return pmap.get(observation, 0.0)
 
     def compute_trajectory_progress(
-        self, task_id: str, observations: List[str]
+        self, task_id: str, observations: List[str],
+        agg_mode: str = "mean",
     ) -> float:
-        """P(τ) = (1/T) Σ Φ(s_t)  — average progress over the trajectory."""
+        """Aggregate per-step potentials into a single trajectory progress P(tau).
+
+        Args:
+            task_id: Task identifier for potential lookup.
+            observations: Normalized observation strings.
+            agg_mode: Aggregation mode.
+                "mean"  -- P(tau) = (1/T) sum Phi(s_t)  (original)
+                "max"   -- P(tau) = max_t Phi(s_t)
+                "last"  -- P(tau) = Phi(s_T)  (last observation, i.e. current state)
+        """
         if not observations:
             return 0.0
-        total = sum(self.get_potential(task_id, obs) for obs in observations)
-        return total / len(observations)
+
+        if agg_mode == "last":
+            return self.get_potential(task_id, observations[-1])
+        elif agg_mode == "max":
+            return max(self.get_potential(task_id, obs) for obs in observations)
+        else:  # "mean" (default)
+            total = sum(self.get_potential(task_id, obs) for obs in observations)
+            return total / len(observations)
 
     def compute_step_deltas(
         self, task_id: str, observations: List[str]

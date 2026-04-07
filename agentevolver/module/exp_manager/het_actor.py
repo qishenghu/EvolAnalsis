@@ -1232,6 +1232,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     broadcast_params=bool(dr3_cfg.get("broadcast_params", False)),
                                     broadcast_every_n_calls=int(dr3_cfg.get("broadcast_every_n_calls", 1)),
                                 )
+                                # ⭐ EMA w_hat: set alpha after construction (not a ctor param to stay backward-compatible)
+                                _ema_alpha = float(dr3_cfg.get("w_hat_ema_alpha", 0.0))
+                                if _ema_alpha > 0:
+                                    self._dr3_est.w_hat_ema_alpha = _ema_alpha
+                                    # Initialize EMA disc copy if not yet created
+                                    if self._dr3_est._disc is not None and self._dr3_est._disc_ema is None:
+                                        import copy as _copy
+                                        self._dr3_est._disc_ema = _copy.deepcopy(self._dr3_est._disc)
                             # Build teacher_sample even if teacher_mask missing (all False)
                             teacher_sample = (
                                 (teacher_mask.sum(dim=-1) > 0)
@@ -1257,7 +1265,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 if alpha_mode is not None:
                                     alpha_arg = None
                                     alpha_mode_arg = str(alpha_mode)
-                            else:
+                                else:
                                     # backward-compatible: use micro-batch teacher ratio (can be 0/1 when micro-batch=1)
                                     alpha_arg = float(teacher_sample.float().mean().detach().item())
                                     alpha_mode_arg = "micro"
@@ -1361,6 +1369,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 teacher_policy_shaping_enable=self.config.get("teacher_policy_shaping_enable", True),
                                 teacher_policy_shaping_mode=self.config.get("teacher_policy_shaping_mode", "p_div_p_beta"),
                                 teacher_policy_shaping_beta=self.config.get("teacher_policy_shaping_beta", 0.1),
+                                teacher_policy_shaping_bell_p_target=self.config.get("teacher_policy_shaping_bell_p_target", 0.08),
+                                teacher_policy_shaping_bell_sigma=self.config.get("teacher_policy_shaping_bell_sigma", 1.5),
                                 teacher_use_clip=self.config.get("teacher_use_clip", False),
                                 loss_agg_mode=loss_agg_mode,
                                 teacher_loss_scale=teacher_loss_scale,
@@ -1403,6 +1413,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     teacher_policy_shaping_enable=self.config.get("teacher_policy_shaping_enable", True),
                                     teacher_policy_shaping_mode=self.config.get("teacher_policy_shaping_mode", "p_div_p_beta"),
                                     teacher_policy_shaping_beta=self.config.get("teacher_policy_shaping_beta", 0.1),
+                                    teacher_policy_shaping_bell_p_target=self.config.get("teacher_policy_shaping_bell_p_target", 0.08),
+                                    teacher_policy_shaping_bell_sigma=self.config.get("teacher_policy_shaping_bell_sigma", 1.5),
                                     teacher_use_clip=self.config.get("teacher_use_clip", False),
                                     loss_agg_mode=loss_agg_mode,
                                     teacher_loss_scale=teacher_loss_scale,
@@ -1536,6 +1548,14 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     if teacher_loss_scale is not None:
                                         _hybrid_scale = teacher_loss_scale * _hybrid_w
                                     _hybrid_beta = float(dr3_cfg.get("policy_shaping_beta", 0.1))
+                                    _hybrid_mode = str(dr3_cfg.get("policy_shaping_mode", "p_div_p_beta"))
+                                    # For capped_monotonic: cap stored in policy_shaping_cap, passed via bell_p_target
+                                    # For bell_curve: p_target and sigma stored in their own keys
+                                    if _hybrid_mode == "capped_monotonic":
+                                        _hybrid_bell_p_target = float(dr3_cfg.get("policy_shaping_cap", 0.6))
+                                    else:
+                                        _hybrid_bell_p_target = float(dr3_cfg.get("policy_shaping_bell_p_target", 0.08))
+                                    _hybrid_bell_sigma = float(dr3_cfg.get("policy_shaping_bell_sigma", 1.2))
 
                                     ret_dict = het_compute_teacher_aware_loss(
                                         old_log_prob=old_log_prob,
@@ -1552,8 +1572,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         loss_agg_mode=loss_agg_mode,
                                         teacher_use_log_prob=False,
                                         teacher_policy_shaping_enable=True,
-                                        teacher_policy_shaping_mode="p_div_p_beta",
+                                        teacher_policy_shaping_mode=_hybrid_mode,
                                         teacher_policy_shaping_beta=_hybrid_beta,
+                                        teacher_policy_shaping_bell_p_target=_hybrid_bell_p_target,
+                                        teacher_policy_shaping_bell_sigma=_hybrid_bell_sigma,
                                         teacher_use_clip=False,
                                         teacher_loss_scale=_hybrid_scale,
                                     )
@@ -1711,7 +1733,6 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             log_prob=log_prob,
                             response_mask=response_mask,
                             exp_mask=exp_mask,  # ⭐ SFT 只看 expert 数据
-                            delta=chord_delta,
                             use_token_weighting=chord_use_token_weighting,
                             loss_agg_mode=loss_agg_mode,
                         )
@@ -1821,6 +1842,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_policy_shaping_enable=teacher_policy_shaping_enable,
                             teacher_policy_shaping_mode=teacher_policy_shaping_mode,
                             teacher_policy_shaping_beta=teacher_policy_shaping_beta,
+                            teacher_policy_shaping_bell_p_target=self.config.get("teacher_policy_shaping_bell_p_target", 0.08),
+                            teacher_policy_shaping_bell_sigma=self.config.get("teacher_policy_shaping_bell_sigma", 1.5),
                             teacher_use_clip=teacher_use_clip,
                             teacher_loss_scale=teacher_loss_scale,
                             # 7.7: sequence-level beta schedule

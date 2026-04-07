@@ -68,10 +68,9 @@ actor_rollout_ref:
       param_offload: true
       optimizer_offload: true
     chord_mu_warmup_steps: 0
-    chord_mu_decay_steps: 50
-    chord_mu_peak: 0.5
-    chord_mu_valley: 0.02
-    chord_delta: 0.1
+    chord_mu_decay_steps: 0
+    chord_mu_peak: 0.1
+    chord_mu_valley: 0.1
     chord_use_token_weighting: true
   rollout:
     use_qwen3: false
