@@ -1,6 +1,7 @@
 import os
 import json
 import threading
+from collections import deque
 from .environment import SingleAlfredTWEnv
 from .utils import load_config, process_ob
 
@@ -20,13 +21,15 @@ class ALFWorld_Wrapper:
         self.config = load_config(self.config_path)
 
         self._max_id = 0
-        self.ls = []
         self.env = {}  # dict[id, env_item]
         self.env_init = {}  # dict[id, env_item]
         self.info = {}  # dict[id, env_info]
         self.games = []  # list[game_file]
         self._lock = threading.Lock()
-        
+
+        # Object pool: reuse SingleAlfredTWEnv objects instead of create/destroy
+        self._env_pool = deque()
+
         train_games_root = os.path.join(
             os.environ["ALFWORLD_DATA"], "json_2.1.1", "train"
         )
@@ -77,24 +80,37 @@ class ALFWorld_Wrapper:
         print(f"Loaded {test_games_count} test games")
         print(f"Total {len(self.games)} games")
 
+    def _acquire_env(self):
+        """Get a SingleAlfredTWEnv from the pool, or create one if pool is empty."""
+        with self._lock:
+            if self._env_pool:
+                return self._env_pool.pop()
+        return SingleAlfredTWEnv(self.config)
+
+    def _release_env(self, env_obj):
+        """Return a SingleAlfredTWEnv to the pool for reuse."""
+        with self._lock:
+            self._env_pool.append(env_obj)
+
     def create(self):
         try:
-            # TODO extend to other kinds of environments
             with self._lock:
                 idx = self._max_id
                 self._max_id += 1
-            self.env[idx] = SingleAlfredTWEnv(self.config)
-            self.info[idx] = {"done": False, "reward": 0, "deleted": False}
-            print(f"-------Env {idx} created--------")
-            self.ls.append(idx)
+            self.env[idx] = self._acquire_env()
+            self.info[idx] = {"done": False, "reward": 0}
+            print(f"-------Env {idx} created (pool size: {len(self._env_pool)})--------")
             payload = {"id": idx}
         except Exception as e:
             payload = {"error": f"{e}"}
         return payload
-    
+
     def __del__(self):
-        for idx in self.ls:
-            self.env_init[idx].close()
+        for idx in list(self.env_init.keys()):
+            try:
+                self.env_init[idx].close()
+            except Exception:
+                pass
             print(f"-------Env {idx} closed--------")
 
     def step(self, idx: int, action: str):
@@ -120,9 +136,26 @@ class ALFWorld_Wrapper:
             return {"error": 'world_type must be one of "Text", "Embody" and "Hybrid"'}
         try:
             self._check_id(idx, True)
+
+            # Close previous env_init to free C-level resources (jericho/fast_downward)
+            if idx in self.env_init:
+                try:
+                    self.env_init[idx].close()
+                except Exception:
+                    pass
+
             self.env[idx].game_files = [self.games[game]]
             self.env[idx].num_games = 1
+
+            # Track registry before init_env to clean up afterwards
+            import textworld.gym
+            keys_before = set(textworld.gym.registry.keys())
+
             self.env_init[idx] = self.env[idx].init_env(batch_size=1)
+
+            # Clean up the registry entry that init_env just created (prevents unbounded growth)
+            for key in set(textworld.gym.registry.keys()) - keys_before:
+                del textworld.gym.registry[key]
             ob, info = self.env_init[idx].reset()
             ob = "\n".join(ob[0].split("\n\n")[1:])
             available_actions = info.get("admissible_commands", [[]])[0]
@@ -139,7 +172,6 @@ class ALFWorld_Wrapper:
                 "available_actions": available_actions,
                 "done": False,
                 "reward": 0,
-                "deleted": False,
             }
         except Exception as e:
             payload = {"error": str(e)}
@@ -167,66 +199,33 @@ class ALFWorld_Wrapper:
             return {"error": str(e)}
 
     def delete(self, idx: int):
-        """
-        Delete/close a specific environment instance.
-        
-        This method safely deletes an environment without affecting other environments:
-        - Each environment's id is assigned once and never changes
-        - We only mark it as deleted and clean up its resources
-        - Other environments' ids remain unchanged
-        
-        Args:
-            idx (int): The environment ID to delete.
-        
-        Returns:
-            dict: Success status or error message.
-        """
+        """Return env to pool instead of destroying it."""
         try:
             if idx not in self.info:
                 return {"error": f"The id {idx} is not valid."}
-            
-            if self.info[idx]["deleted"]:
-                return {"success": True, "message": f"Environment {idx} was already deleted."}
-            
-            # Mark as deleted (this prevents future operations on this id)
-            # We keep self.info[idx] and self.env[idx] for consistency checking,
-            # but mark them as deleted so _check_id() will reject operations
-            self.info[idx]["deleted"] = True
-            
-            # Clean up actual environment resources (the initialized env instance)
-            # This is safe because:
-            # 1. Each idx is unique and assigned once (via self._max_id)
-            # 2. Removing from self.ls doesn't affect other environments' ids
-            # 3. Other environments use their own idx, not affected by this deletion
+
+            # Close the initialized game instance (frees jericho/fast_downward state)
             if idx in self.env_init:
                 try:
                     self.env_init[idx].close()
                 except Exception as e:
                     print(f"Error closing environment {idx}: {e}")
                 del self.env_init[idx]
-            
-            # Remove from active list (self.ls is only used for iteration in __del__)
-            # This is safe because:
-            # - self.ls is just a tracking list, not used for id assignment
-            # - Other environments' ids are stored in dict keys, not in self.ls
-            # - Removing from list doesn't change other elements' values
-            if idx in self.ls:
-                self.ls.remove(idx)
-            
-            # Note: We intentionally keep self.env[idx] and self.info[idx] in the dicts
-            # to maintain consistency and allow _check_id() to properly reject operations
-            # on deleted environments. This doesn't affect other environments at all.
-            
-            print(f"-------Env {idx} deleted--------")
+
+            # Return the SingleAlfredTWEnv to pool for reuse (no new C allocation needed)
+            if idx in self.env:
+                self._release_env(self.env.pop(idx))
+
+            del self.info[idx]
+
+            print(f"-------Env {idx} deleted (pool size: {len(self._env_pool)})--------")
             return {"success": True, "message": f"Environment {idx} deleted successfully."}
         except Exception as e:
             return {"error": str(e)}
 
     def _check_id(self, idx: int, is_reset: bool = False):
         if idx not in self.info:
-            raise NameError(f"The id {idx} is not valid.")
-        if self.info[idx]["deleted"]:
-            raise NameError(f"The task with environment {idx} has been deleted.")
+            raise NameError(f"The id {idx} is not valid (may have been deleted).")
         if not is_reset and self.info[idx]["done"]:
             print("is reset", is_reset)
             print("done", self.info[idx]["done"])

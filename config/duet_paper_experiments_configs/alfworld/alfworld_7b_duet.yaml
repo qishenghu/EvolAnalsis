@@ -42,7 +42,7 @@ algorithm:
       soft_penalty_mode: additive
 actor_rollout_ref:
   model:
-    path: /data/code/exp/models/Qwen/Qwen2.5-7B-Instruct
+    path: /data/shared_models/Qwen2.5-7B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:
@@ -71,12 +71,14 @@ actor_rollout_ref:
       enable: true
       apply_to: teacher_no_logprob
       feature_mode: v3_aug
-      gap_gate_enable: true
+      gap_gate_enable: false
+      use_policy_shaping: true
+      policy_shaping_beta: 0.1
       hidden_proj_dim: 64
       hidden_proj_dropout: 0.2
       disc_weight_decay: 0.005
-      disc_label_smoothing: 0.05
-      disc_temperature: 1.2
+      disc_label_smoothing: 0.1
+      disc_temperature: 1.0
       disc_age_weight_decay: 0.02
       apply_warmup_steps: 10
       apply_min_buf_size: 512
@@ -93,7 +95,7 @@ actor_rollout_ref:
       sync_every_n_calls: 1
       broadcast_params: true
       broadcast_every_n_calls: 1
-      clip_max: 10.0
+      clip_max: 5.0
       ppo_clip_eps: 0.2
       ratio_shaping_mode: auto
       ratio_shaping_beta: 0.1
@@ -104,6 +106,7 @@ actor_rollout_ref:
       ess_target_ratio: 0.5
       dual_lr: 0.05
       dual_init: 0.0
+      w_hat_ema_alpha: 0.3
   rollout:
     use_qwen3: false
     thinking_mode: none
@@ -116,7 +119,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 2
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.65
     n: 8
     log_prob_max_token_len_per_gpu: 25580
     stop_sequences:
@@ -125,7 +128,7 @@ actor_rollout_ref:
       n: 1
       stop_sequences:
       - </action>
-    max_env_worker: 32
+    max_env_worker: 64
     context_template: linear
     context_template_train_sp_action: false
     max_env_len: 4096
@@ -224,25 +227,17 @@ exp_manager:
       mode: p_div_p_beta
       beta: 0.1
     adaptive_weight:
-      enable: true
-      mode: gap_linear
-      gate_level: group
-      epsilon: 0.0
-      tau: 0.5
-      min: 0.0
-      max: 1.0
-      ema:
-        enable: true
-        beta: 0.95
+      enable: false
   state_channel:
     enable: true
-    beta: 0.5
-    beta_decay: true
-    beta_decay_target: 0.5
+    exclude_teacher: true
+    beta: 0.2
+    beta_decay: false
     match_mode: hash
+    grpo_decouple: true
     step_level:
-      enable: false
-      eta: 0.1
+      enable: true
+      eta: 0.05
 attribution_driven_credit_assignment:
   enable: false
 thread_pool:

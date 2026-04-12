@@ -42,7 +42,7 @@ algorithm:
       soft_penalty_mode: additive
 actor_rollout_ref:
   model:
-    path: /data/code/exp/models/Qwen/Qwen2.5-7B-Instruct
+    path: /data/shared_models/Qwen2.5-7B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:

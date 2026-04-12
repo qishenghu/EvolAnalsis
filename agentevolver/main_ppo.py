@@ -166,16 +166,19 @@ def run_ppo(config) -> None:
         if os.environ.get("WANDB_MODE"):
             wandb_env_vars["WANDB_MODE"] = os.environ.get("WANDB_MODE")
         
+        ray_temp_dir = os.environ.get("RAY_TMPDIR", os.path.join(os.path.expanduser("~"), "ray_tmp"))
+        os.makedirs(ray_temp_dir, exist_ok=True)
         ray.init(
             runtime_env={"env_vars": {
-                "TOKENIZERS_PARALLELISM": "true", 
-                "NCCL_DEBUG": "WARN", 
+                "TOKENIZERS_PARALLELISM": "true",
+                "NCCL_DEBUG": "WARN",
                 "VLLM_LOGGING_LEVEL": "WARN",
-                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true", 
+                "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                 "VLLM_USE_V1": "1",
                 **wandb_env_vars  # Add wandb env vars if set
             }},
             num_cpus=config.ray_init.num_cpus,
+            _temp_dir=ray_temp_dir,
         )  # ⭐ Initialize the Ray cluster with the specified runtime environment and number of CPUs
 
     max_model_len: int = config.actor_rollout_ref.rollout.max_model_len
@@ -299,7 +302,10 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # init task manager
-        llm_client=DashScopeClient(model_name=config.task_manager.llm_client)
+        try:
+            llm_client=DashScopeClient(model_name=config.task_manager.llm_client)
+        except ValueError:
+            llm_client=None
         train_task_manager=TaskManager(
             config=config,
             exploration_strategy=config.task_manager.strategy,

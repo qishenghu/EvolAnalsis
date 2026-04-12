@@ -140,7 +140,9 @@ class EnvService:
         )
 
         if not ray.is_initialized():
-            ray.init()
+            ray_temp_dir = os.environ.get("RAY_TMPDIR", os.path.join(os.path.expanduser("~"), "ray_tmp"))
+            os.makedirs(ray_temp_dir, exist_ok=True)
+            ray.init(_temp_dir=ray_temp_dir)
         self.env_actors = {}
         self.remote_env = {}
         self.last_access_time = {}

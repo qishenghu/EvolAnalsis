@@ -97,7 +97,11 @@ class TaskManager(object):
         self._post_filter: list[TaskPostFilter] = [LlmFilter(env_service_url,llm_client,self._num_exploration_threads,tokenizer=tokenizer,config=config)]  # ⭐ Initialize the post filter
 
         self._tasks: list[Task]=[]
-        self._exploration_strategy._inject_deps(self._old_retrival,self._llm_client,DashScopeClient(model_name='qwen3-235b-a22b-instruct-2507',max_tokens=8192),env_profile=env_profile)  # ⭐ Inject dependencies into the exploration strategy
+        try:
+            _strong_llm = DashScopeClient(model_name='qwen3-235b-a22b-instruct-2507',max_tokens=8192)
+        except ValueError:
+            _strong_llm = None
+        self._exploration_strategy._inject_deps(self._old_retrival,self._llm_client,_strong_llm,env_profile=env_profile)  # ⭐ Inject dependencies into the exploration strategy
 
     @property
     def seed_tasks(self):

@@ -13,7 +13,7 @@ export RAY_ENV_NAME=alfworld
 
 # Set ALFWORLD_DATA if not already set
 if [ -z "$ALFWORLD_DATA" ]; then
-    export ALFWORLD_DATA=/data/code/exp/alfworld
+    export ALFWORLD_DATA=/data/home/qisheng/alfworld_data
 fi
 
 echo "AGENTGYM_ROOT: $AGENTGYM_ROOT"
