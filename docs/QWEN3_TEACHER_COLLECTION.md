@@ -4,6 +4,13 @@
 
 使用 `Qwen/Qwen3-30B-A3B-Thinking-2507`（MoE, 3B 活跃参数）作为 teacher 模型，为 Qwen3-1.7B student 模型采集 teacher trajectories。
 
+**所有三个环境统一使用直接 rollout 方式**（teacher 直接与环境交互），而非之前 Qwen2.5-72B 在 WebShop/SciWorld 上使用的 gold action + reasoning synthesis 方式。原因：
+1. Qwen3-30B-Thinking 是 reasoning model，直接 rollout 产出的 thought→action 更连贯
+2. 合成 reasoning 是后验合理化，不如真实推理自然
+3. 与 Qwen3 student 的 native thinking 风格一致
+
+**定向采样**：所有环境只采集训练时实际用到的 800 个 task（`seed=2026, max_train_tasks=800`），而非全量 task。
+
 ## 为什么需要 Qwen3 teacher？
 
 - Qwen3 是 reasoning 模型，有 native thinking mode（`<think>` special tokens）
@@ -72,7 +79,7 @@ nohup bash scripts/collect_qwen3_teacher.sh sciworld \
 | 参数 | 值 | 说明 |
 |------|------|------|
 | `--use_qwen3` | true | 启用 native thinking mode，non-final turns 追加 `/no_think` |
-| `--n_per_task` | 2 | 每个 task 采 2 条轨迹，过滤成功的 |
+| `--n_per_task` | 3 | 每个 task 采 3 条轨迹，过滤成功的 |
 | `--filter_success` | true | 只保留 reward=1.0 的轨迹 |
 | `--temperature` | 0.6 | 采样温度 |
 | `--max_workers` | 8 | 并行采样 workers |
@@ -115,13 +122,15 @@ data/teacher_trajectories/qwen3_30b/
 
 ## 预期数据量
 
-| 环境 | Tasks | 采样 | 预期成功 | 过滤后 |
-|------|-------|------|---------|--------|
-| ALFWorld | 2,348 | 4,696 | ~60-80% | ~3,000-4,000 |
-| WebShop | 5,691 | 11,382 | ~50-70% | ~6,000-8,000 |
-| SciWorld | 800 | 1,600 | ~40-60% | ~600-1,000 |
+所有环境定向采 800 个 task（与训练 `seed=2026, max_train_tasks=800` 对齐）：
 
-> SciWorld 只采 800 个 task（与训练的 `max_train_tasks=800, seed=2026` 对齐），确保 teacher 数据覆盖训练时用到的所有 task。
+| 环境 | Tasks | 采样 (×3) | 预期成功率 | 过滤后 | 预计耗时 |
+|------|-------|----------|----------|--------|---------|
+| ALFWorld | 800 | 2,400 | ~60-80% | ~1,500-2,000 | ~2-4h |
+| WebShop | 800 | 2,400 | ~50-70% | ~1,200-1,700 | ~2-4h |
+| SciWorld | 800 | 2,400 | ~40-60% | ~1,000-1,400 | ~3-5h |
+
+如果某个环境成功率过低（<30%），考虑退回 gold action + synthesis 方式。
 
 Qwen3-30B-A3B-Thinking 是 reasoning 模型，预期比 Qwen2.5-72B 有更高的成功率（尤其在需要推理的任务上）。
 
