@@ -157,6 +157,11 @@ def parse_args():
         "--use_qwen3", action="store_true", default=False,
         help="Enable Qwen3 native thinking mode (appends /no_think to non-final turns)"
     )
+    parser.add_argument(
+        "--success_threshold", type=float, default=None,
+        help="Success threshold for evaluate(). None=use env default. "
+             "For SciWorld set to 70 (score scale 0-100, matching training config)."
+    )
 
     # ===== 通用生成参数 =====
     parser.add_argument(
@@ -313,12 +318,14 @@ class TeacherRolloutExecutor:
         config: DictConfig,
         env_url: str,
         collect_log_prob: bool = True,
+        success_threshold: Optional[float] = None,
     ):
         self.teacher_llm = teacher_llm
         self.tokenizer = tokenizer
         self.config = config
         self.env_url = env_url
         self.collect_log_prob = collect_log_prob
+        self.success_threshold = success_threshold
         
         # ⭐ 存储每轮 LLM 调用的 log_probs（分轮存储，便于对齐）
         # 格式：[{"turn_idx": int, "log_probs": [...], "token_ids": [...], "tokens": [...]}]
@@ -488,7 +495,10 @@ class TeacherRolloutExecutor:
             
             # 4. 计算 reward
             try:
-                score = env.evaluate(instance_id, params={"sparse": True})
+                eval_params = {"sparse": True}
+                if self.success_threshold is not None:
+                    eval_params["sciworld_success_threshold"] = self.success_threshold
+                score = env.evaluate(instance_id, params=eval_params)
             except Exception as e:
                 logger.warning(f"Error evaluating task {task.task_id}: {e}")
                 score = 0.0
@@ -696,6 +706,7 @@ def main():
             config=config,
             env_url=args.env_url,
             collect_log_prob=collect_log_prob,
+            success_threshold=args.success_threshold,
         )
         
         task = Task(

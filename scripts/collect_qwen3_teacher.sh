@@ -64,11 +64,13 @@ collect_env() {
     local ENV_START_SCRIPT=$5
 
     local MAX_ATTEMPTS=$6
+    local SUCCESS_THRESHOLD=${7:-}
 
     echo "=== Collecting $ENV Teacher Trajectories ==="
     echo "  Model: $TEACHER_MODEL"
     echo "  Mode: stop_on_success (max $MAX_ATTEMPTS attempts per task)"
     echo "  Tasks: $(wc -l < $TASK_FILE)"
+    echo "  Success threshold: ${SUCCESS_THRESHOLD:-default (reward >= 1.0)}"
     echo "  Output: $OUTPUT_FILE"
     echo ""
 
@@ -83,21 +85,28 @@ collect_env() {
         fi
     fi
 
-    python scripts/collect_teacher_trajectories.py \
-        --env "$ENV" \
-        --env_url "$ENV_URL" \
+    # Build command
+    local CMD="python scripts/collect_teacher_trajectories.py \
+        --env $ENV \
+        --env_url $ENV_URL \
         --backend vllm \
-        --model_path "$TEACHER_MODEL" \
-        --task_file "$TASK_FILE" \
-        --output "$OUTPUT_FILE" \
+        --model_path $TEACHER_MODEL \
+        --task_file $TASK_FILE \
+        --output $OUTPUT_FILE \
         --use_qwen3 \
         --n_per_task $MAX_ATTEMPTS \
         --stop_on_success \
         --filter_success \
         --max_workers $MAX_WORKERS \
         --temperature $TEMPERATURE \
-        --save_every $SAVE_EVERY \
-        2>&1 | tee "logs/collect_qwen3_${ENV}.log"
+        --save_every $SAVE_EVERY"
+
+    # Add success_threshold if specified
+    if [ -n "$SUCCESS_THRESHOLD" ]; then
+        CMD="$CMD --success_threshold $SUCCESS_THRESHOLD"
+    fi
+
+    eval "$CMD" 2>&1 | tee "logs/collect_qwen3_${ENV}.log"
 
     # Post-process: filter and convert to pkl
     echo ""
@@ -150,7 +159,8 @@ case $ENV in
             "data/sciworld/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/sciworld_qwen3_30b.jsonl" \
             "" \
-            "$SCIWORLD_MAX_ATTEMPTS"
+            "$SCIWORLD_MAX_ATTEMPTS" \
+            "70"  # SciWorld success = score > 70 (matching training config)
         ;;
 
     all)
@@ -182,7 +192,8 @@ case $ENV in
             "data/sciworld/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/sciworld_qwen3_30b.jsonl" \
             "" \
-            "$SCIWORLD_MAX_ATTEMPTS"
+            "$SCIWORLD_MAX_ATTEMPTS" \
+            "70"  # SciWorld success = score > 70
 
         echo "============================================"
         echo " ALL collections complete"
