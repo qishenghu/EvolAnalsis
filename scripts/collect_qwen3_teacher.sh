@@ -116,9 +116,43 @@ case $ENV in
             2>&1 | tee "logs/collect_qwen3_webshop.log"
         ;;
 
+    sciworld)
+        ENV_URL="http://127.0.0.1:8085"
+        TASK_FILE="data/sciworld/task_ids_800_seed2026.txt"
+        OUTPUT_FILE="$OUTPUT_DIR/sciworld_qwen3_30b.jsonl"
+
+        echo "=== Collecting SciWorld Teacher Trajectories ==="
+        echo "  Model: $TEACHER_MODEL"
+        echo "  Tasks: $(wc -l < $TASK_FILE) tasks × $N_PER_TASK rollouts (seed=2026 subset)"
+        echo "  Output: $OUTPUT_FILE"
+        echo ""
+
+        # Check if env is running
+        if ! curl -s "$ENV_URL" >/dev/null 2>&1; then
+            echo "ERROR: SciWorld environment not running on $ENV_URL"
+            echo "Start it first (check env_service docs for SciWorld setup)"
+            exit 1
+        fi
+
+        python scripts/collect_teacher_trajectories.py \
+            --env sciworld \
+            --env_url "$ENV_URL" \
+            --backend vllm \
+            --model_path "$TEACHER_MODEL" \
+            --task_file "$TASK_FILE" \
+            --output "$OUTPUT_FILE" \
+            --use_qwen3 \
+            --n_per_task $N_PER_TASK \
+            --filter_success \
+            --max_workers $MAX_WORKERS \
+            --temperature $TEMPERATURE \
+            --save_every $SAVE_EVERY \
+            2>&1 | tee "logs/collect_qwen3_sciworld.log"
+        ;;
+
     *)
         echo "Unknown environment: $ENV"
-        echo "Usage: bash scripts/collect_qwen3_teacher.sh [alfworld|webshop]"
+        echo "Usage: bash scripts/collect_qwen3_teacher.sh [alfworld|webshop|sciworld]"
         exit 1
         ;;
 esac

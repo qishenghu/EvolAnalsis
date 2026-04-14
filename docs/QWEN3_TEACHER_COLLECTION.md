@@ -39,26 +39,32 @@ Qwen3-30B-A3B 是 MoE 模型，4x80G 可以轻松跑。vLLM 原生支持 MoE 推
 
 ## 采样执行
 
-### ALFWorld
+### ALFWorld（2,348 tasks）
 
 ```bash
-# 启动环境
 bash start_env_alfworld.sh
-
-# 采样（约 6-12 小时）
 nohup bash scripts/collect_qwen3_teacher.sh alfworld \
     > logs/collect_qwen3_alfworld.log 2>&1 &
 ```
 
-### WebShop
+### WebShop（5,691 tasks）
 
 ```bash
-# 启动环境
 bash start_env_webshop.sh
-
-# 采样（约 6-12 小时）
 nohup bash scripts/collect_qwen3_teacher.sh webshop \
     > logs/collect_qwen3_webshop.log 2>&1 &
+```
+
+### SciWorld（800 tasks，seed=2026 定向子集）
+
+SciWorld 只采集训练时会用到的 800 个 task（通过 `seed=2026` + `max_train_tasks=800` 确定的子集），而非全部 4137 个 train task。Task ID 文件已生成在 `data/sciworld/task_ids_800_seed2026.txt`。
+
+```bash
+# 启动 SciWorld 环境（需要先配置）
+# bash start_env_sciworld.sh
+
+nohup bash scripts/collect_qwen3_teacher.sh sciworld \
+    > logs/collect_qwen3_sciworld.log 2>&1 &
 ```
 
 ## 采样参数
@@ -113,6 +119,9 @@ data/teacher_trajectories/qwen3_30b/
 |------|-------|------|---------|--------|
 | ALFWorld | 2,348 | 4,696 | ~60-80% | ~3,000-4,000 |
 | WebShop | 5,691 | 11,382 | ~50-70% | ~6,000-8,000 |
+| SciWorld | 800 | 1,600 | ~40-60% | ~600-1,000 |
+
+> SciWorld 只采 800 个 task（与训练的 `max_train_tasks=800, seed=2026` 对齐），确保 teacher 数据覆盖训练时用到的所有 task。
 
 Qwen3-30B-A3B-Thinking 是 reasoning 模型，预期比 Qwen2.5-72B 有更高的成功率（尤其在需要推理的任务上）。
 
