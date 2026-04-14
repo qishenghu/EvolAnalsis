@@ -176,7 +176,12 @@ def parse_args():
     # ===== 采集配置 =====
     parser.add_argument(
         "--n_per_task", type=int, default=1,
-        help="Number of trajectories to collect per task"
+        help="Number of trajectories to collect per task (used as max attempts in stop_on_success mode)"
+    )
+    parser.add_argument(
+        "--stop_on_success", action="store_true", default=False,
+        help="Stop rolling for a task after getting the first successful trajectory. "
+             "n_per_task becomes the max attempts limit. Most efficient for targeted collection."
     )
     parser.add_argument(
         "--filter_success", action="store_true", default=True,
@@ -740,14 +745,30 @@ def main():
         
         return None  # 所有重试都失败
     
-    # 9. 准备所有 (task, rollout) 组合
-    all_work_items = []
-    for task_id in task_ids:
-        for rollout_idx in range(args.n_per_task):
-            all_work_items.append((task_id, rollout_idx))
-    
-    total_work = len(all_work_items)
-    logger.info(f"Total work items: {total_work} (tasks={len(task_ids)}, rollouts_per_task={args.n_per_task})")
+    # 9. 准备工作项
+    def process_task_until_success(task_id: str, thread_index: int) -> Optional[Dict[str, Any]]:
+        """stop_on_success 模式：对单个 task 持续 rollout 直到成功或达到上限"""
+        for attempt in range(args.n_per_task):
+            result = process_single_rollout(task_id, attempt, thread_index)
+            if result is not None:
+                logger.info(f"Task {task_id}: success on attempt {attempt+1}/{args.n_per_task}")
+                return result
+        logger.warning(f"Task {task_id}: no success after {args.n_per_task} attempts")
+        return None
+
+    if args.stop_on_success:
+        # stop_on_success 模式：每个 task 一个工作项，内部循环 rollout
+        all_work_items = [(task_id,) for task_id in task_ids]
+        total_work = len(all_work_items)
+        logger.info(f"Total work items: {total_work} tasks (stop_on_success, max {args.n_per_task} attempts each)")
+    else:
+        # 原始模式：每个 (task, rollout) 一个工作项
+        all_work_items = []
+        for task_id in task_ids:
+            for rollout_idx in range(args.n_per_task):
+                all_work_items.append((task_id, rollout_idx))
+        total_work = len(all_work_items)
+        logger.info(f"Total work items: {total_work} (tasks={len(task_ids)}, rollouts_per_task={args.n_per_task})")
     logger.info(f"Using {args.max_workers} parallel workers")
     
     # 10. 并行采集
@@ -761,11 +782,17 @@ def main():
         # 提交所有任务
         future_to_item = {}
         thread_index = 0
-        for task_id, rollout_idx in all_work_items:
-            future = executor_pool.submit(process_single_rollout, task_id, rollout_idx, thread_index)
-            future_to_item[future] = (task_id, rollout_idx)
+        for item in all_work_items:
+            if args.stop_on_success:
+                task_id = item[0]
+                future = executor_pool.submit(process_task_until_success, task_id, thread_index)
+                future_to_item[future] = (task_id, 0)
+            else:
+                task_id, rollout_idx = item
+                future = executor_pool.submit(process_single_rollout, task_id, rollout_idx, thread_index)
+                future_to_item[future] = (task_id, rollout_idx)
             thread_index += 1
-        
+
         # 收集结果
         for future in as_completed(future_to_item):
             task_id, rollout_idx = future_to_item[future]

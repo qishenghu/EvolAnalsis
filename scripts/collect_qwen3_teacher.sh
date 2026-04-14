@@ -38,10 +38,13 @@ conda activate "${CONDA_ENV_DUET}"
 # ===== Configuration =====
 TEACHER_MODEL="/data/shared_models/Qwen3-30B-A3B-Thinking"
 OUTPUT_DIR="data/teacher_trajectories/qwen3_30b"
-N_PER_TASK=3              # Rollouts per task (collect more, filter for success)
 MAX_WORKERS=8             # Parallel workers
 TEMPERATURE=0.6
 SAVE_EVERY=50
+# Per-env max attempts (stop_on_success mode: stop after first success)
+ALFWORLD_MAX_ATTEMPTS=10
+WEBSHOP_MAX_ATTEMPTS=10
+SCIWORLD_MAX_ATTEMPTS=20   # SciWorld is harder, allow more attempts
 
 mkdir -p "$OUTPUT_DIR" logs
 
@@ -60,9 +63,12 @@ collect_env() {
     local OUTPUT_FILE=$4
     local ENV_START_SCRIPT=$5
 
+    local MAX_ATTEMPTS=$6
+
     echo "=== Collecting $ENV Teacher Trajectories ==="
     echo "  Model: $TEACHER_MODEL"
-    echo "  Tasks: $(wc -l < $TASK_FILE) tasks × $N_PER_TASK rollouts"
+    echo "  Mode: stop_on_success (max $MAX_ATTEMPTS attempts per task)"
+    echo "  Tasks: $(wc -l < $TASK_FILE)"
     echo "  Output: $OUTPUT_FILE"
     echo ""
 
@@ -85,7 +91,8 @@ collect_env() {
         --task_file "$TASK_FILE" \
         --output "$OUTPUT_FILE" \
         --use_qwen3 \
-        --n_per_task $N_PER_TASK \
+        --n_per_task $MAX_ATTEMPTS \
+        --stop_on_success \
         --filter_success \
         --max_workers $MAX_WORKERS \
         --temperature $TEMPERATURE \
@@ -124,7 +131,8 @@ case $ENV in
             "http://127.0.0.1:8081" \
             "data/alfworld/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/alfworld_qwen3_30b.jsonl" \
-            "start_env_alfworld.sh"
+            "start_env_alfworld.sh" \
+            "$ALFWORLD_MAX_ATTEMPTS"
         ;;
 
     webshop)
@@ -132,7 +140,8 @@ case $ENV in
             "http://127.0.0.1:8083" \
             "data/webshop/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/webshop_qwen3_30b.jsonl" \
-            "start_env_webshop.sh"
+            "start_env_webshop.sh" \
+            "$WEBSHOP_MAX_ATTEMPTS"
         ;;
 
     sciworld)
@@ -140,7 +149,8 @@ case $ENV in
             "http://127.0.0.1:8085" \
             "data/sciworld/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/sciworld_qwen3_30b.jsonl" \
-            ""
+            "" \
+            "$SCIWORLD_MAX_ATTEMPTS"
         ;;
 
     all)
@@ -153,25 +163,26 @@ case $ENV in
             "http://127.0.0.1:8081" \
             "data/alfworld/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/alfworld_qwen3_30b.jsonl" \
-            "start_env_alfworld.sh"
+            "start_env_alfworld.sh" \
+            "$ALFWORLD_MAX_ATTEMPTS"
 
-        # Stop ALFWorld, start WebShop
         bash start_env_alfworld.sh stop 2>/dev/null || true
 
         collect_env "webshop" \
             "http://127.0.0.1:8083" \
             "data/webshop/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/webshop_qwen3_30b.jsonl" \
-            "start_env_webshop.sh"
+            "start_env_webshop.sh" \
+            "$WEBSHOP_MAX_ATTEMPTS"
 
-        # Stop WebShop before SciWorld
         bash start_env_webshop.sh stop 2>/dev/null || true
 
         collect_env "sciworld" \
             "http://127.0.0.1:8085" \
             "data/sciworld/task_ids_800_seed2026.txt" \
             "$OUTPUT_DIR/sciworld_qwen3_30b.jsonl" \
-            ""
+            "" \
+            "$SCIWORLD_MAX_ATTEMPTS"
 
         echo "============================================"
         echo " ALL collections complete"
