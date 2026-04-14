@@ -16,7 +16,7 @@ export DUET_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export TMPDIR="${TMPDIR:-/data/home/$(whoami)/tmp}"
 export TEMP="$TMPDIR"
 export TMP="$TMPDIR"
-export RAY_TMPDIR="${RAY_TMPDIR:-/data/ray}"
+export RAY_TMPDIR="/data/ray"
 
 # --- ALFWorld ---
 export ALFWORLD_DATA="${ALFWORLD_DATA:-/data/home/$(whoami)/alfworld_data}"

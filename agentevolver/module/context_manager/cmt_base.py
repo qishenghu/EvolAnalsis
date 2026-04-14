@@ -76,12 +76,28 @@ def extract_assistant_header_tokens(tokenizer) -> List[int]:
                     return header
                 break
 
-        # Fallback: try the hardcoded Qwen format
-        logger.warning("Dynamic assistant header extraction found empty header, using Qwen fallback")
-        return tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        # Fallback: use apply_chat_template with generation prompt to extract header
+        logger.warning("Dynamic assistant header extraction found empty header, using generation prompt fallback")
+        no_gen = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=False
+        )
+        with_gen = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=True
+        )
+        if len(with_gen) > len(no_gen):
+            return with_gen[len(no_gen):]
+        raise ValueError("Cannot extract assistant header tokens from tokenizer")
     except Exception as e:
-        logger.warning(f"Failed to dynamically extract assistant header tokens: {e}, using Qwen fallback")
-        return tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+        logger.warning(f"Failed to dynamically extract assistant header tokens: {e}, using generation prompt fallback")
+        no_gen = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=False
+        )
+        with_gen = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=True
+        )
+        if len(with_gen) > len(no_gen):
+            return with_gen[len(no_gen):]
+        raise ValueError(f"Cannot extract assistant header tokens from tokenizer: {e}")
 
 
 class ContextManagerBase:

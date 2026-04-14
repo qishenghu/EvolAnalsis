@@ -197,6 +197,8 @@ class AlfworldEnv(BaseEnv):
             'is invalid and you should try more options.\n Reminder: \n1. the action must be chosen from the '
             'given available actions. Any actions except provided available actions will be regarded as illegal. '
             '\n2. Think when necessary, try to act directly more in the process.'
+            '\n3. You must respond using the XML tag format shown above. Do NOT respond with JSON.'
+            '\n\nHere is an example of a valid response:\n<think>\nI need to find the object first. Let me check the desk.\n</think>\n<action>\ngo to desk 1\n</action>'
         )
     
     def step(self, action: Dict[str, Any], params: Dict[str, Any] = None) -> Dict[str, Any]:

@@ -388,6 +388,7 @@ In each turn, you must output your thought/reasoning and then output your action
 ```
 {self._get_action_format_example()}
 ```
+You must respond using the XML tag format shown above. Do NOT respond with JSON.
 '''
 
     def _format_available_actions(self) -> str:

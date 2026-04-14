@@ -79,58 +79,29 @@ def _extract_role_header_tokens(tokenizer, role: str) -> List[int]:
                 raise ValueError(f"Invalid token positions for role {role}: user_len={user_len}, x_pos={x_position}")
                 
         else:
-            # For user and other roles: compare empty content vs content-filled
-            # Key fix: don't let user template include system message
-            empty_msg = [{"role": role, "content": ""}]
-            empty_tokens = tokenizer.apply_chat_template(
-                empty_msg, tokenize=True, add_generation_prompt=False
+            # For user and other roles: use multi-turn diff to get pure role header
+            # (avoids including system message prefix that single-message templates add)
+            one_turn = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}],
+                tokenize=True, add_generation_prompt=False
             )
-            
-            content_msg = [{"role": role, "content": "x"}]
-            content_tokens = tokenizer.apply_chat_template(
-                content_msg, tokenize=True, add_generation_prompt=False
+            two_turn = tokenizer.apply_chat_template(
+                [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+                 {"role": role, "content": "x"}],
+                tokenize=True, add_generation_prompt=False
             )
-            
-            # Find the position of "x" (using safe subsequence search)
+            # The added part is: role_footer(assistant) + role_header(user/role) + "x" + role_footer
+            added_part = two_turn[len(one_turn):]
+
             x_tokens = tokenizer.encode("x", add_special_tokens=False)
             if not x_tokens:
                 raise ValueError(f"Cannot encode 'x' token for role {role}")
-            
-            x_position = _find_first_subseq(content_tokens, x_tokens)
-            if x_position is None:
-                raise ValueError(f"Cannot find 'x' token sequence in content message for role {role}")
-            
-            # Key fix: use a more precise method to extract pure role header
-            # For content_msg, the part before x should be role header
-            # But if empty_tokens includes extra content (like system), need to exclude
-            
-            if len(content_tokens) > len(empty_tokens):
-                # Added part is header + "x"
-                added_part = content_tokens[len(empty_tokens):]
-                x_pos_in_added = _find_first_subseq(added_part, x_tokens)
-                if x_pos_in_added is not None:
-                    header_tokens = added_part[:x_pos_in_added]
-                else:
-                    # fallback: directly take the part before x
-                    header_tokens = content_tokens[:x_position]
+
+            x_pos = _find_first_subseq(added_part, x_tokens)
+            if x_pos is not None:
+                header_tokens = added_part[:x_pos]
             else:
-                # directly from start to x position
-                header_tokens = content_tokens[:x_position]
-            
-            # Additional verification: if header is too long (contains system message), try to extract pure role part
-            header_decoded = tokenizer.decode(header_tokens)
-            
-            # If contains system message, try to take only the last role part
-            if f"<|im_start|>{role}" in header_decoded:
-                # Find the position of the last role marker
-                role_marker = f"<|im_start|>{role}\n"
-                role_tokens = tokenizer.encode(role_marker, add_special_tokens=False)
-                
-                # Find the position of role_tokens in header_tokens
-                role_pos = _find_first_subseq(header_tokens, role_tokens)
-                if role_pos is not None:
-                    # Only take the role marker part
-                    header_tokens = role_tokens
+                raise ValueError(f"Cannot find 'x' token in multi-turn diff for role {role}")
             return header_tokens
             
     except Exception as e:

@@ -57,20 +57,26 @@ for i in $(seq 1 60); do
 done
 
 echo "[2/2] Starting env_service wrapper on port $ENVSERVICE_PORT..."
+rm -rf "${RAY_TMPDIR}/session_"* 2>/dev/null || true
+
 PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH" \
 WEBSHOP_SERVER_URL=http://127.0.0.1:$AGENTGYM_PORT \
 nohup $PYTHON_DUET -m env_service.env_service --env webshop --portal 127.0.0.1 --port $ENVSERVICE_PORT \
     > "$LOGDIR/webshop_envservice.log" 2>&1 &
 disown
 
-sleep 5
-if lsof -ti:$ENVSERVICE_PORT >/dev/null 2>&1; then
-    echo "  env_service ready (PID: $(lsof -ti:$ENVSERVICE_PORT | head -1))"
-else
-    echo "  ERROR: env_service failed to start. Check $LOGDIR/webshop_envservice.log"
-    kill_port $AGENTGYM_PORT
-    exit 1
-fi
+for i in $(seq 1 30); do
+    if lsof -ti:$ENVSERVICE_PORT >/dev/null 2>&1; then
+        echo "  env_service ready (PID: $(lsof -ti:$ENVSERVICE_PORT | head -1))"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        echo "  ERROR: env_service failed to start. Check $LOGDIR/webshop_envservice.log"
+        kill_port $AGENTGYM_PORT
+        exit 1
+    fi
+    sleep 1
+done
 
 echo ""
 echo "=== WebShop Environment Stack Running ==="

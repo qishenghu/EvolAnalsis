@@ -26,8 +26,10 @@ class ControlledAgentFlow(BaseAgentFlow):
         self._max_record_len=max_record_len
         self._enable_context_generator=False
 
-        self.instruction_template_ids = self.tokenizer.encode("<|im_start|>user\n")
-        self.response_template_ids = self.tokenizer.encode("<|im_start|>assistant\n")
+        # Dynamically extract role header tokens (model-agnostic)
+        from agentevolver.utils.step_parser import _extract_role_header_tokens
+        self.instruction_template_ids = _extract_role_header_tokens(self.tokenizer, "user")
+        self.response_template_ids = _extract_role_header_tokens(self.tokenizer, "assistant")
         self.em_client = EMClient(base_url=self.config.experience_maker.base_url)
         
 

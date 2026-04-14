@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# DUET Paper: ALFWorld 7B Experiments (LUFFY / On-policy / CHORD / DUET)
+# DUET Paper: ALFWorld Qwen2.5-3B Experiments (OnPolicy / LUFFY / CHORD / DUET)
 #
 # 4 GPUs per experiment, 2 experiments in parallel on 8xA100
 # Config: bs=8, 800 tasks, rollout.n=8, 100 steps/epoch
@@ -10,11 +10,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env_config.sh"
 
+# Activate conda environment
+eval "$(conda shell.bash hook)"
+conda activate "${CONDA_ENV_DUET}"
+
 CONFIG_DIR="config/duet_paper_experiments_configs/alfworld"
 
 cleanup_training() {
     echo ">>> Cleaning up stale training processes..."
-    rm -rf ${RAY_TMPDIR}/alfworld_7b_*/session_* 2>/dev/null || true
+    rm -rf ${RAY_TMPDIR}/alfworld_qwen3b_*/session_* 2>/dev/null || true
 }
 
 start_env() {
@@ -49,38 +53,38 @@ run_experiment() {
 }
 
 echo "============================================"
-echo " DUET Paper: ALFWorld 7B All Experiments"
+echo " DUET Paper: ALFWorld Qwen2.5-3B All Experiments"
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================"
 
 mkdir -p logs
 
-# ---------- Round 1: LUFFY + On-policy in parallel ----------
+# ---------- Round 1: OnPolicy + LUFFY in parallel ----------
 echo ""
-echo "[Round 1/2] LUFFY (GPU 0-3) + On-policy (GPU 4-7)"
+echo "[Round 1/2] OnPolicy (GPU 0-3) + LUFFY (GPU 4-7)"
 echo "============================================"
 cleanup_training
 start_env
 
-#run_experiment "0,1,2,3" "${CONFIG_DIR}/alfworld_7b_luffy.yaml" "alfworld_7b_luffy" &
-#PID1=$!
-#run_experiment "4,5,6,7" "${CONFIG_DIR}/alfworld_7b_onpolicy.yaml" "alfworld_7b_onpolicy" &
-#PID2=$!
+run_experiment "0,1,2,3" "${CONFIG_DIR}/alfworld_qwen3b_onpolicy.yaml" "alfworld_qwen3b_onpolicy" &
+PID1=$!
+run_experiment "4,5,6,7" "${CONFIG_DIR}/alfworld_qwen3b_luffy.yaml" "alfworld_qwen3b_luffy" &
+PID2=$!
 
-#wait $PID1; echo "[Round 1] LUFFY finished (exit: $?)"
-#wait $PID2; echo "[Round 1] On-policy finished (exit: $?)"
+wait $PID1; echo "[Round 1] OnPolicy finished (exit: $?)"
+wait $PID2; echo "[Round 1] LUFFY finished (exit: $?)"
 
 # ---------- Round 2: CHORD + DUET in parallel ----------
 echo ""
 echo "[Round 2/2] CHORD (GPU 0-3) + DUET (GPU 4-7)"
 echo "============================================"
-#stop_env
-#cleanup_training
-#start_env
+stop_env
+cleanup_training
+start_env
 
-run_experiment "0,1,2,3" "${CONFIG_DIR}/alfworld_7b_chord.yaml" "alfworld_7b_chord" &
+run_experiment "0,1,2,3" "${CONFIG_DIR}/alfworld_qwen3b_chord.yaml" "alfworld_qwen3b_chord" &
 PID3=$!
-run_experiment "4,5,6,7" "${CONFIG_DIR}/alfworld_7b_duet.yaml" "alfworld_7b_duet" &
+run_experiment "4,5,6,7" "${CONFIG_DIR}/alfworld_qwen3b_duet.yaml" "alfworld_qwen3b_duet" &
 PID4=$!
 
 wait $PID3; echo "[Round 2] CHORD finished (exit: $?)"
@@ -91,6 +95,6 @@ stop_env
 cleanup_training
 echo ""
 echo "============================================"
-echo " All ALFWorld 7B experiments done (4 total)."
+echo " All ALFWorld Qwen2.5-3B experiments done."
 echo " $(date '+%Y-%m-%d %H:%M:%S')"
 echo "============================================"

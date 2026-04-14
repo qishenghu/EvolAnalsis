@@ -152,6 +152,12 @@ def parse_args():
         help="[vLLM] Maximum number of sequences processed in parallel (default: vLLM default, typically 256-1024)"
     )
     
+    # ===== 模型特性配置 =====
+    parser.add_argument(
+        "--use_qwen3", action="store_true", default=False,
+        help="Enable Qwen3 native thinking mode (appends /no_think to non-final turns)"
+    )
+
     # ===== 通用生成参数 =====
     parser.add_argument(
         "--temperature", type=float, default=0.6,
@@ -265,7 +271,7 @@ def create_minimal_config(env_name: str, env_url: str, max_steps: int = 30) -> D
                 # Rollout 控制
                 "sparse": True,
                 "debug_llm_io": False,
-                "use_qwen3": False,  # 与 alfworld 配置一致
+                "use_qwen3": args.use_qwen3,
                 "enable_request_id": False,
                 # Multi-turn 配置
                 "multi_turn": {

@@ -80,7 +80,7 @@ def repetition_penalty_reward_scalar(completion, detail=False):
             'has_non_ascii': has_non_ascii(completion),
             'has_repeat': has_repeat(completion.split(), remember_n_words=5, patience_max=10),
             'has_repeat_x': has_repeat(completion, remember_n_words=4, patience_max=200),
-            'has_wrong_sp_token': '<|im_start|>' in completion,
+            'has_wrong_sp_token': '<|im_start|>' in completion or '<|start_header_id|>' in completion,
             # 'non_ascii': {ch for ch in completion if ord(ch) > 127}
         }
         if has_non_ascii(completion):
@@ -91,7 +91,7 @@ def repetition_penalty_reward_scalar(completion, detail=False):
 
         return result
 
-    if '<|im_start|>' in completion:
+    if '<|im_start|>' in completion or '<|start_header_id|>' in completion:
         return -1.0
 
     # if has_non_ascii(completion):
