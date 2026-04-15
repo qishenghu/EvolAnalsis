@@ -110,7 +110,19 @@ FastAPI + Ray Actor Pool (`env_service/`). Each environment (ALFWorld, WebShop, 
 
 ## Teacher Data
 
+### Qwen2.5-72B (existing)
 - ALFWorld: `data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered_react_tags.pkl` (19K trajectories, react_tags format)
 - WebShop: `data/teacher_trajectories/qwen72b/webshop_qwen72b_filtered.pkl` (26K trajectories, react_tags format)
+
+### Qwen3-30B-A3B-Thinking-2507 (new teacher)
+- Model: `models/Qwen/Qwen3-30B-A3B-Thinking-2507` (MoE, qwen3_moe, ~30B total / ~3B active, BF16 ~61GB)
+- Collection: `bash scripts/collect_qwen3_teacher.sh {alfworld|webshop|sciworld|all}`
+- Output: `data/teacher_trajectories/qwen3_30b/{env}_qwen3_30b.jsonl`
+- Guide: `docs/QWEN3_TEACHER_COLLECTION.md`
+- Student: `Qwen3-1.7B` (same vocab/tokenizer, log_probs directly reusable)
+- Training context: 32K (prompt=28672 + response=4096), fits 4×A100-80GB for 1.7B
+
+### General
 - Format conversion: `python scripts/convert_alfworld_react_to_tags.py`
+- Filtering: `python scripts/filter_teacher_trajectories.py --input <raw.jsonl> --output <filtered.jsonl>`
 - If `teacher_experience.enable: true` but data file missing, `ExperienceManager` raises `FileNotFoundError` (fail-fast).

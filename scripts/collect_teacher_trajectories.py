@@ -162,6 +162,12 @@ def parse_args():
         help="Success threshold for evaluate(). None=use env default. "
              "For SciWorld set to 70 (score scale 0-100, matching training config)."
     )
+    parser.add_argument(
+        "--action_format", type=str, default="react_tags",
+        choices=["react", "react_tags"],
+        help="Action format for environment. 'react_tags' uses <think>/<action> XML tags "
+             "(recommended for Qwen3 models), 'react' uses Thought:/Action: text format."
+    )
 
     # ===== 通用生成参数 =====
     parser.add_argument(
@@ -255,11 +261,27 @@ def load_completed_task_ids(output_file: str) -> set:
     return completed
 
 
-def create_minimal_config(env_name: str, env_url: str, max_steps: int = 30) -> DictConfig:
+def create_minimal_config(env_name: str, env_url: str, max_steps: int = 30, use_qwen3: bool = False) -> DictConfig:
     """创建最小配置用于 rollout
-    
-    参考 config/alfworld_grpo_3b.yaml 中的配置
+
+    Qwen3 Thinking 模型的长度配置（对齐训练侧 32K context）：
+    - prompt_length: 28672 (历史对话上下文)
+    - response_length: 4096 (每轮 think+action 生成空间)
+    - max_model_len: 32768 (总 context 上限, 匹配 4×A100-80GB 训练 1.7B 的内存)
+    - max_env_len: 按环境调整 (WebShop 页面内容更长)
     """
+    # Qwen3 Thinking 模型需要更大的 context window
+    if use_qwen3:
+        prompt_length = 28672
+        response_length = 4096
+        max_model_len = 32768
+        max_env_len = 8192 if env_name == "webshop" else 4096
+    else:
+        prompt_length = 20480
+        response_length = 2048
+        max_model_len = 25580
+        max_env_len = 4096
+
     config = OmegaConf.create({
         "env_service": {
             "env_url": env_url,
@@ -270,18 +292,17 @@ def create_minimal_config(env_name: str, env_url: str, max_steps: int = 30) -> D
         },
         "actor_rollout_ref": {
             "rollout": {
-                # ⭐ 关键参数：必须与训练配置一致
-                "prompt_length": 20480,
-                "response_length": 2048,
-                "max_model_len": 25580,
-                "max_env_len": 4096,
+                "prompt_length": prompt_length,
+                "response_length": response_length,
+                "max_model_len": max_model_len,
+                "max_env_len": max_env_len,
                 # Context 管理
                 "context_template": "linear",
                 "context_template_train_sp_action": False,
                 # Rollout 控制
                 "sparse": True,
                 "debug_llm_io": False,
-                "use_qwen3": args.use_qwen3,
+                "use_qwen3": use_qwen3,
                 "enable_request_id": False,
                 # Multi-turn 配置
                 "multi_turn": {
@@ -292,8 +313,8 @@ def create_minimal_config(env_name: str, env_url: str, max_steps: int = 30) -> D
             }
         },
         "data": {
-            "max_prompt_length": 4000,
-            "max_response_length": 21580,
+            "max_prompt_length": prompt_length - 4096,
+            "max_response_length": max_model_len - prompt_length + response_length,
         },
         "exp_manager": {
             "experience_replay": {
@@ -319,6 +340,7 @@ class TeacherRolloutExecutor:
         env_url: str,
         collect_log_prob: bool = True,
         success_threshold: Optional[float] = None,
+        action_format: str = "react_tags",
     ):
         self.teacher_llm = teacher_llm
         self.tokenizer = tokenizer
@@ -326,6 +348,7 @@ class TeacherRolloutExecutor:
         self.env_url = env_url
         self.collect_log_prob = collect_log_prob
         self.success_threshold = success_threshold
+        self.action_format = action_format
         
         # ⭐ 存储每轮 LLM 调用的 log_probs（分轮存储，便于对齐）
         # 格式：[{"turn_idx": int, "log_probs": [...], "token_ids": [...], "tokens": [...]}]
@@ -406,7 +429,7 @@ class TeacherRolloutExecutor:
                 env_type=task.env_type,
                 task_id=task.task_id,
                 instance_id=instance_id,
-                params={'is_open_query': task.open_query}
+                params={'is_open_query': task.open_query, 'action_format': self.action_format}
             )
             
             init_messages: list = init_response["state"]
@@ -428,7 +451,10 @@ class TeacherRolloutExecutor:
             cmt.query = task.query
             
             # 初始化消息
-            add_nothink = self.config.actor_rollout_ref.rollout.get("use_qwen3", True)
+            # ⭐ Teacher 采集时不添加 /no_think：我们需要 teacher 的完整推理过程
+            # 训练时 add_nothink=True 是为了效率（中间步骤不需要长思考），
+            # 但 teacher 采集时恰恰需要完整的 <think>...</think> 内容
+            add_nothink = False
             cmt.save_init_input(init_messages, add_nothink)
             
             # 3. 执行 rollout 循环
@@ -637,7 +663,7 @@ def main():
     logger.info(f"Collect log_prob: {collect_log_prob}")
     
     # 5. 创建配置
-    config = create_minimal_config(args.env, args.env_url, args.max_steps)
+    config = create_minimal_config(args.env, args.env_url, args.max_steps, use_qwen3=args.use_qwen3)
     
     # 6. 创建 Teacher LLM
     from agentevolver.module.teacher import create_teacher_llm
@@ -707,6 +733,7 @@ def main():
             env_url=args.env_url,
             collect_log_prob=collect_log_prob,
             success_threshold=args.success_threshold,
+            action_format=args.action_format,
         )
         
         task = Task(

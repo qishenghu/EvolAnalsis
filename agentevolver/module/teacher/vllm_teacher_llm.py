@@ -156,6 +156,12 @@ class VLLMTeacherLLM(BaseTeacherLLM):
             
             # 提取响应文本
             response_text = output.outputs[0].text
+
+            # ⭐ Qwen3 Thinking 模型的 chat template 会在 prompt 末尾自动追加 "<think>\n"
+            # 作为 generation prompt 的一部分，但 vLLM 的 .text 只包含模型新生成的 token。
+            # 因此需要检测并将 "<think>\n" 前缀补回 response_text，保持完整的推理格式。
+            if prompt.rstrip().endswith("<think>"):
+                response_text = "<think>\n" + response_text
             
             # 提取 log_prob（如果采集）
             metadata = {}

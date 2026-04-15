@@ -2,10 +2,10 @@
 
 ## 概述
 
-使用 `Qwen/Qwen3-30B-A3B-Thinking-2507`（MoE, 3B 活跃参数）作为 teacher 模型，为 Qwen3-1.7B student 模型采集 teacher trajectories。
+使用 `Qwen/Qwen3-30B-A3B-Thinking-2507`（MoE, qwen3_moe, ~30B 总参数 / ~3B 活跃参数, BF16 ~61GB）作为 teacher 模型采集 teacher trajectories。
 
 **所有三个环境统一使用直接 rollout 方式**（teacher 直接与环境交互），而非之前 Qwen2.5-72B 在 WebShop/SciWorld 上使用的 gold action + reasoning synthesis 方式。原因：
-1. Qwen3-30B-Thinking 是 reasoning model，直接 rollout 产出的 thought→action 更连贯
+1. Qwen3-Next-80B-Thinking 是 reasoning model，直接 rollout 产出的 thought→action 更连贯
 2. 合成 reasoning 是后验合理化，不如真实推理自然
 3. 与 Qwen3 student 的 native thinking 风格一致
 
@@ -13,9 +13,10 @@
 
 ## 为什么需要 Qwen3 teacher？
 
-- Qwen3 是 reasoning 模型，有 native thinking mode（`<think>` special tokens）
+- Qwen3-Next-80B 是 reasoning 模型，有 native thinking mode（`<think>` special tokens）
 - Qwen2.5-72B 是普通 instruct 模型，其推理风格可能不适合 Qwen3 student
 - Reasoning teacher + reasoning student = 更自然的知识传递
+- 30B MoE（~3B 活跃）推理速度快，4×H100 轻松跑
 
 ## 环境准备（4xA100-80G 服务器）
 
@@ -31,22 +32,17 @@ source env_config.sh
 ### 2. 下载 Teacher 模型
 
 ```bash
-# Qwen3-30B-A3B-Thinking (~8GB, MoE 模型)
+# Qwen3-30B-A3B-Thinking-2507 (~163GB, MoE 512 experts, BF16)
+# ~61GB, MoE 模型, 4xH100 用 tp=4 或 2xH100 用 tp=2
 huggingface-cli download Qwen/Qwen3-30B-A3B-Thinking-2507 \
-    --local-dir /data/shared_models/Qwen3-30B-A3B-Thinking
-
-# 也下载 student 模型（后续训练用）
-huggingface-cli download Qwen/Qwen3-1.7B \
-    --local-dir /data/shared_models/Qwen3-1.7B
+    --local-dir models/Qwen/Qwen3-30B-A3B-Thinking-2507
 ```
 
-### 3. 下载 Teacher 数据所需的模型（用于 vLLM 推理）
-
-Qwen3-30B-A3B 是 MoE 模型，4x80G 可以轻松跑。vLLM 原生支持 MoE 推理。
+MoE 模型（qwen3_moe），总参数 ~30B（权重 ~61GB），每 token 只激活 ~3B 参数，推理速度很快。vLLM 0.8.5 原生支持。
 
 ## 采样执行
 
-### ALFWorld（2,348 tasks）
+### ALFWorld（800 targeted tasks）
 
 ```bash
 bash start_env_alfworld.sh
@@ -54,7 +50,7 @@ nohup bash scripts/collect_qwen3_teacher.sh alfworld \
     > logs/collect_qwen3_alfworld.log 2>&1 &
 ```
 
-### WebShop（5,691 tasks）
+### WebShop（800 targeted tasks）
 
 ```bash
 bash start_env_webshop.sh
@@ -112,7 +108,7 @@ data/teacher_trajectories/qwen3_30b/
     ],
     "reward": 1.0,
     "success": true,
-    "teacher_model": "Qwen3-30B-A3B-Thinking",
+    "teacher_model": "Qwen3-30B-A3B-Thinking-2507",
     "log_probs": [...],
     "log_probs_per_turn": [...]
 }
@@ -132,7 +128,7 @@ data/teacher_trajectories/qwen3_30b/
 
 如果某个环境成功率过低（<30%），考虑退回 gold action + synthesis 方式。
 
-Qwen3-30B-A3B-Thinking 是 reasoning 模型，预期比 Qwen2.5-72B 有更高的成功率（尤其在需要推理的任务上）。
+Qwen3-30B-A3B-Thinking-2507 是 reasoning 模型，预期比 Qwen2.5-72B 有更高的成功率（尤其在需要推理的任务上）。
 
 ## 后续步骤
 
@@ -143,7 +139,7 @@ Qwen3-30B-A3B-Thinking 是 reasoning 模型，预期比 Qwen2.5-72B 有更高的
 
 ## 故障排查
 
-- **vLLM OOM**：Qwen3-30B-A3B MoE 只有 3B 活跃参数，4x80G 应该不会 OOM。如果 OOM，减少 `--max_workers`
+- **vLLM OOM**：Qwen3-30B MoE 只有 ~3B 活跃参数，4xH100-80G 不会 OOM。如果 OOM，减少 `--max_workers`
 - **环境连接失败**：确认 env_service 在对应端口运行（ALFWorld: 8081, WebShop: 8083）
 - **采样中断**：脚本支持断点续传（`--save_every`），重新运行会跳过已采集的 task
 - **成功率过低**：检查 `logs/collect_qwen3_*.log` 中的轨迹样本，确认模型输出格式正确

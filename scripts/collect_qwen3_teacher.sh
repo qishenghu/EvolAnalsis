@@ -2,18 +2,18 @@
 # ==============================================================================
 # Qwen3 Teacher Trajectory Collection (Direct Rollout, Targeted 800 Tasks)
 #
-# Collects teacher trajectories from Qwen3-30B-A3B-Thinking via direct rollout.
+# Collects teacher trajectories from Qwen3-30B-A3B-Thinking-2507 via direct rollout.
 # All environments use the same approach: teacher interacts with env directly.
 # Only the 800 tasks matching training config (seed=2026, max_train_tasks=800)
 # are collected, for efficiency.
 #
-# Run on a 4xA100-80G server while main experiments run on the 8xA100 server.
+# Run on a 4xH100-80G server.
 #
 # Prerequisites:
 #   1. Clone repo and install environment (bash setup_envs.sh)
 #   2. Download teacher model:
 #      huggingface-cli download Qwen/Qwen3-30B-A3B-Thinking-2507 \
-#          --local-dir /data/shared_models/Qwen3-30B-A3B-Thinking
+#          --local-dir models/Qwen/Qwen3-30B-A3B-Thinking-2507
 #   3. Start the target environment (ALFWorld, WebShop, or SciWorld)
 #
 # Usage:
@@ -36,7 +36,7 @@ eval "$(conda shell.bash hook)"
 conda activate "${CONDA_ENV_DUET}"
 
 # ===== Configuration =====
-TEACHER_MODEL="/data/shared_models/Qwen3-30B-A3B-Thinking"
+TEACHER_MODEL="${PROJECT_ROOT}/models/Qwen/Qwen3-30B-A3B-Thinking-2507"
 OUTPUT_DIR="data/teacher_trajectories/qwen3_30b"
 MAX_WORKERS=8             # Parallel workers
 TEMPERATURE=0.6
@@ -94,6 +94,7 @@ collect_env() {
         --task_file $TASK_FILE \
         --output $OUTPUT_FILE \
         --use_qwen3 \
+        --action_format react_tags \
         --n_per_task $MAX_ATTEMPTS \
         --stop_on_success \
         --filter_success \
