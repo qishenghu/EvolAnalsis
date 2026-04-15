@@ -6,7 +6,7 @@
 - log_probs: 1804 tokens
 - total messages: 6
 
-### \[0\] System
+### [0] System
 
 <details><summary>System prompt (click to expand)</summary>
 
@@ -39,11 +39,13 @@ You must respond using the XML tag format shown above. Do NOT respond with JSON.
 
 </details>
 
-### \[1\] Assistant
+### [1] Assistant
 
+```
 OK. I'll help you find and purchase the item according to your requirements.
+```
 
-### \[2\] User / Environment
+### [2] User / Environment
 
 ```
 WebShop [SEP] Instruction: [SEP] Find me machine wash men's pants with relaxed fit with color: grey, and size: 40w x 34l, and price lower than 70.00 dollars [SEP] Search
@@ -52,8 +54,9 @@ You can use: search[your query]
 Clickable elements: ['search']
 ```
 
-### \[3\] Assistant
+### [3] Assistant
 
+```
 <think>
 Okay, let's see. The user wants to find machine wash men's pants with a relaxed fit, grey color, size 40w x 34l, and under $70. The available actions are search or click, but the clickable elements here are just ['search'], so I need to use the search action.
 
@@ -79,8 +82,9 @@ To find the desired pants, I need to create a search query that includes all the
 <action>
 search[machine washable men's pants relaxed fit grey size 40w 34l under 70]
 </action>
+```
 
-### \[4\] User / Environment
+### [4] User / Environment
 
 ```
 Invalid action format. Please use the format: '<think>\n your thoughts.\n</think>\n<action>\n search[query]\n</action>' or '<think>\n your thoughts.\n</think>\n<action>\n click[element]\n</action>'.
@@ -89,8 +93,9 @@ You can use: search[your query]
 Clickable elements: ['search']
 ```
 
-### \[5\] Assistant
+### [5] Assistant
 
+```
 <think>
 Okay, the user wants machine wash men's pants that are relaxed fit, grey, size 40w x 34l, under $70. Let me check the previous action. The first attempt used search[machine washable men's pants relaxed fit grey size 40w 34l under 70], but the system said invalid format.
 
@@ -177,6 +182,7 @@ The user is looking for machine washable men's pants with specific attributes. T
 <action>
 search[machine wash men's pants relaxed fit grey 40w 34l under 70]
 </action>
+```
 
 ---
 
@@ -186,7 +192,7 @@ search[machine wash men's pants relaxed fit grey 40w 34l under 70]
 - log_probs: 3533 tokens
 - total messages: 6
 
-### \[0\] System
+### [0] System
 
 <details><summary>System prompt (click to expand)</summary>
 
@@ -219,11 +225,13 @@ You must respond using the XML tag format shown above. Do NOT respond with JSON.
 
 </details>
 
-### \[1\] Assistant
+### [1] Assistant
 
+```
 OK. I'll help you find and purchase the item according to your requirements.
+```
 
-### \[2\] User / Environment
+### [2] User / Environment
 
 ```
 WebShop [SEP] Instruction: [SEP] Find me double sided, easy clean, easy use hair extensions, wigs & accessories for hair extensions, and price lower than 30.00 dollars [SEP] Search
@@ -232,8 +240,9 @@ You can use: search[your query]
 Clickable elements: ['search']
 ```
 
-### \[3\] Assistant
+### [3] Assistant
 
+```
 <think>
 Okay, let's see. The user wants double-sided, easy clean, easy use hair extensions, wigs & accessories priced under $30. The available actions are search and clickable elements, which only have 'search' listed.
 
@@ -270,8 +279,9 @@ I need to search for hair extensions that are double-sided, easy to clean, easy 
 search[double sided easy clean easy use hair extensions under 30]
 </action>
 ```
+```
 
-### \[4\] User / Environment
+### [4] User / Environment
 
 ```
 Invalid action format. Please use the format: '<think>\n your thoughts.\n</think>\n<action>\n search[query]\n</action>' or '<think>\n your thoughts.\n</think>\n<action>\n click[element]\n</action>'.
@@ -280,8 +290,9 @@ You can use: search[your query]
 Clickable elements: ['search']
 ```
 
-### \[5\] Assistant
+### [5] Assistant
 
+```
 <think>
 Okay, let's see. The user wants double-sided, easy clean, easy use hair extensions, wigs, and accessories under $30. The previous attempt used "double sided easy clean easy use hair extensions under 30" but the system said the action format was invalid. Wait, the user mentioned the format should be exactly 'search[query]' without any extra text. Maybe the error was because of the way the query was structured.
 
@@ -483,6 +494,7 @@ The previous search query missed including "wigs" and "accessories" as specified
 <action>
 search[double sided easy clean easy use hair extensions wigs accessories under 30]
 </action>
+```
 ```
 
 ---
