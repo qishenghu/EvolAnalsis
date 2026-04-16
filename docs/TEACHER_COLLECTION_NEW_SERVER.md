@@ -89,13 +89,12 @@ pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 pip install vllm==0.8.5
 pip install transformers huggingface_hub loguru omegaconf tqdm jieba
 
-# WebShop 环境
-conda create -n agentenv-webshop python=3.9 -y
+# WebShop 环境 (python 3.8, 需要 Java + pyserini + 搜索索引)
+conda create -n agentenv-webshop python=3.8 -y
 conda activate agentenv-webshop
+conda install -c conda-forge openjdk=11 -y        # Java FIRST (pyserini depends on it)
 cd AgentGym/agentenv-webshop
-pip install -e .
-# WebShop 需要 Java:
-conda install -c conda-forge openjdk=11 -y
+bash setup.sh      # 完整安装: requirements.txt → pyserini → 搜索索引构建 → pip install -e .
 
 # SciWorld 环境
 conda create -n agentenv-sciworld python=3.8 -y

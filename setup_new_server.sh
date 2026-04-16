@@ -79,19 +79,41 @@ echo "=== Step 2: Setting up WebShop environment ==="
 if conda env list | grep -q "^agentenv-webshop "; then
     echo "  'agentenv-webshop' env already exists"
 else
-    echo "  Creating 'agentenv-webshop' env..."
-    conda create -n agentenv-webshop python=3.9 -y
+    echo "  Creating 'agentenv-webshop' env (python 3.8, matching requirement)..."
+    conda create -n agentenv-webshop python=3.8 -y
     conda activate agentenv-webshop
+
+    # Java is required FIRST — pyserini depends on it
+    echo "  Installing Java (required by pyserini/Lucene)..."
+    conda install -c conda-forge openjdk=11 -y
+
     if [ -d "$SCRIPT_DIR/AgentGym/agentenv-webshop" ]; then
         cd "$SCRIPT_DIR/AgentGym/agentenv-webshop"
-        pip install -q -e .
+
+        # Full setup: install deps, build search index, then install package
+        # This follows AgentGym/agentenv-webshop/setup.sh
+        echo "  Installing WebShop dependencies (incl. pyserini, spacy)..."
+        cd webshop
+        pip install -r requirements.txt
+        pip install -U "Werkzeug>=2,<3" "typing_extensions<4.6.0" "gym==0.23.1"
+        pip install en-core-web-lg@https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.3.0/en_core_web_lg-3.3.0-py3-none-any.whl
+
+        # Build Lucene search indexes (pyserini)
+        echo "  Building search indexes (this may take a few minutes)..."
+        cd search_engine
+        mkdir -p resources resources_100 resources_1k resources_100k
+        python convert_product_file_format.py
+        mkdir -p indexes indexes_100 indexes_1k indexes_100k
+        bash run_indexing.sh
+        cd ../..
+
+        # Install the agentenv-webshop package
+        pip install -e .
         cd "$SCRIPT_DIR"
     else
-        echo "  WARNING: AgentGym/agentenv-webshop not found. Install manually."
+        echo "  WARNING: AgentGym/agentenv-webshop not found."
+        echo "  You need to set it up manually. See setup.sh in that directory."
     fi
-    # Java for WebShop
-    conda install -c conda-forge openjdk=11 -y 2>/dev/null || \
-        echo "  WARNING: Failed to install Java. Install manually."
 fi
 
 # ===== Step 3: SciWorld environment =====
