@@ -27,10 +27,15 @@
   }
 
   html, body {
+    margin: 0;
+    padding: 0;
     background: var(--paper);
+    overflow: hidden;
   }
 
   .reveal-viewport { background: var(--paper); }
+  .reveal .slides > section,
+  .reveal .slides > section > section { overflow: hidden; box-sizing: border-box; }
 
   .reveal {
     font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
@@ -39,7 +44,7 @@
     -moz-osx-font-smoothing: grayscale;
   }
   .reveal .slides { text-align: left; }
-  .reveal .slides section { padding: 40px 60px 44px 60px; }
+  .reveal .slides section { padding: 48px 64px 52px 64px; max-width: 100%; }
 
   /* typography */
   .reveal h1, .reveal h2, .reveal h3, .reveal .display {
@@ -50,12 +55,12 @@
     line-height: 1.15;
     text-transform: none;
   }
-  .reveal h1 { font-size: 2.2em; font-weight: 400; }
-  .reveal h2 { font-size: 1.7em; font-weight: 400; margin: 0 0 0.55em 0; }
-  .reveal h3 { font-size: 1.05em; font-weight: 400; color: var(--ink-soft); margin: 0; }
+  .reveal h1 { font-size: 2.4em; font-weight: 400; }
+  .reveal h2 { font-size: 1.95em; font-weight: 400; margin: 0 0 0.55em 0; }
+  .reveal h3 { font-size: 1.2em; font-weight: 400; color: var(--ink-soft); margin: 0; }
 
   .reveal p, .reveal li, .reveal td, .reveal th {
-    font-size: 0.72em;
+    font-size: 0.85em;
     line-height: 1.55;
     color: var(--ink);
     font-weight: 400;
@@ -66,10 +71,10 @@
   /* section label (top-right) */
   .section-label {
     position: absolute;
-    top: 32px;
-    right: 60px;
+    top: 36px;
+    right: 64px;
     font-family: "Inter", sans-serif;
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 500;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -126,7 +131,7 @@
   }
   .reveal thead th {
     font-family: "Inter", sans-serif;
-    font-size: 0.62em;
+    font-size: 0.72em;
     font-weight: 600;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -195,7 +200,7 @@
 
   .panel-label {
     font-family: "Inter", sans-serif;
-    font-size: 0.55em;
+    font-size: 0.62em;
     font-weight: 600;
     letter-spacing: 0.12em;
     text-transform: uppercase;
@@ -223,7 +228,7 @@
 
   /* figure */
   .reveal img {
-    max-height: 420px;
+    max-height: 380px;
     max-width: 100%;
     width: auto;
     margin: 10px auto;
@@ -233,7 +238,7 @@
   .caption {
     font-family: "Source Serif 4", serif;
     font-style: italic;
-    font-size: 0.64em;
+    font-size: 0.74em;
     color: var(--ink-soft);
     text-align: center;
     margin-top: 8px;
@@ -321,13 +326,13 @@
   /* page footer */
   .page-footer {
     position: absolute;
-    bottom: 20px;
-    left: 60px;
-    right: 60px;
+    bottom: 22px;
+    left: 64px;
+    right: 64px;
     display: flex;
     justify-content: space-between;
     font-family: "Inter", sans-serif;
-    font-size: 12px;
+    font-size: 14px;
     color: var(--muted);
     letter-spacing: 0.05em;
   }
@@ -339,7 +344,7 @@
 
   /* notes under tables */
   .note {
-    font-size: 0.6em;
+    font-size: 0.68em;
     color: var(--muted);
     font-style: italic;
     margin-top: 10px;
@@ -1066,11 +1071,13 @@ Reveal.initialize({
   transition: 'fade',
   transitionSpeed: 'fast',
   slideNumber: 'c/t',
-  width: 1280,
+  width: 1200,
   height: 720,
-  margin: 0.04,
+  margin: 0.08,
   minScale: 0.2,
   maxScale: 2.0,
+  embedded: false,
+  display: 'block',
 });
 </script>
 </body>
