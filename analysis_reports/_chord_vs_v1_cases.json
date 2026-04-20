@@ -1,0 +1,357 @@
+[
+  {
+    "task_idx": 68,
+    "instruction": "Find me wash cold, machine wash women's suiting & blazers with button closure, polyester spandex, long sleeve with color: lavender, and size: x-small, and price lower than 70.00 dollars",
+    "required": {
+      "color": "lavender",
+      "size": "x-small"
+    },
+    "variants": {
+      "CHORD": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 6,
+        "n_option_clicks": 3,
+        "unique_opts": [
+          "lavender",
+          "x-small"
+        ],
+        "actions": [
+          "search[women's suiting & blazers with button closure, polyester spandex, long sleeve, lavender, x-small, price: less than 70.00 dollars]",
+          "click[b08dxl22jn]",
+          "click[lavender]",
+          "click[lavender]",
+          "click[x-small]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      },
+      "v1": {
+        "reward": -0.10000000149011612,
+        "score": -0.10000000149011612,
+        "n_turns": 2,
+        "n_option_clicks": 0,
+        "unique_opts": [],
+        "actions": [
+          null,
+          null
+        ],
+        "product_click_step": null,
+        "first_option_step": null
+      },
+      "v24": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 5,
+        "n_option_clicks": 2,
+        "unique_opts": [
+          "lavender",
+          "x-small"
+        ],
+        "actions": [
+          "search[wash cold, machine wash women's suiting & blazers with button closure, polyester spandex, long sleeve, lavender, x-small, price: $70.00 or less]",
+          "click[b08dxl22jn]",
+          "click[lavender]",
+          "click[x-small]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      }
+    }
+  },
+  {
+    "task_idx": 150,
+    "instruction": "Find me machine wash men's dress shirts with cotton spandex, classic fit, short sleeve with color: bright cobalt, and size: x-large tall, and price lower than 50.00 dollars",
+    "required": {
+      "color": "bright cobalt",
+      "size": "x-large tall"
+    },
+    "variants": {
+      "CHORD": {
+        "reward": 0.8571428656578064,
+        "score": 0.8571428656578064,
+        "n_turns": 5,
+        "n_option_clicks": 2,
+        "unique_opts": [
+          "x-large tall"
+        ],
+        "actions": [
+          "search[bright cobalt men's dress shirts x-large tall]",
+          "click[b07hrfsnl4]",
+          "click[x-large tall]",
+          "click[x-large tall]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      },
+      "v1": {
+        "reward": -0.10000000149011612,
+        "score": -0.10000000149011612,
+        "n_turns": 2,
+        "n_option_clicks": 0,
+        "unique_opts": [],
+        "actions": [
+          null,
+          null
+        ],
+        "product_click_step": null,
+        "first_option_step": null
+      },
+      "v24": {
+        "reward": 0.8571428656578064,
+        "score": 0.8571428656578064,
+        "n_turns": 5,
+        "n_option_clicks": 2,
+        "unique_opts": [
+          "bright cobalt"
+        ],
+        "actions": [
+          "search[Find me machine wash men's dress shirts with cotton spandex, classic fit, short sleeve with color: bright cobalt, and size: x-large tall, and price lower than 50.00 dollars]",
+          "click[b07hrfsnl4]",
+          "click[bright cobalt]",
+          "click[bright cobalt]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      }
+    }
+  },
+  {
+    "task_idx": 194,
+    "instruction": "Find me men's t-shirts & tanks with short sleeve, fashion design, long sleeve, button closure with color: e-white, and size: 5x-large, and price lower than 30.00 dollars",
+    "required": {
+      "color": "e-white",
+      "size": "5x-large"
+    },
+    "variants": {
+      "CHORD": {
+        "reward": 0.8571428656578064,
+        "score": 0.8571428656578064,
+        "n_turns": 4,
+        "n_option_clicks": 1,
+        "unique_opts": [
+          "e-white"
+        ],
+        "actions": [
+          "search[e-white men's t-shirts & tanks with short sleeve, long sleeve, button closure, size: 5x-large, color: e-white, price: less than 30.00 dollars]",
+          "click[b078wsnd96]",
+          "click[e-white]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      },
+      "v1": {
+        "reward": -0.10000000149011612,
+        "score": -0.10000000149011612,
+        "n_turns": 2,
+        "n_option_clicks": 0,
+        "unique_opts": [],
+        "actions": [
+          "search[e-white, long sleeve, button closure, 5x-large, price:30.00-] and size:5x-large, price:30.00-]",
+          "search[e-white, long sleeve, button closure, 5x-large, price:30.00-] and size:5x-large, price:30.00-"
+        ],
+        "product_click_step": null,
+        "first_option_step": null
+      },
+      "v24": {
+        "reward": 0.5714285969734192,
+        "score": 0.5714285969734192,
+        "n_turns": 5,
+        "n_option_clicks": 2,
+        "unique_opts": [
+          "large",
+          "light blue"
+        ],
+        "actions": [
+          "search[Men's t-shirts & tanks with short sleeve, fashion design, long sleeve, button closure, color: e-white, size: 5x-large, price: $30.00 or less]",
+          "click[b09qqp3356]",
+          "click[light blue]",
+          "click[large]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      }
+    }
+  },
+  {
+    "task_idx": 88,
+    "instruction": "Find me long lasting, high quality hair loss products with color: fs4 | 30, and price lower than 60.00 dollars",
+    "required": {
+      "color": "fs4 | 30"
+    },
+    "variants": {
+      "CHORD": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 4,
+        "n_option_clicks": 1,
+        "unique_opts": [
+          "fs4 | 30"
+        ],
+        "actions": [
+          "search[long lasting hair loss products with color: fs4 | 30 and price lower than 60.00 dollars]",
+          "click[b07bb1fjv8]",
+          "click[fs4 | 30]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      },
+      "v1": {
+        "reward": 0.05000000074505806,
+        "score": 0.05000000074505806,
+        "n_turns": 3,
+        "n_option_clicks": 0,
+        "unique_opts": [],
+        "actions": [
+          "search[fs4 hair loss products with high quality lasting and price lower than 60 dollars]",
+          "click[B09SHRV5JW]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": null
+      },
+      "v24": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 4,
+        "n_option_clicks": 1,
+        "unique_opts": [
+          "fs4 | 30"
+        ],
+        "actions": [
+          "search[long lasting hair loss products with color: fs4 | 30 and price less than 60.00 dollars]",
+          "click[b07bb1fjv8]",
+          "click[fs4 | 30]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      }
+    }
+  },
+  {
+    "task_idx": 64,
+    "instruction": "Find me long lasting, moisture wicking, loose fit men's shorts with elastic waistband, quality materials, polyester cotton, short sleeve with color: black, and size: 3x-large, and price lower than 40.00 dollars",
+    "required": {
+      "color": "black",
+      "size": "3x-large"
+    },
+    "variants": {
+      "CHORD": {
+        "reward": 0.8999999761581421,
+        "score": 0.8999999761581421,
+        "n_turns": 5,
+        "n_option_clicks": 2,
+        "unique_opts": [
+          "3x-large"
+        ],
+        "actions": [
+          "search[long lasting moisture wicking loose fit men's shorts with elastic waistband quality materials polyester cotton short sleeve color black size 3x-large price less than 40.00 dollars]",
+          "click[b09q5zhrvm]",
+          "click[3x-large]",
+          "click[3x-large]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      },
+      "v1": {
+        "reward": 0.10000000149011612,
+        "score": 0.10000000149011612,
+        "n_turns": 3,
+        "n_option_clicks": 0,
+        "unique_opts": [],
+        "actions": [
+          "search[men's shorts with elastic waistband, moisture wicking, polyester cotton, short sleeve, size: 3x-large, color: black, price: less than 40.00 dollars]",
+          "click[B092T8CY89]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": null
+      },
+      "v24": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 5,
+        "n_option_clicks": 2,
+        "unique_opts": [
+          "3x-large",
+          "black"
+        ],
+        "actions": [
+          "search[Long lasting moisture wicking loose fit men's shorts with elastic waistband quality materials polyester cotton short sleeve size 3x-large color black price less than 40.00 dollars]",
+          "click[b09q5zhrvm]",
+          "click[black]",
+          "click[3x-large]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      }
+    }
+  },
+  {
+    "task_idx": 178,
+    "instruction": "Find me easy clean sofa tables with solid wood for living room with color: brown, and price lower than 270.00 dollars",
+    "required": {
+      "color": "brown"
+    },
+    "variants": {
+      "CHORD": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 4,
+        "n_option_clicks": 1,
+        "unique_opts": [
+          "brown"
+        ],
+        "actions": [
+          "search[Easy clean sofa tables with solid wood for living room, color: brown, price: lower than 270.00 dollars]",
+          "click[b079n3vlrj]",
+          "click[brown]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      },
+      "v1": {
+        "reward": 0.4000000059604645,
+        "score": 0.4000000059604645,
+        "n_turns": 3,
+        "n_option_clicks": 0,
+        "unique_opts": [],
+        "actions": [
+          "search[solid wood sofa tables with brown color and price lower than 270.00 dollars]",
+          "click[B084HBQYTD]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": null
+      },
+      "v24": {
+        "reward": 1.0,
+        "score": 1.0,
+        "n_turns": 4,
+        "n_option_clicks": 1,
+        "unique_opts": [
+          "brown"
+        ],
+        "actions": [
+          "search[Easy clean sofa tables with solid wood for living room with color: brown and price lower than 270.00 dollars]",
+          "click[b079n3vlrj]",
+          "click[brown]",
+          "click[buy now]"
+        ],
+        "product_click_step": 1,
+        "first_option_step": 2
+      }
+    }
+  }
+]

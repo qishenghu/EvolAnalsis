@@ -1,0 +1,377 @@
+[
+  {
+    "task_idx": 5,
+    "instruction": "Find me slim fit men's henleys with short sleeve with color: 155- yellow, and size: x-large, and price lower than 40.00 dollars",
+    "required": {
+      "color": "155- yellow",
+      "size": "x-large",
+      "price_max": 40.0
+    },
+    "v1": {
+      "reward": 0.6000000238418579,
+      "score": 0.6000000238418579,
+      "n_turns": 3,
+      "unique_opts": [],
+      "actions": [
+        "search[slim fit men's henley with short sleeve, color: yellow, size: x-large, price: lower than 40.00 dollars]",
+        "click[B09QQP3356]",
+        "click[buy now]"
+      ]
+    },
+    "v8": {
+      "reward": 0.800000011920929,
+      "score": 0.800000011920929,
+      "n_turns": 4,
+      "unique_opts": [
+        "x-large"
+      ],
+      "actions": [
+        "search[slim fit men's henleys with short sleeve with color: 155- yellow and size: x-large and price lower than 40.00 dollars]",
+        "click[b09r9ycm6r]",
+        "click[x-large]",
+        "click[buy now]"
+      ]
+    },
+    "v12": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 2,
+      "unique_opts": [],
+      "actions": [
+        null,
+        null
+      ]
+    },
+    "v24": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 5,
+      "unique_opts": [
+        "155- yellow",
+        "x-large"
+      ],
+      "actions": [
+        "search[Find me slim fit men's henleys with short sleeve with color: 155- yellow, and size: x-large, and price lower than 40.00 dollars]",
+        "click[b09r9ycm6r]",
+        "click[155- yellow]",
+        "click[x-large]",
+        "click[buy now]"
+      ]
+    },
+    "CHORD": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 6,
+      "unique_opts": [
+        "155- yellow",
+        "x-large"
+      ],
+      "actions": [
+        "search[slim fit men's henleys with short sleeve with color: 155- yellow, size: x-large, price: lower than 40.00 dollars]",
+        "click[b09r9ycm6r]",
+        "click[155- yellow]",
+        "click[x-large]",
+        "click[x-large]",
+        "click[buy now]"
+      ]
+    }
+  },
+  {
+    "task_idx": 9,
+    "instruction": "Find me loose fit, day comfort, hand wash women's tops, tees & blouses with short sleeve, polyester spandex for teen girls with color: a2-white, and size: x-large, and price lower than 30.00 dollars",
+    "required": {
+      "color": "a2-white",
+      "size": "x-large",
+      "price_max": 30.0
+    },
+    "v1": {
+      "reward": 0.5555555820465088,
+      "score": 0.5555555820465088,
+      "n_turns": 4,
+      "unique_opts": [
+        "x-large"
+      ],
+      "actions": [
+        "search[a2-white women's tops with short sleeve, polyester spandex, loose fit, day comfort, hand wash, teen girls, size: x-large, price lower than 30.00 dollars]",
+        "click[B09QQP3356]",
+        "click[x-large]",
+        "click[buy now]"
+      ]
+    },
+    "v8": {
+      "reward": 0.7777777910232544,
+      "score": 0.7777777910232544,
+      "n_turns": 3,
+      "unique_opts": [],
+      "actions": [
+        "search[a2-white x-large polyester spandex women's tops with short sleeve hand wash tees and blouses for teen girls price lower than 30.00 dollars]",
+        "click[b09npml43m]",
+        "click[buy now]"
+      ]
+    },
+    "v12": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 3,
+      "unique_opts": [],
+      "actions": [
+        "search[loose fit day comfort hand wash women's tops, tees & blouses with short sleeve, polyester spandex for teen girls with color: a2-white, and size: x-large, and price lower than 30.00 dollars]",
+        null,
+        null
+      ]
+    },
+    "v24": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 5,
+      "unique_opts": [
+        "a2-white",
+        "x-large"
+      ],
+      "actions": [
+        "search[a2-white x-large women's tops polyester spandex for teen girls with color: a2-white and size: x-large and price: less than 30.00 dollars]",
+        "click[b09npml43m]",
+        "click[a2-white]",
+        "click[x-large]",
+        "click[buy now]"
+      ]
+    },
+    "CHORD": {
+      "reward": 0.5555555820465088,
+      "score": 0.5555555820465088,
+      "n_turns": 4,
+      "unique_opts": [
+        "x-large"
+      ],
+      "actions": [
+        "search[a2-white x-large women's tops with short sleeve, polyester spandex, hand wash, day comfort, loose fit, size: x-large, price: less than 30.00 dollars]",
+        "click[b09qqp3356]",
+        "click[x-large]",
+        "click[buy now]"
+      ]
+    }
+  },
+  {
+    "task_idx": 14,
+    "instruction": "Find me quick drying, moisture wicking women's activewear with long sleeve with color: c-navy blue, and size: large, and price lower than 40.00 dollars",
+    "required": {
+      "color": "c-navy blue",
+      "size": "large",
+      "price_max": 40.0
+    },
+    "v1": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 5,
+      "unique_opts": [
+        "c-navy blue"
+      ],
+      "actions": [
+        "search[c-navy blue women's activewear with long sleeve, size: large, price: less than 40.00 dollars]",
+        "click[b08jd14gjf]",
+        "click[c-navy blue]",
+        "click[b08jd14gjf]",
+        "search[b08jd14gjf]"
+      ]
+    },
+    "v8": {
+      "reward": 0.6166666746139526,
+      "score": 0.6166666746139526,
+      "n_turns": 4,
+      "unique_opts": [],
+      "actions": [
+        "search[quick drying moisture wicking women's activewear with long sleeve color: c-navy blue size: large price lower than 40.00 dollars]",
+        "click[b08jd14gjf]",
+        "click[b08jd14gjf]",
+        "click[buy now]"
+      ]
+    },
+    "v12": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 2,
+      "unique_opts": [],
+      "actions": [
+        null,
+        "=search[Women's activewear with long sleeve, color: c-navy blue, size: large, and price lower than 40.00 dollars]"
+      ]
+    },
+    "v24": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 5,
+      "unique_opts": [
+        "c-navy blue",
+        "large"
+      ],
+      "actions": [
+        "search[Quick Drying Moisture Wicking Women's Activewear with Long Sleeve Color: Navy Blue Size: Large Price: $40.00 and Below]",
+        "click[b08jd14gjf]",
+        "click[c-navy blue]",
+        "click[large]",
+        "click[buy now]"
+      ]
+    },
+    "CHORD": {
+      "reward": 0.8333333134651184,
+      "score": 0.8333333134651184,
+      "n_turns": 4,
+      "unique_opts": [
+        "large"
+      ],
+      "actions": [
+        "search[c-navy blue long sleeve women's activewear with moisture wicking and size large]",
+        "click[b08jd14gjf]",
+        "click[large]",
+        "click[buy now]"
+      ]
+    }
+  },
+  {
+    "task_idx": 65,
+    "instruction": "Find me machine wash men's t-shirts with long sleeve with color: mossy oak bottomland, and size: 5x-large big, and price lower than 70.00 dollars",
+    "required": {
+      "color": "mossy oak bottomland",
+      "size": "5x-large big",
+      "price_max": 70.0
+    },
+    "v1": {
+      "reward": 0.6000000238418579,
+      "score": 0.6000000238418579,
+      "n_turns": 3,
+      "unique_opts": [],
+      "actions": [
+        "search[machine wash men's t-shirts with long sleeve, color: mossy oak bottomland, size: 5x-large big, price lower than 70.00 dollars]",
+        "click[B00O30JLDK]",
+        "click[buy now]"
+      ]
+    },
+    "v8": {
+      "reward": 0.6000000238418579,
+      "score": 0.6000000238418579,
+      "n_turns": 3,
+      "unique_opts": [],
+      "actions": [
+        "search[machine wash men's t-shirts with long sleeve with color: mossy oak bottomland and size: 5x-large big and price lower than 70.00 dollars]",
+        "click[b00o30jldk]",
+        "click[buy now]"
+      ]
+    },
+    "v12": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 2,
+      "unique_opts": [],
+      "actions": [
+        null,
+        null
+      ]
+    },
+    "v24": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 5,
+      "unique_opts": [
+        "5x-large big",
+        "mossy oak bottomland"
+      ],
+      "actions": [
+        "search[machine wash men's t-shirts with long sleeve with color: mossy oak bottomland and size: 5x-large big and price lower than 70.00 dollars]",
+        "click[b00o30jldk]",
+        "click[mossy oak bottomland]",
+        "click[5x-large big]",
+        "click[buy now]"
+      ]
+    },
+    "CHORD": {
+      "reward": 0.6000000238418579,
+      "score": 0.6000000238418579,
+      "n_turns": 7,
+      "unique_opts": [
+        "army"
+      ],
+      "actions": [
+        "search[machine wash men's t-shirts with long sleeve color: mossy oak bottomland size: 5x-large big, price: lower than 70.00 dollars]",
+        "click[b00o30jldk]",
+        "click[army]",
+        "click[army]",
+        "click[army]",
+        "click[army]",
+        "click[buy now]"
+      ]
+    }
+  },
+  {
+    "task_idx": 68,
+    "instruction": "Find me wash cold, machine wash women's suiting & blazers with button closure, polyester spandex, long sleeve with color: lavender, and size: x-small, and price lower than 70.00 dollars",
+    "required": {
+      "color": "lavender",
+      "size": "x-small",
+      "price_max": 70.0
+    },
+    "v1": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 2,
+      "unique_opts": [],
+      "actions": [
+        null,
+        null
+      ]
+    },
+    "v8": {
+      "reward": 0.75,
+      "score": 0.75,
+      "n_turns": 3,
+      "unique_opts": [],
+      "actions": [
+        "search[wash cold, machine wash women's suiting & blazers with button closure, polyester spandex, long sleeve, lavender, x-small, price lower than 70.00 dollars]",
+        "click[b08dxl22jn]",
+        "click[Buy Now]"
+      ]
+    },
+    "v12": {
+      "reward": -0.10000000149011612,
+      "score": -0.10000000149011612,
+      "n_turns": 2,
+      "unique_opts": [],
+      "actions": [
+        "search[women's suiting & blazers with button closure, polyester spandex, long sleeve, color: lavender, and size: x-small, price: $70.00 and below",
+        "<think\n> <click[contains=\"search\"]/>\n</think>\n<think\n>Please wait for the search result to load.\n</think>\n<think\nI will look for the item \"women's suiting & blazers with button closure, polyester spandex, long sleeve, color: lavender, and size: x-small\" in the search result.\n</think>\n<action>search[women's suiting & blazers with button closure, polyester spandex, long sleeve, color: lavender, and size: x-small, price: $70.00 and below]"
+      ]
+    },
+    "v24": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 5,
+      "unique_opts": [
+        "lavender",
+        "x-small"
+      ],
+      "actions": [
+        "search[wash cold, machine wash women's suiting & blazers with button closure, polyester spandex, long sleeve, lavender, x-small, price: $70.00 or less]",
+        "click[b08dxl22jn]",
+        "click[lavender]",
+        "click[x-small]",
+        "click[buy now]"
+      ]
+    },
+    "CHORD": {
+      "reward": 1.0,
+      "score": 1.0,
+      "n_turns": 6,
+      "unique_opts": [
+        "lavender",
+        "x-small"
+      ],
+      "actions": [
+        "search[women's suiting & blazers with button closure, polyester spandex, long sleeve, lavender, x-small, price: less than 70.00 dollars]",
+        "click[b08dxl22jn]",
+        "click[lavender]",
+        "click[lavender]",
+        "click[x-small]",
+        "click[buy now]"
+      ]
+    }
+  }
+]
