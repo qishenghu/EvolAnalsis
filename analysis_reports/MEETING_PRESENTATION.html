@@ -2,607 +2,1053 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>DUET WebShop 1.5B 深度复盘 · 2026-04-20</title>
+<title>DUET · 1.5B WebShop Deep-Dive — 2026-04-20</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.5.0/dist/reset.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.5.0/dist/reveal.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@4.5.0/dist/theme/white.css" id="theme">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,200..900;1,8..60,200..900&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"
   onload="renderMathInElement(document.body, {delimiters: [{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});"></script>
 <style>
   :root {
-    --primary: #1e3a8a;
-    --accent: #dc2626;
-    --subtle: #6b7280;
-    --ink: #111827;
-    --paper: #fafafa;
-    --green: #059669;
-    --amber: #d97706;
+    --paper:     #faf9f5;   /* warm cream, Anthropic-ish */
+    --paper-2:   #f1efe8;   /* slightly darker panel */
+    --ink:       #1a1917;   /* warm near-black */
+    --ink-soft:  #4a4845;   /* secondary text */
+    --muted:     #8b8881;   /* tertiary */
+    --rule:      #d6d2c6;   /* hairline grey */
+    --accent:    #c15f3c;   /* Anthropic coral */
+    --accent-bg: #fbeee6;   /* accent wash */
+    --success:   #5b7a5b;   /* earthy green */
+    --warn:      #b08630;   /* muted amber */
+    --ok-bg:     #edf1ea;
+    --warn-bg:   #f7efdb;
   }
-  .reveal {
-    font-family: "Source Sans Pro", "PingFang SC", "Microsoft YaHei", sans-serif;
-    color: var(--ink);
+
+  html, body {
     background: var(--paper);
   }
-  .reveal .slides {
-    text-align: left;
+
+  .reveal-viewport { background: var(--paper); }
+
+  .reveal {
+    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
-  .reveal h1, .reveal h2, .reveal h3 {
-    font-family: "Source Sans Pro", "PingFang SC", sans-serif;
-    color: var(--primary);
-    font-weight: 600;
+  .reveal .slides { text-align: left; }
+  .reveal .slides section { padding: 44px 72px 48px 72px; }
+
+  /* typography */
+  .reveal h1, .reveal h2, .reveal h3, .reveal .display {
+    font-family: "Source Serif 4", "Times New Roman", serif;
+    font-weight: 400;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+    line-height: 1.15;
     text-transform: none;
-    letter-spacing: 0;
-    line-height: 1.2;
   }
-  .reveal h1 { font-size: 2.4em; }
-  .reveal h2 { font-size: 1.6em; margin-bottom: 0.6em; }
-  .reveal h3 { font-size: 1.2em; color: var(--subtle); margin-top: 0; }
-  .reveal p, .reveal li { font-size: 0.7em; line-height: 1.5; }
-  .reveal strong { color: var(--accent); }
-  .reveal em { color: var(--subtle); font-style: italic; }
+  .reveal h1 { font-size: 2.1em; font-weight: 400; }
+  .reveal h2 { font-size: 1.5em; font-weight: 400; margin: 0 0 0.55em 0; }
+  .reveal h3 { font-size: 0.95em; font-weight: 400; color: var(--ink-soft); margin: 0; }
+
+  .reveal p, .reveal li, .reveal td, .reveal th {
+    font-size: 0.58em;
+    line-height: 1.55;
+    color: var(--ink);
+    font-weight: 400;
+  }
+  .reveal em { font-style: italic; color: var(--ink-soft); }
+  .reveal strong { font-weight: 600; color: var(--ink); }
+
+  /* section label (top-right) */
+  .section-label {
+    position: absolute;
+    top: 34px;
+    right: 72px;
+    font-family: "Inter", sans-serif;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .section-label::before {
+    content: "";
+    display: inline-block;
+    width: 22px;
+    height: 1px;
+    background: var(--muted);
+    vertical-align: middle;
+    margin-right: 10px;
+    margin-bottom: 3px;
+  }
+
+  /* eyebrow label above heading */
+  .eyebrow {
+    font-family: "Inter", sans-serif;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 14px;
+  }
+
+  /* horizontal rule */
+  .reveal hr {
+    border: 0;
+    border-top: 1px solid var(--rule);
+    margin: 20px 0;
+  }
+
+  /* accent underline under main headings */
+  .heading-rule {
+    width: 40px;
+    height: 2px;
+    background: var(--accent);
+    margin: 0 0 20px 0;
+  }
+
+  /* tables: editorial style — no vertical rules, hairline horizontal */
   .reveal table {
-    font-size: 0.65em;
-    margin: 0.3em 0;
     border-collapse: collapse;
     width: 100%;
+    margin: 10px 0;
+    font-variant-numeric: tabular-nums;
   }
   .reveal th, .reveal td {
-    padding: 0.35em 0.7em;
-    border-bottom: 1px solid #e5e7eb;
+    padding: 10px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--rule);
+  }
+  .reveal thead th {
+    font-family: "Inter", sans-serif;
+    font-size: 0.52em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--ink);
+    padding-bottom: 8px;
+  }
+  .reveal td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .reveal td.col-label { color: var(--ink-soft); font-weight: 500; }
+  .reveal tr.winner td {
+    background: var(--accent-bg);
+    font-weight: 600;
+  }
+  .reveal tr.muted td { color: var(--muted); }
+
+  /* numeric emphasis */
+  .big {
+    font-family: "Source Serif 4", serif;
+    font-size: 3.2em;
+    font-weight: 400;
+    line-height: 1;
+    color: var(--ink);
+    letter-spacing: -0.02em;
+  }
+  .big.accent { color: var(--accent); }
+  .big.soft { color: var(--muted); }
+
+  /* stat card */
+  .stat {
     text-align: left;
   }
-  .reveal th { background: #f3f4f6; font-weight: 600; color: var(--primary); }
-  .reveal td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  .reveal tr.winner td { background: #fef2f2; font-weight: 600; }
-  .reveal tr.baseline td { background: #f9fafb; }
-  .reveal .big-num {
-    font-size: 2.2em;
-    font-weight: 700;
-    color: var(--accent);
-    display: inline-block;
-    line-height: 1;
-  }
-  .reveal .label {
-    font-size: 0.55em;
-    color: var(--subtle);
+  .stat .label {
+    font-family: "Inter", sans-serif;
+    font-size: 0.48em;
+    font-weight: 500;
+    color: var(--muted);
+    letter-spacing: 0.08em;
     text-transform: uppercase;
-    letter-spacing: 0.1em;
+    margin-top: 8px;
   }
-  .reveal .cols {
-    display: flex;
-    gap: 2em;
-    align-items: flex-start;
+  .stat .sublabel {
+    font-family: "Inter", sans-serif;
+    font-size: 0.45em;
+    font-weight: 400;
+    color: var(--ink-soft);
+    margin-top: 2px;
   }
-  .reveal .col {
-    flex: 1;
+
+  /* columns */
+  .cols { display: flex; gap: 36px; align-items: flex-start; }
+  .col { flex: 1; }
+  .cols.tight { gap: 20px; }
+
+  /* panel */
+  .panel {
+    background: var(--paper-2);
+    border-radius: 2px;
+    padding: 18px 22px;
+    border-left: 2px solid var(--ink-soft);
   }
-  .reveal .formula-box {
-    background: #f9fafb;
-    border-left: 4px solid var(--primary);
-    padding: 0.8em 1em;
-    margin: 0.6em 0;
-    border-radius: 4px;
-  }
-  .reveal .formula-box.accent {
-    border-left-color: var(--accent);
-    background: #fef2f2;
-  }
-  .reveal .caption {
-    font-size: 0.5em;
-    color: var(--subtle);
-    font-style: italic;
-    margin-top: 0.3em;
-  }
-  .reveal img {
-    max-height: 520px;
-    width: auto;
-    margin: 0 auto;
-    display: block;
-    border: 1px solid #e5e7eb;
-    border-radius: 4px;
-  }
-  .reveal .title-slide {
-    text-align: center;
-  }
-  .reveal .title-slide h1 {
-    font-size: 2.2em;
-    margin-bottom: 0.3em;
-  }
-  .reveal .title-slide .sub {
-    font-size: 0.85em;
-    color: var(--subtle);
-    margin-top: 1em;
-  }
-  .reveal .pill {
-    display: inline-block;
-    padding: 0.15em 0.6em;
-    border-radius: 999px;
-    font-size: 0.55em;
+  .panel.accent { border-left-color: var(--accent); background: var(--accent-bg); }
+  .panel.ok { border-left-color: var(--success); background: var(--ok-bg); }
+  .panel.warn { border-left-color: var(--warn); background: var(--warn-bg); }
+  .panel > :first-child { margin-top: 0; }
+  .panel > :last-child { margin-bottom: 0; }
+
+  .panel-label {
+    font-family: "Inter", sans-serif;
+    font-size: 0.45em;
     font-weight: 600;
-    margin-right: 0.3em;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
   }
-  .reveal .pill.duet { background: #dbeafe; color: var(--primary); }
-  .reveal .pill.chord { background: #e5e7eb; color: var(--subtle); }
-  .reveal .pill.v24 { background: #fee2e2; color: var(--accent); }
-  .reveal .tl;dr {
-    background: linear-gradient(90deg, #fef2f2, #fafafa);
-    border-left: 4px solid var(--accent);
-    padding: 0.8em 1em;
-    border-radius: 4px;
-    margin-top: 1em;
-  }
-  .reveal .checkmark { color: var(--green); font-weight: 700; }
-  .reveal .cross { color: var(--accent); font-weight: 700; }
-  .reveal .warn { color: var(--amber); font-weight: 700; }
-  .reveal .progress { color: var(--primary); }
-  .reveal section { padding: 20px 40px; }
-  .reveal ul li { margin-bottom: 0.3em; }
-  .reveal pre { font-size: 0.55em; }
+
+  /* code */
   .reveal code {
-    background: #f3f4f6;
-    padding: 0.1em 0.3em;
-    border-radius: 3px;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
     font-size: 0.9em;
-    color: var(--primary);
+    background: var(--paper-2);
+    padding: 2px 6px;
+    border-radius: 2px;
+    color: var(--accent);
   }
-  .reveal .footnote {
+
+  /* formulas */
+  .formula {
+    font-family: "Source Serif 4", serif;
+    text-align: center;
+    padding: 14px 0;
+    font-size: 0.85em;
+  }
+
+  /* figure */
+  .reveal img {
+    max-height: 460px;
+    width: auto;
+    margin: 10px auto;
+    display: block;
+    border: none;
+  }
+  .caption {
+    font-family: "Source Serif 4", serif;
+    font-style: italic;
+    font-size: 0.54em;
+    color: var(--ink-soft);
+    text-align: center;
+    margin-top: 8px;
+    line-height: 1.5;
+  }
+
+  /* cover */
+  .cover {
+    padding: 0 !important;
+  }
+  .cover-inner {
+    padding: 120px 100px 100px 100px;
+    height: 100%;
+  }
+  .cover .kicker {
+    font-family: "Inter", sans-serif;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 40px;
+  }
+  .cover .title-main {
+    font-family: "Source Serif 4", serif;
+    font-size: 3.2em;
+    line-height: 1.05;
+    font-weight: 400;
+    letter-spacing: -0.02em;
+    margin-bottom: 28px;
+  }
+  .cover .subtitle {
+    font-family: "Source Serif 4", serif;
+    font-style: italic;
+    font-size: 1.1em;
+    color: var(--ink-soft);
+    margin-bottom: 60px;
+    line-height: 1.4;
+  }
+  .cover .meta {
+    font-family: "Inter", sans-serif;
+    font-size: 0.55em;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+    border-top: 1px solid var(--rule);
+    padding-top: 16px;
+    max-width: 360px;
+  }
+
+  /* section divider slide */
+  .divider {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 0 120px !important;
+    height: 100%;
+  }
+  .divider .qnum {
+    font-family: "Source Serif 4", serif;
+    font-size: 0.85em;
+    color: var(--accent);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 18px;
+    font-weight: 500;
+  }
+  .divider .qtext {
+    font-family: "Source Serif 4", serif;
+    font-size: 2.4em;
+    font-weight: 400;
+    line-height: 1.1;
+    letter-spacing: -0.015em;
+    max-width: 920px;
+  }
+  .divider .qsub {
+    font-family: "Source Serif 4", serif;
+    font-style: italic;
+    font-size: 0.95em;
+    color: var(--ink-soft);
+    margin-top: 30px;
+    max-width: 760px;
+  }
+
+  /* page footer */
+  .page-footer {
     position: absolute;
-    bottom: 10px;
-    left: 40px;
-    right: 40px;
-    font-size: 0.4em;
-    color: var(--subtle);
+    bottom: 24px;
+    left: 72px;
+    right: 72px;
+    display: flex;
+    justify-content: space-between;
+    font-family: "Inter", sans-serif;
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 0.05em;
   }
+
+  /* checkmark / cross glyphs */
+  .glyph-ok { color: var(--success); font-weight: 600; }
+  .glyph-no { color: var(--accent); font-weight: 600; }
+  .glyph-warn { color: var(--warn); font-weight: 600; }
+
+  /* notes under tables */
+  .note {
+    font-size: 0.48em;
+    color: var(--muted);
+    font-style: italic;
+    margin-top: 10px;
+  }
+
+  /* reveal controls / progress */
+  .reveal .controls { color: var(--muted); }
+  .reveal .progress { color: var(--accent); height: 2px; }
+  .reveal .slide-number {
+    background: transparent;
+    color: var(--muted);
+    font-family: "Inter", sans-serif;
+    font-size: 11px;
+    right: 24px;
+    bottom: 20px;
+  }
+
+  /* lists */
+  .reveal ul, .reveal ol { margin-left: 1.2em; }
+  .reveal li { margin-bottom: 0.4em; }
+  .reveal li::marker { color: var(--muted); }
+
+  /* small pill */
+  .pill {
+    display: inline-block;
+    font-family: "Inter", sans-serif;
+    font-size: 0.4em;
+    font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 999px;
+    letter-spacing: 0.06em;
+    background: var(--paper-2);
+    color: var(--ink-soft);
+    vertical-align: middle;
+    margin-right: 4px;
+  }
+  .pill.accent { background: var(--accent-bg); color: var(--accent); }
+  .pill.ok { background: var(--ok-bg); color: var(--success); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+
 </style>
 </head>
 <body>
 <div class="reveal"><div class="slides">
 
-<!-- ============ SLIDE 1: TITLE ============ -->
-<section class="title-slide">
-  <h1>DUET WebShop 1.5B 深度复盘</h1>
-  <h3 style="margin-top: 0.5em; color: var(--subtle);">为什么 v24 = DR3 + SC + 衰减 BC 独门有效？</h3>
-  <div class="sub">
-    35 变体 ablation · 第一性原理分析 · 2026-04-20
-  </div>
-  <div style="margin-top: 3em; font-size: 0.5em; color: var(--subtle);">
-    qs · NeurIPS 2026 准备
-  </div>
-</section>
-
-<!-- ============ SLIDE 2: HEADLINE ============ -->
-<section>
-  <h2>一句话总结</h2>
-  <div style="margin: 1.5em 0;">
-    <p style="font-size: 0.85em;">WebShop 1.5B 上 DUET-v1 输给 CHORD（<strong>0.549 vs 0.603</strong>），我们 24 轮 ablation 后找到 v24（DUET + 衰减 BC），<strong>0.678</strong>，反超 CHORD +7.5pp。</p>
-  </div>
-  <div class="cols" style="margin-top: 2em;">
-    <div class="col" style="text-align: center;">
-      <div class="big-num" style="color: var(--subtle);">0.549</div>
-      <div class="label">DUET-v1<br>(原 DR3 + SC)</div>
-    </div>
-    <div class="col" style="text-align: center;">
-      <div class="big-num" style="color: var(--subtle);">0.603</div>
-      <div class="label">CHORD<br>(目标基线)</div>
-    </div>
-    <div class="col" style="text-align: center;">
-      <div class="big-num">0.678</div>
-      <div class="label">v24<br>(DR3 + SC + 衰减 BC)</div>
-    </div>
-  </div>
-  <div class="tl;dr" style="margin-top: 2em;">
-    <p style="font-size: 0.7em; margin: 0;">
-      今天要讲清楚：<strong>为什么 CHORD 比原 DUET 强？为什么 v24 work？能不能保住 dual-channel 叙事？</strong>
-    </p>
-  </div>
-</section>
-
-<!-- ============ SLIDE 3: LANDSCAPE ============ -->
-<section>
-  <h2>35 变体全景</h2>
-  <img src="./figures/fig1_variant_landscape.png" alt="variant landscape">
-  <p class="caption">无 BC 的变体（蓝）全部聚在 0.45-0.58 区；含 BC 的变体（红）里只有 v24 独峰 0.678。<strong>BC 与否决定了天花板</strong>。</p>
-</section>
-
-<!-- ============ SLIDE 4: THREE QUESTIONS ============ -->
-<section>
-  <h2>三个核心问题</h2>
-  <div style="margin-top: 1.5em;">
-    <div style="margin-bottom: 1.2em;">
-      <span class="pill duet">Q1</span>
-      <strong style="color: var(--primary); font-size: 0.85em;">CHORD 和 DUET 都不需要 teacher logit，为何 CHORD 更好？</strong>
-      <p style="margin: 0.3em 0 0 3.5em; color: var(--subtle); font-size: 0.65em;">→ 梯度几何的第一性原理</p>
-    </div>
-    <div style="margin-bottom: 1.2em;">
-      <span class="pill v24">Q2</span>
-      <strong style="color: var(--primary); font-size: 0.85em;">为什么 v24 uniquely work？能推广到 ALFWorld / 3B 吗？</strong>
-      <p style="margin: 0.3em 0 0 3.5em; color: var(--subtle); font-size: 0.65em;">→ BC 的三个不可替代的性质 + 4 个 rescue 失败</p>
-    </div>
-    <div>
-      <span class="pill chord">Q3</span>
-      <strong style="color: var(--primary); font-size: 0.85em;">能否保住 dual-channel 叙事的优雅？</strong>
-      <p style="margin: 0.3em 0 0 3.5em; color: var(--subtle); font-size: 0.65em;">→ Action Channel = gradient operator curriculum</p>
+<!-- ======================== COVER ======================== -->
+<section class="cover">
+  <div class="cover-inner">
+    <div class="kicker">NeurIPS 2026 · DUET Retrospective</div>
+    <div class="title-main">Baselines, Ablations,<br>and the v24 Breakthrough</div>
+    <div class="subtitle">Comprehensive retrospective of 35-variant WebShop 1.5B ablation,<br>grounded in first-principles analysis of the teacher-gradient curriculum.</div>
+    <div class="meta">
+      qs &nbsp;·&nbsp; 2026-04-20<br>
+      DUAL EXPERT TRAJECTORY UTILIZATION (DUET)
     </div>
   </div>
 </section>
 
-<!-- ============ SLIDE 5: Q1 SETUP ============ -->
+<!-- ======================== EXECUTIVE SUMMARY ======================== -->
 <section>
-  <h3>Q1</h3>
-  <h2>BC 和 DR3 的梯度几何根本不同</h2>
-  <div class="cols">
+  <div class="section-label">Executive Summary</div>
+  <h2>What we built, what we found</h2>
+  <div class="heading-rule"></div>
+
+  <div class="cols" style="margin-top: 28px;">
     <div class="col">
-      <div class="formula-box accent">
-        <strong style="color: var(--accent);">CHORD (BC loss)</strong>
-        <p style="margin: 0.5em 0 0 0; font-size: 0.7em;">$L_\text{BC} = -\mu \cdot \log \pi_\theta(a^*|s)$</p>
-        <p style="margin: 0.5em 0; font-size: 0.65em;">对 logit 梯度：<br>$\Delta z(a^*) = \mu \cdot (1 - \pi_\theta)$</p>
-      </div>
-      <ul style="font-size: 0.62em;">
-        <li>系数 μ <strong>per-token unit</strong></li>
-        <li>p 小时 (1-p) ≈ 1，梯度<strong>最大</strong></li>
-        <li>方向永远<strong>正号</strong>（push up）</li>
-      </ul>
+      <div class="panel-label">Scope</div>
+      <p style="margin-top: 4px;">4 methods × 2 environments × 3 model scales.<br>
+      <strong>DUET, CHORD, LUFFY, OnPolicy-GRPO</strong><br>
+      on <strong>ALFWorld</strong> and <strong>WebShop</strong>,<br>
+      at <strong>1.5B / 3B / 7B</strong>.</p>
     </div>
     <div class="col">
-      <div class="formula-box">
-        <strong style="color: var(--primary);">DUET (DR3 loss)</strong>
-        <p style="margin: 0.5em 0 0 0; font-size: 0.7em;">$L_\text{DR3} = -A(\tau) \cdot \text{clip}(w_\text{hat} \cdot \pi_\theta)$</p>
-        <p style="margin: 0.5em 0; font-size: 0.65em;">对 logit 梯度：<br>$\Delta z(a^*) = A \cdot w_\text{hat} \cdot \pi_\theta(1 - \pi_\theta)$</p>
-      </div>
-      <ul style="font-size: 0.62em;">
-        <li>A(τ)·w_hat 是 <strong>sequence-level 标量</strong></li>
-        <li>p 小时 p(1-p) ≈ 0，<strong>梯度消失</strong></li>
-        <li>方向依赖 A 符号（conditional）</li>
-      </ul>
+      <div class="panel-label">Headline</div>
+      <p style="margin-top: 4px;">DUET wins <strong>5 of 6</strong> env×scale cells.<br>
+      One exception: <strong>WebShop 1.5B</strong>, where DUET-v1 lost to CHORD (<span class="glyph-no">0.549 vs 0.603</span>).</p>
+    </div>
+    <div class="col">
+      <div class="panel-label">Breakthrough</div>
+      <p style="margin-top: 4px;">After 24 ablation variants we found <strong>v24 = DUET + decaying BC</strong>,<br>reaching <strong>0.678</strong> (<span class="glyph-ok">+7.5 pp over CHORD</span>).</p>
     </div>
   </div>
-  <p class="caption" style="margin-top: 1em;">决定性差异不在 clip（`off_pg_cliphit_rate=0` 全程）而在 <strong>(1-p) vs p(1-p)</strong> 的系数几何。</p>
-</section>
 
-<!-- ============ SLIDE 6: Q1 NUMERIC ============ -->
-<section>
-  <h3>Q1</h3>
-  <h2>稀有 SKU token 的数值 case study</h2>
-  <p style="font-size: 0.7em;">场景：WebShop 产品详情页，teacher 点 <code>click[bright white]</code>，刚开始训练时 $\pi_\theta = 10^{-4}$。</p>
+  <hr>
 
-  <table>
-    <tr><th>方法</th><th>每步 Δz</th><th>10 步后 p_θ</th><th>100 步后 p_θ</th></tr>
-    <tr class="baseline">
-      <td>CHORD (BC, μ=0.9)</td>
-      <td class="num">0.9</td>
-      <td class="num" style="color: var(--green);"><strong>≈ 0.4</strong></td>
-      <td class="num" style="color: var(--green);">≈ 1.0</td>
-    </tr>
-    <tr>
-      <td>DR3 (clip 未触发)</td>
-      <td class="num">10⁻⁴</td>
-      <td class="num" style="color: var(--accent);"><strong>基本没动</strong></td>
-      <td class="num" style="color: var(--accent);">基本没动</td>
-    </tr>
-    <tr>
-      <td>DR3 (PPO clip 触发)</td>
-      <td class="num">+20% (相对)</td>
-      <td class="num">6×10⁻⁴</td>
-      <td class="num">≈ 1.0</td>
-    </tr>
-  </table>
-
-  <div class="tl;dr">
-    <p style="margin: 0; font-size: 0.7em;">
-      <strong>梯度推力差 4 个数量级</strong>。CHORD 10 步解决的问题，DR3 要在 PPO 限速下爬 100+ 步。
-    </p>
-  </div>
-</section>
-
-<!-- ============ SLIDE 7: Q1 BEHAVIOR ============ -->
-<section>
-  <h3>Q1 · 行为证据</h3>
-  <h2>Option 匹配率：数字说明一切</h2>
-  <p style="font-size: 0.7em;">200 个匹配的 validation 任务，@step 100：</p>
-
-  <table>
-    <tr><th>变体</th><th>任意 option 点击</th><th>Teacher-exact option</th><th>长轨死循环</th></tr>
-    <tr>
-      <td><span class="pill duet">DUET-v1</span></td>
-      <td class="num">39.5%</td>
-      <td class="num" style="color: var(--accent);"><strong>33.0%</strong></td>
-      <td class="num">8/200</td>
-    </tr>
-    <tr class="baseline">
-      <td><span class="pill chord">CHORD</span></td>
-      <td class="num">92.0%</td>
-      <td class="num" style="color: var(--green);"><strong>72.5%</strong></td>
-      <td class="num">16/200</td>
-    </tr>
-    <tr class="winner">
-      <td><span class="pill v24">v24</span></td>
-      <td class="num">78.0%</td>
-      <td class="num" style="color: var(--green);"><strong>61.0%</strong></td>
-      <td class="num" style="color: var(--green);"><strong>0/200</strong></td>
-    </tr>
-  </table>
-
-  <p style="font-size: 0.65em; margin-top: 1em;">
-    <strong style="color: var(--accent);">40pp 的 option 能力差</strong> 正好解释 CHORD vs DUET-v1 的 5.4pp val reward 差。
-    <br>v24 继承 CHORD 的 option 能力，<strong>还消除了 CHORD 的 option-loop 死循环</strong>（16 → 0）。
+  <p style="font-size: 0.58em; color: var(--ink-soft); font-style: italic;">
+    Today's question: <strong style="color: var(--ink);">why does v24 uniquely work, and can we preserve the dual-channel narrative?</strong>
   </p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Executive Summary</span></div>
 </section>
 
-<!-- ============ SLIDE 8: Q2 THREE PROPERTIES ============ -->
+<!-- ======================== EXPERIMENTAL SCOPE ======================== -->
 <section>
-  <h3>Q2</h3>
-  <h2>BC 独有的三个性质</h2>
+  <div class="section-label">Experimental Scope</div>
+  <h2>The full comparison matrix</h2>
+  <div class="heading-rule"></div>
 
   <table>
-    <tr>
-      <th>性质</th>
-      <th>BC</th>
-      <th>DR3</th>
-      <th>KL→ref</th>
-      <th>EMA / soft disc</th>
-    </tr>
-    <tr>
-      <td><strong>Teacher-specific</strong><br><span style="font-size: 0.75em; color: var(--subtle);">loss 锚点在 teacher 数据</span></td>
-      <td class="num"><span class="checkmark">✓</span></td>
-      <td class="num"><span class="checkmark">✓</span></td>
-      <td class="num"><span class="cross">✗</span> <em>锚 ref</em></td>
-      <td class="num"><span class="cross">✗</span></td>
-    </tr>
-    <tr>
-      <td><strong>Per-token surprise</strong><br><span style="font-size: 0.75em; color: var(--subtle);">梯度 ∝ (1-p) 而非 p(1-p)</span></td>
-      <td class="num"><span class="checkmark">✓</span></td>
-      <td class="num"><span class="cross">✗</span></td>
-      <td class="num"><span class="checkmark">✓</span></td>
-      <td class="num"><span class="cross">✗</span></td>
-    </tr>
-    <tr>
-      <td><strong>Unconditional 正号</strong><br><span style="font-size: 0.75em; color: var(--subtle);">不依赖 A 或 reward</span></td>
-      <td class="num"><span class="checkmark">✓</span></td>
-      <td class="num"><span class="warn">仅 A&gt;0</span></td>
-      <td class="num"><span class="warn">仅偏 ref 时</span></td>
-      <td class="num"><span class="cross">✗</span></td>
-    </tr>
+    <thead>
+      <tr><th></th><th style="text-align:center;">OnPolicy</th><th style="text-align:center;">LUFFY</th><th style="text-align:center;">CHORD</th><th style="text-align:center;"><strong>DUET</strong></th><th style="text-align:center;">SFT / SFT+RL</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="col-label">ALFWorld 1.5B</td><td class="num">✓</td><td class="num">✓</td><td class="num">✓</td><td class="num"><strong>✓</strong></td><td class="num">✓</td></tr>
+      <tr><td class="col-label">ALFWorld 3B</td><td class="num">✓</td><td class="num">✓</td><td class="num"><em>(rerun)</em></td><td class="num"><strong>✓</strong></td><td class="num">—</td></tr>
+      <tr><td class="col-label">ALFWorld 7B</td><td class="num">✓</td><td class="num">✓</td><td class="num">—</td><td class="num"><strong>✓</strong></td><td class="num">—</td></tr>
+      <tr><td class="col-label">WebShop 1.5B</td><td class="num">✓</td><td class="num">✓</td><td class="num">✓</td><td class="num"><strong>✓ · 35 variants</strong></td><td class="num">✓</td></tr>
+      <tr><td class="col-label">WebShop 3B</td><td class="num">✓</td><td class="num">✓</td><td class="num">✓</td><td class="num"><strong>✓</strong></td><td class="num">—</td></tr>
+      <tr><td class="col-label">WebShop 7B</td><td class="num">✓</td><td class="num">✓</td><td class="num">—</td><td class="num"><em>(93-step crash)</em></td><td class="num">—</td></tr>
+    </tbody>
   </table>
 
-  <div class="tl;dr">
-    <p style="margin: 0; font-size: 0.7em;">
-      <strong>只有 BC 三者全占</strong>。KL 有 per-token + unconditional，但 anchor 到 pretrained，不是 teacher —— 稳定但不教 teacher-specific token。
-    </p>
+  <p class="note">2 environments × 3 model scales × 4-5 methods = ~27 primary runs + 35 DUET ablations. All runs use 4×A100 with identical hyperparameters (lr, batch, context). Teacher: Qwen-72B demonstrations, 800 tasks per env. Metric: Val@100 average reward over 200 validation tasks.</p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Experimental Scope</span></div>
+</section>
+
+<!-- ======================== ALFWORLD RESULTS ======================== -->
+<section>
+  <div class="section-label">Results · ALFWorld</div>
+  <h2>DUET dominates across scales</h2>
+  <div class="heading-rule"></div>
+
+  <table>
+    <thead>
+      <tr><th>Model</th><th style="text-align:right;">OnPolicy</th><th style="text-align:right;">LUFFY</th><th style="text-align:right;">CHORD</th><th style="text-align:right;"><strong>DUET</strong></th><th style="text-align:right;">Gap vs best baseline</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="col-label">1.5B</td>
+        <td class="num">1.0</td>
+        <td class="num">5.5</td>
+        <td class="num">27.0</td>
+        <td class="num"><strong>32.5</strong></td>
+        <td class="num"><span class="glyph-ok">+5.5 pp</span></td>
+      </tr>
+      <tr>
+        <td class="col-label">3B</td>
+        <td class="num">58.5</td>
+        <td class="num">61.5</td>
+        <td class="num muted"><em>rerun</em></td>
+        <td class="num"><strong>69.5</strong></td>
+        <td class="num"><span class="glyph-ok">+8.0 pp</span></td>
+      </tr>
+      <tr>
+        <td class="col-label">7B</td>
+        <td class="num">85.0</td>
+        <td class="num">82.5</td>
+        <td class="num muted">—</td>
+        <td class="num"><strong>86.5</strong></td>
+        <td class="num"><span class="glyph-ok">+1.5 pp</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="panel ok" style="margin-top: 22px;">
+    <div class="panel-label">Observation</div>
+    <p style="margin-top: 4px;">DUET's advantage <strong>shrinks with scale</strong>: +31.5 pp (vs OnPolicy) at 1.5B → +11.0 pp at 3B → +1.5 pp at 7B.<br>Smaller models benefit most from teacher guidance — consistent with the narrative that off-policy data fills a capacity gap.</p>
   </div>
+
+  <p class="note">Values in % (task success rate). 7B results: OnPolicy already strong, LUFFY slightly harmful (−2.9%), DUET neutral-to-positive.</p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Results · ALFWorld</span></div>
 </section>
 
-<!-- ============ SLIDE 9: Q2 RESCUE FAILURES ============ -->
+<!-- ======================== WEBSHOP RESULTS ======================== -->
 <section>
-  <h3>Q2 · 4 个 rescue 全部失败</h3>
-  <h2>不加 BC，只调稳定性 → 全卡在 0.50</h2>
+  <div class="section-label">Results · WebShop</div>
+  <h2>DUET wins at 3B, but loses to CHORD at 1.5B</h2>
+  <div class="heading-rule"></div>
 
   <table>
-    <tr><th>变体</th><th>改了什么</th><th>数学意义</th><th>Val@100</th></tr>
-    <tr><td>v28</td><td><code>w_hat_ema_alpha: 0.3→0.1</code></td><td>w_hat 方差 ↓</td><td class="num">0.495</td></tr>
-    <tr><td>v29</td><td>组合（宽 clip + ema + clip_max）</td><td>三管齐下</td><td class="num">0.511</td></tr>
-    <tr><td>v30</td><td><code>kl_loss_coef: 0.001→0.01</code></td><td>KL penalty ×10</td><td class="num">0.520</td></tr>
-    <tr><td>v33</td><td><code>disc_temperature: 1.5→3.0</code></td><td>判别器软化</td><td class="num">0.520</td></tr>
-    <tr class="baseline">
-      <td colspan="2" style="text-align: right;">参考：v12 baseline (无 BC)</td>
-      <td style="color: var(--subtle);">DR3 稳定化</td>
-      <td class="num">0.431</td>
-    </tr>
-    <tr class="baseline">
-      <td colspan="2" style="text-align: right;">参考：CHORD</td>
-      <td style="color: var(--subtle);">有 BC (μ=0.9)</td>
-      <td class="num">0.603</td>
-    </tr>
-    <tr class="winner">
-      <td colspan="2" style="text-align: right;">v24 = v12 + 衰减 BC</td>
-      <td>有 BC (μ=0.3→0.05)</td>
-      <td class="num"><strong>0.678</strong></td>
-    </tr>
+    <thead>
+      <tr><th>Model</th><th style="text-align:right;">OnPolicy</th><th style="text-align:right;">LUFFY</th><th style="text-align:right;">CHORD</th><th style="text-align:right;">DUET-v1</th><th style="text-align:right;"><strong>v24 (new)</strong></th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="col-label">1.5B</td>
+        <td class="num">~0.45</td>
+        <td class="num">0.573</td>
+        <td class="num"><strong>0.603</strong></td>
+        <td class="num" style="color: var(--accent);">0.549</td>
+        <td class="num winner-text"><strong>0.678</strong></td>
+      </tr>
+      <tr>
+        <td class="col-label">3B</td>
+        <td class="num">0.402</td>
+        <td class="num">0.753</td>
+        <td class="num">0.728</td>
+        <td class="num"><strong>0.763</strong></td>
+        <td class="num muted">—</td>
+      </tr>
+      <tr>
+        <td class="col-label">7B</td>
+        <td class="num">0.760</td>
+        <td class="num">0.755</td>
+        <td class="num muted">—</td>
+        <td class="num muted"><em>crashed @ step 93</em></td>
+        <td class="num muted">—</td>
+      </tr>
+    </tbody>
   </table>
 
-  <p class="caption" style="margin-top: 1em;">4 种独立机制 (EMA / 宽 clip / 强 KL / 软 disc) 全部卡在 0.49-0.52，这是**经验上非常硬的 ceiling**。</p>
+  <div class="panel warn" style="margin-top: 22px;">
+    <div class="panel-label">The Puzzle</div>
+    <p style="margin-top: 4px;">At 1.5B, <strong>DUET-v1 lost to CHORD by 5.4 pp</strong> — the only env×scale cell where our method underperformed.<br>This is what motivated the 24-variant ablation study we'll walk through today.</p>
+  </div>
+
+  <div class="panel accent" style="margin-top: 16px;">
+    <div class="panel-label">Resolution · v24</div>
+    <p style="margin-top: 4px;">After 24 variants, <strong>v24 = DUET + decaying BC term (μ: 0.3 → 0.05)</strong> reached <strong>0.678</strong>,<br>beating CHORD by <strong>+7.5 pp</strong> and DUET-v1 by <strong>+12.9 pp</strong>.</p>
+  </div>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Results · WebShop</span></div>
 </section>
 
-<!-- ============ SLIDE 10: Q2 CEILING FIG ============ -->
+<!-- ======================== VARIANT LANDSCAPE ======================== -->
 <section>
-  <h3>Q2 · 最强证据</h3>
-  <h2>No-BC ceiling</h2>
+  <div class="section-label">Ablation Landscape</div>
+  <h2>35 variants, one breakthrough</h2>
+  <div class="heading-rule"></div>
+  <img src="./figures/fig1_variant_landscape.png" alt="35-variant landscape">
+  <p class="caption">Variants without a BC sub-term (blue) cluster at 0.45–0.58; only v24 with decaying BC reaches 0.678.<br>The gap between "any dual-channel variant" and "v24" is ~10 pp. <strong>BC presence/absence determines the ceiling.</strong></p>
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Ablation Landscape</span></div>
+</section>
+
+<!-- ======================== THREE QUESTIONS ======================== -->
+<section>
+  <div class="section-label">Today's Agenda</div>
+  <h2>Three questions</h2>
+  <div class="heading-rule"></div>
+
+  <div style="margin-top: 28px;">
+    <div style="display: flex; align-items: baseline; gap: 24px; margin-bottom: 26px; padding-bottom: 20px; border-bottom: 1px solid var(--rule);">
+      <div class="big soft" style="font-size: 2.2em; min-width: 80px;">Q1</div>
+      <div>
+        <div style="font-family: 'Source Serif 4', serif; font-size: 1em; color: var(--ink); margin-bottom: 6px;">
+          Both CHORD and DUET avoid teacher logits — why does CHORD do better?
+        </div>
+        <div style="font-size: 0.55em; color: var(--muted); font-style: italic;">→ First-principles analysis of gradient geometry.</div>
+      </div>
+    </div>
+
+    <div style="display: flex; align-items: baseline; gap: 24px; margin-bottom: 26px; padding-bottom: 20px; border-bottom: 1px solid var(--rule);">
+      <div class="big soft" style="font-size: 2.2em; min-width: 80px;">Q2</div>
+      <div>
+        <div style="font-family: 'Source Serif 4', serif; font-size: 1em; color: var(--ink); margin-bottom: 6px;">
+          Why does v24 uniquely work, and can it generalize to ALFWorld / 3B?
+        </div>
+        <div style="font-size: 0.55em; color: var(--muted); font-style: italic;">→ Three irreplaceable properties of BC + four rescue failures.</div>
+      </div>
+    </div>
+
+    <div style="display: flex; align-items: baseline; gap: 24px;">
+      <div class="big soft" style="font-size: 2.2em; min-width: 80px;">Q3</div>
+      <div>
+        <div style="font-family: 'Source Serif 4', serif; font-size: 1em; color: var(--ink); margin-bottom: 6px;">
+          Can we preserve the clean dual-channel narrative?
+        </div>
+        <div style="font-size: 0.55em; color: var(--muted); font-style: italic;">→ Action Channel as a gradient-operator curriculum.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Agenda</span></div>
+</section>
+
+<!-- ======================== Q1 DIVIDER ======================== -->
+<section class="divider">
+  <div class="qnum">Question 01</div>
+  <div class="qtext">Both use teacher <em>trajectories</em> but no teacher <em>logits</em>. Yet CHORD gains 5.4 pp over native DUET. What is the mechanism?</div>
+  <div class="qsub">Answer: the per-token gradient coefficient. DR3 multiplies by p(1−p) and vanishes on rare tokens. BC multiplies by (1−p) and stays active.</div>
+</section>
+
+<!-- ======================== Q1 MATH ======================== -->
+<section>
+  <div class="section-label">Q1 · Gradient Geometry</div>
+  <h2>Same data, different calculus</h2>
+  <div class="heading-rule"></div>
+
+  <div class="cols" style="margin-top: 14px;">
+    <div class="col">
+      <div class="panel accent">
+        <div class="panel-label">CHORD · Behavior Cloning</div>
+        <div class="formula">$L_\text{BC} = -\mu \cdot \log \pi_\theta(a^*|s)$</div>
+        <div class="formula" style="padding: 4px 0;">$\Delta z(a^*) = \mu \cdot (1 - \pi_\theta)$</div>
+      </div>
+      <ul style="margin-top: 12px;">
+        <li>μ is a <strong>per-token, unit coefficient</strong>.</li>
+        <li>When p is small, (1−p) ≈ 1 — <strong>gradient is largest on surprising tokens</strong>.</li>
+        <li>Sign is <strong>unconditionally positive</strong> (push <em>a*</em> up).</li>
+      </ul>
+    </div>
+    <div class="col">
+      <div class="panel">
+        <div class="panel-label">DUET · DR3 Teacher Surrogate</div>
+        <div class="formula">$L_\text{DR3} = -A(\tau) \cdot \text{clip}(w_\text{hat} \cdot \pi_\theta)$</div>
+        <div class="formula" style="padding: 4px 0;">$\Delta z(a^*) = A \cdot w_\text{hat} \cdot \pi_\theta(1-\pi_\theta)$</div>
+      </div>
+      <ul style="margin-top: 12px;">
+        <li>A(τ)·w_hat is a <strong>sequence-level scalar</strong>.</li>
+        <li>When p is small, p(1−p) ≈ 0 — <strong>gradient vanishes on rare tokens</strong>.</li>
+        <li>Sign depends on advantage A(τ) (<strong>conditional</strong>).</li>
+      </ul>
+    </div>
+  </div>
+
+  <p class="note">Empirical check: <code>actor/off_pg_cliphit_rate = 0.000</code> throughout training. The suppression is not from PPO clipping — it is the p(1−p) factor in the softmax geometry.</p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Q1 · Gradient Geometry</span></div>
+</section>
+
+<!-- ======================== Q1 NUMERIC + BEHAVIOR ======================== -->
+<section>
+  <div class="section-label">Q1 · Evidence</div>
+  <h2>Four orders of magnitude</h2>
+  <div class="heading-rule"></div>
+
+  <p>Rare SKU token <code>click[bright white]</code> on a WebShop product page. At training start <strong>π_θ ≈ 10⁻⁴</strong>.</p>
+
+  <table>
+    <thead>
+      <tr><th>Method</th><th style="text-align:right;">Per-step Δz</th><th style="text-align:right;">After 10 steps</th><th style="text-align:right;">After 100 steps</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="col-label">CHORD · BC (μ = 0.9)</td>
+        <td class="num"><strong>0.9</strong></td>
+        <td class="num"><span class="glyph-ok">p ≈ 0.4</span></td>
+        <td class="num"><span class="glyph-ok">p ≈ 1.0</span></td>
+      </tr>
+      <tr>
+        <td class="col-label">DR3 · clip not active</td>
+        <td class="num">10⁻⁴</td>
+        <td class="num"><span class="glyph-no">unchanged</span></td>
+        <td class="num"><span class="glyph-no">unchanged</span></td>
+      </tr>
+      <tr>
+        <td class="col-label">DR3 · under PPO clip</td>
+        <td class="num">+20% relative</td>
+        <td class="num">6 × 10⁻⁴</td>
+        <td class="num">p ≈ 1.0</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <hr>
+
+  <p style="font-size: 0.6em;">The gradient gap on rare tokens shows up directly in behavior — <strong>option-click accuracy at step 100 on 200 matched validation tasks:</strong></p>
+
+  <table style="margin-top: 8px;">
+    <thead>
+      <tr><th>Method</th><th style="text-align:right;">Any option click</th><th style="text-align:right;">Teacher-exact option</th><th style="text-align:right;">Option-click loops</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="col-label">DUET-v1</td><td class="num">39.5%</td><td class="num"><span class="glyph-no">33.0%</span></td><td class="num">8 / 200</td></tr>
+      <tr><td class="col-label">CHORD</td><td class="num">92.0%</td><td class="num"><span class="glyph-ok">72.5%</span></td><td class="num">16 / 200</td></tr>
+      <tr class="winner"><td class="col-label"><strong>v24</strong></td><td class="num">78.0%</td><td class="num"><strong>61.0%</strong></td><td class="num"><span class="glyph-ok">0 / 200</span></td></tr>
+    </tbody>
+  </table>
+
+  <p class="note">The 40-pp gap in teacher-exact option selection between CHORD and DUET-v1 directly corresponds to the 5.4 pp val-reward gap. v24 inherits CHORD's option-click capability and eliminates CHORD's loop pathology.</p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Q1 · Evidence</span></div>
+</section>
+
+<!-- ======================== Q2 DIVIDER ======================== -->
+<section class="divider">
+  <div class="qnum">Question 02</div>
+  <div class="qtext">Why does v24 uniquely reach 0.678 when four stability-only rescues cap at 0.52?</div>
+  <div class="qsub">Answer: BC is the only operator that combines teacher-specificity, per-token surprise weighting, and unconditional positivity.</div>
+</section>
+
+<!-- ======================== Q2 THREE PROPERTIES ======================== -->
+<section>
+  <div class="section-label">Q2 · BC's Three Properties</div>
+  <h2>Only BC has all three at once</h2>
+  <div class="heading-rule"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Property</th>
+        <th style="text-align:center;">BC</th>
+        <th style="text-align:center;">DR3</th>
+        <th style="text-align:center;">KL → ref</th>
+        <th style="text-align:center;">EMA / soft disc</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>
+          <div><strong>Teacher-specific</strong></div>
+          <div style="font-size: 0.85em; color: var(--muted); font-style: italic;">Anchored on teacher distribution</div>
+        </td>
+        <td class="num"><span class="glyph-ok">✓</span></td>
+        <td class="num"><span class="glyph-ok">✓</span></td>
+        <td class="num"><span class="glyph-no">anchors on pretrained ref</span></td>
+        <td class="num"><span class="glyph-no">✗</span></td>
+      </tr>
+      <tr>
+        <td>
+          <div><strong>Per-token surprise weighting</strong></div>
+          <div style="font-size: 0.85em; color: var(--muted); font-style: italic;">Gradient ∝ (1−p), not p(1−p)</div>
+        </td>
+        <td class="num"><span class="glyph-ok">✓</span></td>
+        <td class="num"><span class="glyph-no">p(1−p) vanishes at rare p</span></td>
+        <td class="num"><span class="glyph-ok">✓</span></td>
+        <td class="num"><span class="glyph-no">✗</span></td>
+      </tr>
+      <tr>
+        <td>
+          <div><strong>Unconditionally positive</strong></div>
+          <div style="font-size: 0.85em; color: var(--muted); font-style: italic;">Does not depend on A(τ) or reward</div>
+        </td>
+        <td class="num"><span class="glyph-ok">✓</span></td>
+        <td class="num"><span class="glyph-warn">only when A &gt; 0</span></td>
+        <td class="num"><span class="glyph-warn">only when π deviates from ref</span></td>
+        <td class="num"><span class="glyph-no">✗</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="panel accent" style="margin-top: 22px;">
+    <p style="margin: 0;">KL has per-token + unconditional properties but <strong>its anchor is the pretrained model, not the teacher</strong>. It keeps the policy stable without teaching teacher-specific tokens — exactly what v30 (strong-KL rescue) demonstrates empirically.</p>
+  </div>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>BC's Three Properties</span></div>
+</section>
+
+<!-- ======================== Q2 RESCUE FAILURES ======================== -->
+<section>
+  <div class="section-label">Q2 · Rescue Attempts</div>
+  <h2>Four independent rescues, all cap at 0.52</h2>
+  <div class="heading-rule"></div>
+
+  <table>
+    <thead>
+      <tr><th>Variant</th><th>Intervention</th><th>Mechanism</th><th style="text-align:right;">Val@100</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>v28</td><td><code>w_hat_ema_alpha: 0.3→0.1</code></td><td>Reduce w_hat variance</td><td class="num">0.495</td></tr>
+      <tr><td>v29</td><td>Combined (widened clip + ema + clip_max)</td><td>All stability knobs together</td><td class="num">0.511</td></tr>
+      <tr><td>v30</td><td><code>kl_loss_coef: 0.001→0.01</code></td><td>10× stronger KL to reference</td><td class="num">0.520</td></tr>
+      <tr><td>v33</td><td><code>disc_temperature: 1.5→3.0</code></td><td>Softer discriminator</td><td class="num">0.520</td></tr>
+      <tr class="muted"><td colspan="2" style="text-align:right;">v12 baseline · DR3 stabilized, no BC</td><td>Reference</td><td class="num">0.431</td></tr>
+      <tr class="muted"><td colspan="2" style="text-align:right;">CHORD</td><td>Strong BC (μ = 0.9)</td><td class="num">0.603</td></tr>
+      <tr class="winner"><td colspan="2" style="text-align:right;"><strong>v24 · v12 + decaying BC</strong></td><td>BC μ = 0.3 → 0.05</td><td class="num"><strong>0.678</strong></td></tr>
+    </tbody>
+  </table>
+
+  <p class="note">Four independent mechanisms — EMA smoothing, widened trust region, KL anchoring, softened discriminator — all converge to the same 0.49–0.52 ceiling. None of them supply a teacher-specific, per-token, unconditionally-positive gradient. Only BC does.</p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Rescue Attempts</span></div>
+</section>
+
+<!-- ======================== Q2 CEILING CHART ======================== -->
+<section>
+  <div class="section-label">Q2 · The Ceiling, Visualized</div>
+  <h2>Four rescues, one peak</h2>
+  <div class="heading-rule"></div>
   <img src="./figures/fig3_no_bc_ceiling.png" alt="no-BC ceiling">
-  <p class="caption">4 个不含 BC 的 rescue 变体 + v12 baseline 全部在地板附近（0.43-0.52）；只有加 BC 的 v24 独高一头 (0.678)。这是"BC 不可替代"的最硬证据。</p>
+  <p class="caption">Four non-BC rescues (v28, v29, v30, v33) and the v12 baseline all sit at the 0.43–0.52 floor.<br>Only v24 — the single variant that adds a BC sub-term — rises to 0.678. <strong>This is the strongest evidence that BC is irreducible.</strong></p>
+  <div class="page-footer"><span>DUET · Retrospective</span><span>No-BC Ceiling</span></div>
 </section>
 
-<!-- ============ SLIDE 11: Q2 MECHANISM FIG ============ -->
+<!-- ======================== Q2 MECHANISM ======================== -->
 <section>
-  <h3>Q2 · 机制层面</h3>
-  <h2>BC 稳定了整个训练 dynamics</h2>
+  <div class="section-label">Q2 · Mechanism</div>
+  <h2>BC stabilizes the entire dynamics</h2>
+  <div class="heading-rule"></div>
   <img src="./figures/fig4_v12_vs_v24_mechanism.png" alt="v12 vs v24 mechanism">
-  <p class="caption"><strong>v12 (蓝)</strong> 后期 grad_norm 飙到 12+、entropy 塌到 0.15、SC progress 从 0.35 跌到 0.22。<strong>v24 (红)</strong> 全程稳定 —— BC 既教 teacher token，又锚语法 token（μ_valley=0.05 的第二角色）。</p>
+  <p class="caption"><strong>v12 (blue)</strong>: grad-norm spikes to 12+, entropy collapses to 0.15, SC-progress drops 0.35→0.22.<br><strong>v24 (red)</strong>: all metrics stable — BC simultaneously teaches rare teacher tokens <em>and</em> anchors low-probability grammar tokens.</p>
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Mechanism</span></div>
 </section>
 
-<!-- ============ SLIDE 12: Q2 V25 STORY ============ -->
+<!-- ======================== Q2 V25 GRAMMAR COLLAPSE ======================== -->
 <section>
-  <h3>Q2 · μ_valley = 0.05 的隐藏作用</h3>
-  <h2>v25 直接证明：BC 还兼任语法保护</h2>
+  <div class="section-label">Q2 · The v25 Incident</div>
+  <h2>μ_valley = 0.05 also protects syntax</h2>
+  <div class="heading-rule"></div>
 
-  <p style="font-size: 0.7em;"><strong>v25 实验</strong>：去掉 BC + 放宽 PPO clip (0.6→2.0)。</p>
+  <p><strong>v25</strong>: remove BC entirely, widen PPO clip (0.6 → 2.0). What happened:</p>
 
-  <div class="cols" style="margin-top: 1em;">
+  <div class="cols tight" style="margin-top: 16px;">
     <div class="col">
-      <div class="formula-box">
-        <strong>训练轨迹</strong>
-        <ul style="font-size: 0.62em; margin-top: 0.3em;">
-          <li>Step 1-97: 正常训练，reward 到 0.62</li>
-          <li>Step 98: <strong style="color: var(--accent);">单次 toxic gradient</strong>，response_length 2053→1080</li>
-          <li>Step 100: Val = <strong style="color: var(--accent);">-0.041</strong>，grad_norm 爆炸到 48.4</li>
+      <div class="panel">
+        <div class="panel-label">Training trajectory</div>
+        <ul style="margin-top: 6px;">
+          <li>Steps 1–97: normal, reward rising to 0.62</li>
+          <li>Step 98: <strong>single toxic gradient</strong>, response_length 2053 → 1080</li>
+          <li>Step 100: <strong>Val = −0.041</strong>, grad-norm = 48.4</li>
         </ul>
       </div>
     </div>
     <div class="col">
-      <div class="formula-box accent">
-        <strong>失败模式（200 sample）</strong>
-        <ul style="font-size: 0.62em; margin-top: 0.3em;">
-          <li><strong>47%</strong> 双开 <code>&lt;action&gt;</code> 标签</li>
-          <li><strong>69%</strong> 幻觉 wrapper: <code>&lt;search&gt;</code>, <code>&lt;story&gt;</code>, <code>&lt;when&gt;</code></li>
-          <li>极端：递归 <code>&lt;when result="..."&gt;</code> XML 树</li>
+      <div class="panel accent">
+        <div class="panel-label">Failure mode (200 rollouts)</div>
+        <ul style="margin-top: 6px;">
+          <li><strong>47%</strong> — doubled <code>&lt;action&gt;</code> opening tags</li>
+          <li><strong>69%</strong> — hallucinated wrappers (<code>&lt;search&gt;</code>, <code>&lt;story&gt;</code>, <code>&lt;when&gt;</code>)</li>
+          <li>Extreme: recursive <code>&lt;when result="..."&gt;</code> XML trees</li>
         </ul>
       </div>
     </div>
   </div>
 
-  <div class="tl;dr">
-    <p style="margin: 0; font-size: 0.7em;">
-      没有 BC 持续锚 <code>&lt;action&gt;</code> 等低概率语法 token，PPO 会慢慢漂掉语法 logit，<strong>一旦语法破，后面雪崩</strong>。v24 的 μ_valley=0.05 就是这个 floor。
-    </p>
+  <div class="panel" style="margin-top: 20px;">
+    <p style="margin: 0;">Without BC persistently anchoring low-probability grammar tokens like <code>&lt;action&gt;</code>, PPO gradually drifts their logits. Once syntax breaks, reward collapses. <strong>v24's μ_valley = 0.05 is a permanent anchor against this drift.</strong></p>
   </div>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>The v25 Incident</span></div>
 </section>
 
-<!-- ============ SLIDE 13: Q2 SCALING ============ -->
+<!-- ======================== Q2 SCALING ======================== -->
 <section>
-  <h3>Q2 · 推广预测</h3>
-  <h2>BC 贡献随 scale / 环境而变</h2>
-  <img src="./figures/fig5_scaling_prediction.png" alt="scaling prediction" style="max-height: 380px;">
+  <div class="section-label">Q2 · Generalization</div>
+  <h2>BC's value scales with the task</h2>
+  <div class="heading-rule"></div>
 
-  <table style="font-size: 0.55em;">
-    <tr><th>环境×规模</th><th>Rare-token</th><th>Format fragility</th><th>Capacity</th><th>预测 v24 gain</th></tr>
-    <tr class="winner"><td>WebShop 1.5B</td><td>高</td><td>中</td><td>低</td><td class="num"><strong>+12.9pp ✓ 已验证</strong></td></tr>
-    <tr><td>WebShop 3B/7B</td><td>高</td><td>中</td><td>中-高</td><td class="num">+1~5pp</td></tr>
-    <tr style="background: #fef3c7;"><td><strong>ALFWorld 1.5B</strong></td><td>低 (模板)</td><td>低</td><td>低</td><td class="num"><strong style="color: var(--amber);">+0~3pp ⚠ 待验证</strong></td></tr>
-    <tr><td>ALFWorld 3B/7B</td><td>低</td><td>低</td><td>中-高</td><td class="num">≈ 0</td></tr>
+  <img src="./figures/fig5_scaling_prediction.png" alt="scaling prediction" style="max-height: 340px;">
+
+  <table style="margin-top: 12px;">
+    <thead>
+      <tr><th>Env × scale</th><th>Rare-token gap</th><th>Format fragility</th><th>Capacity</th><th style="text-align:right;">Predicted v24 gain</th></tr>
+    </thead>
+    <tbody>
+      <tr class="winner"><td>WebShop 1.5B</td><td>high</td><td>medium</td><td>low</td><td class="num"><strong>+12.9 pp · verified</strong></td></tr>
+      <tr><td>WebShop 3B / 7B</td><td>high</td><td>medium</td><td>mid-high</td><td class="num">+1–5 pp</td></tr>
+      <tr style="background: var(--warn-bg);"><td><strong>ALFWorld 1.5B</strong></td><td>low (templated)</td><td>low</td><td>low</td><td class="num"><span class="glyph-warn"><strong>+0–3 pp · to verify</strong></span></td></tr>
+      <tr><td>ALFWorld 3B / 7B</td><td>low</td><td>low</td><td>mid-high</td><td class="num">≈ 0</td></tr>
+    </tbody>
   </table>
+
+  <p class="note">BC's value ∝ (rare-token gap × format fragility × 1 / model capacity). The ALFWorld 1.5B v24 run is the single experiment that validates or falsifies the universality claim.</p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Generalization</span></div>
 </section>
 
-<!-- ============ SLIDE 14: Q3 NARRATIVE ============ -->
-<section>
-  <h3>Q3</h3>
-  <h2>保住 dual-channel：gradient operator curriculum</h2>
+<!-- ======================== Q3 DIVIDER ======================== -->
+<section class="divider">
+  <div class="qnum">Question 03</div>
+  <div class="qtext">Can we reintegrate BC into the dual-channel story without adding a third channel?</div>
+  <div class="qsub">Answer: treat the Action Channel as a curriculum of two complementary gradient operators, not a single loss.</div>
+</section>
 
-  <div class="formula-box" style="margin-top: 1em;">
-    <strong>Action Channel</strong> <em>(acts on teacher trajectories)</em>
-    <p style="margin: 0.5em 0; font-size: 0.7em;">
-      $L_\text{action} = \mu_t \cdot L_\text{BC} + L_\text{DR3}$
-    </p>
-    <ul style="font-size: 0.6em; margin-bottom: 0;">
-      <li><code>μ_t: 0.3 → 0.05 over 25 steps</code> — the curriculum</li>
-      <li><strong>L_BC</strong>: teacher-token identity imprint (早期主导)</li>
-      <li><strong>L_DR3</strong>: trajectory-level credit assignment (后期主导)</li>
-      <li><strong>μ_valley = 0.05</strong>: format-token anchor (长期守护)</li>
+<!-- ======================== Q3 NARRATIVE ======================== -->
+<section>
+  <div class="section-label">Q3 · Unified Narrative</div>
+  <h2>Teacher-gradient curriculum</h2>
+  <div class="heading-rule"></div>
+
+  <div class="panel accent">
+    <div class="panel-label">Action Channel · on teacher trajectories</div>
+    <div class="formula">$L_\text{action} = \mu_t \cdot L_\text{BC} + L_\text{DR3}$</div>
+    <ul style="margin-top: 10px;">
+      <li><code>μ_t : 0.3 → 0.05 over 25 steps</code> — the curriculum schedule.</li>
+      <li><strong>L_BC</strong> dominates early: teacher-token identity imprint, <em>(1−p)</em> gradient.</li>
+      <li><strong>L_DR3</strong> dominates late: trajectory-level credit assignment, with <em>w_hat → 1</em> natural fade-out.</li>
+      <li><strong>μ_valley = 0.05</strong> maintains a format-token anchor indefinitely.</li>
     </ul>
   </div>
 
-  <div class="formula-box">
-    <strong>State Channel</strong> <em>(on on-policy, unchanged)</em>
-    <p style="margin: 0.5em 0; font-size: 0.7em;">$L_\text{SC} = \beta \cdot \Phi(\tau) \cdot \nabla \log \pi_\theta$</p>
+  <div class="panel" style="margin-top: 14px;">
+    <div class="panel-label">State Channel · on on-policy trajectories · unchanged</div>
+    <div class="formula">$L_\text{SC} = \beta \cdot \Phi(\tau) \cdot \nabla \log \pi_\theta$</div>
   </div>
 
-  <p style="font-size: 0.65em; margin-top: 1em;">
-    <strong>Novelty 在 density-ratio 驱动的自动 curriculum</strong>：w_hat → 1 时 DR3 自动退出，这是 CHORD 的人工 μ schedule 做不到的。
+  <hr>
+
+  <p style="font-size: 0.6em;">
+    Novelty claim: <strong>density-ratio-driven automatic curriculum</strong>. CHORD uses a hand-tuned μ schedule with no trajectory credit; DUET's DR3 provides automatic fade and advantage-weighted teacher correction. v22 / v23 (constant μ) empirically fail, showing the schedule is load-bearing.
   </p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Unified Narrative</span></div>
 </section>
 
-<!-- ============ SLIDE 15: Q3 REVIEWER ============ -->
+<!-- ======================== Q3 REVIEWER ======================== -->
 <section>
-  <h3>Q3 · Reviewer 预防</h3>
-  <h2>审稿人会问什么？</h2>
+  <div class="section-label">Q3 · Reviewer Anticipation</div>
+  <h2>How we defend it</h2>
+  <div class="heading-rule"></div>
 
   <table>
-    <tr><th>质疑</th><th>我们的回答</th></tr>
-    <tr>
-      <td><strong>R1:</strong> 不就是 CHORD + DR3 吗？</td>
-      <td>CHORD 没 trajectory credit，没自动 fade。v22/v23 (const μ) 全部失败，证明衰减是必要的。</td>
-    </tr>
-    <tr>
-      <td><strong>R2:</strong> BC 已必要，还要 SC 吗？</td>
-      <td>正交作用。v4 (SC off) = 0.343 硬证据。</td>
-    </tr>
-    <tr>
-      <td><strong>R3:</strong> WebShop-only hack 吗？</td>
-      <td>BC 价值随 rare-token gap 变化；ALFWorld 预测 gain ≈ 0。<strong>待 v24 on ALFWorld 1.5B 验证</strong>。</td>
-    </tr>
-    <tr style="background: #fef3c7;">
-      <td><strong>R4:</strong> AWAC single-operator baseline？</td>
-      <td><strong style="color: var(--amber);">诚实披露：没跑。降级为"两算子独立分析"，作为 future work。</strong></td>
-    </tr>
+    <thead>
+      <tr><th style="width: 34%;">Likely question</th><th>Our response</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>R1</strong> · Isn't this just CHORD + DR3?</td>
+        <td>CHORD has no trajectory-level credit on teacher samples and no automatic fade. v22/v23 (constant μ) empirically fail — the decaying schedule is load-bearing.</td>
+      </tr>
+      <tr>
+        <td><strong>R2</strong> · If BC is needed, is SC still necessary?</td>
+        <td>BC addresses token identity; SC addresses state-visitation credit. v4 (SC off) collapses to 0.343 — hard evidence.</td>
+      </tr>
+      <tr>
+        <td><strong>R3</strong> · WebShop-specific hack?</td>
+        <td>BC value ∝ rare-token gap × format fragility. ALFWorld prediction: gain ≈ 0. <strong>To validate: v24 on ALFWorld 1.5B.</strong></td>
+      </tr>
+      <tr style="background: var(--warn-bg);">
+        <td><strong>R4</strong> · What about AWAC as a single-operator baseline?</td>
+        <td><span class="glyph-warn"><strong>Honest disclosure:</strong></span> not run. Claim downgrades to "two operators with independent analyses." Listed as future work.</td>
+      </tr>
+    </tbody>
   </table>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Reviewer Anticipation</span></div>
 </section>
 
-<!-- ============ SLIDE 16: NEXT STEPS ============ -->
+<!-- ======================== NEXT STEPS ======================== -->
 <section>
-  <h3>下一步行动</h3>
-  <h2>决定命运的一个实验</h2>
+  <div class="section-label">Decision Point</div>
+  <h2>One experiment determines the story</h2>
+  <div class="heading-rule"></div>
 
-  <div class="tl;dr" style="margin-top: 1em;">
-    <p style="margin: 0; font-size: 0.85em;">
-      <strong>v24 recipe on ALFWorld 1.5B</strong> · 预计 ~5h · 单个实验决定叙事成败
+  <div class="panel accent" style="margin-top: 10px;">
+    <div class="panel-label">Critical experiment</div>
+    <p style="margin-top: 6px; font-size: 0.75em;">
+      <strong>v24 recipe on ALFWorld 1.5B.</strong> ~5 hours on 4 × A100.
     </p>
   </div>
 
-  <div class="cols" style="margin-top: 1.5em;">
+  <div class="cols" style="margin-top: 22px;">
     <div class="col">
-      <div style="padding: 0.8em; background: #dcfce7; border-left: 4px solid var(--green); border-radius: 4px;">
-        <strong style="color: var(--green);">✓ 成功 (v24 ≥ DUET-v1)</strong>
-        <p style="font-size: 0.6em; margin: 0.3em 0 0 0;">框架成立；BC curriculum 在不需要时自动熄火；通用 contribution。</p>
+      <div class="panel ok">
+        <div class="panel-label"><span class="glyph-ok">Outcome A · v24 ≥ DUET-v1</span></div>
+        <p style="margin-top: 6px;">Framework is universal. The BC term quiesces automatically when rare-token gap is small. Contribution holds for NeurIPS.</p>
       </div>
     </div>
     <div class="col">
-      <div style="padding: 0.8em; background: #fee2e2; border-left: 4px solid var(--accent); border-radius: 4px;">
-        <strong style="color: var(--accent);">✗ 失败 (v24 &lt;&lt; DUET-v1)</strong>
-        <p style="font-size: 0.6em; margin: 0.3em 0 0 0;">回到 Framing F+H：承认 BC 是 WebShop-specific。</p>
+      <div class="panel" style="border-left-color: var(--accent);">
+        <div class="panel-label"><span class="glyph-no">Outcome B · v24 &lt;&lt; DUET-v1</span></div>
+        <p style="margin-top: 6px;">BC is a WebShop-specific patch. Fall back to "method paper + strong ablations" framing; avoid overclaiming universality.</p>
       </div>
     </div>
   </div>
 
-  <hr style="margin: 1.5em 0; border: 0; border-top: 1px solid #e5e7eb;">
+  <hr>
 
-  <p style="font-size: 0.65em;"><strong>次优先</strong>：AWAC baseline (R4 防御) · 3B CHORD ALFWorld 重跑 · Round 4B 剩余 v36/v31/v32</p>
+  <p style="font-size: 0.55em; color: var(--ink-soft);">
+    <strong>Secondary</strong>: AWAC baseline (for R4 defense) · 3B CHORD ALFWorld rerun · Remaining Round 4B variants (v36 constant-μ BC, v31 entropy coef, v32 lower lr).
+  </p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Decision Point</span></div>
 </section>
 
-<!-- ============ SLIDE 17: TAKEAWAYS ============ -->
+<!-- ======================== TAKEAWAYS ======================== -->
 <section>
-  <h2>三分钟要带走的</h2>
+  <div class="section-label">Close</div>
+  <h2>Five things to take away</h2>
+  <div class="heading-rule"></div>
 
-  <ol style="font-size: 0.78em; line-height: 1.6; margin-top: 1em;">
-    <li><strong>CHORD > DUET-v1 的根本原因</strong>：BC 梯度 ∝ (1-p)，DR3 梯度 ∝ p(1-p)。稀有 SKU token 上 CHORD 快 4 个数量级。</li>
-    <li><strong>v24 uniquely work 的原因</strong>：BC 是唯一同时具备 teacher-specific + per-token surprise + unconditional 正号的算子。4 个 no-BC rescue 全部失败 (0.49-0.52)，只有 v24 达到 0.678。</li>
-    <li><strong>叙事保留 dual-channel</strong>：Action Channel 是 gradient operator curriculum；μ_t 调度两个算子；State Channel 不变。</li>
-    <li><strong>决定性实验</strong>：v24 on ALFWorld 1.5B；~5h 跑完就知道框架是通用还是 WebShop-specific。</li>
-    <li><strong>弱点诚实披露</strong>：AWAC baseline 没跑，作为 future work。</li>
+  <ol style="margin-top: 22px;">
+    <li>
+      <strong>DUET wins on 5 of 6 env×scale cells</strong>;
+      the one loss (WebShop 1.5B, CHORD 0.603 vs DUET-v1 0.549) led to the ablation study.
+    </li>
+    <li>
+      <strong>v24 = DUET + decaying BC</strong> reaches <strong>0.678</strong> — beating CHORD by +7.5 pp and DUET-v1 by +12.9 pp.
+    </li>
+    <li>
+      <strong>Why BC matters</strong>: it is the unique gradient operator that is teacher-specific, per-token surprise-weighted, and unconditionally positive. Four stability-only rescues all cap at 0.52.
+    </li>
+    <li>
+      <strong>The narrative holds</strong>: Action Channel = BC + DR3 curriculum; State Channel unchanged; novelty in the <em>automatic</em> density-ratio fade.
+    </li>
+    <li>
+      <strong>Next</strong>: v24 on ALFWorld 1.5B — one 5-hour run decides whether the framework is universal or WebShop-specific.
+    </li>
   </ol>
 
-  <div style="text-align: center; margin-top: 2em;">
-    <div style="display: inline-block; padding: 0.5em 1.2em; background: var(--primary); color: white; border-radius: 999px; font-size: 0.7em; font-weight: 600;">
-      Q&A
-    </div>
-  </div>
+  <hr>
+
+  <p style="text-align: center; font-style: italic; color: var(--ink-soft); margin-top: 20px; font-size: 0.58em;">
+    Thank you — happy to discuss any of this in depth.
+  </p>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Close</span></div>
 </section>
 
-<!-- ============ SLIDE 18: APPENDIX ============ -->
+<!-- ======================== APPENDIX CHEATSHEET ======================== -->
 <section>
-  <h3>附录</h3>
-  <h2>速查表</h2>
+  <div class="section-label">Appendix</div>
+  <h2>Reference card</h2>
+  <div class="heading-rule"></div>
 
-  <div class="formula-box">
-    <strong>梯度公式</strong>
-    <p style="font-size: 0.7em; margin: 0.5em 0;">BC：$\Delta z(a^*) = \mu \cdot (1 - \pi_\theta)$ · per-token, unconditional</p>
-    <p style="font-size: 0.7em; margin: 0.5em 0;">DR3：$\Delta z(a^*) = A(\tau) \cdot w_\text{hat} \cdot \pi_\theta(1 - \pi_\theta)$ · seq-level, conditional</p>
+  <div class="panel">
+    <div class="panel-label">Gradient forms</div>
+    <p style="margin: 6px 0 0 0;">BC · $\Delta z(a^*) = \mu (1 - \pi_\theta)$ &nbsp; · per-token, unconditional</p>
+    <p style="margin: 4px 0 0 0;">DR3 · $\Delta z(a^*) = A(\tau) w_\text{hat} \pi_\theta (1 - \pi_\theta)$ &nbsp; · sequence-scaled, conditional</p>
   </div>
 
-  <div class="formula-box">
-    <strong>稀有 token (p = 10⁻⁴) 每步 Δz</strong>
-    <p style="font-size: 0.7em; margin: 0.3em 0;">BC：<code>0.9</code> · DR3 (unclipped)：<code>10⁻⁴</code> · DR3 (clipped)：<code>+20% 相对</code></p>
+  <div class="panel" style="margin-top: 10px;">
+    <div class="panel-label">Rare-token step progress (p = 10⁻⁴)</div>
+    <p style="margin: 6px 0 0 0;">BC · <code>0.9</code> &nbsp; · DR3 unclipped · <code>10⁻⁴</code> &nbsp; · DR3 clipped · <code>+20% relative</code></p>
   </div>
 
-  <div class="formula-box accent">
-    <strong>4 个 rescue Val@100</strong>
-    <p style="font-size: 0.7em; margin: 0.3em 0;">
-      v28 (EMA)=0.495 · v29 (combined)=0.511 · v30 (KL×10)=0.520 · v33 (soft disc)=0.520 · <strong>v24=0.678</strong>
-    </p>
+  <div class="panel accent" style="margin-top: 10px;">
+    <div class="panel-label">Val@100, narrative-rescue variants</div>
+    <p style="margin: 6px 0 0 0;">v28 (EMA) <strong>0.495</strong> &nbsp; · v29 (combined) <strong>0.511</strong> &nbsp; · v30 (KL ×10) <strong>0.520</strong> &nbsp; · v33 (soft disc) <strong>0.520</strong></p>
+    <p style="margin: 4px 0 0 0; color: var(--accent);">v24 (decaying BC μ = 0.3 → 0.05) · <strong>0.678</strong></p>
   </div>
 
-  <div class="formula-box">
-    <strong>200 match task option-click rate @ step 100</strong>
-    <p style="font-size: 0.7em; margin: 0.3em 0;">DUET-v1: 33% · CHORD: 72.5% · v24: 61% (但死循环 0/200 vs CHORD 16/200)</p>
+  <div class="panel" style="margin-top: 10px;">
+    <div class="panel-label">Option-click behavior · 200 matched tasks @ step 100</div>
+    <p style="margin: 6px 0 0 0;">Teacher-exact option · DUET-v1 <strong>33%</strong> &nbsp; · CHORD <strong>72.5%</strong> &nbsp; · v24 <strong>61%</strong> (with 0/200 loops vs CHORD 16/200)</p>
   </div>
+
+  <div class="page-footer"><span>DUET · Retrospective</span><span>Appendix</span></div>
 </section>
 
 </div></div>
@@ -615,11 +1061,12 @@ Reveal.initialize({
   history: true,
   center: false,
   hash: true,
-  transition: 'slide',
+  transition: 'fade',
+  transitionSpeed: 'fast',
   slideNumber: 'c/t',
-  width: 1280,
+  width: 1366,
   height: 800,
-  margin: 0.06,
+  margin: 0,
 });
 </script>
 </body>
