@@ -30,6 +30,12 @@
 
 这一节是整份 prep 的基石。你会在这里看到 "BC per-token unit coefficient" 和 "DR3 sequence-level × advantage × clip" 到底是什么意思。
 
+**先看全局**（展示这份复盘到底在讨论什么）：
+
+![35 变体全景散点 —— no-BC 区都聚在 0.5 左右，唯独 v24 独峰 0.678](./figures/fig1_variant_landscape.png)
+
+*图意：横轴是 35 个实验变体，纵轴是 Val@100。灰色虚线是 CHORD (0.603) 和 v24 (0.678)。蓝色是所有不含 BC 的变体，红色是含 BC 的变体。视觉上就是一句话：**BC 与否决定了天花板**。*
+
 ### 1.1 Softmax 梯度的基本事实（谁都逃不掉的）
 
 对于任意 loss `L = −log π_θ(a*|s)`（即把 teacher token `a*` 的概率拉高），对 logit `z(a)` 的梯度是：
@@ -168,6 +174,10 @@ DR3 的 `apply_warmup_steps = 10`，意味着**前 10 步 DR3 完全不激活**�
 
 这个 9 步的 head-start 让 CHORD 先把 teacher 的语法和 SKU 概念印刻到 policy 里。
 
+![CHORD vs DUET-v1 训练动态 4 面板对比](./figures/fig2_chord_vs_duet_v1_dynamics.png)
+
+*图意：同样 100 步，同样 GPU 配置。左上 reward 曲线：CHORD 在 μ decay 窗口（step 1-25，灰色阴影区）快速爬升，DUET-v1 因 DR3 warmup=10 前 10 步没 teacher 信号。右上 KL：CHORD 因 BC 持续锚 teacher 导致 KL-to-ref 更高（但不崩）。右下 entropy：v1 探索性更强但学不到目标 token。*
+
 ### 2.4 讲给导师的 1 句话（可直接念）
 
 > "CHORD 的 SFT 梯度是 per-token 的 unit 系数，DR3 的 teacher 梯度是 sequence-level 的 `A·w_hat` 乘 softmax 的 `p(1-p)` 方差。对稀有 SKU token (p = 10⁻⁴)，CHORD 一步推 log π 上升 0.9，DR3 一步只推 10⁻⁴；相差四个数量级。经验上表现为 CHORD 在 200 个验证任务里 72.5% 点对 teacher 指定的 option，DUET v1 只有 33%。这 40pp 的 option-click 能力差直接对应 5.4pp 的 val reward 差。"
@@ -206,6 +216,10 @@ Val@100 = **0.678**，比 CHORD (0.603) 高 7.5pp，比 DUET-v1 (0.549) 高 12.9
 
 **规律：所有不加 BC 的 rescue 都卡在 0.49-0.52**。这是一个**经验上非常硬的 ceiling**。
 
+![No-BC ceiling —— 最强证据图](./figures/fig3_no_bc_ceiling.png)
+
+*图意：6 个变体一字排开。左边 4 根柱（v28、v29、v30、v33）是"试图用稳定化代替 BC"的尝试，全部被压在 0.49-0.52 的地板附近。中间 CHORD 0.603 作为参考基线。最右 v24 以 0.678 独高一头。**这张图本身就是 Q2 的答案 —— 任何只调稳定性不加 BC 的干预，都到不了 v24 的水平**。*
+
 ### 3.3 为什么每个 rescue 都失败？—— 对照三个性质
 
 把 4 个 rescue 摆到"三性质矩阵"里：
@@ -243,6 +257,10 @@ v25 实验直接证明了这一点。v25 配置：去掉 BC + 放宽 PPO clip（
 1. **前期（μ=0.3）**：强力推稀有 SKU token 概率
 2. **后期（μ=0.05 floor）**：持续守住语法 token
 
+![v12 vs v24 机制级 6 面板对比](./figures/fig4_v12_vs_v24_mechanism.png)
+
+*图意：6 个训练指标随 step 的演化，v12（蓝）和 v24（红）对照。关键观察：(1) grad_norm 面板：v12 后期飙到 12+（policy drift 信号），v24 稳定在 4 以下（BC 锚住了）；(2) entropy：v12 entropy collapse（0.3→0.15），v24 维持 0.5（健康探索）；(3) state_channel progress：v12 从 0.35 跌到 0.22（policy 偏离 expert manifold），v24 单调上升到 0.38；(4) disc_acc：v24 更早达到 0.9+，说明判别器更早能区分 teacher vs on-policy —— BC 先把 teacher 模式印进去，判别器才能学得快。*
+
 ### 3.5 推广到 ALFWorld / 3B / 7B 的预测
 
 BC 的价值取决于三个环境/模型属性：
@@ -263,6 +281,10 @@ BC 的价值取决于三个环境/模型属性：
 | ALFWorld 1.5B | 低（模板） | 低 | 低 | **+0~3pp**（关键待验证） |
 | ALFWorld 3B | 低 | 低 | 中 | +0~1pp |
 | ALFWorld 7B | 低 | 低 | 高 | **≈ 0**，BC 可以彻底关掉 |
+
+![跨 scale 跨环境的 gain 预测](./figures/fig5_scaling_prediction.png)
+
+*图意：左 ALFWorld 随规模（1.5B→3B→7B）DUET 的 gain 曲线；右 WebShop 同构图。实线是已有数据点，虚线是基于 "BC 贡献 ∝ rare-token gap × 1/capacity" 的预测。**ALFWorld 1.5B 那个点是红色的 —— 必须跑的决定性实验**，其他虚线都建立在它的值上。*
 
 ### 3.6 决定性实验：v24 on ALFWorld 1.5B
 
