@@ -295,6 +295,13 @@ def het_compute_teacher_aware_loss(
     teacher_ag_pm_prob_min: float = 0.0,
     teacher_ag_pm_prob_max_gate: float = 1.0,
     teacher_ag_pm_stop_grad: bool = True,
+    # ⭐ Spec 2 (Candidate B): Surprise-Weighted DR3
+    # Multiply teacher ratio by φ(s,a) = (1 - π_θ(a|s)) (detached) on TEACHER tokens only.
+    # Motivation: down-weight teacher tokens the policy already knows; focus on rare/surprising teacher actions.
+    # Guarded by use_spw_teacher; φ is detached so no gradient flows through the weight.
+    use_spw_teacher: bool = False,
+    spw_phi_formula: str = "1_minus_pi",  # future-proofing (currently only "1_minus_pi" supported)
+    spw_mask_on_positive_A: bool = True,  # if True, only down-weight when A>0 (avoid pushing rare tokens DOWN on failure)
 ):
     """
     计算混合 on-policy、self-generated off-policy 和 teacher off-policy 的 loss。
@@ -569,7 +576,39 @@ def het_compute_teacher_aware_loss(
         if teacher_loss_scale.dim() == 1:
             teacher_loss_scale = teacher_loss_scale.unsqueeze(-1)
         teacher_ratio = teacher_ratio * teacher_loss_scale
-    
+
+    # ⭐ Spec 2 / Candidate B: Surprise-Weighted DR3
+    # φ(s,a) = (1 - π_θ(a|s)) detached, applied ONLY on teacher tokens.
+    # On non-teacher tokens, phi_factor = 1 so `teacher_ratio` is unchanged there —
+    # but note `teacher_ratio` is only consumed where teacher_mask=1 in the final
+    # `torch.where` below, so any effect on non-teacher positions is inert.
+    spw_phi_raw = None           # (bs, resp_len) — raw φ values for logging (no mask)
+    spw_effective_coef = None    # (bs, resp_len) — φ × A on teacher tokens for diagnostics
+    if use_spw_teacher:
+        # π_θ(a|s) = exp(log_prob), clamp to [0, 1] for numerical safety (fp16 rounding)
+        formula = str(spw_phi_formula).lower().strip()
+        if formula != "1_minus_pi":
+            # only supported formula at this time; fall back silently
+            formula = "1_minus_pi"
+        pi_theta = torch.exp(log_prob).detach().clamp(0.0, 1.0)
+        spw_phi_raw = (1.0 - pi_theta).clamp(0.0, 1.0)  # φ ∈ [0, 1], detached
+
+        # Build the multiplier: on teacher tokens use φ; elsewhere use 1 (no-op).
+        # Optionally restrict to A>0 so failed teacher tokens (A<0) are NOT down-weighted
+        # (pushing a rare teacher action DOWN on a bad trajectory is unsafe).
+        tm = teacher_mask_float  # (bs, resp_len), 1=teacher
+        if spw_mask_on_positive_A:
+            pos_A = (advantages > 0).float()
+            apply_mask = tm * pos_A
+        else:
+            apply_mask = tm
+        # phi_factor = 1 - apply_mask * (1 - φ)   # == φ where apply_mask=1, == 1 elsewhere
+        phi_factor = 1.0 - apply_mask * (1.0 - spw_phi_raw)
+        teacher_ratio = teacher_ratio * phi_factor
+
+        # Effective teacher coef (φ · A) on teacher tokens — for diagnostics
+        spw_effective_coef = spw_phi_raw * advantages.detach()
+
     # Teacher loss 计算
     teacher_off_pg_losses_raw = -advantages * teacher_ratio
     
@@ -712,6 +751,11 @@ def het_compute_teacher_aware_loss(
         ratio_stats.update(_masked_stats(teacher_ag_pm_prob_gate_w, teacher_token_mask, "ag_pm_prob_gate_w"))
     if teacher_prob is not None and torch.is_tensor(teacher_prob):
         ratio_stats.update(_masked_stats(teacher_prob, teacher_token_mask, "teacher_prob"))
+    # ⭐ Spec 2: Surprise-weighted DR3 diagnostics (teacher tokens only)
+    if spw_phi_raw is not None and torch.is_tensor(spw_phi_raw):
+        ratio_stats.update(_masked_stats(spw_phi_raw, teacher_token_mask, "spw/phi"))
+    if spw_effective_coef is not None and torch.is_tensor(spw_effective_coef):
+        ratio_stats.update(_masked_stats(spw_effective_coef, teacher_token_mask, "spw/effective_teacher_coef"))
     # self_off ratio: exp(log_prob - old_log_prob)
     ratio_stats.update(_masked_stats(ratio, self_token_mask, "self_off_ratio"))
     # on-policy ratio is always 1 in PPO surrogate, but we can still log on-policy advantage stats

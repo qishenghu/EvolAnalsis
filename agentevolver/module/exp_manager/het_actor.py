@@ -20,6 +20,7 @@ Single Process Actor
 
 import itertools
 import logging
+import math
 import os
 from typing import Tuple
 
@@ -1557,6 +1558,11 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         _hybrid_bell_p_target = float(dr3_cfg.get("policy_shaping_bell_p_target", 0.08))
                                     _hybrid_bell_sigma = float(dr3_cfg.get("policy_shaping_bell_sigma", 1.2))
 
+                                    # ⭐ Spec 2 (Candidate B): Surprise-Weighted DR3
+                                    _use_spw = bool(self.config.get("use_spw_teacher", False))
+                                    _spw_formula = str(self.config.get("spw_phi_formula", "1_minus_pi"))
+                                    _spw_mask_posA = bool(self.config.get("spw_mask_on_positive_A", True))
+
                                     ret_dict = het_compute_teacher_aware_loss(
                                         old_log_prob=old_log_prob,
                                         log_prob=log_prob,
@@ -1578,9 +1584,15 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         teacher_policy_shaping_bell_sigma=_hybrid_bell_sigma,
                                         teacher_use_clip=False,
                                         teacher_loss_scale=_hybrid_scale,
+                                        use_spw_teacher=_use_spw,
+                                        spw_phi_formula=_spw_formula,
+                                        spw_mask_on_positive_A=_spw_mask_posA,
                                     )
                                     metrics["dr3/hybrid_policy_shaping"] = 1.0
                                     metrics["dr3/hybrid_beta"] = _hybrid_beta
+                                    if _use_spw:
+                                        metrics["spw/enabled"] = 1.0
+                                        metrics["spw/mask_on_positive_A"] = 1.0 if _spw_mask_posA else 0.0
                                 else:
                                     ret_dict = repo_compute_token_loss(
                                         old_log_prob=old_log_prob,
@@ -1694,73 +1706,292 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             loss_agg_mode=loss_agg_mode,
                         )
 
-                    if (ret_dict is None) and use_chord and has_teacher_data:
-                        # ========== CHORD 模式 ==========
-                        # CHORD (Controllable Harmonization of On- and Off-Policy RL)
-                        # 使用 SFT loss 代替 policy gradient 学习 expert 数据
-                        # 公式: L_chord = (1-μ) * L_grpo(on-policy) + μ * L_sft(expert)
-                        #
-                        # ⭐ 关键区别：
-                        # - GRPO loss 只计算 on-policy 数据（exp_mask=0）的 policy gradient
-                        # - SFT loss 只计算 expert 数据（exp_mask=1）的监督学习
-                        # - Expert 数据不参与 policy gradient，避免分布偏移
-                        
-                        # Step 1: 计算 GRPO loss（只取 on-policy 数据的 loss）
-                        grpo_ret_dict = het_compute_token_on_off_policy_loss(
-                            old_log_prob=old_log_prob,
-                            log_prob=log_prob,
-                            advantages=advantages,
-                            response_mask=response_mask,
-                            exp_mask=exp_mask,  # ⭐ 使用原始 exp_mask 正确区分 on/off-policy
-                            cliprange=clip_ratio,
-                            cliprange_low=clip_ratio_low,
-                            cliprange_high=clip_ratio_high,
-                            off_cliprange_high=off_cliprange_high,
-                            clip_ratio_c=clip_ratio_c,
-                            loss_agg_mode=loss_agg_mode,
-                            off_policy_shaping_mode=off_policy_shaping_mode,
-                            off_policy_shaping_beta=off_policy_shaping_beta,
-                        )
-                        # ⭐ 只取 on_pg_loss（on-policy 数据的 policy gradient）
-                        # 忽略 off_pg_loss，因为 expert 数据由 SFT loss 负责
-                        grpo_loss = grpo_ret_dict["on_pg_loss"]
-                        
-                        # Step 2: 计算 CHORD SFT loss（只对 expert 数据）
+                    if use_chord and has_teacher_data and (ret_dict is None or (dr3_enable and use_chord)):
+                        # ========== CHORD 模式 (可与 DR3 共存) ==========
+                        # 公式: L = L_dr3_or_grpo + μ * L_sft(expert)
+                        # 当 DR3 启用时: L = L_dr3 + μ * L_sft (DR3 处理 on/off-policy gradient, SFT 提供 token 级正则)
+                        # 当 DR3 未启用时: L = (1-μ) * L_grpo + μ * L_sft (原始 CHORD)
+
+                        if ret_dict is None:
+                            # 纯 CHORD 模式（DR3 未启用）
+                            grpo_ret_dict = het_compute_token_on_off_policy_loss(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                exp_mask=exp_mask,
+                                cliprange=clip_ratio,
+                                cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,
+                                off_cliprange_high=off_cliprange_high,
+                                clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,
+                                off_policy_shaping_mode=off_policy_shaping_mode,
+                                off_policy_shaping_beta=off_policy_shaping_beta,
+                            )
+                            grpo_loss = grpo_ret_dict["on_pg_loss"]
+                            base_ret_dict = grpo_ret_dict
+                        else:
+                            # DR3 + CHORD 混合模式：DR3 已提供 ret_dict，只需加 SFT 项
+                            grpo_loss = ret_dict["pg_loss"]
+                            base_ret_dict = ret_dict
+
+                        # 计算 CHORD SFT loss（只对 expert 数据）
                         chord_delta = self.config.get("chord_delta", 0.1)
                         chord_use_token_weighting = self.config.get("chord_use_token_weighting", True)
-                        
+
                         sft_ret = compute_chord_sft_loss(
                             log_prob=log_prob,
                             response_mask=response_mask,
-                            exp_mask=exp_mask,  # ⭐ SFT 只看 expert 数据
+                            exp_mask=exp_mask,
                             use_token_weighting=chord_use_token_weighting,
                             loss_agg_mode=loss_agg_mode,
                         )
                         sft_loss = sft_ret["sft_loss"]
-                        
-                        # Step 3: 计算 μ 并合并 loss
-                        # ⭐ 使用预先获取的 chord_global_step（在 mini_batch 级别获取）
-                        # CHORD 原作者实现：三阶段调度（Warmup → Decay → 稳定）
+
+                        # 计算 μ
                         chord_mu_warmup_steps = self.config.get("chord_mu_warmup_steps", 200)
                         chord_mu_decay_steps = self.config.get("chord_mu_decay_steps", 400)
                         chord_mu_peak = self.config.get("chord_mu_peak", 0.5)
                         chord_mu_valley = self.config.get("chord_mu_valley", 0.02)
-                        
-                        mu = chord_mu_scheduler(
-                            global_step=chord_global_step,
-                            mu_warmup_steps=chord_mu_warmup_steps,
-                            mu_decay_steps=chord_mu_decay_steps,
-                            mu_peak=chord_mu_peak,
-                            mu_valley=chord_mu_valley,
-                        )
-                        
-                        # ⭐ CHORD 总 loss: L_chord = (1-μ) * L_grpo + μ * L_sft
-                        # 训练初期 μ 大：更多依赖 SFT（学习 expert）
-                        # 训练后期 μ 小：更多依赖 GRPO（on-policy 探索）
-                        pg_loss = (1 - mu) * grpo_loss + mu * sft_loss
-                        
-                        # 构建 ret_dict（复用现有结构）
-                        ret_dict = grpo_ret_dict.copy()
+
+                        # --- Adaptive μ (v37/v39) ---
+                        # Modes:
+                        #   "disc_acc" (v39, recommended): μ tracks 1-EMA(dr3/disc_acc); empirical r=0.97 with v24 schedule.
+                        #       See analysis_reports/adaptive_signal_discovery.md
+                        #   "va" (v37, legacy/broken): post-GRPO advantage variance; ≈ const, not recommended.
+                        #       See analysis_reports/duet_second_pass_theory.md §4
+                        #   Disabled (default): use hand-tuned chord_mu_scheduler (v24 path)
+                        use_adaptive_mu = bool(self.config.get("chord_mu_adaptive", False))
+                        adaptive_mode = str(self.config.get("chord_mu_adaptive_mode", "disc_acc")).lower().strip()
+                        if use_adaptive_mu and adaptive_mode == "disc_acc":
+                            # --- v39: discriminator-accuracy-based adaptive μ ---
+                            # Rule: μ = clamp(μ_max * max(0, (1 - d)/(1 - d_floor)), μ_min, μ_max)
+                            #   d = EMA(dr3/disc_acc, alpha=d_ema_alpha)
+                            # Semantics:
+                            #   d = d_floor (e.g. 0.5, indistinguishable) → μ = μ_max (full BC)
+                            #   d = 1.0 (fully separable)                  → μ = μ_min (no BC beyond floor)
+                            # NOTE: Pre-warmup, `dr3/disc_acc` is raw 0.0 (default init in DR3). We treat
+                            # `_disc_acc_now == 0.0` as "no signal yet" and default to 0.5 (chance level)
+                            # so that μ holds at μ_max during warmup rather than spuriously falling to
+                            # μ_valley via gated=1 → yes, μ_max. Both conventions land on μ_max, but
+                            # treating 0.0 as 0.5 makes the EMA post-warmup curve cleaner.
+                            _disc_acc_raw = float(dr3_metrics.get("dr3/disc_acc", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            _disc_ready = float(dr3_metrics.get("dr3/disc_trained_steps", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            _disc_acc_now = _disc_acc_raw if _disc_ready > 0 else 0.5
+                            d_ema_alpha = float(self.config.get("chord_mu_d_ema_alpha", 0.2))
+                            if not hasattr(self, "_disc_acc_ema"):
+                                self._disc_acc_ema = _disc_acc_now
+                            else:
+                                self._disc_acc_ema = (1 - d_ema_alpha) * self._disc_acc_ema + d_ema_alpha * _disc_acc_now
+                            d_floor = float(self.config.get("chord_mu_d_floor", 0.5))
+                            # Optional sigmoid mapping (v39f): gated = sigmoid(k*(d_floor - d_ema))
+                            d_mapping = str(self.config.get("chord_mu_d_mapping", "linear")).lower().strip()
+                            if d_mapping == "sigmoid":
+                                d_k = float(self.config.get("chord_mu_d_sigmoid_k", 10.0))
+                                _gated = 1.0 / (1.0 + math.exp(d_k * (float(self._disc_acc_ema) - d_floor)))
+                            else:
+                                # Normalize (1 - d) into [0, 1] using (1 - d_floor) as the scale
+                                _scale = max(1e-6, 1.0 - d_floor)
+                                _gated = max(0.0, (1.0 - float(self._disc_acc_ema)) / _scale)
+                                _gated = min(1.0, _gated)
+                            mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _gated
+                            adaptive_metrics = {
+                                "chord/mu_mode": 3.0,  # 3 = adaptive disc_acc (v39)
+                                "chord/disc_acc_ema": float(self._disc_acc_ema),
+                                "chord/disc_acc_current": float(_disc_acc_now),
+                                "chord/disc_acc_raw": float(_disc_acc_raw),
+                                "chord/disc_ready": float(_disc_ready),
+                                "chord/mu_adaptive_gated": float(_gated),
+                                "chord/d_floor": d_floor,
+                            }
+                        elif use_adaptive_mu and adaptive_mode == "nll":
+                            # --- v40: teacher-NLL-based adaptive μ (theory-researcher's alternative) ---
+                            # Semantics: NLL high (teacher not learned) → μ high; NLL low → μ low
+                            # Supports 3 mappings via chord_mu_nll_mapping:
+                            #   "sigmoid" (default): μ = μ_min + (μ_max - μ_min) * sigmoid(k*(NLL_ema - τ))
+                            #   "linear":  μ = clamp(μ_min + slope*NLL_ema, μ_min, μ_max)
+                            #   "ratio":   μ = clamp(μ_max * (NLL_ema / NLL_0), μ_min, μ_max)
+                            #      NLL_0 captured as avg over first 3 post-warmup steps (see v42 kl_ratio family)
+                            _nll_now = float(sft_loss.detach().item())
+                            nll_ema_alpha = float(self.config.get("chord_mu_nll_ema_alpha", 0.3))
+                            if not hasattr(self, "_nll_ema"):
+                                self._nll_ema = _nll_now
+                            else:
+                                self._nll_ema = (1 - nll_ema_alpha) * self._nll_ema + nll_ema_alpha * _nll_now
+
+                            nll_mapping = str(self.config.get("chord_mu_nll_mapping", "sigmoid")).lower().strip()
+                            if nll_mapping == "linear":
+                                nll_slope = float(self.config.get("chord_mu_nll_slope", 0.156))  # defaults to μ=0.02+0.156·NLL
+                                nll_intercept = float(self.config.get("chord_mu_nll_intercept", chord_mu_valley))
+                                mu_raw = nll_intercept + nll_slope * float(self._nll_ema)
+                                mu = max(chord_mu_valley, min(chord_mu_peak, mu_raw))
+                                _gated_nll = (mu - chord_mu_valley) / max(1e-6, (chord_mu_peak - chord_mu_valley))
+                            elif nll_mapping == "ratio":
+                                # ratio-to-initial normalization. Collect first N post-warmup NLLs as anchor.
+                                warm_n = int(self.config.get("chord_mu_nll_ratio_anchor_n", 3))
+                                if not hasattr(self, "_nll_anchor_buf"):
+                                    self._nll_anchor_buf = []
+                                    self._nll_anchor = None
+                                if self._nll_anchor is None and _nll_now > 0:
+                                    self._nll_anchor_buf.append(_nll_now)
+                                    if len(self._nll_anchor_buf) >= warm_n:
+                                        self._nll_anchor = float(sum(self._nll_anchor_buf) / max(1, len(self._nll_anchor_buf)))
+                                _nll_anchor_cur = self._nll_anchor if self._nll_anchor is not None else max(_nll_now, 1e-3)
+                                ratio_pow = float(self.config.get("chord_mu_nll_ratio_pow", 1.0))
+                                _gated_nll = max(0.0, min(1.0, (float(self._nll_ema) / max(1e-6, _nll_anchor_cur)) ** ratio_pow))
+                                mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _gated_nll
+                            else:
+                                nll_target = float(self.config.get("chord_mu_nll_target", 0.65))
+                                nll_k = float(self.config.get("chord_mu_nll_k", 6.0))
+                                _gated_nll = 1.0 / (1.0 + math.exp(-nll_k * (self._nll_ema - nll_target)))
+                                mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _gated_nll
+                            adaptive_metrics = {
+                                "chord/mu_mode": 4.0,  # 4 = adaptive nll (v40)
+                                "chord/nll_ema": float(self._nll_ema),
+                                "chord/nll_current": float(_nll_now),
+                                "chord/mu_adaptive_gated": float(_gated_nll),
+                                "chord/nll_mapping": 0.0 if nll_mapping == "sigmoid" else (1.0 if nll_mapping == "linear" else 2.0),
+                            }
+                            if nll_mapping == "ratio" and getattr(self, "_nll_anchor", None) is not None:
+                                adaptive_metrics["chord/nll_anchor"] = float(self._nll_anchor)
+                            elif nll_mapping == "sigmoid":
+                                adaptive_metrics["chord/nll_target"] = float(self.config.get("chord_mu_nll_target", 0.65))
+                        elif use_adaptive_mu and adaptive_mode == "va":
+                            # --- v37: advantage-variance adaptive μ (legacy; known broken due to GRPO normalization) ---
+                            with torch.no_grad():
+                                _rm = response_mask.float()
+                                _denom = _rm.sum(-1).clamp_min(1.0)
+                                _adv_per_sample = (advantages.detach().abs() * _rm).sum(-1) / _denom
+                                _va_current = float(_adv_per_sample.std().item()) if _adv_per_sample.numel() > 1 else 0.0
+                            if not hasattr(self, "_VA_ema"):
+                                self._VA_ema = _va_current
+                            else:
+                                self._VA_ema = 0.9 * self._VA_ema + 0.1 * _va_current
+                            VA_star = float(self.config.get("chord_mu_VA_target", 0.035))
+                            sigmoid_k = float(self.config.get("chord_mu_sigmoid_k", 3.0))
+                            excess = (self._VA_ema - VA_star) / max(1e-6, VA_star)
+                            gated = 1.0 / (1.0 + math.exp(-sigmoid_k * excess))
+                            mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * gated
+                            adaptive_metrics = {
+                                "chord/mu_mode": 2.0,  # 2 = adaptive va (v37)
+                                "chord/VA_ema": float(self._VA_ema),
+                                "chord/VA_current": float(_va_current),
+                                "chord/VA_star": VA_star,
+                                "chord/mu_adaptive_gated": float(gated),
+                            }
+                        elif use_adaptive_mu and adaptive_mode == "ess_ratio":
+                            # --- v41b: ESS-ratio adaptive μ ---
+                            # Problem with vanilla ESS/N: saturates at ~1.0 quickly, μ sticks at μ_min.
+                            # Fix: normalize by INITIAL ESS (first post-warmup value) so ratio ∈ [~0, >=1],
+                            # giving room to respond.  Two mappings:
+                            #   "saturating" (A): gated = max(0, 1 - ratio^α)
+                            #   "sigmoid"    (B): gated = sigmoid(-k*(ratio - τ))
+                            # Velocity variant ("velocity") uses delta-ESS EMA; sparingly recommended.
+                            _ess_now = float(dr3_metrics.get("dr3/ess_off_window", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            _ess_len = float(dr3_metrics.get("dr3/ess_window_len", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            ess_ema_alpha = float(self.config.get("chord_mu_ess_ema_alpha", 0.2))
+                            if not hasattr(self, "_ess_ema"):
+                                self._ess_ema = _ess_now
+                            else:
+                                self._ess_ema = (1 - ess_ema_alpha) * self._ess_ema + ess_ema_alpha * _ess_now
+                            # Anchor ESS_0 once window has filled to avoid anchoring on partial stats
+                            min_window = float(self.config.get("chord_mu_ess_anchor_min_window", 8.0))
+                            if not hasattr(self, "_ess_anchor"):
+                                self._ess_anchor = None
+                            if self._ess_anchor is None and _ess_len >= min_window and _ess_now > 0:
+                                self._ess_anchor = float(self._ess_ema)
+                            _ess_anchor_cur = float(self._ess_anchor) if self._ess_anchor is not None else max(_ess_now, 1.0)
+                            ratio = float(self._ess_ema) / max(1e-6, _ess_anchor_cur)
+                            ess_mapping = str(self.config.get("chord_mu_ess_mapping", "saturating")).lower().strip()
+                            if ess_mapping == "sigmoid":
+                                ess_tau = float(self.config.get("chord_mu_ess_tau", 0.5))
+                                ess_k = float(self.config.get("chord_mu_ess_sigmoid_k", 8.0))
+                                _gated = 1.0 / (1.0 + math.exp(ess_k * (ratio - ess_tau)))
+                            elif ess_mapping == "velocity":
+                                if not hasattr(self, "_ess_prev"):
+                                    self._ess_prev = _ess_now
+                                vel = _ess_now - float(self._ess_prev)
+                                self._ess_prev = _ess_now
+                                if not hasattr(self, "_ess_vel_ema"):
+                                    self._ess_vel_ema = vel
+                                else:
+                                    self._ess_vel_ema = 0.8 * self._ess_vel_ema + 0.2 * vel
+                                vel_beta = float(self.config.get("chord_mu_ess_velocity_beta", 2.0))
+                                _gated = max(0.0, min(1.0, math.exp(-vel_beta * max(0.0, self._ess_vel_ema))))
+                            else:
+                                ess_pow = float(self.config.get("chord_mu_ess_saturating_pow", 0.5))
+                                _gated = max(0.0, 1.0 - max(0.0, ratio) ** ess_pow)
+                                _gated = min(1.0, _gated)
+                            mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _gated
+                            adaptive_metrics = {
+                                "chord/mu_mode": 5.0,  # 5 = adaptive ess_ratio (v41b)
+                                "chord/ess_current": float(_ess_now),
+                                "chord/ess_ema": float(self._ess_ema),
+                                "chord/ess_anchor": float(_ess_anchor_cur),
+                                "chord/ess_ratio": float(ratio),
+                                "chord/mu_adaptive_gated": float(_gated),
+                            }
+                        elif use_adaptive_mu and adaptive_mode == "kl_lagrangian":
+                            # --- v43: KL-Lagrangian (dual-ascent) adaptive μ ---
+                            # Interpretation: treat SFT NLL (or an externally supplied KL proxy) as a
+                            # per-step "cost"; update μ as a Lagrange multiplier that tracks how far
+                            # we exceed a slowly-moving cost budget.
+                            #   μ_{t+1} = clamp(μ_t * exp(η * (cost_ema - ε_t)), μ_min, μ_max)
+                            #   ε_t    = ρ * ε_{t-1} + (1-ρ) * cost_ema
+                            # Initial μ_0 = μ_peak (warmup to high BC).
+                            _cost_now = float(sft_loss.detach().item())
+                            if not hasattr(self, "_kl_cost_ema"):
+                                self._kl_cost_ema = _cost_now
+                            else:
+                                kl_cost_alpha = float(self.config.get("chord_mu_kl_cost_ema_alpha", 0.3))
+                                self._kl_cost_ema = (1 - kl_cost_alpha) * self._kl_cost_ema + kl_cost_alpha * _cost_now
+                            kl_eps_fixed = self.config.get("chord_mu_kl_eps_fixed", None)
+                            if kl_eps_fixed is not None:
+                                _kl_budget = float(kl_eps_fixed)
+                            else:
+                                kl_rho = float(self.config.get("chord_mu_kl_budget_rho", 0.9))
+                                if not hasattr(self, "_kl_budget_ema"):
+                                    self._kl_budget_ema = self._kl_cost_ema
+                                else:
+                                    self._kl_budget_ema = kl_rho * self._kl_budget_ema + (1 - kl_rho) * self._kl_cost_ema
+                                _kl_budget = float(self._kl_budget_ema)
+                            kl_eta = float(self.config.get("chord_mu_kl_eta", 0.3))
+                            if not hasattr(self, "_mu_lagrange_state"):
+                                self._mu_lagrange_state = float(chord_mu_peak)
+                            # Dual ascent: grow μ when cost > budget, shrink when cost < budget
+                            _step_mult = math.exp(kl_eta * (self._kl_cost_ema - _kl_budget))
+                            _new_mu = float(self._mu_lagrange_state) * _step_mult
+                            _new_mu = max(chord_mu_valley, min(chord_mu_peak, _new_mu))
+                            self._mu_lagrange_state = _new_mu
+                            mu = _new_mu
+                            _gated = (mu - chord_mu_valley) / max(1e-6, (chord_mu_peak - chord_mu_valley))
+                            adaptive_metrics = {
+                                "chord/mu_mode": 6.0,  # 6 = adaptive kl_lagrangian (v43)
+                                "chord/kl_cost_ema": float(self._kl_cost_ema),
+                                "chord/kl_budget": float(_kl_budget),
+                                "chord/kl_step_mult": float(_step_mult),
+                                "chord/mu_lagrange_state": float(self._mu_lagrange_state),
+                                "chord/mu_adaptive_gated": float(_gated),
+                            }
+                        else:
+                            mu = chord_mu_scheduler(
+                                global_step=chord_global_step,
+                                mu_warmup_steps=chord_mu_warmup_steps,
+                                mu_decay_steps=chord_mu_decay_steps,
+                                mu_peak=chord_mu_peak,
+                                mu_valley=chord_mu_valley,
+                            )
+                            adaptive_metrics = {"chord/mu_mode": 1.0}  # 1 = scheduler
+
+                        if dr3_enable:
+                            # DR3 + mini-SFT: L = L_dr3 + μ * L_sft
+                            pg_loss = grpo_loss + mu * sft_loss
+                        else:
+                            # 原始 CHORD: L = (1-μ) * L_grpo + μ * L_sft
+                            pg_loss = (1 - mu) * grpo_loss + mu * sft_loss
+
+                        ret_dict = base_ret_dict.copy()
                         ret_dict["pg_loss"] = pg_loss
                         
                         # 记录 CHORD 诊断指标
@@ -1774,6 +2005,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         chord_diag = sft_ret.get("chord_diag", {})
                         for k, v in chord_diag.items():
                             chord_metrics[f"chord/{k}"] = v
+                        chord_metrics.update(adaptive_metrics)
                         append_to_dict(metrics, chord_metrics)
                         
                     if (ret_dict is None) and has_teacher_data:
@@ -1872,6 +2104,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             teacher_ag_pm_prob_min=teacher_ag_pm_prob_min,
                             teacher_ag_pm_prob_max_gate=teacher_ag_pm_prob_max_gate,
                             teacher_ag_pm_stop_grad=teacher_ag_pm_stop_grad,
+                            # ⭐ Spec 2: Surprise-Weighted DR3 (LUFFY-mode fallback)
+                            use_spw_teacher=bool(self.config.get("use_spw_teacher", False)),
+                            spw_phi_formula=str(self.config.get("spw_phi_formula", "1_minus_pi")),
+                            spw_mask_on_positive_A=bool(self.config.get("spw_mask_on_positive_A", True)),
                         )  # ⭐ Compute teacher-aware loss (LUFFY + ExGRPO + 7.6 AG-PM)
                         # Collect raw per-trajectory values for correct step-level aggregation
                         traj_vals = ret_dict.get("teacher_diag_traj_values")

@@ -42,7 +42,7 @@ algorithm:
       soft_penalty_mode: additive
 actor_rollout_ref:
   model:
-    path: checkpoints/agentevolver/alfworld_qwen1.5b_sft/global_step_50/actor
+    path: checkpoints/agentevolver/alfworld_qwen1.5b_sft/global_step_50/actor_hf
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:

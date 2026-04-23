@@ -9,12 +9,12 @@ defaults:
   - _self_
 
 trainer:
-  experiment_name: alfworld_qwen3b_sft_rl
+  experiment_name: alfworld_qwen1.5b_duet_v39
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
   total_epochs: 1
-  save_freq: 50
+  save_freq: 100
   test_freq: 50
   val_before_train: false
   validation_data_dir: experiments/alfworld/${trainer.experiment_name}/validation_log
@@ -27,7 +27,7 @@ algorithm:
   use_kl_in_reward: false
   grpo:
     teacher_baseline_separation:
-      enable: false
+      enable: true
       teacher_baseline: all_mean
       non_teacher_baseline: non_teacher_mean
       std_source: non_teacher
@@ -42,7 +42,7 @@ algorithm:
       soft_penalty_mode: additive
 actor_rollout_ref:
   model:
-    path: checkpoints/agentevolver/alfworld_qwen3b_sft/global_step_50/actor_hf
+    path: /data/shared_models/Qwen2.5-1.5B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:
@@ -51,14 +51,24 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 2
     ppo_mini_batch_size: 8
     use_kl_loss: true
-    kl_loss_coef: 0.001
+    kl_loss_coef: 0.005
     kl_loss_type: low_var_kl
     entropy_coeff: 0
     off_cliprange_high: 0.6
     clip_ratio_high: 0.28
     loss_agg_mode: token-mean
-    use_dr3: false
-    use_chord: false
+    use_dr3: true
+    use_chord: true
+    chord_mu_warmup_steps: 0
+    chord_mu_decay_steps: 25
+    chord_mu_peak: 0.3
+    chord_mu_valley: 0.05
+    chord_use_token_weighting: false
+    # v39: adaptive μ from discriminator accuracy
+    chord_mu_adaptive: true
+    chord_mu_adaptive_mode: "disc_acc"
+    chord_mu_d_floor: 0.5
+    chord_mu_d_ema_alpha: 0.2
     use_uniform_mix: false
     teacher_use_log_prob: false
     teacher_policy_shaping_enable: false
@@ -67,6 +77,43 @@ actor_rollout_ref:
     fsdp_config:
       param_offload: false
       optimizer_offload: false
+    dr3:
+      enable: true
+      apply_to: teacher_no_logprob
+      feature_mode: v3_aug
+      gap_gate_enable: true
+      hidden_proj_dim: 64
+      hidden_proj_dropout: 0.2
+      disc_weight_decay: 0.005
+      disc_label_smoothing: 0.1
+      disc_temperature: 1.5
+      disc_age_weight_decay: 0.02
+      apply_warmup_steps: 10
+      apply_min_buf_size: 512
+      disc_train_min_buf_size: 256
+      alpha_mode: sync_batch_ema
+      alpha_ema_beta: 0.9
+      disc_hidden: 64
+      disc_lr: 0.0003
+      disc_steps_per_call: 2
+      buffer_size: 1024
+      train_batch_size: 128
+      ess_window: 32
+      sync_across_ranks: true
+      sync_every_n_calls: 1
+      broadcast_params: true
+      broadcast_every_n_calls: 1
+      clip_max: 5.0
+      ppo_clip_eps: 0.2
+      ratio_shaping_mode: auto
+      ratio_shaping_beta: 0.1
+      ratio_shaping_auto_acc_min: 0.8
+      ratio_shaping_auto_buf_min: 512
+      ratio_shaping_auto_ess_min: 16.0
+      dual_enable: true
+      ess_target_ratio: 0.5
+      dual_lr: 0.05
+      dual_init: 0.0
   rollout:
     use_qwen3: false
     thinking_mode: none
@@ -79,7 +126,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.65
+    gpu_memory_utilization: 0.75
     n: 8
     log_prob_max_token_len_per_gpu: 25580
     stop_sequences:
@@ -118,7 +165,7 @@ data:
   val_files: null
   val_batch_size: 8
   val_type: val
-  max_train_tasks: 400
+  max_train_tasks: 800
   shuffle: true
   seed: 2026
 env_service:
@@ -167,13 +214,46 @@ exp_manager:
   summary_batch_size: 8
   reme:
     base_url: http://127.0.0.1:8124
-    workspace_id: alfworld_qwen3b_sft_rl
+    workspace_id: alfworld_qwen1.5b_duet_v39
     enable_summarizer: false
     enable_context_generator: false
     retrieve_top_k: 3
     updated_freq: 0
   experience_replay:
     enable: false
+  teacher_experience:
+    enable: true
+    mix_mode: rollout_level
+    data_path: data/teacher_trajectories/qwen72b/alfworld_qwen72b_filtered_react_tags.pkl
+    n_teacher_rollouts_per_task: 1
+    max_trajectories_per_task: 6
+    select_mode: random
+    use_log_prob: false
+    policy_shaping:
+      enable: false
+      mode: p_div_p_beta
+      beta: 0.1
+    adaptive_weight:
+      enable: true
+      mode: gap_linear
+      gate_level: group
+      epsilon: 0.0
+      tau: 0.5
+      min: 0.0
+      max: 1.0
+      ema:
+        enable: true
+        beta: 0.95
+  state_channel:
+    enable: true
+    exclude_teacher: true
+    beta: 0.2
+    beta_decay: true
+    beta_decay_target: 0.3
+    match_mode: hash
+    step_level:
+      enable: true
+      eta: 0.05
 attribution_driven_credit_assignment:
   enable: false
 thread_pool:

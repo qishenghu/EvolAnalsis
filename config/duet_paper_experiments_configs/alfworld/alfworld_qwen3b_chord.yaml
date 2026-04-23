@@ -66,7 +66,7 @@ actor_rollout_ref:
     use_dapo: false
     fsdp_config:
       param_offload: false
-      optimizer_offload: false
+      optimizer_offload: true
     chord_mu_warmup_steps: 0
     chord_mu_decay_steps: 25
     chord_mu_peak: 0.9
@@ -84,7 +84,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.65
+    gpu_memory_utilization: 0.5
     n: 8
     log_prob_max_token_len_per_gpu: 25580
     stop_sequences:
