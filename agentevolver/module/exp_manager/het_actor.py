@@ -1606,6 +1606,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         off_ratio_shaping_enable=False,  # set below
                                         off_ratio_shaping_beta=dr3_ratio_shaping_beta,
                                         loss_agg_mode=loss_agg_mode,
+                                        teacher_mask=teacher_mask,  # B3: enable teacher_off_pg_loss split
                                     )
                                 # Decide shaping enable (step/always/off/auto)
                                 # Skip ratio_shaping recomputation in hybrid mode — already using LUFFY's loss
@@ -1646,6 +1647,7 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                         off_ratio_shaping_enable=True,
                                         off_ratio_shaping_beta=dr3_ratio_shaping_beta,
                                         loss_agg_mode=loss_agg_mode,
+                                        teacher_mask=teacher_mask,  # B3: enable teacher_off_pg_loss split
                                     )
 
                                 try:

@@ -756,6 +756,28 @@ class DR3RatioEstimator:
             self._broadcast_model_params()
             bcast_metrics["dr3/bcast_happened"] = 1.0
 
+            # B2 fix: also broadcast disc training scalars from rank0.
+            # Previously rank>=1 read disc_acc_val=0.0 (default init), then in
+            # het_actor.py the `_disc_ready==0 -> fallback 0.5` path drove EMA toward
+            # 0.5 forever, pinning chord_mu at peak on those ranks while rank0 ran the
+            # real EMA (e.g. 0.99) and dropped to floor. FSDP averages the per-rank
+            # gradients so the inconsistency leaked directly into grad_norm spikes.
+            try:
+                import torch.distributed as dist
+                if dist.is_available() and dist.is_initialized():
+                    _dr3_bcast_t = torch.tensor(
+                        [float(disc_acc_val), float(disc_trained_steps), float(disc_loss_val)],
+                        device=self._buf_x.device, dtype=torch.float32,
+                    )
+                    dist.broadcast(_dr3_bcast_t, src=0)
+                    disc_acc_val = float(_dr3_bcast_t[0].item())
+                    disc_trained_steps = float(_dr3_bcast_t[1].item())
+                    disc_loss_val = float(_dr3_bcast_t[2].item())
+                    bcast_metrics["dr3/bcast_disc_acc_synced"] = 1.0
+            except Exception:
+                # never break training — single-GPU / pre-init paths skip broadcast.
+                bcast_metrics["dr3/bcast_disc_acc_synced"] = 0.0
+
         # ⭐ EMA w_hat: Polyak-average live disc into _disc_ema after each training step.
         # This decouples discriminator training from w_hat inference — the policy sees
         # a smoothed density ratio, reducing coupled oscillation with GRPO/SC.

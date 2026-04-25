@@ -1938,6 +1938,7 @@ def repo_compute_token_loss(
     off_ratio_shaping_enable: bool = False,
     off_ratio_shaping_beta: float = 0.1,
     loss_agg_mode: str = "token-mean",
+    teacher_mask: torch.Tensor = None,
 ) -> dict:
     """
     Compute RePO policy loss with importance ratio clipping for off-policy data.
@@ -2036,7 +2037,7 @@ def repo_compute_token_loss(
     diag_stats.update(_masked_stats(advantages, on_policy_mask, "adv/on"))
     diag_stats.update(_masked_stats(advantages, off_policy_mask, "adv/off"))
     
-    return {
+    ret = {
         "pg_loss": pg_loss,
         "pg_losses": pg_losses,
         "on_pg_loss": on_pg_loss,
@@ -2048,3 +2049,23 @@ def repo_compute_token_loss(
         "ppo_kl": ppo_kl,
         "repo_diag_stats": diag_stats,
     }
+
+    # B3 fix: split off-policy PG loss into self (replay) vs teacher branches so
+    # the actor can log `actor/teacher_off_pg_loss` even on the DR3 path. Without
+    # this, het_actor.py:2160 receives None and the wandb metric stays missing,
+    # making it impossible to monitor late-stage teacher gradient blow-ups.
+    if teacher_mask is not None and torch.is_tensor(teacher_mask):
+        # teacher_mask is full off-policy + teacher token-level (1=teacher token).
+        # Per-token mask: only off-policy + teacher tokens carry teacher loss; the
+        # remainder of off-policy is "self" (e.g. own replay / non-teacher off).
+        teacher_token_mask = teacher_mask * response_mask
+        self_off_token_mask = exp_mask * response_mask * (1.0 - teacher_mask)
+        teacher_off_pg_loss = verl_F.masked_mean(off_pg_losses, teacher_token_mask)
+        self_off_pg_loss = verl_F.masked_mean(off_pg_losses, self_off_token_mask)
+        # Guard against nan when one of the branches has zero mask coverage.
+        teacher_off_pg_loss = torch.tensor(0.0, device=log_prob.device) if teacher_off_pg_loss.isnan().item() else teacher_off_pg_loss
+        self_off_pg_loss = torch.tensor(0.0, device=log_prob.device) if self_off_pg_loss.isnan().item() else self_off_pg_loss
+        ret["teacher_off_pg_loss"] = teacher_off_pg_loss
+        ret["self_off_pg_loss"] = self_off_pg_loss
+
+    return ret

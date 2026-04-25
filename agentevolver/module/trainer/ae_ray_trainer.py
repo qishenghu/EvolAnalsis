@@ -3303,8 +3303,22 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         _sc_resp_len = _sc_rmask_decay.sum(dim=-1).clamp(min=1.0)
                                         _sc_current_mean = (batch.batch["token_level_rewards"].sum(dim=-1) / _sc_resp_len).mean().item()
                                     _sc_target = float(_sc_cfg.get("beta_decay_target", 0.5))
+                                    # B1 fix: window-based fade-out instead of premature collapse.
+                                    # Old formula `1 - mean/target` zeroed beta whenever success>=target,
+                                    # killing SC from step 1 if start success >= target. New behavior:
+                                    #   success <= target          -> full beta (early-stage exploration)
+                                    #   success in [target, target+window] -> linear fade
+                                    #   success > target + window  -> beta = 0 (no longer needed)
+                                    _sc_window = float(_sc_cfg.get("beta_decay_window", 0.3))
                                     if _sc_target > 0:
-                                        _sc_beta *= max(0.0, 1.0 - _sc_current_mean / _sc_target)
+                                        if _sc_current_mean <= _sc_target:
+                                            _sc_decay_factor = 1.0
+                                        else:
+                                            _sc_decay_factor = max(
+                                                0.0,
+                                                1.0 - (_sc_current_mean - _sc_target) / max(_sc_window, 1e-6),
+                                            )
+                                        _sc_beta *= _sc_decay_factor
 
                                 _sc_env_type = str(self.config.env_service.env_type)
                                 _sc_task_ids = batch.non_tensor_batch.get("task_ids", None)
@@ -3846,6 +3860,19 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 def _alpha_from_gap(g_eff: float) -> float:
                                     a = (g_eff - eps) / denom
                                     a = max(a_min, min(a_max, a))
+                                    # U1 fix (mid-term cleanup): the gap is already incorporated into
+                                    # GRPO's group-relative advantage, so amplifying teacher loss by
+                                    # gap-based alpha double-counts the gap once on-policy starts to
+                                    # regress (teacher_pos% rises to 100%, t/o adv gap widens, alpha
+                                    # rises, BC pull amplifies further). Fade alpha when the student
+                                    # is no longer a beginner so DR3's natural fade-out is not fought.
+                                    # Threshold range [0.60, 0.85]: below 0.60 keep alpha as-is; in
+                                    # [0.60, 0.85] linearly fade; above 0.85 alpha->0.
+                                    s_ema = getattr(self, "_onpolicy_success_ema", None)
+                                    if s_ema is not None:
+                                        s = float(s_ema)
+                                        fade = max(0.0, min(1.0, (0.85 - s) / 0.25))
+                                        a = a * fade
                                     return float(a)
 
                                 if gate_level == "group" and rewards_sum_local is not None and is_teacher_sample_local is not None:
@@ -4175,6 +4202,25 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+
+                # U1 fix (mid-term cleanup): track on-policy success EMA so that
+                # _alpha_from_gap (adaptive teacher weight) can fade as the student
+                # approaches mastery. Beta=0.9 on raw step-level success means the
+                # EMA lags but smooths step-to-step variance. Stored on `self` so
+                # the closure in the next iteration's _alpha_from_gap can read it.
+                _suc_now = metrics.get("critic/success_onpolicy/mean", None)
+                if _suc_now is not None:
+                    try:
+                        _suc_val = float(_suc_now)
+                        _ema_beta = 0.9
+                        prev = getattr(self, "_onpolicy_success_ema", None)
+                        if prev is None:
+                            self._onpolicy_success_ema = _suc_val
+                        else:
+                            self._onpolicy_success_ema = _ema_beta * float(prev) + (1.0 - _ema_beta) * _suc_val
+                        metrics["adaptive_weight/onpolicy_success_ema"] = float(self._onpolicy_success_ema)
+                    except Exception:
+                        pass
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
