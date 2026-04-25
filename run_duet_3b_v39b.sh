@@ -28,12 +28,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env_config.sh"
 
-eval "$(conda shell.bash hook)"
+# Initialize conda if not already available (nohup starts with empty PATH)
+if ! command -v conda >/dev/null 2>&1; then
+    source "${CONDA_PATH}/etc/profile.d/conda.sh"
+fi
 conda activate "${CONDA_ENV_DUET}"
 
-# 3B runs: use all 8 GPUs (n_gpus_per_node=4 in config implies 4-GPU slot but
-# adjust here if 3B needs larger TP). Defaults assume 8xA100-80G.
-GPUS="${CUDA_GPUS:-0,1,2,3,4,5,6,7}"
+# This server has 4× L20X-144G (not 8× A100). Config n_gpus_per_node=4 matches.
+# L20X has ~1.8× A100-80G memory but weaker BF16 compute — expect ~1.5-2× runtime.
+GPUS="${CUDA_GPUS:-0,1,2,3}"
 mkdir -p logs
 
 run_experiment() {
