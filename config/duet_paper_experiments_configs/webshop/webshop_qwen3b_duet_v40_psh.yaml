@@ -72,6 +72,8 @@ actor_rollout_ref:
     use_uniform_mix: false
     teacher_use_log_prob: false
     teacher_policy_shaping_enable: true
+    teacher_policy_shaping_mode: p_div_p_beta
+    teacher_policy_shaping_beta: 0.1
     teacher_use_clip: false
     use_dapo: false
     fsdp_config:
@@ -240,7 +242,7 @@ exp_manager:
     select_mode: random
     use_log_prob: false
     policy_shaping:
-      enable: false
+      enable: true
       mode: p_div_p_beta
       beta: 0.1
     adaptive_weight:
