@@ -9,7 +9,7 @@ defaults:
   - _self_
 
 trainer:
-  experiment_name: ws_swA_02_v39b_default
+  experiment_name: ws_swA_11_pk05_v10
   project_name: agentevolver
   n_gpus_per_node: 4
   nnodes: 1
@@ -61,8 +61,8 @@ actor_rollout_ref:
     use_chord: true
     chord_mu_warmup_steps: 0
     chord_mu_decay_steps: 25
-    chord_mu_peak: 0.3
-    chord_mu_valley: 0.05
+    chord_mu_peak: 0.5
+    chord_mu_valley: 0.10
     chord_use_token_weighting: false
     # v39b: adaptive μ from disc_acc (fast EMA α=0.5) — Phase 1 winner on 1.5B
     chord_mu_adaptive: true

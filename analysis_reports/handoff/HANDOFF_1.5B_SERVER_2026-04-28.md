@@ -167,26 +167,45 @@ WebShop env service 有内存泄漏：
 
 3B 已经设计好 12-config single-seed sweep，**1.5B server 应跑相同 sweep** (一份 ALFWorld + 一份 WebShop)。
 
-### Sweep dimensions (12 configs total)
+**重要原则：sweep 只动 v39b-specific 的 BC schedule 参数（peak / valley / d_floor / d_ema_alpha），
+不动 training infrastructure（batch_size / offload / env_worker / gpu_mem_util）**，
+让 DUET\* 能跟其他 baseline 在同 infrastructure 下公平对比。
 
-| #   | Tag                          | base   | BC | peak | valley | d_ema_alpha | 测试什么                  |
-| --- | ---------------------------- | ------ | -- | ---- | ------ | ----------- | ------------------------- |
-| 01  | v1cfg_no_bc                  | v1cfg  | ✗  | —    | —      | —           | pipeline sanity           |
-| 02  | v39b_default                 | v39b   | ✓  | 0.3  | 0.05   | 0.5         | v39b baseline             |
-| 03  | v1cfg_peak02                 | v1cfg  | ✓  | 0.2  | 0.05   | 0.5         | low BC                    |
-| 04  | v1cfg_peak03                 | v1cfg  | ✓  | 0.3  | 0.05   | 0.5         | v39b peak baseline        |
-| 05  | v1cfg_peak04                 | v1cfg  | ✓  | 0.4  | 0.05   | 0.5         | medium BC                 |
-| 06  | v1cfg_peak05                 | v1cfg  | ✓  | 0.5  | 0.05   | 0.5         | strong BC                 |
-| 07  | v1cfg_peak07                 | v1cfg  | ✓  | 0.7  | 0.05   | 0.5         | very strong BC            |
-| 08  | v1cfg_ema02                  | v1cfg  | ✓  | 0.3  | 0.05   | 0.2         | slow EMA                  |
-| 09  | v1cfg_ema08                  | v1cfg  | ✓  | 0.3  | 0.05   | 0.8         | fast EMA                  |
-| 10  | v1cfg_pk05_ema02             | v1cfg  | ✓  | 0.5  | 0.05   | 0.2         | strong BC + slow fade     |
-| 11  | v1cfg_pk05_v10               | v1cfg  | ✓  | 0.5  | 0.10   | 0.5         | strong BC + high floor    |
-| 12  | v1cfg_pk05_ema02_v10         | v1cfg  | ✓  | 0.5  | 0.10   | 0.2         | full combo                |
+### Sweep dimensions (12 configs, all on v39b cfg infrastructure)
 
-`v1cfg` = `ppo_micro_batch_size_per_gpu=1, log_prob_micro_batch_size_per_gpu=1, param_offload=true, optimizer_offload=true, gpu_memory_utilization=0.5, max_env_worker=32`
+| #   | Tag                          | peak | valley | d_floor | d_ema_alpha | 测试什么                                 |
+| --- | ---------------------------- | ---- | ------ | ------- | ----------- | ---------------------------------------- |
+| 01  | v39b_default                 | 0.3  | 0.05   | 0.5     | 0.5         | v39b baseline 复核                       |
+| 02  | peak02                       | 0.2  | 0.05   | 0.5     | 0.5         | low BC                                   |
+| 03  | peak04                       | 0.4  | 0.05   | 0.5     | 0.5         | medium BC                                |
+| 04  | peak05                       | 0.5  | 0.05   | 0.5     | 0.5         | strong BC ⭐                             |
+| 05  | peak06                       | 0.6  | 0.05   | 0.5     | 0.5         | very strong BC                           |
+| 06  | peak07                       | 0.7  | 0.05   | 0.5     | 0.5         | extreme BC                               |
+| 07  | ema02                        | 0.3  | 0.05   | 0.5     | 0.2         | slow EMA → BC stays high longer          |
+| 08  | ema08                        | 0.3  | 0.05   | 0.5     | 0.8         | fast EMA → BC fades quick                 |
+| 09  | floor04                      | 0.3  | 0.05   | 0.4     | 0.5         | lower d_floor → μ_raw 触底更快           |
+| 10  | pk05_ema02                   | 0.5  | 0.05   | 0.5     | 0.2         | strong BC + slow fade ⭐                 |
+| 11  | pk05_v10                     | 0.5  | 0.10   | 0.5     | 0.5         | strong BC + high floor ⭐                |
+| 12  | pk05_ema02_v10               | 0.5  | 0.10   | 0.5     | 0.2         | full combo: 强 BC + 慢退 + 高 floor ⭐⭐ |
 
-`v39b cfg` (default) = `batch=2, offload=false, gpu_mem=0.65, env_worker=64`
+⭐ = 预测 candidate winners
+
+`v39b cfg infrastructure` (FIXED, not swept):
+```
+ppo_micro_batch_size_per_gpu = 2
+log_prob_micro_batch_size_per_gpu = 2
+param_offload = false
+optimizer_offload = false
+gpu_memory_utilization = 0.65
+max_env_worker = 64
+n (rollouts per task) = 8
+n_teacher_rollouts_per_task = 1
+temperature = 0.6
+```
+
+**(注：v1.0 of this plan included `v1cfg` variants that swept infrastructure too;
+this was removed in v2 because changing infrastructure makes DUET\* not directly
+comparable to non-DUET baselines on the same hardware substrate.)**
 
 ### Why v1cfg as the base
 
