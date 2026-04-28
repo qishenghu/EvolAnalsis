@@ -3789,6 +3789,17 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             logger.warning(f"Failed to compute teacher effect metrics: {_e}")
                             diag_metrics = None
 
+                        # ⭐ Pipe reward gap (group-level teacher-on-policy reward delta) into
+                        # meta_info so the actor's gap-driven μ scheduler (chord_mu_adaptive_mode='gap')
+                        # can read it without recomputing.
+                        try:
+                            if isinstance(diag_metrics, dict):
+                                _gap_val = diag_metrics.get("diag/group_teacher_minus_on_reward_mean", None)
+                                if _gap_val is not None:
+                                    batch.meta_info["reward_gap"] = float(_gap_val)
+                        except Exception:
+                            pass
+
                         # ============================================================================
                         # ⭐ 2.2 Improvement (optional): adaptive teacher loss gating/annealing
                         # ============================================================================

@@ -693,6 +693,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         # ⭐ CHORD: 在方法开头获取 global_step（从原始 data 的 meta_info）
         # 因为后续 dataloader 迭代产生的 mini_batch 是 TensorDict，没有 meta_info
         chord_global_step_from_data: int = int(data.meta_info.get("global_step", 0))
+        # ⭐ Gap-driven μ (chord_mu_adaptive_mode='gap'): teacher-on-policy reward gap signal
+        # populated by trainer; captured here so the mini-batch loop can read it without meta_info.
+        try:
+            _reward_gap_from_data: float = float(data.meta_info.get("reward_gap", float("nan")))
+        except Exception:
+            _reward_gap_from_data = float("nan")
         ##################
         # ANNI
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
@@ -1806,6 +1812,77 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 "chord/disc_ready": float(_disc_ready),
                                 "chord/mu_adaptive_gated": float(_gated),
                                 "chord/d_floor": d_floor,
+                            }
+                        elif use_adaptive_mu and adaptive_mode == "gap":
+                            # --- v_gap: teacher-student outcome-gap-driven adaptive μ ---
+                            # Semantics: μ ∝ (teacher_reward - student_reward) within a group.
+                            # As student catches up, gap → 0 → μ → valley (BC fades).
+                            # If gap stays high (e.g. AF where student never matches teacher),
+                            # an optional time-decay cap (chord_mu_gap_decay_gamma > 0) provides
+                            # an upper bound that fades regardless of gap, so BC doesn't stay
+                            # high indefinitely.
+                            #
+                            # Source: batch.meta_info["reward_gap"] populated by trainer with
+                            # diag/group_teacher_minus_on_reward_mean (see ae_ray_trainer.py).
+                            #
+                            # Formula (hybrid):
+                            #   μ_gap   = valley + (peak - valley) * clamp(gap_ema / gap_anchor, 0, 1)
+                            #   μ_decay = valley + (peak - valley) * γ^t       (only if γ > 0)
+                            #   μ       = min(μ_gap, μ_decay) if hybrid else μ_gap
+                            #
+                            # gap_anchor = avg of first N post-warmup gap_ema values (auto-calibration).
+                            _gap_now = float(_reward_gap_from_data)
+                            if _gap_now != _gap_now:  # NaN check (no signal yet)
+                                # Fall back to peak (full BC) when no gap signal — typically only at step 1
+                                # before any teacher-on-policy mixed group has been processed.
+                                _gap_now = chord_mu_peak
+
+                            gap_ema_alpha = float(self.config.get("chord_mu_gap_ema_alpha", 0.2))
+                            if not hasattr(self, "_gap_ema"):
+                                self._gap_ema = _gap_now
+                            else:
+                                self._gap_ema = (1 - gap_ema_alpha) * self._gap_ema + gap_ema_alpha * _gap_now
+
+                            # Anchor: avg of first N gap_ema readings, capped to a sane minimum
+                            gap_anchor_n = int(self.config.get("chord_mu_gap_anchor_n", 5))
+                            gap_anchor_min = float(self.config.get("chord_mu_gap_anchor_min", 0.05))
+                            if not hasattr(self, "_gap_anchor_buf"):
+                                self._gap_anchor_buf = []
+                                self._gap_anchor = None
+                            if self._gap_anchor is None:
+                                self._gap_anchor_buf.append(float(self._gap_ema))
+                                if len(self._gap_anchor_buf) >= gap_anchor_n:
+                                    _avg = sum(self._gap_anchor_buf) / max(1, len(self._gap_anchor_buf))
+                                    self._gap_anchor = max(gap_anchor_min, float(_avg))
+                            _anchor_cur = float(self._gap_anchor) if self._gap_anchor is not None \
+                                else max(gap_anchor_min, float(self._gap_ema))
+
+                            _gated_gap = max(0.0, min(1.0, float(self._gap_ema) / max(1e-6, _anchor_cur)))
+                            mu_gap = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _gated_gap
+
+                            # Optional decay-cap (hybrid mode): μ = min(μ_gap, μ_decay)
+                            gap_decay_gamma = float(self.config.get("chord_mu_gap_decay_gamma", 0.0))
+                            if gap_decay_gamma > 0.0:
+                                _t = float(chord_global_step)
+                                mu_decay = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * (gap_decay_gamma ** _t)
+                                mu = min(mu_gap, mu_decay)
+                                _cap_active = 1.0 if mu_decay < mu_gap else 0.0
+                            else:
+                                mu = mu_gap
+                                mu_decay = float("nan")
+                                _cap_active = 0.0
+
+                            adaptive_metrics = {
+                                "chord/mu_mode": 6.0,  # 6 = adaptive gap (v_gap)
+                                "chord/gap_now": float(_gap_now),
+                                "chord/gap_ema": float(self._gap_ema),
+                                "chord/gap_anchor": float(_anchor_cur),
+                                "chord/gap_anchor_set": 1.0 if self._gap_anchor is not None else 0.0,
+                                "chord/mu_gap_gated": float(_gated_gap),
+                                "chord/mu_gap_only": float(mu_gap),
+                                "chord/mu_decay_cap": float(mu_decay) if mu_decay == mu_decay else 0.0,
+                                "chord/gap_decay_cap_active": float(_cap_active),
+                                "chord/gap_decay_gamma": float(gap_decay_gamma),
                             }
                         elif use_adaptive_mu and adaptive_mode == "nll":
                             # --- v40: teacher-NLL-based adaptive μ (theory-researcher's alternative) ---
