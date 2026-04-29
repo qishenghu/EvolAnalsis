@@ -16,27 +16,36 @@ ROOT = Path("/data/home/qisheng/EvolAnalsis")
 LOGS = ROOT / "logs"
 OUT = ROOT / "analysis_reports/1.5b_master_experiment_table.md"
 
-# (cell_id, tag, peak, valley, d_floor, d_ema_alpha)
+# (phase, cell_id, tag, peak, valley, d_floor, d_ema_alpha)
 SWEEP = [
-    ("01", "v39b_default",     0.3, 0.05, 0.5, 0.5),
-    ("02", "peak02",           0.2, 0.05, 0.5, 0.5),
-    ("03", "peak04",           0.4, 0.05, 0.5, 0.5),
-    ("04", "peak05",           0.5, 0.05, 0.5, 0.5),
-    ("05", "peak06",           0.6, 0.05, 0.5, 0.5),
-    ("06", "peak07",           0.7, 0.05, 0.5, 0.5),
-    ("07", "ema02",            0.3, 0.05, 0.5, 0.2),
-    ("08", "ema08",            0.3, 0.05, 0.5, 0.8),
-    ("09", "floor04",          0.3, 0.05, 0.4, 0.5),
-    ("10", "pk05_ema02",       0.5, 0.05, 0.5, 0.2),
-    ("11", "pk05_v10",         0.5, 0.10, 0.5, 0.5),
-    ("12", "pk05_ema02_v10",   0.5, 0.10, 0.5, 0.2),
+    # Phase A — handoff §5 grid
+    ("swA", "01", "v39b_default",     0.3, 0.05, 0.5, 0.5),
+    ("swA", "02", "peak02",           0.2, 0.05, 0.5, 0.5),
+    ("swA", "03", "peak04",           0.4, 0.05, 0.5, 0.5),
+    ("swA", "04", "peak05",           0.5, 0.05, 0.5, 0.5),
+    ("swA", "05", "peak06",           0.6, 0.05, 0.5, 0.5),
+    ("swA", "06", "peak07",           0.7, 0.05, 0.5, 0.5),
+    ("swA", "07", "ema02",            0.3, 0.05, 0.5, 0.2),
+    ("swA", "08", "ema08",            0.3, 0.05, 0.5, 0.8),
+    ("swA", "09", "floor04",          0.3, 0.05, 0.4, 0.5),
+    ("swA", "10", "pk05_ema02",       0.5, 0.05, 0.5, 0.2),
+    ("swA", "11", "pk05_v10",         0.5, 0.10, 0.5, 0.5),
+    ("swA", "12", "pk05_ema02_v10",   0.5, 0.10, 0.5, 0.2),
+    # Phase B — Plan B (raise valley)
+    ("swB", "01", "pk03_v10_ema02",   0.3, 0.10, 0.5, 0.2),
+    ("swB", "02", "pk03_v15_ema02",   0.3, 0.15, 0.5, 0.2),
+    ("swB", "03", "pk03_v10_ema01",   0.3, 0.10, 0.5, 0.1),
+    # Phase C — Plan C (precision search around swB_01 = 21.5%)
+    ("swC", "01", "pk03_v10_floor04", 0.3, 0.10, 0.4, 0.2),
+    ("swC", "02", "pk03_v10_floor06", 0.3, 0.10, 0.6, 0.2),
+    ("swC", "03", "pk03_v12_ema02",   0.3, 0.12, 0.5, 0.2),
 ]
 
-# Cells already covered by old runs (mapped tag -> existing log filename stem)
+# Cells already covered by old runs (mapped (phase, cell_id) -> existing log filename stem)
 PRE_EXISTING = {
-    "01": "v39b_postfix",   # v39b = peak=0.3, valley=0.05, d_floor=0.5, d_ema=0.5
-    "07": "v39_postfix",    # v39  = peak=0.3, valley=0.05, d_floor=0.5, d_ema=0.2
-    "09": "v39c_postfix",   # v39c = peak=0.3, valley=0.05, d_floor=0.4, d_ema=0.5
+    ("swA", "01"): "v39b_postfix",   # peak=0.3, valley=0.05, d_floor=0.5, d_ema=0.5
+    ("swA", "07"): "v39_postfix",    # peak=0.3, valley=0.05, d_floor=0.5, d_ema=0.2
+    ("swA", "09"): "v39c_postfix",   # peak=0.3, valley=0.05, d_floor=0.4, d_ema=0.5
 }
 
 # Baselines (from raw logs we've previously verified)
@@ -59,8 +68,14 @@ BASELINES_AF = [
 ]
 
 
-VAL_KEY = re.compile(
+VAL_KEY_QUOTED = re.compile(
     r"'val-summary/(?:webshop|alfworld)/(reward_mean_all|success_rate_mean_all)':\s*([0-9.]+)"
+)
+# Some runs only emit the inline " - val-summary/<env>/<key>:<float>" format
+# in the per-step metric block. Fall back to that when the quoted dict form
+# is missing (cut off, malformed, etc).
+VAL_KEY_INLINE = re.compile(
+    r"val-summary/(?:webshop|alfworld)/(reward_mean_all|success_rate_mean_all):([0-9.]+)"
 )
 STEP_KEY = re.compile(r"Training Progress:\s*(\d+)%\|[^|]*\|\s*(\d+)/(\d+)")
 
@@ -86,13 +101,21 @@ def parse_log(log_path: Path) -> tuple[float | None, float | None, int | None]:
     try:
         with log_path.open("r", errors="ignore") as f:
             for line in f:
-                m = VAL_KEY.search(line)
-                if m:
+                # Prefer quoted dict form (more precise, full-precision float)
+                for m in VAL_KEY_QUOTED.finditer(line):
                     key, val = m.group(1), float(m.group(2))
                     if key == "reward_mean_all":
                         reward = val
                     elif key == "success_rate_mean_all":
                         success = val
+                # Fall back to inline metric-block form
+                if reward is None or success is None:
+                    for m in VAL_KEY_INLINE.finditer(line):
+                        key, val = m.group(1), float(m.group(2))
+                        if key == "reward_mean_all" and reward is None:
+                            reward = val
+                        elif key == "success_rate_mean_all" and success is None:
+                            success = val
                 m = STEP_KEY.search(line)
                 if m:
                     last_step = max(last_step, int(m.group(2)))
@@ -113,20 +136,26 @@ def fmt_pct(x: float | None) -> str:
     return f"{x*100:.1f}%"
 
 
-def render_env_table(env: str, log_prefix: str) -> str:
+def render_env_table(env: str, log_prefix: str, only_phase: str | None = None) -> str:
     lines = []
     if env == "webshop":
-        lines.append("| # | Tag | peak | valley | d_floor | d_ema_α | reward_mean | success | step |")
+        lines.append("| Phase | # | Tag | peak | valley | d_floor | d_ema_α | reward_mean | success | step |")
     else:
-        lines.append("| # | Tag | peak | valley | d_floor | d_ema_α | success | step |")
+        lines.append("| Phase | # | Tag | peak | valley | d_floor | d_ema_α | success | step |")
     lines.append("|" + "|".join(["---"] * (len(lines[0].split("|")) - 2)) + "|")
-    for cell_id, tag, peak, valley, d_floor, d_ema in SWEEP:
+    for phase, cell_id, tag, peak, valley, d_floor, d_ema in SWEEP:
+        if only_phase and phase != only_phase:
+            continue
+        # AF only has swA cells
+        if env == "alfworld" and phase != "swA":
+            continue
         # Decide which log to read
-        if cell_id in PRE_EXISTING:
-            stem = PRE_EXISTING[cell_id]
+        key = (phase, cell_id)
+        if key in PRE_EXISTING:
+            stem = PRE_EXISTING[key]
             log_path = LOGS / f"{log_prefix}_qwen1.5b_duet_{stem}.log"
         else:
-            stem = f"swA_{cell_id}_{tag}"
+            stem = f"{phase}_{cell_id}_{tag}"
             log_path = LOGS / f"{log_prefix}_qwen1.5b_duet_{stem}.log"
         reward, success, step = parse_log(log_path)
         status = (
@@ -136,12 +165,12 @@ def render_env_table(env: str, log_prefix: str) -> str:
         )
         if env == "webshop":
             lines.append(
-                f"| {cell_id} | {tag} | {peak} | {valley} | {d_floor} | {d_ema} | "
+                f"| {phase} | {cell_id} | {tag} | {peak} | {valley} | {d_floor} | {d_ema} | "
                 f"{fmt(reward)} | {fmt_pct(success)} | {status} |"
             )
         else:
             lines.append(
-                f"| {cell_id} | {tag} | {peak} | {valley} | {d_floor} | {d_ema} | "
+                f"| {phase} | {cell_id} | {tag} | {peak} | {valley} | {d_floor} | {d_ema} | "
                 f"{fmt_pct(success)} | {status} |"
             )
     return "\n".join(lines)
