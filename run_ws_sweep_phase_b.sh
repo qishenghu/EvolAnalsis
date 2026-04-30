@@ -96,12 +96,19 @@ print(f'{sr/n*100:.1f}')
 
 # Priority order: most likely to win first.
 priority=(
-    # Tier 0 — 1.5B-inspired winners (highest priority, based on 1.5B server findings).
-    # 1.5B server found: valley=0.10 + d_floor=0.6 + ema=0.2 → 36.0% (their SOTA)
-    # d_floor=0.6 alone contributed +14.5pp on 1.5B.
-    # Phase A had NO d_floor=0.6 configs — this is the missing critical lever.
-    "ws_swB_21_15Bwinner_exact"      # exact 1.5B recipe on 3B
+    # Tier 0+ — 3B-data-driven combos (highest priority, evidence from Phase A:
+    #   peak=0.5 alone → 43.0% (best);  floor=0.4 alone → 40.5% (2nd best);
+    #   ema=0.2 alone → 2.0% (catastrophic);  ema=0.8 → 18.5%; valley untested).
+    # Hypothesis: combine the two top 3B-validated single levers + try 1.5B's valley insight.
+    "ws_swB_27_3Bbest_pk05_fl04"     # pk=.5 + floor=.4 (combine 3B top 2)
+    "ws_swB_28_3Bbest_pk05_fl04_v10" # + valley=.10 (1.5B insight, no risky ema)
+    "ws_swB_29_3Bbest_pk05_fl04_v15" # + valley=.15 (push higher)
+    "ws_swB_30_pk04_fl04"            # intermediate peak (less risk of over-imitation)
+    # Tier 0 — 1.5B-inspired winners (1.5B server found: valley=0.10 + floor=0.6 + ema=0.2 → 36.0%)
+    # Risk note: 3B Phase A showed ema=0.2 ALONE is catastrophic (swA_07 = 2.0%, swA_10 = 17%).
+    # These work only if the 3-lever combo creates synergy not visible in single-lever data.
     "ws_swB_22_15Brecipe_pk05"       # 1.5B recipe + our peak=0.5 finding
+    "ws_swB_21_15Bwinner_exact"      # exact 1.5B recipe on 3B
     "ws_swB_24_pk05_floor07"         # push floor further with strong BC
     "ws_swB_23_floor07"              # push floor only
     "ws_swB_25_pk02_15Brecipe"       # low peak (1.5B winner uses peak=0.3)
