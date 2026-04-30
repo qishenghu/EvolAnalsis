@@ -191,6 +191,19 @@ def render_baseline_table(env: str) -> str:
     return "\n".join(lines)
 
 
+def render_sota_banner() -> str:
+    """Pin the current SOTA on top so it's visible at a glance."""
+    lines = []
+    lines.append("## 🏆 Current SOTA")
+    lines.append("")
+    lines.append("| Env | Cell | success | reward_mean | vs prev SOTA |")
+    lines.append("|---|---|---|---|---|")
+    lines.append("| ALFWorld | swA_09 / `v39c_postfix` (peak=0.3, valley=0.05, d_floor=0.4, ema=0.5) | **47.5%** | 0.475 | +15.0pp over DUET v1 32.5% |")
+    lines.append("| WebShop  | swC_02 / `pk03_v10_floor06` (peak=0.3, valley=0.10, d_floor=0.6, ema=0.2) | **36.0%** | **0.706** | +14.0pp over DUET v24 22.0% |")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def main():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     text = []
@@ -205,6 +218,9 @@ def main():
     text.append("")
     text.append("**Sweep dimensions (handoff §5)**: only `(chord_mu_peak, chord_mu_valley, chord_mu_d_floor, chord_mu_d_ema_alpha)`.")
     text.append("")
+    text.append("---")
+    text.append("")
+    text.append(render_sota_banner())
     text.append("---")
     text.append("")
     text.append("## WebShop")
