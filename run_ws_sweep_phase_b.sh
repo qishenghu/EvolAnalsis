@@ -96,9 +96,17 @@ print(f'{sr/n*100:.1f}')
 
 # Priority order: most likely to win first.
 priority=(
-    # Tier 0: re-run any Phase A failures (e.g. ws_swA_02 killed by buggy Phase C wrapper)
-    # Look in Phase A's sweep dir
-    # Tier 1: combined best-bets
+    # Tier 0 — 1.5B-inspired winners (highest priority, based on 1.5B server findings).
+    # 1.5B server found: valley=0.10 + d_floor=0.6 + ema=0.2 → 36.0% (their SOTA)
+    # d_floor=0.6 alone contributed +14.5pp on 1.5B.
+    # Phase A had NO d_floor=0.6 configs — this is the missing critical lever.
+    "ws_swB_21_15Bwinner_exact"      # exact 1.5B recipe on 3B
+    "ws_swB_22_15Brecipe_pk05"       # 1.5B recipe + our peak=0.5 finding
+    "ws_swB_24_pk05_floor07"         # push floor further with strong BC
+    "ws_swB_23_floor07"              # push floor only
+    "ws_swB_25_pk02_15Brecipe"       # low peak (1.5B winner uses peak=0.3)
+    "ws_swB_26_pk08_15Brecipe"       # very strong BC + 1.5B recipe
+    # Tier 1: combined best-bets (Phase B original)
     "ws_swB_19_pk05_tw_ema02_v10"
     "ws_swB_18_pk07_ema02_v10"
     "ws_swB_03_pk08_ema02"
