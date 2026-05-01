@@ -96,64 +96,36 @@ print(f'{sr/n*100:.1f}')
 
 # Priority order: most likely to win first.
 priority=(
-    # Tier 0+++ — ULTRA SAFE 3B combos (only peak + floor, no ema/valley risk).
-    # Phase A 9/12 evidence: ema=.2 → 2.0%, valley=.10 (with pk=.5) → 19.5%.
-    # Both 1.5B-recommended levers (ema=.2, valley=.10) FAIL on 3B.
-    # Safe path: combine 3B-validated single winners (peak=.5 + floor=.4).
-    "ws_swB_27_3Bbest_pk05_fl04"     # pk=.5 + floor=.4 (combine 3B top 2)  ⭐⭐⭐
-    "ws_swB_31_pk05_fl03"            # pk=.5 + floor=.3 (push floor lower)  ⭐⭐
-    "ws_swB_32_pk05_fl035"           # pk=.5 + floor=.35  ⭐⭐
-    "ws_swB_33_pk045_fl04"           # pk=.45 + floor=.4 (gentler peak)  ⭐⭐
-    "ws_swB_34_pk05_fl04_v03"        # pk=.5 + floor=.4 + valley=.03 (try lower)  ⭐
-    "ws_swB_30_pk04_fl04"            # pk=.4 + floor=.4  ⭐
-    # Tier 0+ — 3B + 1.5B valley combos (RISKY: valley=.10 alone hurt on 3B)
-    "ws_swB_28_3Bbest_pk05_fl04_v10" # + valley=.10
-    "ws_swB_29_3Bbest_pk05_fl04_v15" # + valley=.15
-    # Tier 0 — 1.5B-inspired winners (1.5B server found: valley=0.10 + floor=0.6 + ema=0.2 → 36.0%)
-    # Risk note: 3B Phase A showed ema=0.2 ALONE is catastrophic (swA_07 = 2.0%, swA_10 = 17%).
-    # These work only if the 3-lever combo creates synergy not visible in single-lever data.
-    "ws_swB_22_15Brecipe_pk05"       # 1.5B recipe + our peak=0.5 finding
-    "ws_swB_21_15Bwinner_exact"      # exact 1.5B recipe on 3B
-    "ws_swB_24_pk05_floor07"         # push floor further with strong BC
-    "ws_swB_23_floor07"              # push floor only
-    "ws_swB_25_pk02_15Brecipe"       # low peak (1.5B winner uses peak=0.3)
-    "ws_swB_26_pk08_15Brecipe"       # very strong BC + 1.5B recipe
-    # Tier 1: combined best-bets (Phase B original)
-    "ws_swB_19_pk05_tw_ema02_v10"
-    "ws_swB_18_pk07_ema02_v10"
-    "ws_swB_03_pk08_ema02"
-    "ws_swB_06_pk05_tw"
-    "ws_swB_10_pk05_psb015"
-    # Tier 2: extension of Phase A direction
-    "ws_swB_04_pk10_ema02"
-    "ws_swB_01_pk08"
-    "ws_swB_02_pk10"
-    "ws_swB_20_pk05_psb015_ema02"
-    "ws_swB_08_pk05_tw_ema02"
-    # Tier 3: unique mechanism tests
-    "ws_swB_05_pk03_tw"
-    "ws_swB_17_pk05_T04"
-    "ws_swB_16_pk03_T04"
-    "ws_swB_07_pk07_tw"
-    "ws_swB_14_pk05_sc_b04"
-    "ws_swB_15_pk05_sc_eta10"
-    # Tier 4: secondary
-    "ws_swB_12_pk05_kl_low"
-    "ws_swB_13_pk05_kl_high"
-    "ws_swB_09_pk05_psb005"
-    "ws_swB_11_pk05_psb020"
+    # Tier S — focused 3B-data-driven candidates ONLY
+    # All other Phase B configs (with ema=.2, valley=.10, peak>.5, 1.5B recipes,
+    # token weighting, KL/SC variations) are SKIPPED based on Phase A signal:
+    #   - ema=.2 always tanked (3/3 < 20%)
+    #   - valley=.10 always tanked (2/2 < 20%)
+    #   - peak ≥ .6 always tanked (2/2 ~20%)
+    # Tier S = pure peak + floor sweep (3B-validated safe space).
+    "ws_swB_27_3Bbest_pk05_fl04"     # ⭐⭐⭐ pk=.5 + floor=.4 (combine 3B top 2)
+    "ws_swB_31_pk05_fl03"            # pk=.5 + floor=.3
+    "ws_swB_32_pk05_fl035"           # pk=.5 + floor=.35
+    "ws_swB_33_pk045_fl04"           # pk=.45 + floor=.4
+    "ws_swB_30_pk04_fl04"            # pk=.4 + floor=.4
+    "ws_swB_35_pk05_fl045"           # pk=.5 + floor=.45 (gap fill)
+    "ws_swB_36_pk05_fl06"            # pk=.5 + floor=.6 (test 1.5B floor without other toxic)
+    "ws_swB_37_pk055_fl04"           # pk=.55 + floor=.4
+    "ws_swB_38_pk04_fl03"            # pk=.4 + floor=.3
+    "ws_swB_34_pk05_fl04_v03"        # pk=.5 + floor=.4 + valley=.03 (lower valley, safe)
+    "ws_swB_39_pk05_fl04_psb015"     # pk=.5 + floor=.4 + DR3 boost
 )
 
-# Re-run any Phase A configs that don't have val@100 (failed/killed)
-for swA_yaml in config/duet_paper_experiments_configs/webshop/sweep/ws_swA_*.yaml; do
-    name=$(basename "$swA_yaml" .yaml)
-    if [ ! -f "experiments/webshop/${name}/validation_log/100.jsonl" ]; then
-        echo "[$(date '+%m-%d %H:%M')] Phase A retry: $name (no val@100)"
-        run_one "$swA_yaml" "$name"
-    fi
-done
+# Phase A retries DISABLED (saves time; ws_swA_02/03 are informational, not SOTA candidates).
+# If you want to retry them, uncomment the loop below.
+# for swA_yaml in config/duet_paper_experiments_configs/webshop/sweep/ws_swA_*.yaml; do
+#     name=$(basename "$swA_yaml" .yaml)
+#     if [ ! -f "experiments/webshop/${name}/validation_log/100.jsonl" ]; then
+#         run_one "$swA_yaml" "$name"
+#     fi
+# done
 
-# Then run Phase B priority list
+# Phase B priority list (Tier S only — see priority array above for rationale)
 for name in "${priority[@]}"; do
     cfg="config/duet_paper_experiments_configs/webshop/sweep_phase_b/${name}.yaml"
     run_one "$cfg" "$name"
