@@ -96,14 +96,19 @@ print(f'{sr/n*100:.1f}')
 
 # Priority order: most likely to win first.
 priority=(
-    # Tier 0+ — 3B-data-driven combos (highest priority, evidence from Phase A:
-    #   peak=0.5 alone → 43.0% (best);  floor=0.4 alone → 40.5% (2nd best);
-    #   ema=0.2 alone → 2.0% (catastrophic);  ema=0.8 → 18.5%; valley untested).
-    # Hypothesis: combine the two top 3B-validated single levers + try 1.5B's valley insight.
-    "ws_swB_27_3Bbest_pk05_fl04"     # pk=.5 + floor=.4 (combine 3B top 2)
-    "ws_swB_28_3Bbest_pk05_fl04_v10" # + valley=.10 (1.5B insight, no risky ema)
-    "ws_swB_29_3Bbest_pk05_fl04_v15" # + valley=.15 (push higher)
-    "ws_swB_30_pk04_fl04"            # intermediate peak (less risk of over-imitation)
+    # Tier 0+++ — ULTRA SAFE 3B combos (only peak + floor, no ema/valley risk).
+    # Phase A 9/12 evidence: ema=.2 → 2.0%, valley=.10 (with pk=.5) → 19.5%.
+    # Both 1.5B-recommended levers (ema=.2, valley=.10) FAIL on 3B.
+    # Safe path: combine 3B-validated single winners (peak=.5 + floor=.4).
+    "ws_swB_27_3Bbest_pk05_fl04"     # pk=.5 + floor=.4 (combine 3B top 2)  ⭐⭐⭐
+    "ws_swB_31_pk05_fl03"            # pk=.5 + floor=.3 (push floor lower)  ⭐⭐
+    "ws_swB_32_pk05_fl035"           # pk=.5 + floor=.35  ⭐⭐
+    "ws_swB_33_pk045_fl04"           # pk=.45 + floor=.4 (gentler peak)  ⭐⭐
+    "ws_swB_34_pk05_fl04_v03"        # pk=.5 + floor=.4 + valley=.03 (try lower)  ⭐
+    "ws_swB_30_pk04_fl04"            # pk=.4 + floor=.4  ⭐
+    # Tier 0+ — 3B + 1.5B valley combos (RISKY: valley=.10 alone hurt on 3B)
+    "ws_swB_28_3Bbest_pk05_fl04_v10" # + valley=.10
+    "ws_swB_29_3Bbest_pk05_fl04_v15" # + valley=.15
     # Tier 0 — 1.5B-inspired winners (1.5B server found: valley=0.10 + floor=0.6 + ema=0.2 → 36.0%)
     # Risk note: 3B Phase A showed ema=0.2 ALONE is catastrophic (swA_07 = 2.0%, swA_10 = 17%).
     # These work only if the 3-lever combo creates synergy not visible in single-lever data.
