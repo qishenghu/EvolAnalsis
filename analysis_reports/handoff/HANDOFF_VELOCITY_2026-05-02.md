@@ -16,9 +16,66 @@ We discovered that the existing disc_acc-based μ schedule **structurally fails 
 
 **Code is implemented and committed.** You should:
 1. `git pull` to get the new `disc_acc_velocity` mode + 4 ready configs
-2. Run 4 main experiments (1 AF + 3 WS) — 21 hours
-3. Run Phase C multi-seed confirmation of WS winner — 10 hours
-4. Total: ~31h, fits in 48h budget with margin for paper writing
+2. **(Updated 2026-05-02)** L20X agent has joined velocity sprint — split duty (see §0)
+3. Run **2** main experiments on your end (was 4) — ~13.5 hours
+4. Phase C multi-seed handled by L20X side
+5. Total your wall-clock: ~14h, leaves margin for paper writing
+
+---
+
+## Section 0 — Critical setup info (READ FIRST, updated 2026-05-02)
+
+### Model: **Qwen2.5-3B-Instruct** (NOT 1.5B)
+
+All 4 configs we provide have model.path hardcoded to:
+```
+/mnt/workspace/qisheng/HLE_QA_workflow/EvolAnalsis/models/Qwen/Qwen2.5-3B-Instruct
+```
+
+On your 4×A100 server, **edit `actor_rollout_ref.model.path`** in each yaml to point to your local copy of `Qwen2.5-3B-Instruct`. Same goes for `teacher_experience.data_path` (teacher: Qwen-72B traj pickles). **Do NOT switch to 1.5B** — the velocity hypothesis we are testing is specifically for 3B WS where disc_acc plateaus ~0.91.
+
+### 3B WebShop baselines (the wall we're trying to break)
+
+| Method | val@100 SR | Notes |
+|--------|-----------|-------|
+| GRPO (no teacher) | ~30% | floor |
+| CHORD (BC + GRPO, fixed μ) | ~40-45% | |
+| **LUFFY** (teacher mixing + p/p_β) | **49.5%** | ⭐ first hard target |
+| **DUET v1** (DR3 + SC, no BC) | **53.0%** | ⭐⭐ stretch goal |
+| DUET\* v39b (current best, μ=disc_acc) | 45.5% (best of 1 seed) | structurally bounded ≈ 44% mean |
+
+DUET\* sweep (16 runs across peak/floor/valley combinations) on L20X **topped at 44.5%** — evidence that level-based μ is the bottleneck, not the BC formula itself. This is **why velocity matters**.
+
+### 3B ALFWorld baseline / SOTA
+
+| Method | val@100 SR | Notes |
+|--------|-----------|-------|
+| GRPO | ~50% | |
+| LUFFY | ~64% | |
+| DUET v1 | 69.5% | prior best |
+| **DUET\* v39b RERUN** | **77.5%** | **OUR CURRENT SOTA** — must not regress |
+
+AF velocity run (`af_swC_v_pk05`) is purely defensive: confirm velocity mode preserves 77.5% (not improve it). If af_swC_v_pk05 ≥ 75%, we're fine.
+
+### Targets
+
+- **WS goal**: any single seed ≥ 49.5% (beat LUFFY) → 3-seed mean ≥ 49.5% confirms claim
+- **WS stretch**: any single seed ≥ 53.0% (beat DUET v1) → would be ideal headline number
+- **AF guardrail**: af_swC_v_pk05 ≥ 75% (no regression)
+
+### Updated split between L20X (us) and 4×A100 (you)
+
+L20X has killed its sweep (it was capped at 44.5%) and joined velocity sprint:
+
+| Server | Run | Why this run | Sequence |
+|--------|-----|-------------|----------|
+| L20X (us) | `ws_swC_v_pk05` | ⭐ main candidate (peak=0.5) | T+0 |
+| L20X (us) | `ws_swC_v_pk03_aggr` | aggressive plateau detection | T+3.5h |
+| L20X (us) | Phase C 3-seed of winner | mean±std for paper | T+7h ~ T+17.5h |
+| **4×A100 (you)** | `ws_swC_v_pk03` | peak=0.3 backup | T+0 |
+| **4×A100 (you)** | `af_swC_v_pk05` | AF SOTA verification (~10h) | T+3.5h |
+
+This gives us first WS signal at T+3.5h (2 runs land), final WS signal at T+7h (3 runs land), AF answer at T+13.5h, 3-seed mean at T+17.5h.
 
 ---
 
@@ -196,7 +253,11 @@ for c in ['config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_
 "
 ```
 
-### Day 1 — 4 main experiments (~21h, sequential on 4 GPUs)
+### Day 1 — Your share: 2 main experiments (~13.5h, sequential on 4 GPUs)
+
+> **(Split with L20X — see §0 for full picture.)**
+> Your queue: `ws_swC_v_pk03` (T+0, ~3.5h) → `af_swC_v_pk05` (T+3.5h, ~10h).
+> L20X queue: `ws_swC_v_pk05` → `ws_swC_v_pk03_aggr` → 3-seed of winner.
 
 **CRITICAL: each run must restart env services freshly to avoid memory leaks.**
 
@@ -223,25 +284,29 @@ run_one() {
 }
 ```
 
-**Schedule (sequential)**:
+**Schedule (your 2 runs, sequential)**:
 
 ```
 Hour  Run                                          Env           ETA
 ─────────────────────────────────────────────────────────────────────
-T+0   ws_swC_v_pk05.yaml         (peak=0.5)        webshop       ~3.5h
-T+4   ws_swC_v_pk03.yaml         (peak=0.3)        webshop       ~3.5h
-T+8   ws_swC_v_pk03_aggr.yaml    (window=5, agg)   webshop       ~3.5h
-T+12  af_swC_v_pk05.yaml         (peak=0.5)        alfworld      ~9-11h
-T+22  → all 4 main experiments done
+T+0    ws_swC_v_pk03.yaml        (peak=0.3)        webshop       ~3.5h
+T+3.5  af_swC_v_pk05.yaml        (peak=0.5)        alfworld      ~9-11h
+T+13.5 → your share done
 ```
 
-**Why this order**: WS first (fastest, gives signal in 3.5h whether velocity mode beats current ~44%); AF last (longest, mostly verification it doesn't regress 77.5% SOTA).
+L20X side runs in parallel: `ws_swC_v_pk05` (T+0) + `ws_swC_v_pk03_aggr` (T+3.5h) + 3-seed Phase C (T+7h+).
 
-### Day 2 — Phase C multi-seed confirmation of best WS candidate (~10h)
+**Why this split**: You take the longer AF run (10h) plus 1 WS; L20X takes 2 WS + 3-seed Phase C. WS results all land by T+7h so we can pick a winner; AF answer + 3-seed mean by T+17.5h. **Total wall-clock: ~18h vs original 31h sequential.**
 
-After Day 1 results land, identify the WS winner:
-- If best single-seed ≥ 49.5%: GREAT → Phase C × 3 seeds for mean±std
-- If best 45-49%: PROMISING → Phase C × 3 seeds; mean might cross 49.5%
+**Coordinate**: please post each val@100 in a shared channel (or commit to `analysis_reports/handoff/results_log.md`) as soon as it lands so L20X can decide which config to use for the 3-seed Phase C run starting T+7h.
+
+### Day 2 — Phase C multi-seed (handled by L20X)
+
+L20X will run 3 seeds (42/7/1234) of whichever WS config wins Day 1. **You do not need to run anything for Day 2** unless your AF run finishes early and you want to help — in that case, ping L20X and we'll hand you 1 of the 3 seeds.
+
+Decision rule (for L20X):
+- If best Day 1 single-seed ≥ 49.5%: GREAT → 3 seeds for mean±std
+- If best 45-49%: PROMISING → 3 seeds; mean might cross 49.5%
 - If best < 45%: velocity mode same ceiling → fallback to AF SOTA narrative
 
 ```bash
