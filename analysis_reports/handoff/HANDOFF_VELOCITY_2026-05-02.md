@@ -18,7 +18,7 @@ We discovered that the existing disc_acc-based μ schedule **structurally fails 
 1. `git pull` to get the new `disc_acc_velocity` mode + 4 ready configs
 2. **(Updated 2026-05-02)** L20X agent has joined velocity sprint — split duty (see §0)
 3. Run **2** main experiments on your end (was 4) — ~13.5 hours
-4. Phase C multi-seed handled by L20X side
+4. **(Updated 2026-05-02-2)** No 3-seed Phase C (time too tight). L20X switched to **3 ADDITIONAL velocity-mode variants** instead, to maximize SOTA chances.
 5. Total your wall-clock: ~14h, leaves margin for paper writing
 
 ---
@@ -63,19 +63,33 @@ AF velocity run (`af_swC_v_pk05`) is purely defensive: confirm velocity mode pre
 - **WS stretch**: any single seed ≥ 53.0% (beat DUET v1) → would be ideal headline number
 - **AF guardrail**: af_swC_v_pk05 ≥ 75% (no regression)
 
-### Updated split between L20X (us) and 4×A100 (you)
+### Updated split between L20X (us) and 4×A100 (you) — **REVISED 2026-05-02 PM**
 
-L20X has killed its sweep (it was capped at 44.5%) and joined velocity sprint:
+L20X has killed its sweep (it was capped at 44.5%) and joined velocity sprint.
+**Time is too tight for 3-seed Phase C — instead, we run more parameter
+variants to maximize SOTA-hit probability.**
 
 | Server | Run | Why this run | Sequence |
 |--------|-----|-------------|----------|
-| L20X (us) | `ws_swC_v_pk05` | ⭐ main candidate (peak=0.5) | T+0 |
-| L20X (us) | `ws_swC_v_pk03_aggr` | aggressive plateau detection | T+3.5h |
-| L20X (us) | Phase C 3-seed of winner | mean±std for paper | T+7h ~ T+17.5h |
-| **4×A100 (you)** | `ws_swC_v_pk03` | peak=0.3 backup | T+0 |
-| **4×A100 (you)** | `af_swC_v_pk05` | AF SOTA verification (~10h) | T+3.5h |
+| L20X (us) | `ws_swC_v_pk05` (peak=0.5, valley=0.05) | ⭐ main candidate | T+0 (running) |
+| L20X (us) | `ws_swC_v_pk03_aggr` (peak=0.3, K=5, vt=0.005) | aggressive plateau detection | T+3.5h |
+| L20X (us) | `ws_swC_v_pk05_v00` (peak=0.5, **valley=0**) | full BC-off after plateau | T+7h |
+| L20X (us) | `ws_swC_v_pk07_v00` (peak=0.7, **valley=0**) | strong early imit + full off | T+10.5h |
+| L20X (us) | `ws_swC_v_pk03_v00_K15` (peak=0.3, **valley=0**, K=15) | gentle + slower detect | T+14h |
+| **4×A100 (you)** | `ws_swC_v_pk03` (peak=0.3, valley=0.05) | peak=0.3 backup | T+0 |
+| **4×A100 (you)** | `af_swC_v_pk05` (peak=0.5, valley=0.05) | AF SOTA verification (~10h) | T+3.5h |
 
-This gives us first WS signal at T+3.5h (2 runs land), final WS signal at T+7h (3 runs land), AF answer at T+13.5h, 3-seed mean at T+17.5h.
+**Total velocity attempts**: 6 WS runs (5 on L20X + 1 on you) + 1 AF guardrail.
+**No multi-seed**: each run reports single-seed val@100; we report best run as headline.
+
+**Why valley=0 in the new variants**: current pk05/pk03/pk03_aggr all use valley=0.05 (so even after plateau, μ_late ≈ 0.05 BC residual). The **new variants set valley=0** — when velocity detects plateau, BC turns OFF entirely, so late training equals **DUET v1's algorithm** (which scores 53% on WS). If BC residual is the bottleneck (as our analysis suggests), valley=0 should bridge the gap.
+
+**Schedule**:
+- T+3.5h:  2 WS signals land (pk05, pk03 from 4×A100) — first verdict on velocity mode
+- T+7h:   3 WS signals land (+ pk03_aggr from L20X) — wider sample
+- T+10.5h: 4 WS signals land (+ pk05_v00) — first valley=0 result
+- T+14h:  5 WS signals land (+ pk07_v00) — high-peak valley=0
+- T+17.5h: all 6 WS signals + AF guardrail — final state for paper
 
 ---
 
@@ -300,14 +314,26 @@ L20X side runs in parallel: `ws_swC_v_pk05` (T+0) + `ws_swC_v_pk03_aggr` (T+3.5h
 
 **Coordinate**: please post each val@100 in a shared channel (or commit to `analysis_reports/handoff/results_log.md`) as soon as it lands so L20X can decide which config to use for the 3-seed Phase C run starting T+7h.
 
-### Day 2 — Phase C multi-seed (handled by L20X)
+### Day 2 — Extra parameter variants (handled by L20X, no 3-seed)
 
-L20X will run 3 seeds (42/7/1234) of whichever WS config wins Day 1. **You do not need to run anything for Day 2** unless your AF run finishes early and you want to help — in that case, ping L20X and we'll hand you 1 of the 3 seeds.
+**Pivot (2026-05-02 PM)**: Time too tight for 3-seed multi-seed confirmation. L20X is instead running **3 additional velocity-mode variants** with `valley=0` (vs valley=0.05 in the first batch) to widen the parameter search and maximize SOTA chances.
 
-Decision rule (for L20X):
-- If best Day 1 single-seed ≥ 49.5%: GREAT → 3 seeds for mean±std
-- If best 45-49%: PROMISING → 3 seeds; mean might cross 49.5%
-- If best < 45%: velocity mode same ceiling → fallback to AF SOTA narrative
+L20X queue from T+7h onward:
+- `ws_swC_v_pk05_v00`        peak=0.5, valley=0.0, K=10, vt=0.01
+- `ws_swC_v_pk07_v00`        peak=0.7, valley=0.0, K=10, vt=0.01
+- `ws_swC_v_pk03_v00_K15`    peak=0.3, valley=0.0, K=15, vt=0.015 (slower detect)
+
+**You do NOT need to run anything for Day 2** unless your AF run finishes early. If `af_swC_v_pk05` lands by T+13.5h and your remaining budget allows, **optionally** run 1 more WS variant we haven't covered. Suggestions:
+- `ws_swC_v_pk05_v00_K5_vt005` (peak=0.5, valley=0.0, K=5, vt=0.005) — aggressive + full off — would test if `pk03_aggr` got the right idea but at higher peak
+- `ws_swC_v_pk04_v00` (peak=0.4, valley=0.0, K=10, vt=0.01) — interpolate between pk03 and pk05
+- Easiest: just clone any sweep_phase_c yaml + edit the 4 params with sed
+
+Coordinate with L20X via `analysis_reports/handoff/results_log.md` (or any shared channel) — post each val@100 as it lands, including which `chord_mu_*` params you used. We'll pick the best across all servers as the paper headline.
+
+**Reporting bar**:
+- ≥ 49.5% → ⭐ beat LUFFY (good headline, suggests our framework works)
+- ≥ 53.0% → ⭐⭐ beat DUET v1 (great headline, the velocity claim is fully validated)
+- < 49.5% → velocity hypothesis didn't bridge the gap; we still have the AF 77.5% SOTA to lead the paper
 
 ```bash
 # Generate 3-seed yamls of best WS config (replace BEST_NAME):
