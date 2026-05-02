@@ -16,9 +16,80 @@ We discovered that the existing disc_acc-based μ schedule **structurally fails 
 
 **Code is implemented and committed.** You should:
 1. `git pull` to get the new `disc_acc_velocity` mode + 4 ready configs
-2. Run 4 main experiments (1 AF + 3 WS) — 21 hours
-3. Run Phase C multi-seed confirmation of WS winner — 10 hours
-4. Total: ~31h, fits in 48h budget with margin for paper writing
+2. **(Updated 2026-05-02)** L20X agent has joined velocity sprint — split duty (see §0)
+3. Run **2** main experiments on your end (was 4) — ~13.5 hours
+4. **(Updated 2026-05-02-2)** No 3-seed Phase C (time too tight). L20X switched to **3 ADDITIONAL velocity-mode variants** instead, to maximize SOTA chances.
+5. Total your wall-clock: ~14h, leaves margin for paper writing
+
+---
+
+## Section 0 — Critical setup info (READ FIRST, updated 2026-05-02)
+
+### Model: **Qwen2.5-3B-Instruct** (NOT 1.5B)
+
+All 4 configs we provide have model.path hardcoded to:
+```
+/mnt/workspace/qisheng/HLE_QA_workflow/EvolAnalsis/models/Qwen/Qwen2.5-3B-Instruct
+```
+
+On your 4×A100 server, **edit `actor_rollout_ref.model.path`** in each yaml to point to your local copy of `Qwen2.5-3B-Instruct`. Same goes for `teacher_experience.data_path` (teacher: Qwen-72B traj pickles). **Do NOT switch to 1.5B** — the velocity hypothesis we are testing is specifically for 3B WS where disc_acc plateaus ~0.91.
+
+### 3B WebShop baselines (the wall we're trying to break)
+
+| Method | val@100 SR | Notes |
+|--------|-----------|-------|
+| GRPO (no teacher) | ~30% | floor |
+| CHORD (BC + GRPO, fixed μ) | ~40-45% | |
+| **LUFFY** (teacher mixing + p/p_β) | **49.5%** | ⭐ first hard target |
+| **DUET v1** (DR3 + SC, no BC) | **53.0%** | ⭐⭐ stretch goal |
+| DUET\* v39b (current best, μ=disc_acc) | 45.5% (best of 1 seed) | structurally bounded ≈ 44% mean |
+
+DUET\* sweep (16 runs across peak/floor/valley combinations) on L20X **topped at 44.5%** — evidence that level-based μ is the bottleneck, not the BC formula itself. This is **why velocity matters**.
+
+### 3B ALFWorld baseline / SOTA
+
+| Method | val@100 SR | Notes |
+|--------|-----------|-------|
+| GRPO | ~50% | |
+| LUFFY | ~64% | |
+| DUET v1 | 69.5% | prior best |
+| **DUET\* v39b RERUN** | **77.5%** | **OUR CURRENT SOTA** — must not regress |
+
+AF velocity run (`af_swC_v_pk05`) is purely defensive: confirm velocity mode preserves 77.5% (not improve it). If af_swC_v_pk05 ≥ 75%, we're fine.
+
+### Targets
+
+- **WS goal**: any single seed ≥ 49.5% (beat LUFFY) → 3-seed mean ≥ 49.5% confirms claim
+- **WS stretch**: any single seed ≥ 53.0% (beat DUET v1) → would be ideal headline number
+- **AF guardrail**: af_swC_v_pk05 ≥ 75% (no regression)
+
+### Updated split between L20X (us) and 4×A100 (you) — **REVISED 2026-05-02 PM**
+
+L20X has killed its sweep (it was capped at 44.5%) and joined velocity sprint.
+**Time is too tight for 3-seed Phase C — instead, we run more parameter
+variants to maximize SOTA-hit probability.**
+
+| Server | Run | Why this run | Sequence |
+|--------|-----|-------------|----------|
+| L20X (us) | `ws_swC_v_pk05` (peak=0.5, valley=0.05) | ⭐ main candidate | T+0 (running) |
+| L20X (us) | `ws_swC_v_pk03_aggr` (peak=0.3, K=5, vt=0.005) | aggressive plateau detection | T+3.5h |
+| L20X (us) | `ws_swC_v_pk05_v00` (peak=0.5, **valley=0**) | full BC-off after plateau | T+7h |
+| L20X (us) | `ws_swC_v_pk07_v00` (peak=0.7, **valley=0**) | strong early imit + full off | T+10.5h |
+| L20X (us) | `ws_swC_v_pk03_v00_K15` (peak=0.3, **valley=0**, K=15) | gentle + slower detect | T+14h |
+| **4×A100 (you)** | `ws_swC_v_pk03_v00` (peak=0.3, **valley=0.0**) ⚡swapped | direct comparison vs pk05_v00 | T+0 |
+| **4×A100 (you)** | `af_swC_v_pk05` (peak=0.5, valley=0.05) | AF SOTA verification (~10h) | T+3.5h |
+
+**Total velocity attempts**: 6 WS runs (5 on L20X + 1 on you) + 1 AF guardrail.
+**No multi-seed**: each run reports single-seed val@100; we report best run as headline.
+
+**Why valley=0 in the new variants**: current pk05/pk03/pk03_aggr all use valley=0.05 (so even after plateau, μ_late ≈ 0.05 BC residual). The **new variants set valley=0** — when velocity detects plateau, BC turns OFF entirely, so late training equals **DUET v1's algorithm** (which scores 53% on WS). If BC residual is the bottleneck (as our analysis suggests), valley=0 should bridge the gap.
+
+**Schedule**:
+- T+3.5h:  2 WS signals land (pk05, pk03 from 4×A100) — first verdict on velocity mode
+- T+7h:   3 WS signals land (+ pk03_aggr from L20X) — wider sample
+- T+10.5h: 4 WS signals land (+ pk05_v00) — first valley=0 result
+- T+14h:  5 WS signals land (+ pk07_v00) — high-peak valley=0
+- T+17.5h: all 6 WS signals + AF guardrail — final state for paper
 
 ---
 
@@ -196,7 +267,11 @@ for c in ['config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_
 "
 ```
 
-### Day 1 — 4 main experiments (~21h, sequential on 4 GPUs)
+### Day 1 — Your share: 2 main experiments (~13.5h, sequential on 4 GPUs)
+
+> **(Split with L20X — see §0 for full picture.)**
+> Your queue: `ws_swC_v_pk03` (T+0, ~3.5h) → `af_swC_v_pk05` (T+3.5h, ~10h).
+> L20X queue: `ws_swC_v_pk05` → `ws_swC_v_pk03_aggr` → 3-seed of winner.
 
 **CRITICAL: each run must restart env services freshly to avoid memory leaks.**
 
@@ -223,26 +298,46 @@ run_one() {
 }
 ```
 
-**Schedule (sequential)**:
+**Schedule (your 2 runs, sequential)** — ⚡ **2026-05-02 PM**: swapped pk03 → pk03_v00 for higher information yield:
 
 ```
 Hour  Run                                          Env           ETA
 ─────────────────────────────────────────────────────────────────────
-T+0   ws_swC_v_pk05.yaml         (peak=0.5)        webshop       ~3.5h
-T+4   ws_swC_v_pk03.yaml         (peak=0.3)        webshop       ~3.5h
-T+8   ws_swC_v_pk03_aggr.yaml    (window=5, agg)   webshop       ~3.5h
-T+12  af_swC_v_pk05.yaml         (peak=0.5)        alfworld      ~9-11h
-T+22  → all 4 main experiments done
+T+0    ws_swC_v_pk03_v00.yaml    (peak=0.3, val=0)  webshop      ~3.5h
+T+3.5  af_swC_v_pk05.yaml        (peak=0.5)         alfworld     ~9-11h
+T+13.5 → your share done
 ```
 
-**Why this order**: WS first (fastest, gives signal in 3.5h whether velocity mode beats current ~44%); AF last (longest, mostly verification it doesn't regress 77.5% SOTA).
+**If you already started `ws_swC_v_pk03`**: that's fine, let it finish — it's a useful data point. Then run `ws_swC_v_pk03_v00` (the swap) instead of `af_swC_v_pk05` is **NOT** advised — AF is the SOTA-preservation guardrail and must run. If you have extra slack post-AF, run the swap then.
 
-### Day 2 — Phase C multi-seed confirmation of best WS candidate (~10h)
+**If you have NOT started**: pull the latest commit and use `ws_swC_v_pk03_v00.yaml` instead of `ws_swC_v_pk03.yaml`. The swap fills a missing search-space corner: it's the only `peak=0.3 + valley=0 + default-K` config and gives a clean 1-variable comparison against L20X's `pk05_v00`.
 
-After Day 1 results land, identify the WS winner:
-- If best single-seed ≥ 49.5%: GREAT → Phase C × 3 seeds for mean±std
-- If best 45-49%: PROMISING → Phase C × 3 seeds; mean might cross 49.5%
-- If best < 45%: velocity mode same ceiling → fallback to AF SOTA narrative
+L20X side runs in parallel: `ws_swC_v_pk05` (T+0) + `ws_swC_v_pk03_aggr` (T+3.5h) + 3-seed Phase C (T+7h+).
+
+**Why this split**: You take the longer AF run (10h) plus 1 WS; L20X takes 2 WS + 3-seed Phase C. WS results all land by T+7h so we can pick a winner; AF answer + 3-seed mean by T+17.5h. **Total wall-clock: ~18h vs original 31h sequential.**
+
+**Coordinate**: please post each val@100 in a shared channel (or commit to `analysis_reports/handoff/results_log.md`) as soon as it lands so L20X can decide which config to use for the 3-seed Phase C run starting T+7h.
+
+### Day 2 — Extra parameter variants (handled by L20X, no 3-seed)
+
+**Pivot (2026-05-02 PM)**: Time too tight for 3-seed multi-seed confirmation. L20X is instead running **3 additional velocity-mode variants** with `valley=0` (vs valley=0.05 in the first batch) to widen the parameter search and maximize SOTA chances.
+
+L20X queue from T+7h onward:
+- `ws_swC_v_pk05_v00`        peak=0.5, valley=0.0, K=10, vt=0.01
+- `ws_swC_v_pk07_v00`        peak=0.7, valley=0.0, K=10, vt=0.01
+- `ws_swC_v_pk03_v00_K15`    peak=0.3, valley=0.0, K=15, vt=0.015 (slower detect)
+
+**You do NOT need to run anything for Day 2** unless your AF run finishes early. If `af_swC_v_pk05` lands by T+13.5h and your remaining budget allows, **optionally** run 1 more WS variant we haven't covered. Suggestions:
+- `ws_swC_v_pk05_v00_K5_vt005` (peak=0.5, valley=0.0, K=5, vt=0.005) — aggressive + full off — would test if `pk03_aggr` got the right idea but at higher peak
+- `ws_swC_v_pk04_v00` (peak=0.4, valley=0.0, K=10, vt=0.01) — interpolate between pk03 and pk05
+- Easiest: just clone any sweep_phase_c yaml + edit the 4 params with sed
+
+Coordinate with L20X via `analysis_reports/handoff/results_log.md` (or any shared channel) — post each val@100 as it lands, including which `chord_mu_*` params you used. We'll pick the best across all servers as the paper headline.
+
+**Reporting bar**:
+- ≥ 49.5% → ⭐ beat LUFFY (good headline, suggests our framework works)
+- ≥ 53.0% → ⭐⭐ beat DUET v1 (great headline, the velocity claim is fully validated)
+- < 49.5% → velocity hypothesis didn't bridge the gap; we still have the AF 77.5% SOTA to lead the paper
 
 ```bash
 # Generate 3-seed yamls of best WS config (replace BEST_NAME):
