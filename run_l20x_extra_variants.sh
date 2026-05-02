@@ -95,7 +95,13 @@ print(f'{sr/n*100:.1f}')
     fi
 }
 
-# Run the 3 new variants (priority: most likely winner first)
+# 🚨 Plan B: pure DUET v1 reproduction (use_chord=false). CRITICAL — runs FIRST.
+# If this hits ≥50%, the BC residual hypothesis is confirmed → valley=0 variants
+# should also bridge the gap. If this hits ≤45%, infra gap with H100 is the
+# bottleneck — gives us a paper narrative even if all velocity variants fail.
+run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_pure_v1.yaml"        "ws_swC_pure_v1"
+
+# Run the 3 new velocity variants (priority: most likely winner first)
 run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk05_v00.yaml"     "ws_swC_v_pk05_v00"
 run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk07_v00.yaml"     "ws_swC_v_pk07_v00"
 run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk03_v00_K15.yaml" "ws_swC_v_pk03_v00_K15"

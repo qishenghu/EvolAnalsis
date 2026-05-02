@@ -73,14 +73,17 @@ variants to maximize SOTA-hit probability.**
 |--------|-----|-------------|----------|
 | L20X (us) | `ws_swC_v_pk05` (peak=0.5, valley=0.05) | ⭐ main candidate | T+0 (running) |
 | L20X (us) | `ws_swC_v_pk03_aggr` (peak=0.3, K=5, vt=0.005) | aggressive plateau detection | T+3.5h |
-| L20X (us) | `ws_swC_v_pk05_v00` (peak=0.5, **valley=0**) | full BC-off after plateau | T+7h |
-| L20X (us) | `ws_swC_v_pk07_v00` (peak=0.7, **valley=0**) | strong early imit + full off | T+10.5h |
-| L20X (us) | `ws_swC_v_pk03_v00_K15` (peak=0.3, **valley=0**, K=15) | gentle + slower detect | T+14h |
+| L20X (us) | **`ws_swC_pure_v1`** (use_chord=false) 🚨 | **CRITICAL Plan B**: pure DR3+SC reproduction | T+7h |
+| L20X (us) | `ws_swC_v_pk05_v00` (peak=0.5, **valley=0**) | full BC-off after plateau | T+10.5h |
+| L20X (us) | `ws_swC_v_pk07_v00` (peak=0.7, **valley=0**) | strong early imit + full off | T+14h |
+| L20X (us) | `ws_swC_v_pk03_v00_K15` (peak=0.3, **valley=0**, K=15) | gentle + slower detect | T+17.5h |
 | **4×A100 (you)** | `ws_swC_v_pk03_v00` (peak=0.3, **valley=0.0**) ⚡swapped | direct comparison vs pk05_v00 | T+0 |
 | **4×A100 (you)** | `af_swC_v_pk05` (peak=0.5, valley=0.05) | AF SOTA verification (~10h) | T+3.5h |
 
-**Total velocity attempts**: 6 WS runs (5 on L20X + 1 on you) + 1 AF guardrail.
+**Total attempts**: 6 velocity WS runs + **1 critical Plan B (pure DR3+SC, use_chord=false)** + 1 AF guardrail = **8 runs**.
 **No multi-seed**: each run reports single-seed val@100; we report best run as headline.
+
+🚨 **Why pure_v1 is critical**: L20X's earlier `v_no_bc_ws` got 1.0% (single seed, very likely variance — known WS std ≈ 17pp). We need a clean retry. If pure_v1 hits ≥ 50%, it confirms BC residual is the bottleneck (so velocity's valley=0 variants will likely cross 49.5%). If pure_v1 hits ≤ 45%, there's an L20X infra gap with the H100 baseline — gives us a defensible paper narrative even if all velocity variants fail.
 
 **Why valley=0 in the new variants**: current pk05/pk03/pk03_aggr all use valley=0.05 (so even after plateau, μ_late ≈ 0.05 BC residual). The **new variants set valley=0** — when velocity detects plateau, BC turns OFF entirely, so late training equals **DUET v1's algorithm** (which scores 53% on WS). If BC residual is the bottleneck (as our analysis suggests), valley=0 should bridge the gap.
 
