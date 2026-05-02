@@ -79,8 +79,8 @@ variants to maximize SOTA-hit probability.**
 | **4×A100 (you)** | `ws_swC_v_pk03_v00` (peak=0.3, **valley=0.0**) ⚡swapped | direct comparison vs pk05_v00 | T+0 |
 | **4×A100 (you)** | `af_swC_v_pk05` (peak=0.5, valley=0.05) | AF SOTA verification (~10h) | T+3.5h |
 
-**Total velocity attempts**: 6 WS runs (5 on L20X + 1 on you) + 1 AF guardrail.
-**No multi-seed**: each run reports single-seed val@100; we report best run as headline.
+**Total attempts**: 6 velocity WS runs (5 on L20X + 1 on you) + 1 AF guardrail = **7 runs**.
+**No multi-seed, no pure-v1 reproduction** (no time): each run reports single-seed val@100; we report best run as headline.
 
 **Why valley=0 in the new variants**: current pk05/pk03/pk03_aggr all use valley=0.05 (so even after plateau, μ_late ≈ 0.05 BC residual). The **new variants set valley=0** — when velocity detects plateau, BC turns OFF entirely, so late training equals **DUET v1's algorithm** (which scores 53% on WS). If BC residual is the bottleneck (as our analysis suggests), valley=0 should bridge the gap.
 

@@ -1854,14 +1854,28 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             # Pre-history: assume rising (BC stays at peak during early training)
                             if len(self._disc_acc_history_v) < velocity_window:
                                 _velocity = 1.0
-                                _rising_strength = 1.0
+                                _rising_strength_raw = 1.0
                                 _history_full = 0.0
                             else:
                                 _velocity = float(self._disc_acc_history_v[-1] - self._disc_acc_history_v[0])
                                 vel_target = float(self.config.get("chord_mu_velocity_target", 0.01))
                                 vel_target = max(1e-6, vel_target)
-                                _rising_strength = max(0.0, min(1.0, _velocity / vel_target))
+                                _rising_strength_raw = max(0.0, min(1.0, _velocity / vel_target))
                                 _history_full = 1.0
+
+                            # --- Monotonic latch (hot-fix 2026-05-02) ---
+                            # Without this, rs flips between 0/1 as velocity oscillates around 0
+                            # near the disc_acc plateau, causing μ to whip-saw between peak/valley
+                            # and destabilizing the policy (observed pk05 collapse 22% → 1.5%).
+                            # Once we detect plateau (rs drops below latch_threshold AND history is
+                            # full), latch rs=0 permanently. BC fades once and stays faded.
+                            latch_threshold = float(self.config.get("chord_mu_velocity_latch_threshold", 0.3))
+                            if not hasattr(self, "_rs_latched_v"):
+                                self._rs_latched_v = False
+                            if (not self._rs_latched_v) and (_history_full > 0) and (_rising_strength_raw < latch_threshold):
+                                self._rs_latched_v = True
+                            _rising_strength = 0.0 if self._rs_latched_v else _rising_strength_raw
+
                             mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _rising_strength
                             adaptive_metrics = {
                                 "chord/mu_mode": 7.0,  # 7 = adaptive disc_acc_velocity
@@ -1872,7 +1886,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 "chord/d_velocity": float(_velocity),
                                 "chord/d_velocity_target": float(self.config.get("chord_mu_velocity_target", 0.01)),
                                 "chord/d_velocity_window": float(velocity_window),
+                                "chord/rising_strength_raw": float(_rising_strength_raw),
                                 "chord/rising_strength": float(_rising_strength),
+                                "chord/rs_latched": float(self._rs_latched_v),
+                                "chord/rs_latch_threshold": float(latch_threshold),
                                 "chord/d_history_len": float(len(self._disc_acc_history_v)),
                                 "chord/d_history_full": float(_history_full),
                             }

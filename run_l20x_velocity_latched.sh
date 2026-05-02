@@ -1,17 +1,16 @@
 #!/bin/bash
 # ==============================================================================
-# L20X Phase 2 takeover (2026-05-02 update):
+# L20X velocity-LATCHED queue (2026-05-02 hot-fix):
 #
-# Original plan was 3-seed Phase C of winner. Pivoted: instead, run 3 ADDITIONAL
-# velocity-mode variants to maximize SOTA chances within the same time budget.
+# After pk05 collapsed (22% → 1.5%) due to μ whip-sawing between peak/valley,
+# we added a monotonic latch in het_actor.py: once rising_strength drops below
+# threshold (default 0.3) AND velocity history is full, latch rs=0 permanently.
 #
-# This watchdog script:
-#   1. Waits until ws_swC_v_pk03_aggr (last run of phase 1 orchestrator) is DONE
-#   2. Kills the old orchestrator (it'd otherwise enter 3-seed dispatch)
-#   3. Runs 3 new variants sequentially (~10.5h):
-#        ws_swC_v_pk05_v00     (peak=0.5, valley=0.0, K=10, vt=0.01)
-#        ws_swC_v_pk07_v00     (peak=0.7, valley=0.0, K=10, vt=0.01)
-#        ws_swC_v_pk03_v00_K15 (peak=0.3, valley=0.0, K=15, vt=0.015)
+# All 5 configs use the SAME hot-fixed code. They differ only in chord_mu_*
+# parameters. Total wall-clock: 5 × 3.5h ≈ 17.5h.
+#
+# Stale results (from broken whip-saw) are renamed *_broken so we don't confuse
+# them with the new clean runs.
 # ==============================================================================
 
 set +e
@@ -25,30 +24,18 @@ fi
 conda activate "${CONDA_ENV_DUET}"
 
 GPUS="${CUDA_GPUS:-0,1,2,3}"
-LOG="logs/l20x_extra_variants.log"
+LOG="logs/l20x_velocity_latched.log"
 mkdir -p logs
 
-echo "[$(date '+%m-%d %H:%M')] watchdog: waiting for ws_swC_v_pk03_aggr to finish..." | tee -a "$LOG"
-
-# Phase 1: wait for pk03_aggr completion marker
-SENTINEL="experiments/webshop/ws_swC_v_pk03_aggr/validation_log/100.jsonl"
-while [ ! -f "$SENTINEL" ]; do
-    sleep 120
+# Move stale (broken-velocity) results aside so the script doesn't skip them
+for stale in ws_swC_v_pk05 ws_swC_v_pk03_aggr; do
+    if [ -d "experiments/webshop/${stale}" ] && [ ! -d "experiments/webshop/${stale}_broken" ]; then
+        mv "experiments/webshop/${stale}" "experiments/webshop/${stale}_broken"
+        echo "[$(date '+%m-%d %H:%M')] archived stale: ${stale} → ${stale}_broken" | tee -a "$LOG"
+    fi
 done
-echo "[$(date '+%m-%d %H:%M')] pk03_aggr DONE — proceeding to takeover." | tee -a "$LOG"
 
-# Phase 2: kill the old orchestrator + any still-running launcher (pk03_aggr should already be cleaned up)
-echo "[$(date '+%m-%d %H:%M')] killing old orchestrator (run_l20x_velocity_queue.sh) + lingering launcher..." | tee -a "$LOG"
-pgrep -f "run_l20x_velocity_queue.sh" | xargs -r kill -9 2>/dev/null
-sleep 3
-pgrep -f "launcher.py" | xargs -r kill -9 2>/dev/null
-pgrep -f "ray::"       | xargs -r kill -9 2>/dev/null
-sleep 5
-
-# Phase 3: env restart cleanup before our first new run
-bash start_env_alfworld.sh stop 2>&1 | tail -1
-bash start_env_webshop.sh  stop 2>&1 | tail -1
-sleep 8
+echo "[$(date '+%m-%d %H:%M')] L20X velocity-LATCHED queue starting" | tee -a "$LOG"
 
 run_one() {
     local config=$1
@@ -95,23 +82,26 @@ print(f'{sr/n*100:.1f}')
     fi
 }
 
-# Run the 3 valley=0 velocity variants (priority: most likely winner first)
+# Queue: 5 runs in priority order. valley=0 variants first since they're our
+# strongest hypothesis (BC fully off after latch = pure DUET v1 algorithm).
 run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk05_v00.yaml"     "ws_swC_v_pk05_v00"
 run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk07_v00.yaml"     "ws_swC_v_pk07_v00"
 run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk03_v00_K15.yaml" "ws_swC_v_pk03_v00_K15"
+run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk05.yaml"         "ws_swC_v_pk05"
+run_one "config/duet_paper_experiments_configs/webshop/sweep_phase_c/ws_swC_v_pk03_aggr.yaml"    "ws_swC_v_pk03_aggr"
 
 bash start_env_webshop.sh stop 2>&1 | tail -1
 
-echo "[$(date '+%m-%d %H:%M')] L20X extra variants COMPLETE." | tee -a "$LOG"
-
-# Summary across all 5 velocity runs
 echo "" | tee -a "$LOG"
-echo "=== Final velocity-mode WS leaderboard ===" | tee -a "$LOG"
+echo "[$(date '+%m-%d %H:%M')] L20X velocity-LATCHED queue COMPLETE." | tee -a "$LOG"
+
+# Final leaderboard
+echo "=== Final WS velocity-LATCHED leaderboard ===" | tee -a "$LOG"
 python <<'PYEOF' | tee -a "$LOG"
 import json, os
 runs = [
-    "ws_swC_v_pk05", "ws_swC_v_pk03_aggr", "ws_swC_v_pk03",
     "ws_swC_v_pk05_v00", "ws_swC_v_pk07_v00", "ws_swC_v_pk03_v00_K15",
+    "ws_swC_v_pk05", "ws_swC_v_pk03_aggr", "ws_swC_v_pk03_v00"  # last is from 4×A100 if shared FS
 ]
 results = {}
 for n in runs:
