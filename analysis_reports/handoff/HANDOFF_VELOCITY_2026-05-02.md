@@ -76,7 +76,7 @@ variants to maximize SOTA-hit probability.**
 | L20X (us) | `ws_swC_v_pk05_v00` (peak=0.5, **valley=0**) | full BC-off after plateau | T+7h |
 | L20X (us) | `ws_swC_v_pk07_v00` (peak=0.7, **valley=0**) | strong early imit + full off | T+10.5h |
 | L20X (us) | `ws_swC_v_pk03_v00_K15` (peak=0.3, **valley=0**, K=15) | gentle + slower detect | T+14h |
-| **4×A100 (you)** | `ws_swC_v_pk03` (peak=0.3, valley=0.05) | peak=0.3 backup | T+0 |
+| **4×A100 (you)** | `ws_swC_v_pk03_v00` (peak=0.3, **valley=0.0**) ⚡swapped | direct comparison vs pk05_v00 | T+0 |
 | **4×A100 (you)** | `af_swC_v_pk05` (peak=0.5, valley=0.05) | AF SOTA verification (~10h) | T+3.5h |
 
 **Total velocity attempts**: 6 WS runs (5 on L20X + 1 on you) + 1 AF guardrail.
@@ -298,15 +298,19 @@ run_one() {
 }
 ```
 
-**Schedule (your 2 runs, sequential)**:
+**Schedule (your 2 runs, sequential)** — ⚡ **2026-05-02 PM**: swapped pk03 → pk03_v00 for higher information yield:
 
 ```
 Hour  Run                                          Env           ETA
 ─────────────────────────────────────────────────────────────────────
-T+0    ws_swC_v_pk03.yaml        (peak=0.3)        webshop       ~3.5h
-T+3.5  af_swC_v_pk05.yaml        (peak=0.5)        alfworld      ~9-11h
+T+0    ws_swC_v_pk03_v00.yaml    (peak=0.3, val=0)  webshop      ~3.5h
+T+3.5  af_swC_v_pk05.yaml        (peak=0.5)         alfworld     ~9-11h
 T+13.5 → your share done
 ```
+
+**If you already started `ws_swC_v_pk03`**: that's fine, let it finish — it's a useful data point. Then run `ws_swC_v_pk03_v00` (the swap) instead of `af_swC_v_pk05` is **NOT** advised — AF is the SOTA-preservation guardrail and must run. If you have extra slack post-AF, run the swap then.
+
+**If you have NOT started**: pull the latest commit and use `ws_swC_v_pk03_v00.yaml` instead of `ws_swC_v_pk03.yaml`. The swap fills a missing search-space corner: it's the only `peak=0.3 + valley=0 + default-K` config and gives a clean 1-variable comparison against L20X's `pk05_v00`.
 
 L20X side runs in parallel: `ws_swC_v_pk05` (T+0) + `ws_swC_v_pk03_aggr` (T+3.5h) + 3-seed Phase C (T+7h+).
 
