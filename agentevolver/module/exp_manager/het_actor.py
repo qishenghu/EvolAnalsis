@@ -1813,6 +1813,69 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 "chord/mu_adaptive_gated": float(_gated),
                                 "chord/d_floor": d_floor,
                             }
+                        elif use_adaptive_mu and adaptive_mode == "disc_acc_velocity":
+                            # --- velocity-based adaptive μ ---
+                            # Detects whether discriminator accuracy is still RISING (BC has
+                            # signal to extract) vs PLATEAUED (student-teacher distribution
+                            # converged, BC has saturated its imitation gradient).
+                            #
+                            # Logic:
+                            #   d_ema(t)        = EMA(dr3/disc_acc, α=d_ema_alpha)
+                            #   velocity(t)     = d_ema(t) - d_ema(t-K)         # change over window K
+                            #   rising_strength = clamp(velocity / vel_target, 0, 1)
+                            #   μ(t)            = valley + (peak - valley) * rising_strength
+                            #
+                            # Cross-env behavior (auto-adaptive without manual tuning):
+                            #   - ALFWorld (disc_acc rises monotonically due to persistent stylistic
+                            #     differences): velocity > 0 throughout → μ stays near peak → BC active
+                            #   - WebShop (disc_acc plateaus ~0.91 due to template-driven actions):
+                            #     velocity → 0 mid-training → μ → valley → BC fades, GRPO refines policy
+                            #   - 1.5B / scale-dependent: disc_acc dynamics differ; velocity adapts
+                            #
+                            # Pre-warmup: dr3/disc_acc raw is 0 (default init). Treat as 0.5 (chance level)
+                            # to keep d_ema in a sensible range during the warmup phase.
+                            _disc_acc_raw = float(dr3_metrics.get("dr3/disc_acc", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            _disc_ready = float(dr3_metrics.get("dr3/disc_trained_steps", 0.0)) if isinstance(dr3_metrics, dict) else 0.0
+                            _disc_acc_now = _disc_acc_raw if _disc_ready > 0 else 0.5
+                            d_ema_alpha = float(self.config.get("chord_mu_d_ema_alpha", 0.2))
+                            # EMA on disc_acc (use distinct attribute name to avoid mode-switch pollution)
+                            if not hasattr(self, "_disc_acc_ema_v"):
+                                self._disc_acc_ema_v = _disc_acc_now
+                            else:
+                                self._disc_acc_ema_v = (1 - d_ema_alpha) * self._disc_acc_ema_v + d_ema_alpha * _disc_acc_now
+                            # Window of d_ema history for velocity computation
+                            velocity_window = int(self.config.get("chord_mu_velocity_window", 10))
+                            if not hasattr(self, "_disc_acc_history_v"):
+                                self._disc_acc_history_v = []
+                            self._disc_acc_history_v.append(float(self._disc_acc_ema_v))
+                            if len(self._disc_acc_history_v) > velocity_window:
+                                self._disc_acc_history_v.pop(0)
+                            # Velocity = d_ema(t) - d_ema(t - window)
+                            # Pre-history: assume rising (BC stays at peak during early training)
+                            if len(self._disc_acc_history_v) < velocity_window:
+                                _velocity = 1.0
+                                _rising_strength = 1.0
+                                _history_full = 0.0
+                            else:
+                                _velocity = float(self._disc_acc_history_v[-1] - self._disc_acc_history_v[0])
+                                vel_target = float(self.config.get("chord_mu_velocity_target", 0.01))
+                                vel_target = max(1e-6, vel_target)
+                                _rising_strength = max(0.0, min(1.0, _velocity / vel_target))
+                                _history_full = 1.0
+                            mu = chord_mu_valley + (chord_mu_peak - chord_mu_valley) * _rising_strength
+                            adaptive_metrics = {
+                                "chord/mu_mode": 7.0,  # 7 = adaptive disc_acc_velocity
+                                "chord/disc_acc_current": float(_disc_acc_now),
+                                "chord/disc_acc_raw": float(_disc_acc_raw),
+                                "chord/disc_ready": float(_disc_ready),
+                                "chord/disc_acc_ema_v": float(self._disc_acc_ema_v),
+                                "chord/d_velocity": float(_velocity),
+                                "chord/d_velocity_target": float(self.config.get("chord_mu_velocity_target", 0.01)),
+                                "chord/d_velocity_window": float(velocity_window),
+                                "chord/rising_strength": float(_rising_strength),
+                                "chord/d_history_len": float(len(self._disc_acc_history_v)),
+                                "chord/d_history_full": float(_history_full),
+                            }
                         elif use_adaptive_mu and adaptive_mode == "gap":
                             # --- v_gap: teacher-student outcome-gap-driven adaptive μ ---
                             # Semantics: μ ∝ (teacher_reward - student_reward) within a group.
