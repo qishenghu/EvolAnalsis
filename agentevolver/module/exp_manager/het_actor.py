@@ -1863,16 +1863,43 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 _rising_strength_raw = max(0.0, min(1.0, _velocity / vel_target))
                                 _history_full = 1.0
 
-                            # --- Monotonic latch (hot-fix 2026-05-02) ---
-                            # Without this, rs flips between 0/1 as velocity oscillates around 0
-                            # near the disc_acc plateau, causing μ to whip-saw between peak/valley
-                            # and destabilizing the policy (observed pk05 collapse 22% → 1.5%).
-                            # Once we detect plateau (rs drops below latch_threshold AND history is
-                            # full), latch rs=0 permanently. BC fades once and stays faded.
-                            latch_threshold = float(self.config.get("chord_mu_velocity_latch_threshold", 0.3))
+                            # --- Triple-gated monotonic latch (v2 hot-fix 2026-05-02 evening) ---
+                            # v1 latch (threshold=0.3, single-step) fired prematurely on noise:
+                            # observed pk03_v00 latched at step 17 from a single disc_acc dip
+                            # (0.715 → 0.625), even though disc_acc was still rising for 80+
+                            # more steps. This destroyed BC warm-up and capped result at 36.5%.
+                            #
+                            # v2 latch requires ALL THREE gates to pass before locking rs=0:
+                            #   1. warmup gate:  global_step >= min_warmup_steps
+                            #      → guarantees BC stays at peak through warm-up phase
+                            #   2. plateau-level gate: disc_acc EMA >= plateau_level_min
+                            #      → blocks early-training noise: disc_acc starts ~0.5-0.65,
+                            #        so single dips can produce low velocity but disc_acc
+                            #        itself is far from saturated; this gate vetoes such cases
+                            #   3. persistence gate: rs_raw < latch_threshold for N consecutive
+                            #                        gradient steps (counter with gradual reset)
+                            #      → robust to single-step dips
+                            # Default latch_threshold lowered 0.3 → 0.05 (only deeply-low rs counts).
+                            latch_threshold = float(self.config.get("chord_mu_velocity_latch_threshold", 0.05))
+                            min_warmup_steps = int(self.config.get("chord_mu_velocity_min_warmup_steps", 30))
+                            plateau_level_min = float(self.config.get("chord_mu_velocity_plateau_level_min", 0.85))
+                            latch_persist_steps = int(self.config.get("chord_mu_velocity_latch_persist_steps", 3))
                             if not hasattr(self, "_rs_latched_v"):
                                 self._rs_latched_v = False
-                            if (not self._rs_latched_v) and (_history_full > 0) and (_rising_strength_raw < latch_threshold):
+                            if not hasattr(self, "_rs_below_count_v"):
+                                self._rs_below_count_v = 0
+
+                            _warmup_gate_pass = (chord_global_step >= min_warmup_steps)
+                            _plateau_gate_pass = (float(self._disc_acc_ema_v) >= plateau_level_min)
+                            _below_thr = (_history_full > 0) and (_rising_strength_raw < latch_threshold)
+                            # Persistence counter: increment on below, gradual reset on above.
+                            if _below_thr:
+                                self._rs_below_count_v = self._rs_below_count_v + 1
+                            else:
+                                self._rs_below_count_v = max(0, self._rs_below_count_v - 1)
+
+                            if (not self._rs_latched_v) and _warmup_gate_pass and _plateau_gate_pass \
+                                    and (self._rs_below_count_v >= latch_persist_steps):
                                 self._rs_latched_v = True
                             _rising_strength = 0.0 if self._rs_latched_v else _rising_strength_raw
 
@@ -1890,6 +1917,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                 "chord/rising_strength": float(_rising_strength),
                                 "chord/rs_latched": float(self._rs_latched_v),
                                 "chord/rs_latch_threshold": float(latch_threshold),
+                                "chord/rs_min_warmup_steps": float(min_warmup_steps),
+                                "chord/rs_plateau_level_min": float(plateau_level_min),
+                                "chord/rs_latch_persist_steps": float(latch_persist_steps),
+                                "chord/rs_warmup_gate_pass": float(_warmup_gate_pass),
+                                "chord/rs_plateau_gate_pass": float(_plateau_gate_pass),
+                                "chord/rs_below_count": float(self._rs_below_count_v),
                                 "chord/d_history_len": float(len(self._disc_acc_history_v)),
                                 "chord/d_history_full": float(_history_full),
                             }
