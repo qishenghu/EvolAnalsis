@@ -249,17 +249,27 @@ def compute_teacher_effect_metrics(batch: DataProto, entropys: Optional[torch.Te
                     else:
                         grp[gid]["o"].append(rs[i])
                 gaps = []
+                gaps_best_of_k = []  # teacher_mean - student_MAX (capability gap, not consistency gap)
                 nt_means = []
                 all_means = []
                 for gid, d in grp.items():
                     if d["t"] and d["o"]:
-                        gaps.append(float(np.mean(d["t"]) - np.mean(d["o"])))
-                        nt_means.append(float(np.mean(d["o"])))
+                        t_mean = float(np.mean(d["t"]))
+                        o_mean = float(np.mean(d["o"]))
+                        o_max = float(np.max(d["o"]))  # best-of-k student in this group
+                        gaps.append(t_mean - o_mean)
+                        gaps_best_of_k.append(t_mean - o_max)
+                        nt_means.append(o_mean)
                         all_means.append(float(np.mean(d["t"] + d["o"])))
                 if gaps:
                     metrics["diag/group_teacher_minus_on_reward_mean"] = float(np.mean(gaps))
                     metrics["diag/group_teacher_minus_on_reward_std"] = float(np.std(gaps))
                     metrics["diag/group_gap_count"] = float(len(gaps))
+                    # Best-of-k variant: gap that closes when ANY student rollout matches teacher.
+                    # On WS where teacher has full-success rewards but student has consistency issues,
+                    # this version actually closes (vs mean-gap which stays open indefinitely).
+                    metrics["diag/group_teacher_minus_on_max_reward_mean"] = float(np.mean(gaps_best_of_k))
+                    metrics["diag/group_teacher_minus_on_max_reward_std"] = float(np.std(gaps_best_of_k))
                 if nt_means:
                     # Useful for 2.1 teacher-baseline separation: this approximates the non-teacher baseline.
                     metrics["diag/group_non_teacher_reward_mean"] = float(np.mean(nt_means))
@@ -3792,11 +3802,28 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         # ⭐ Pipe reward gap (group-level teacher-on-policy reward delta) into
                         # meta_info so the actor's gap-driven μ scheduler (chord_mu_adaptive_mode='gap')
                         # can read it without recomputing.
+                        # Best-of-k variant (chord_mu_gap_use_best_of_k=true):
+                        #   uses gap = teacher_mean - student_MAX (capability gap), which closes when
+                        #   ANY student rollout matches teacher. Solves the "WS gap never fades" problem
+                        #   where teacher always has r=1 but student means can't reach 1 due to partial
+                        #   credit / consistency issues.
                         try:
                             if isinstance(diag_metrics, dict):
-                                _gap_val = diag_metrics.get("diag/group_teacher_minus_on_reward_mean", None)
+                                _use_bok = False
+                                try:
+                                    _actor_cfg = self.config.actor_rollout_ref.actor
+                                    _use_bok = bool(getattr(_actor_cfg, "chord_mu_gap_use_best_of_k", False))
+                                except Exception:
+                                    _use_bok = False
+                                _gap_key = (
+                                    "diag/group_teacher_minus_on_max_reward_mean"
+                                    if _use_bok else
+                                    "diag/group_teacher_minus_on_reward_mean"
+                                )
+                                _gap_val = diag_metrics.get(_gap_key, None)
                                 if _gap_val is not None:
                                     batch.meta_info["reward_gap"] = float(_gap_val)
+                                    batch.meta_info["reward_gap_source"] = _gap_key
                         except Exception:
                             pass
 
