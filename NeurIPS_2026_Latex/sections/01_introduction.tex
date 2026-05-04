@@ -1,0 +1,54 @@
+% ============================================================================
+% Introduction — DUET (NeurIPS 2026)
+% Last revised: 2026-05-04
+%
+% Structure: 5-paragraph diagnose-then-fix arc
+%   §1 Problem    — cold-start trap of on-policy RL on weak LLM agents
+%   §2 Existing   — LUFFY/CHORD as natural mitigations, with CHORD's known critique
+%   §3 Diagnosis  — TWO systematic biases (paper's intellectual contribution)
+%   §4 DUET       — principled fix + extensions, two-channel architecture
+%   §5 Results    — 4/4 SOTA, +13pp avg, contributions list
+%
+% Citation placeholders: \citep{TODO_*} need bibtex entries:
+%   - GRPO: shao2024deepseekmath
+%   - LUFFY: yan2025luffy (placeholder)
+%   - CHORD: chord2025 (placeholder)
+%   - ALFWorld: shridhar2021alfworld
+%   - WebShop: yao2022webshop
+%   - Ng potential shaping: ng1999policy
+%   - GAN density ratio: goodfellow2014gan, sugiyama2012density
+% ============================================================================
+
+\section{Introduction}
+
+% --- Paragraph 1: Problem statement ---
+Training large language model (LLM) agents to interact with complex environments via reinforcement learning has emerged as a central paradigm for embodied and tool-using AI~\citep{TODO_alfworld,TODO_webshop,TODO_react}. On-policy methods such as GRPO~\citep{TODO_grpo} train the agent purely from its own rollouts and provide stable updates when the policy is already capable. On weaker base models, however---the regime most relevant to deployment cost---on-policy RL hits a \emph{cold-start trap}: success rates collapse to near zero before the policy has accumulated enough successful trajectories to bootstrap learning. On ALFWorld~\citep{TODO_alfworld} and WebShop~\citep{TODO_webshop}, GRPO on Qwen2.5-1.5B-Instruct reaches only $1.0\%$ and $0.5\%$ strict success rates respectively, with no recovery within $100$ training steps.
+
+% --- Paragraph 2: Existing teacher-mixing approaches ---
+A natural mitigation is to inject expert trajectories from a stronger teacher LLM into the rollout batch, as in LUFFY~\citep{TODO_luffy} and CHORD~\citep{TODO_chord}. These methods provide cold-start guidance and demonstrate substantial gains over pure on-policy RL on weak agents. However, both approaches treat teacher trajectories as if they were on-policy samples, plugging them directly into the GRPO objective with at most a manually-scheduled imitation weight (CHORD). This design choice has drawn criticism in prior reviews, both for its heuristic nature and for unstable late-training dynamics.
+
+% --- Paragraph 3: Diagnosis (the paper's intellectual contribution) ---
+We identify two \emph{systematic biases} in LUFFY-style experience replay that explain these issues:
+\begin{itemize}[leftmargin=1.5em, itemsep=2pt, topsep=2pt]
+\item \textbf{Baseline contamination.} GRPO normalizes advantages by the within-group mean and standard deviation. Teacher trajectories are always successful (reward $=1$); when they share a group with on-policy rollouts, they inflate the group's baseline. As a consequence, even \emph{successful} on-policy rollouts can receive negative advantage, and the policy gradient effectively penalizes the very exploration that on-policy RL is trying to encourage.
+\item \textbf{Unaddressed off-policy mismatch.} Teacher trajectories are sampled from a distribution $\pi_\beta \neq \pi_\theta$, so the policy-update importance ratio for teacher samples is biased. Without explicit correction, teacher gradients continue to dominate even after the student has matched the teacher's capability---damaging asymptotic performance and forcing practitioners to hand-tune teacher-decay schedules.
+\end{itemize}
+Both biases compound on weak base models, where the gap between teacher and student is largest and lasts longest---which is exactly where one most wants teacher mixing to work.
+
+% --- Paragraph 4: Our solution: DUET ---
+We propose \textbf{DUET}, a principled experience-replay framework that addresses both biases and extracts richer signal from teacher data through two complementary channels.
+\begin{itemize}[leftmargin=1.5em, itemsep=2pt, topsep=2pt]
+\item \textbf{Fix~1 --- Baseline separation.} GRPO baselines are computed separately for teacher and on-policy sub-groups, eliminating the contamination bias.
+\item \textbf{Fix~2 --- DR3 density-ratio correction.} A small discriminator $D(\cdot)$ estimates the importance ratio $\hat w(\tau) = \pi_\theta/\pi_\beta$ for teacher trajectories; this replaces the (biased) GRPO importance ratio for teacher samples. By construction, $\hat w \to 1$ as the student catches up, providing data-driven teacher fade-out without any schedule.
+\item \textbf{Extension~1 --- BC adaptive imitation.} A token-level cross-entropy loss on teacher tokens with adaptive weight $\mu(t)$ serves as a \emph{cold-start safety net} while DR3's discriminator is still learning. The weight $\mu(t)$ decays as discriminator accuracy rises, transferring control to DR3 once the latter is reliable.
+\item \textbf{Extension~2 --- SC potential-based shaping.} A hash-based expert progress map $P(s)$ provides per-state reward shaping for on-policy samples only, using the potential-based form $r' = r + \beta\bigl(P(s')-P(s)\bigr)$ that preserves the optimal policy by Ng et al.~\citeyearpar{TODO_ng1999}.
+\end{itemize}
+The four mechanisms are organized into two orthogonal channels: an \textbf{Action Channel} (DR3 + BC) operating on the policy gradient, and a \textbf{State Channel} (SC) operating on the reward. Every teacher mechanism is driven by an internal, data-derived signal---no manual schedule.
+
+% --- Paragraph 5: Results & contributions ---
+Across four settings spanning two model sizes (Qwen2.5-1.5B/3B-Instruct) and two environments (ALFWorld, WebShop), DUET achieves state-of-the-art on every setting, surpassing the strongest baseline (CHORD or SFT$+$GRPO) by $+13.0$pp success rate on average. The improvement is largest on weak base models ($+17.5$pp on 1.5B), confirming that DUET specifically resolves the cold-start regime where on-policy RL fails. Component ablations show that each of the four mechanisms contributes non-trivially, and that the two channels are complementary rather than redundant. Our contributions are:
+\begin{enumerate}[leftmargin=1.5em, itemsep=1pt, topsep=2pt]
+\item A \textbf{diagnosis} of two systematic biases---baseline contamination and unaddressed off-policy mismatch---in LUFFY-style experience replay for LLM agents.
+\item \textbf{DUET}, a principled experience-replay framework with four self-calibrating mechanisms organized into two orthogonal channels.
+\item \textbf{Strong empirical results}: SOTA on all four (model size $\times$ environment) settings, with $+13.0$pp average success-rate gain over the strongest non-DUET baseline, and up to $+17.5$pp on weaker base models.
+\end{enumerate}

@@ -1,0 +1,20 @@
+% ============================================================================
+% Abstract — DUET (NeurIPS 2026)
+% Word count: ~211 words (target 180-220)
+% Last revised: 2026-05-04 (v2 — rewrite for readability)
+% ============================================================================
+%
+% Design principles for this version:
+%   - Open with plain English, not jargon. The 1.5B success-rate numbers
+%     come in sentence 1 as a concrete hook.
+%   - Each sentence carries ONE idea. No subordinate-clause stacks.
+%   - "Exploration is punished." stands alone as a 3-word punch line.
+%   - DR3 / BC / SC / Action / State are NOT named in the abstract;
+%     they are introduced in the body. Abstract uses plain descriptions.
+%   - Em-dash used only once (--- around "experience replay" definition).
+%   - Final sentence carries both aggregate (+13pp) and worst-case (+17.5pp).
+% ============================================================================
+
+\begin{abstract}
+Training large language model agents with on-policy reinforcement learning often fails on small base models: a 1.5B model trained with GRPO reaches only 1.0\% success on ALFWorld and 0.5\% on WebShop. A natural remedy is to mix expert demonstrations into each training batch---experience replay. But we show this remedy carries two hidden biases that quietly degrade learning. First, expert trajectories always succeed, so when group-relative methods compute their advantage baseline from a mixed group, the baseline is inflated and successful on-policy attempts receive negative advantage. Exploration is punished. Second, the gap between expert and student action distributions is never corrected, so expert gradients keep dominating long after the student has caught up, hurting final performance and forcing manual decay schedules. We propose \textbf{DUET}, a principled experience replay framework that addresses both biases without manual scheduling. DUET separates the expert and on-policy advantage baselines, learns a discriminator that automatically down-weights expert samples as the student improves, adds adaptive behavior cloning as a cold-start safety net, and shapes rewards using a potential function derived from expert states. Across four settings spanning two model sizes and two environments, DUET reaches state of the art, improving over the strongest prior baseline by \textbf{13.0 points on average} and \textbf{17.5 points on the weakest base}.
+\end{abstract}

@@ -1,0 +1,50 @@
+% ============================================================================
+% Extended Main Results — success_rate (SR) + reward_mean (RM)
+%
+% NOTE: For ALFWorld (binary reward), SR ≈ RM by construction.
+% For WebShop (partial credit), SR and RM are distinct metrics.
+%
+% ⚠ TODO before submission:
+%   - 3B WebShop baselines' reward_mean: need to be verified with L20X
+%     (currently shown as success_rate × 1 = SR as a placeholder; remove if unconfirmed)
+% ============================================================================
+
+\begin{table}[t]
+\centering
+\caption{Extended main results showing both success rate (SR; strict $\text{score} \geq 1.0$) and reward mean (RM; meaningful only on WebShop due to partial credit). DUET\textsuperscript{*} is consistently strongest on both. For ALFWorld, SR $\approx$ RM by construction (binary reward). 3B-WebShop reward means for baselines marked $\dagger$ are pending verification.}
+\label{tab:main_results_extended}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.15}
+\small
+\begin{tabular}{lcccccccc}
+\toprule
+\multirow{2}{*}{\textbf{Method}}
+  & \multicolumn{2}{c}{\textbf{1.5B-ALFWorld}}
+  & \multicolumn{2}{c}{\textbf{1.5B-WebShop}}
+  & \multicolumn{2}{c}{\textbf{3B-ALFWorld}}
+  & \multicolumn{2}{c}{\textbf{3B-WebShop}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5} \cmidrule(lr){6-7} \cmidrule(lr){8-9}
+ & SR & RM & SR & RM & SR & RM & SR & RM \\
+\midrule
+OnPolicy GRPO   & 1.0\%  & 0.010 & 0.5\%  & 0.152 & 47.0\% & 0.470 & 2.0\%  & TBD$^\dagger$ \\
+SFT (no RL)     & ---    & ---   & 7.0\%  & 0.562 & ---    & ---   & ---    & ---   \\
+LUFFY           & 5.5\%  & 0.055 & 5.5\%  & 0.573 & 61.5\% & 0.615 & 38.0\% & TBD$^\dagger$ \\
+CHORD           & 27.0\% & 0.270 & 11.5\% & 0.603 & \underline{67.0\%} & \underline{0.670} & \underline{39.0\%} & TBD$^\dagger$ \\
+SFT $+$ GRPO    & \underline{30.0\%} & \underline{0.300} & \underline{18.5\%} & \underline{0.641} & 59.5\% & 0.595 & 24.0\% & TBD$^\dagger$ \\
+\midrule
+\rowcolor{gray!12}
+\textbf{DUET\textsuperscript{*} (Ours)}
+                & \textbf{47.5\%} & \textbf{0.475}
+                & \textbf{36.0\%} & \textbf{0.706}
+                & \textbf{77.5\%} & \textbf{0.775}
+                & \textbf{45.5\%} & \textbf{0.743} \\
+\midrule
+$\Delta$ vs best baseline (SR) & \multicolumn{2}{c}{$+17.5$pp} & \multicolumn{2}{c}{$+17.5$pp} & \multicolumn{2}{c}{$+10.5$pp} & \multicolumn{2}{c}{$+6.5$pp} \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+
+\raggedright
+\footnotesize
+$^\dagger$ 3B-WebShop reward means for baselines pending verification with collaborator (L20X server).
+\end{table}

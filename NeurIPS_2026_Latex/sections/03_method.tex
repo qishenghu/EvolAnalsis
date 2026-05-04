@@ -1,0 +1,109 @@
+% ============================================================================
+% Method (opening) — DUET (NeurIPS 2026)
+% Last revised: 2026-05-04
+%
+% This file contains:
+%   §3.1 Problem setup (notation, GRPO, LUFFY mixing)
+%   §3.2 Diagnosis: two biases (formalized)
+%   §3.3 DUET overview (two channels + four mechanisms map)
+%
+% Detailed sub-sections (Baseline separation / DR3 / BC / SC) deferred to a
+% subsequent pass — the structure is sketched at the bottom of this file.
+% ============================================================================
+
+\section{DUET: Principled Experience Replay}
+\label{sec:method}
+
+\subsection{Problem Setup}
+\label{sec:setup}
+
+We consider an LLM agent acting in a finite-horizon environment with state space $\mathcal{S}$, action space $\mathcal{A}$, transition kernel $P$, reward $R$, and horizon $T$. The policy $\pi_\theta(a_t \mid s_t)$ is an autoregressive language model that emits a textual action $a_t$ given the current observation $s_t$ (a concatenation of the task prompt and history). We have access to two streams of experience:
+\begin{itemize}[leftmargin=1.5em, itemsep=1pt, topsep=2pt]
+\item \textbf{On-policy rollouts}: $n_o$ trajectories $\tau \sim \pi_\theta$ per task.
+\item \textbf{Teacher cache}: a fixed set of trajectories $\{\tau^\beta\}$ collected offline from a stronger LLM $\pi_\beta$ (e.g., Qwen2.5-72B-Instruct), pre-filtered for success ($R(\tau^\beta) = 1$).
+\end{itemize}
+
+We use Group Relative Policy Optimization (GRPO)~\citep{TODO_grpo} as the base RL algorithm. For each task, GRPO collects a group of $n$ rollouts and standardizes returns within the group:
+\begin{equation}
+\hat A^{(i)} = \frac{R^{(i)} - \mu_g}{\sigma_g}, \qquad \mu_g = \frac{1}{n}\sum_{j} R^{(j)}, \quad \sigma_g^2 = \frac{1}{n}\sum_{j} (R^{(j)} - \mu_g)^2.
+\label{eq:grpo_advantage}
+\end{equation}
+The policy is then updated with a clipped surrogate
+\begin{equation}
+\mathcal{L}_{\text{PG}}(\theta) = -\mathbb{E}\!\left[\min\!\big(\rho_t \hat A_t,\; \mathrm{clip}(\rho_t, 1{-}\epsilon, 1{+}\epsilon)\hat A_t\big)\right], \quad \rho_t = \frac{\pi_\theta(a_t|s_t)}{\pi_{\theta_{\text{old}}}(a_t|s_t)}.
+\label{eq:grpo_loss}
+\end{equation}
+
+LUFFY-style experience replay~\citep{TODO_luffy} extends GRPO by replacing $n_\beta$ of the $n$ rollouts in each group with teacher trajectories from $\{\tau^\beta\}$. The GRPO objective is then computed over the mixed batch \emph{as if all samples were on-policy}.
+
+\subsection{Two Biases in LUFFY-Style Experience Replay}
+\label{sec:biases}
+
+Treating teacher trajectories as on-policy samples introduces two systematic biases.
+
+\paragraph{Bias 1: Baseline contamination.}
+Because teacher trajectories are pre-filtered, $R^\beta = 1$ deterministically, while on-policy rewards are sparse with $\bar R^o \ll 1$ on weak agents. With $n_\beta$ teacher samples and $n_o = n - n_\beta$ on-policy samples in a group,
+\begin{equation}
+\mu_g = \frac{n_\beta + n_o\, \bar R^o}{n}, \qquad \sigma_g^2 = \frac{n_\beta n_o}{n^2}\,(1 - \bar R^o)^2 + \frac{n_o}{n}\,\mathrm{Var}(R^o).
+\label{eq:contamination}
+\end{equation}
+A successful on-policy rollout ($R^o = 1$) receives advantage $\hat A^o = (1 - \mu_g)/\sigma_g$, which can be \emph{small or negative} whenever the teacher contribution dominates $\mu_g$. The policy gradient on on-policy successes is thus systematically suppressed---successful exploration is penalized relative to teacher imitation, contradicting the intent of on-policy RL. The bias is most severe on weak base models, where $\bar R^o$ is closest to $0$.
+
+\paragraph{Bias 2: Unaddressed off-policy mismatch.}
+Teacher trajectories are drawn from $\pi_\beta \neq \pi_\theta$. The GRPO importance ratio $\rho_t = \pi_\theta(a_t|s_t)/\pi_{\theta_{\text{old}}}(a_t|s_t)$ correctly accounts for the policy-update step (old $\to$ new), but does \emph{not} correct for the teacher--student distributional gap. As $\pi_\theta$ improves, the teacher gradient should attenuate; with no explicit correction, it does not, and teacher samples continue to dominate the gradient long after the student has caught up. This damages asymptotic performance and forces practitioners (e.g., CHORD~\citep{TODO_chord}) to introduce manually-tuned decay schedules over the imitation weight---a heuristic that prior reviewers have flagged.
+
+\subsection{DUET Overview}
+\label{sec:overview}
+
+DUET addresses both biases and extracts richer signal from teacher data through four mechanisms organized into two orthogonal channels (Figure~\ref{fig:method}).
+
+\paragraph{Action Channel} operates on the policy gradient via two sub-mechanisms that share the teacher trajectories but act at different granularities.
+\begin{itemize}[leftmargin=1.5em, itemsep=2pt, topsep=2pt]
+\item \textbf{DR3} (\S\ref{sec:dr3}; Fix~2). A discriminator $D(s,a)$ estimates the density ratio $\hat w(\tau) = \pi_\theta/\pi_\beta$ for teacher trajectories; we replace the GRPO importance ratio with $\hat w(\tau)\cdot\rho_t$ for teacher samples. As $\pi_\theta \to \pi_\beta$, $D \to 1/2$ and $\hat w \to 1$, so the correction \emph{auto-fades} to a fixed point---no schedule.
+\item \textbf{BC} (\S\ref{sec:bc}; Extension~1). A token-level cross-entropy loss on teacher tokens with adaptive weight $\mu(t)$. BC functions as a \emph{cold-start safety net while DR3 stabilizes}: when the discriminator is still learning (low accuracy), $\hat w$ is noisy and DR3 alone is risky; BC supplies dense token-level supervision in the meantime. As discriminator accuracy rises, $\mu(t)$ fades and control transfers to DR3.
+\end{itemize}
+
+\paragraph{State Channel} operates on the reward via potential-based shaping (\S\ref{sec:sc}; Extension~2). A hash-based expert progress map $P:\mathcal{S}\to[0,1]$, built from teacher state visitation, defines
+\begin{equation}
+r'(s_t, a_t, s_{t+1}) = r(s_t, a_t, s_{t+1}) + \beta \bigl(P(s_{t+1}) - P(s_t)\bigr).
+\label{eq:sc_reward}
+\end{equation}
+This is the canonical potential-based form of \citet{TODO_ng1999}, and so \emph{provably preserves the optimal policy}: SC supplies dense per-step learning signal without altering what the agent ultimately learns to do. The shaping is applied to on-policy samples only; teacher samples retain their original reward (see \S\ref{sec:sc} for the rationale).
+
+\paragraph{Baseline separation} (\S\ref{sec:baseline_sep}; Fix~1) is orthogonal to the channel structure. We compute the GRPO baseline statistics $(\mu_g, \sigma_g)$ separately for teacher and on-policy sub-groups, eliminating Bias~1 by construction.
+
+\paragraph{Combined update.} The full DUET objective combines the (DR3-corrected, SC-shaped) policy gradient with the BC term:
+\begin{equation}
+\mathcal{L}_{\text{DUET}}(\theta) \;=\; \mathcal{L}_{\text{PG}}^{\text{DR3,SC}}(\theta) \;+\; \mu(t)\,\mathcal{L}_{\text{BC}}(\theta).
+\label{eq:duet_loss}
+\end{equation}
+
+The remainder of this section details each mechanism. We emphasize throughout that every teacher mechanism is driven by a data-derived internal signal---$\hat w$ from the discriminator, $\mu(t)$ from discriminator accuracy, and the SC bonus from observed teacher visitation---so DUET requires no schedule or annealing hyperparameter for teacher influence.
+
+% ============================================================================
+% Sub-sections to be written in next pass:
+%
+% \subsection{Baseline Separation: Fixing Advantage Contamination}
+% \label{sec:baseline_sep}
+% (~½ page) — restate eq.~\ref{eq:contamination}; state separation rule;
+%             show the on-policy advantage now has zero mean within sub-group.
+%
+% \subsection{DR3: Discriminator-Based Density-Ratio Correction}
+% \label{sec:dr3}
+% (~1 page) — discriminator architecture and training (BCE on (s,a) pairs);
+%             ŵ = D/(1−D); dual ESS clipping; w_min floor for numerical safety;
+%             fade-out fixed-point lemma; ESS variance bound.
+%
+% \subsection{BC: Adaptive Cold-Start Imitation}
+% \label{sec:bc}
+% (~½ page) — μ(t) schedule driven by discriminator accuracy;
+%             role as safety net when DR3 is unreliable;
+%             d_floor as the "DR3 trustworthy" threshold.
+%
+% \subsection{SC: Potential-Based State-Channel Shaping}
+% \label{sec:sc}
+% (~½ page) — hash construction of P(s) from teacher trajectories;
+%             Eq.~\ref{eq:sc_reward}; Ng 1999 invariance theorem applied to
+%             on-policy MDP; teacher-exclusion rationale (avoiding double-correction
+%             via DR3 + reward bonus on the same teacher data).
+% ============================================================================
