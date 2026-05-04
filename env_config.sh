@@ -13,7 +13,7 @@ else
 fi
 export CONDA_ENV_DUET="${CONDA_ENV_DUET:-duet}"
 export CONDA_ENV_WEBSHOP="${CONDA_ENV_WEBSHOP:-agentenv-webshop}"
-export CONDA_ENV_ALFWORLD="${CONDA_ENV_ALFWORLD:-agentenv-alfworld}"
+export CONDA_ENV_ALFWORLD="${CONDA_ENV_ALFWORLD:-duet}"
 
 # --- Project root (auto-detected from this file's location) ---
 export DUET_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

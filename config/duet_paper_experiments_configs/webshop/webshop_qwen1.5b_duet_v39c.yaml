@@ -127,7 +127,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.75
+    gpu_memory_utilization: 0.70
     n: 8
     log_prob_max_token_len_per_gpu: 25580
     stop_sequences:

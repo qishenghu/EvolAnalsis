@@ -191,11 +191,11 @@ class EnvService:
         if env_type in self.remote_env:
             return self.remote_env[env_type]
 
-        @ray.remote
+        @ray.remote(max_concurrency=64)
         class RemoteEnv:
             """
             Remote environment class.
-            
+
             For environments like alfworld that load large mappings/games at import time,
             this class supports managing multiple env instances within a single actor to
             avoid reloading on every create_instance call.
@@ -371,23 +371,19 @@ class EnvService:
                 f"instance_id: {instance_id}",
             )
 
-            # ⭐ For environments that benefit from shared actors (like alfworld),
-            # reuse a single actor per env_type to avoid reloading mappings/games.
-            # For other environments (like webshop), create a new actor per instance.
-            if env_type in ["alfworld"]:
+            # ⭐ For environments that benefit from shared actors (like alfworld
+            # and webshop), reuse a single actor per env_type to avoid the per-
+            # instance Ray actor explosion and serial-actor deadlocks. WebShop
+            # state lives in agentgym (keyed by remote_env_id) and the per-
+            # instance WebshopEnv object inside RemoteEnv.env_instances dict, so
+            # sharing the actor is safe. The actor is created with max_concurrency
+            # so concurrent step/release HTTP calls do not block each other.
+            if env_type in ["alfworld", "webshop"]:
                 # Reuse shared actor for this env_type
                 if env_type not in self.shared_actors:
                     self.shared_actors[env_type] = env_remote_cls.remote()
                 env_actor = self.shared_actors[env_type]
                 # Create env instance within the shared actor
-                await env_actor.create_env_instance.remote(task_id, instance_id, params)
-                init_state = await env_actor.get_init_state.remote(instance_id, params)
-            elif env_type == "webshop":
-                params["server"] = SIM_SERVER
-                # Default behavior: one actor per instance, but still use RemoteEnv
-                # wrapper to keep a unified interface.
-                env_actor = env_remote_cls.remote()
-                self.env_actors[instance_id] = env_actor
                 await env_actor.create_env_instance.remote(task_id, instance_id, params)
                 init_state = await env_actor.get_init_state.remote(instance_id, params)
             else:
@@ -400,7 +396,7 @@ class EnvService:
 
             # For shared actors, we still track instance_id -> actor mapping
             # for step/evaluate/release operations
-            if env_type in ["alfworld"]:
+            if env_type in ["alfworld", "webshop"]:
                 self.env_actors[instance_id] = env_actor
             
             # Track env_type for each instance
@@ -510,9 +506,9 @@ class EnvService:
         env_actor = self.env_actors[instance_id]
         env_type = self.instance_env_types.get(instance_id)
         
-        # For shared actors (like alfworld), only close the specific instance,
-        # don't kill the entire actor
-        if env_type in ["alfworld"]:
+        # For shared actors (alfworld and webshop), only close the specific
+        # instance, don't kill the entire actor
+        if env_type in ["alfworld", "webshop"]:
             await env_actor.close.remote(instance_id)
             # Don't kill the shared actor, just remove the instance mapping
         else:

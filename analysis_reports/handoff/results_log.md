@@ -23,3 +23,15 @@
 | 2026-05-03 09:30 | L20X    | gap_bok_pk015           | 29.0% (n=200) | partial=0.472 | best-of-k, peak=0.15 |
 | 2026-05-03 12:43 | L20X    | gap_bok_pk025           | 36.5% (n=200) | partial=0.536 | best-of-k, peak=0.25 ⭐ best gap-bok |
 | 2026-05-03 14:44 | L20X    | LUFFY_RERUN_LAUNCH      | — | — | Sanity-check: rerun pure LUFFY (use_chord=false, use_dr3=false, teacher_policy_shaping=p_div_p_beta_0.1) on L20X. Original 49.5% never reproduced on this infra. If reruns at ~49.5% → DUET* genuinely below LUFFY; if ~30-40% → baseline was inflated and our 36.5% is competitive. ETA ~18:15 today. |
+| 2026-05-03 14:53 | 4xA100 | ws_3b_gap_pk02_v05_tw_dr3fast | 38.0% (n=200) | 0.7162 | env=webshop GAP+TOKWEIGHT |
+| 2026-05-03 15:25 | 4xA100 | KILLED+RESTART          | — | — | Killed [2/4] 1.5B WS gap+TW mid-training (step 10/100). Diagnostic agent confirmed token_weighting cuts effective BC dose 15× → both 3B WS and 1.5B WS with TW will underperform. Skipping wasteful TW runs. Launching followup queue: 6 runs without TW (or compensated). |
+| 2026-05-03 19:35 | 4xA100 | ws_3b_gap_pk02_v10_NOtw_dr3fast | 44.0% (n=200) | 0.7359 | env=webshop FOLLOWUP |
+| 2026-05-03 22:41 | 4xA100 | ws_1_5b_gap_pk03_v10_NOtw | 4.5% (n=200) | 0.5494 | env=webshop FOLLOWUP |
+| 2026-05-03 22:42 | 4xA100 | ws_3b_gap_bok_pk02_v10_NOtw_dr3fast | — | — | val@100 missing |
+| 2026-05-03 22:44 | 4xA100 | ws_3b_gap_pk20_v50_TW_dr3fast | — | — | val@100 missing |
+| 2026-05-03 22:45 | 4xA100 | af_3b_gap_pk02_v02_g095_tw | — | — | val@100 missing |
+| 2026-05-03 22:50 | 4xA100 | RECOVERY+LUFFY          | — | — | [3/6] best-of-k FAILED (ray socket path 110>107 byte limit). [2/6] 1.5B WS gap NO_TW disastrous 4.5% (gap mode unstable on 1.5B). New queue: LUFFY-verify → best-of-k retry (short name) → 1.5B WS swC_02 disc_acc recovery → 3B AF → 1.5B AF. ray_tmp uses md5 hash to prevent socket-path overruns. |
+| 2026-05-04 03:47 | 4xA100 | ws_3b_luffy_v | 3.5% (n=200) | 0.5574 | env=webshop RECOVERY |
+| 2026-05-04 08:46 | 4xA100 | ws_3b_bok_v10 | 2.0% (n=200) | 0.0577 | env=webshop RECOVERY |
+| 2026-05-04 11:29 | 4xA100 | ws_1_5b_swC02_da | 1.0% (n=200) | 0.5477 | env=webshop RECOVERY |
+| 2026-05-04 21:52 | 4xA100 | af_3b_gap_pk02_v02_g095_tw | — | — | val@100 missing |
