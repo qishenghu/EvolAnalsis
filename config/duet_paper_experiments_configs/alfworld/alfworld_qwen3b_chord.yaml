@@ -42,7 +42,7 @@ algorithm:
       soft_penalty_mode: additive
 actor_rollout_ref:
   model:
-    path: /data/shared_models/Qwen2.5-3B-Instruct
+    path: /data/code/exp/models/Qwen/Qwen2.5-3B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:
@@ -84,7 +84,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 1
     name: vllm
     mode: async
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.65
     n: 8
     log_prob_max_token_len_per_gpu: 25580
     stop_sequences:

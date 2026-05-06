@@ -48,7 +48,7 @@ actor_rollout_ref:
   actor:
     optim:
       lr: 1.0e-06
-    ppo_micro_batch_size_per_gpu: 2
+    ppo_micro_batch_size_per_gpu: 1
     ppo_mini_batch_size: 8
     use_kl_loss: true
     kl_loss_coef: 0.001
@@ -66,7 +66,7 @@ actor_rollout_ref:
     use_dapo: false
     fsdp_config:
       param_offload: false
-      optimizer_offload: false
+      optimizer_offload: true
   rollout:
     use_qwen3: false
     thinking_mode: none
