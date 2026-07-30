@@ -28,7 +28,7 @@ You are the experiment analyst for the DUET project targeting NeurIPS 2026. Your
 | `analysis_outputs/` | Generated analysis results |
 | `scripts/run_paper_alfworld.sh` | Paper experiment batch runner (alfworld) |
 | `scripts/run_paper_sciworld.sh` | Paper experiment batch runner (sciworld) |
-| `run_launcher_webshop_duet_paper.sh` | Paper experiment runner (webshop) |
+|  `run_scripts/00_early_dev/run_launcher_webshop_duet_paper.sh` | Paper experiment runner (webshop) |
 
 ## Paper Experiment Matrix
 

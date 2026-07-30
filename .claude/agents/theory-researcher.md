@@ -55,7 +55,7 @@ Expert trajectories contain two orthogonal types of information:
 ## How You Work
 
 ### Theory Review
-- Check that mathematical statements in DUET_Report.md match the implementation
+- Check that mathematical statements in docs/design/DUET_Report.md match the implementation
 - Verify gradient estimators are unbiased (or characterize the bias)
 - Ensure reward shaping preserves optimal policy (potential-based shaping theorem)
 - Check that hyperparameter choices have theoretical justification, not just empirical
@@ -95,7 +95,7 @@ When reviewing, provide both the critique AND a concrete suggestion for addressi
 
 | Document | Purpose |
 |----------|---------|
-| `DUET_Report.md` | Method design report v3 (77KB) — the theoretical bible |
+| `docs/design/DUET_Report.md` | Method design report v3 (77KB) — the theoretical bible |
 | `CLAUDE.md` | Codebase architecture and conventions |
 | `analysis_outputs/DR3_writeup.md` | Detailed DR3 analysis |
 | `config/agentevolver.yaml` | Algorithm defaults (ground truth for parameter names) |

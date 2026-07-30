@@ -159,3 +159,8 @@ alfworld_3b_grpo_bz16/
 data/
 
 LUFFY/
+
+# 2026-07-31 reorg: archive payloads stay untracked (tracked files moved via git mv keep history)
+archive/neurips2026/tmp_ckpts/
+archive/neurips2026/duet_anonymous_release/
+archive/reference/Search-R1/

@@ -96,7 +96,7 @@ python scripts/convert_alfworld_react_to_tags.py
 
 ```bash
 # ALFWorld 3B: DUET vs baselines (LUFFY, CHORD, GRPO)
-bash run_launcher.sh
+bash run_scripts/00_early_dev/run_launcher.sh  # archived; copy to repo root to run
 
 # WebShop 3B: DUET vs baselines
 bash run_launcher_webshop_duet_paper.sh
@@ -212,7 +212,7 @@ webshop/
 ├── scripts/                           # Data collection & processing
 ├── data/teacher_trajectories/         # Expert demonstration data
 ├── launcher.py                        # Main launcher (config + services + training)
-└── run_launcher*.sh                   # Experiment launch scripts
+└── run_scripts/                       # Archived experiment launch queues (see run_scripts/README.md)
 ```
 
 ## Acknowledgements

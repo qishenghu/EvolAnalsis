@@ -1,0 +1,5 @@
+usage: launcher.py [-h] [--target TARGET] [--conf CONF] [--db DB]
+                   [--with-appworld] [--with-webshop] [--with-bfcl]
+                   [--with-alfworld] [--with-reme] [--with-logview]
+                   [--with-crafters] [--reboot] [-k]
+launcher.py: error: argument --conf: expected one argument
