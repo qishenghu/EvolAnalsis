@@ -18,6 +18,8 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import os
+import math
+import re
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
@@ -63,7 +65,10 @@ from agentevolver.module.task_manager import TaskManager,NaiveTaskObjectiveRetri
 from agentevolver.schema.task import Task
 from agentevolver.schema.trajectory import Trajectory
 
-from agentevolver.utils.tracking import ValidationGenerationsLogger
+from agentevolver.utils.tracking import (
+    ValidationGenerationsLogger,
+    WANDB_SECRET_ENV_KEYS,
+)
 
 from agentevolver.module.adv_processor.adca_grpo_pipeline import apply_adca_grpo
 
@@ -98,6 +103,887 @@ def _safe_masked_std(x: torch.Tensor, mask: torch.Tensor) -> Optional[torch.Tens
     if vals.numel() <= 1:
         return torch.tensor(0.0, device=x.device)
     return vals.std()
+
+
+def _install_wandb_secret_scrub(ray_cls_with_init) -> None:
+    """Keep credentials out of the final colocated GPU actor runtime env.
+
+    verl creates a fresh outer ``WorkerDict`` actor after receiving the role
+    actor classes, then overwrites its ``runtime_env`` once per rank.  Applying
+    the scrub to this final wrapper ensures those later rank options cannot
+    reintroduce credentials inherited from a reused Ray cluster.
+    """
+
+    if getattr(ray_cls_with_init, "_wandb_secret_scrub_installed", False):
+        return
+    original_update_options = ray_cls_with_init.update_options
+
+    def secure_update_options(options):
+        secured_options = dict(options)
+        runtime_env = dict(secured_options.get("runtime_env") or {})
+        env_vars = dict(runtime_env.get("env_vars") or {})
+        env_vars.update({key: "" for key in WANDB_SECRET_ENV_KEYS})
+        runtime_env["env_vars"] = env_vars
+        secured_options["runtime_env"] = runtime_env
+        original_update_options(secured_options)
+
+    ray_cls_with_init.update_options = secure_update_options
+    ray_cls_with_init._wandb_secret_scrub_installed = True
+    secure_update_options({})
+
+
+_ROLLOUT_DRIFT_POSITION_BUCKETS = ("early", "mid", "late")
+
+_VALIDATION_ROLLOUT_AUDIT_FIELDS = (
+    "finish_reason_code",
+    "truncated_by_length",
+    "decision_count",
+    "length_truncated_decision_count",
+    "has_length_truncated_decision",
+    "context_raw_prompt_tokens",
+    "context_managed_prompt_tokens",
+    "context_compressed_turns",
+    "context_dropped_turns",
+    "context_clipped_observations",
+    "context_selected_decision_step",
+    "context_decision_count",
+    "context_active_decision_count",
+    "context_any_management_active",
+    "context_max_raw_prompt_tokens",
+    "context_max_managed_prompt_tokens",
+    "context_total_dropped_turns",
+    "context_total_clipped_observations",
+)
+
+
+def _validation_rollout_audit(batch: DataProto) -> dict[str, list]:
+    """Extract aligned scalar context/termination fields for JSONL validation.
+
+    Validation previously dumped only text and reward, making it impossible to
+    tell whether a long-horizon context policy had actually activated.  Every
+    field here is sample-level and therefore remains aligned with decoded
+    prompts/outputs through the same DataProto order.
+    """
+    result: dict[str, list] = {}
+    n_samples = len(batch)
+    for field in _VALIDATION_ROLLOUT_AUDIT_FIELDS:
+        if field not in batch.batch.keys():
+            continue
+        values = batch.batch[field]
+        if not torch.is_tensor(values) or values.dim() != 1:
+            raise ValueError(
+                f"validation audit field {field!r} must be a rank-1 tensor"
+            )
+        if values.shape[0] != n_samples:
+            raise ValueError(
+                f"validation audit field {field!r} has {values.shape[0]} "
+                f"rows for {n_samples} samples"
+            )
+        result[field] = values.detach().cpu().tolist()
+    return result
+
+
+def _expected_onpolicy_behavior_mask(
+    *,
+    response_mask: torch.Tensor,
+    response_loss_mask: torch.Tensor,
+    sample_extras: Optional[Any],
+) -> torch.Tensor:
+    """Return response tokens that require sampled-backend log-probabilities.
+
+    Replay and teacher rows may legitimately use their recorded/fallback
+    policy contract. Every trainable token on a freshly sampled on-policy row
+    must instead be covered by vLLM behavior logprobs; a partial mask is as
+    unsafe as a wholly missing tensor.
+    """
+    if response_mask.shape != response_loss_mask.shape:
+        raise ValueError(
+            "response_mask/response_loss_mask shape mismatch: "
+            f"{tuple(response_mask.shape)} vs {tuple(response_loss_mask.shape)}"
+        )
+    n_rows = response_mask.shape[0]
+    if sample_extras is None:
+        onpolicy_rows = [True] * n_rows
+    else:
+        extras_list = list(sample_extras)
+        if len(extras_list) != n_rows:
+            raise ValueError(
+                "sample extras cannot align to response batch: "
+                f"{len(extras_list)} vs {n_rows}"
+            )
+        onpolicy_rows = [
+            not bool((extras or {}).get("is_experience_replay", False))
+            and not bool((extras or {}).get("is_teacher", False))
+            for extras in extras_list
+        ]
+    row_mask = torch.tensor(
+        onpolicy_rows, dtype=torch.bool, device=response_mask.device
+    ).unsqueeze(-1)
+    return response_mask.bool() & response_loss_mask.bool() & row_mask
+
+
+def _length_truncation_batch_diagnostics(
+    *,
+    decision_count: torch.Tensor,
+    length_truncated_decision_count: torch.Tensor,
+    has_length_truncated_decision: torch.Tensor,
+) -> dict[str, float]:
+    """Summarize the true per-decision 10K length-hit rate for a batch."""
+    tensors = (
+        decision_count,
+        length_truncated_decision_count,
+        has_length_truncated_decision,
+    )
+    if any(not torch.is_tensor(value) or value.dim() != 1 for value in tensors):
+        raise ValueError("length-truncation audit fields must be rank-1 tensors")
+    if not (
+        decision_count.shape
+        == length_truncated_decision_count.shape
+        == has_length_truncated_decision.shape
+    ):
+        raise ValueError("length-truncation audit fields must have equal shapes")
+    if torch.any(decision_count < 0) or torch.any(
+        length_truncated_decision_count < 0
+    ):
+        raise ValueError("length-truncation counts must be non-negative")
+    if torch.any(length_truncated_decision_count > decision_count):
+        raise ValueError(
+            "length-truncated decision count cannot exceed decision count"
+        )
+    total_decisions = int(decision_count.sum().item())
+    total_length = int(length_truncated_decision_count.sum().item())
+    sample_count = int(decision_count.numel())
+    sample_hits = int(has_length_truncated_decision.bool().sum().item())
+    return {
+        "rollout/decision_count": float(total_decisions),
+        "rollout/length_truncated_decision_count": float(total_length),
+        "rollout/length_truncated_decision_fraction": (
+            float(total_length / total_decisions) if total_decisions else 0.0
+        ),
+        "rollout/length_truncated_sample_fraction": (
+            float(sample_hits / sample_count) if sample_count else 0.0
+        ),
+    }
+
+
+_ALFWORLD_TASK_FAMILY_BY_TYPE = {
+    "pick_and_place_simple": "simple",
+    "pick_two_obj_and_place": "two",
+    "look_at_obj_in_light": "look",
+    "pick_clean_then_place_in_recep": "clean",
+    "pick_heat_then_place_in_recep": "heat",
+    "pick_cool_then_place_in_recep": "cool",
+}
+
+
+def _canonical_task_family(sample_extra: Any) -> Optional[str]:
+    """Return a fixed low-cardinality family only from trusted env metadata.
+
+    In particular, do not infer ALFWorld families from the natural-language
+    query.  The environment exposes its canonical task type at reset time; an
+    absent or unfamiliar value remains unknown so telemetry cannot silently
+    mislabel a new task schema.
+    """
+    if not isinstance(sample_extra, Mapping):
+        return None
+    env_type = sample_extra.get("env_type")
+    task_type = sample_extra.get("environment_task_type")
+    if not isinstance(env_type, str) or env_type.strip().lower() != "alfworld":
+        return None
+    if not isinstance(task_type, str):
+        return None
+    return _ALFWORLD_TASK_FAMILY_BY_TYPE.get(task_type.strip().lower())
+
+
+def _extract_telemetry_action(content: Any, *, action_format: str) -> Optional[str]:
+    """Extract one normalized action without accepting arbitrary prose.
+
+    This mirrors the two explicit action contracts used by the environment
+    manager.  It intentionally has no last-line fallback: an unparseable
+    response contributes to the coverage denominator instead of being guessed
+    into an action.
+    """
+    if not isinstance(content, str):
+        return None
+    post_think = content.rsplit("</think>", 1)[-1]
+    normalized_format = str(action_format or "").strip().lower()
+
+    action: Optional[str] = None
+    if normalized_format == "react_tags":
+        tagged = list(
+            re.finditer(
+                r"<action>(.*?)</action>",
+                post_think,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+        if tagged:
+            action = tagged[-1].group(1)
+        else:
+            open_tag = list(
+                re.finditer(
+                    r"<action>(.*)$",
+                    post_think,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+            )
+            if open_tag:
+                action = open_tag[-1].group(1)
+    elif normalized_format == "react":
+        lines = post_think.splitlines()
+        candidates: list[str] = []
+        for line_index, line in enumerate(lines):
+            match = re.match(r"^\s*action\s*:\s*(.*?)\s*$", line, re.IGNORECASE)
+            if match is None:
+                continue
+            candidate = match.group(1).strip()
+            if not candidate:
+                for following in lines[line_index + 1 :]:
+                    candidate = following.strip()
+                    if candidate:
+                        break
+            if candidate:
+                candidates.append(candidate)
+        if candidates:
+            action = candidates[-1]
+
+    if action is None:
+        return None
+    normalized = " ".join(action.strip().lower().split())
+    return normalized or None
+
+
+def _action_slots_from_message_row(
+    message_row: Any, *, action_format: str
+) -> list[Optional[str]]:
+    if isinstance(message_row, Mapping) and "messages" in message_row:
+        message_row = message_row.get("messages")
+    if isinstance(message_row, np.ndarray):
+        message_row = message_row.tolist()
+    if not isinstance(message_row, (list, tuple)):
+        return []
+
+    action_slots: list[Optional[str]] = []
+    for message in message_row:
+        if isinstance(message, Mapping):
+            role = message.get("role")
+            content = message.get("content")
+        else:
+            role = getattr(message, "role", None)
+            content = getattr(message, "content", None)
+        if str(role or "").lower() != "assistant":
+            continue
+        action_slots.append(
+            _extract_telemetry_action(
+                content, action_format=action_format
+            )
+        )
+    return action_slots
+
+
+def _rollout_behavior_batch_diagnostics(
+    *,
+    messages: Any,
+    sample_extras: Optional[Any],
+    action_format: str,
+) -> dict[str, float]:
+    """Aggregate low-cardinality action-loop telemetry for on-policy rows."""
+    message_rows = list(messages) if messages is not None else []
+    if sample_extras is None:
+        extras_rows: list[Any] = [{} for _ in message_rows]
+    else:
+        extras_rows = list(sample_extras)
+        if len(extras_rows) != len(message_rows):
+            raise ValueError(
+                "sample extras cannot align to behavior telemetry messages: "
+                f"{len(extras_rows)} vs {len(message_rows)}"
+            )
+
+    onpolicy_count = 0
+    parsed_sample_count = 0
+    look_count = 0
+    adjacent_pair_count = 0
+    adjacent_repeat_count = 0
+    repeat_run_sample_count = 0
+    repeat_run_ge3_count = 0
+
+    for message_row, extra in zip(message_rows, extras_rows):
+        extra = extra if isinstance(extra, Mapping) else {}
+        if bool(extra.get("is_experience_replay", False)) or bool(
+            extra.get("is_teacher", False)
+        ):
+            continue
+        onpolicy_count += 1
+        action_slots = _action_slots_from_message_row(
+            message_row, action_format=action_format
+        )
+        selected_action = action_slots[-1] if action_slots else None
+        if selected_action is not None:
+            parsed_sample_count += 1
+            look_count += int(selected_action == "look")
+
+        if any(action is not None for action in action_slots):
+            repeat_run_sample_count += 1
+        max_run = 0
+        current_run = 0
+        previous_action: Optional[str] = None
+        for action in action_slots:
+            if action is None:
+                previous_action = None
+                current_run = 0
+                continue
+            if previous_action is not None:
+                adjacent_pair_count += 1
+                if action == previous_action:
+                    adjacent_repeat_count += 1
+            if action == previous_action:
+                current_run += 1
+            else:
+                current_run = 1
+            max_run = max(max_run, current_run)
+            previous_action = action
+        repeat_run_ge3_count += int(max_run >= 3)
+
+    return {
+        "rollout/behavior/onpolicy_sample_count": float(onpolicy_count),
+        "rollout/selected_action/parsed_count": float(parsed_sample_count),
+        "rollout/selected_action/unparsed_count": float(
+            onpolicy_count - parsed_sample_count
+        ),
+        "rollout/selected_action/look_count": float(look_count),
+        "rollout/selected_action/look_fraction": (
+            float(look_count / parsed_sample_count)
+            if parsed_sample_count
+            else 0.0
+        ),
+        "rollout/action_history/sample_count": float(
+            repeat_run_sample_count
+        ),
+        "rollout/action_history/adjacent_pair_count": float(
+            adjacent_pair_count
+        ),
+        "rollout/action_history/adjacent_repeat_count": float(
+            adjacent_repeat_count
+        ),
+        "rollout/action_history/adjacent_repeat_fraction": (
+            float(adjacent_repeat_count / adjacent_pair_count)
+            if adjacent_pair_count
+            else 0.0
+        ),
+        "rollout/action_history/sample_has_repeat_run_ge3_count": float(
+            repeat_run_ge3_count
+        ),
+        "rollout/action_history/sample_has_repeat_run_ge3_fraction": (
+            float(repeat_run_ge3_count / repeat_run_sample_count)
+            if repeat_run_sample_count
+            else 0.0
+        ),
+    }
+
+
+def _task_family_reward_batch_diagnostics(
+    *,
+    group_ids: Any,
+    sample_extras: Any,
+    sample_rewards: Any,
+) -> dict[str, float]:
+    """Aggregate reward by trusted family and complete task group.
+
+    GRPO UIDs are used only as in-memory grouping keys and are never emitted as
+    metric names or values. Every mean is paired with its additive numerator
+    and denominator so console/W&B histories can be aggregated correctly.
+    """
+    group_id_rows = list(group_ids) if group_ids is not None else []
+    extras_rows = list(sample_extras) if sample_extras is not None else []
+    if torch.is_tensor(sample_rewards):
+        rewards_tensor = sample_rewards.detach().float().cpu()
+        if rewards_tensor.dim() == 2:
+            rewards_tensor = rewards_tensor.sum(dim=-1)
+        if rewards_tensor.dim() != 1:
+            raise ValueError("family reward telemetry requires rank-1 rewards")
+        reward_rows = rewards_tensor.tolist()
+    else:
+        reward_rows = list(sample_rewards) if sample_rewards is not None else []
+    if not (len(group_id_rows) == len(extras_rows) == len(reward_rows)):
+        raise ValueError(
+            "task family telemetry fields cannot align: "
+            f"group_ids={len(group_id_rows)}, extras={len(extras_rows)}, "
+            f"rewards={len(reward_rows)}"
+        )
+
+    eligible: list[tuple[str, Optional[str], float]] = []
+    invalid_reward_count = 0
+    ungrouped_sample_count = 0
+    for group_id, extra, reward in zip(group_id_rows, extras_rows, reward_rows):
+        extra = extra if isinstance(extra, Mapping) else {}
+        if bool(extra.get("is_experience_replay", False)) or bool(
+            extra.get("is_teacher", False)
+        ):
+            continue
+        reward = float(reward)
+        if not math.isfinite(reward):
+            invalid_reward_count += 1
+            continue
+        normalized_group_id = (
+            str(group_id).strip() if group_id is not None else ""
+        )
+        if not normalized_group_id:
+            ungrouped_sample_count += 1
+        eligible.append(
+            (normalized_group_id, _canonical_task_family(extra), reward)
+        )
+
+    metrics: dict[str, float] = {
+        "rollout/task_family/reward_sample_count": float(len(eligible)),
+        "rollout/task_family/invalid_reward_count": float(
+            invalid_reward_count
+        ),
+        "rollout/task_family/ungrouped_sample_count": float(
+            ungrouped_sample_count
+        ),
+    }
+    metadata_known_samples = sum(
+        family is not None for _, family, _ in eligible
+    )
+    reward_groups: dict[str, list[tuple[Optional[str], float]]] = defaultdict(list)
+    for group_id, family, reward in eligible:
+        if group_id:
+            reward_groups[group_id].append((family, reward))
+
+    family_sample_rewards: dict[str, list[float]] = defaultdict(list)
+    family_group_means: dict[str, list[float]] = defaultdict(list)
+    unknown_group_count = 0
+    inconsistent_group_count = 0
+    for group_rows in reward_groups.values():
+        families = {family for family, _reward in group_rows}
+        if len(families) != 1 or None in families:
+            unknown_group_count += 1
+            if len({family for family in families if family is not None}) > 1:
+                inconsistent_group_count += 1
+            continue
+        family = next(iter(families))
+        assert family is not None
+        group_rewards = [reward for _family, reward in group_rows]
+        family_sample_rewards[family].extend(group_rewards)
+        family_group_means[family].append(float(np.mean(group_rewards)))
+
+    known_samples = sum(len(values) for values in family_sample_rewards.values())
+    known_group_count = sum(len(values) for values in family_group_means.values())
+    metrics.update(
+        {
+            "rollout/task_family/metadata_known_sample_count": float(
+                metadata_known_samples
+            ),
+            "rollout/task_family/known_sample_count": float(known_samples),
+            "rollout/task_family/unknown_sample_count": float(
+                len(eligible) - known_samples
+            ),
+            "rollout/task_family/known_sample_fraction": (
+                float(known_samples / len(eligible)) if eligible else 0.0
+            ),
+            "rollout/task_family/group_count": float(len(reward_groups)),
+            "rollout/task_family/known_group_count": float(known_group_count),
+            "rollout/task_family/unknown_group_count": float(
+                unknown_group_count
+            ),
+            "rollout/task_family/inconsistent_group_count": float(
+                inconsistent_group_count
+            ),
+        }
+    )
+
+    for family, rewards in family_sample_rewards.items():
+        prefix = f"rollout/task_family/{family}"
+        reward_sum = float(sum(rewards))
+        metrics[f"{prefix}/sample_count"] = float(len(rewards))
+        metrics[f"{prefix}/reward_sum"] = reward_sum
+        metrics[f"{prefix}/sample_reward_mean"] = float(
+            reward_sum / len(rewards)
+        )
+        group_means = family_group_means.get(family, [])
+        group_mean_sum = float(sum(group_means))
+        metrics[f"{prefix}/group_count"] = float(len(group_means))
+        metrics[f"{prefix}/group_reward_mean_sum"] = group_mean_sum
+        if group_means:
+            metrics[f"{prefix}/group_reward_mean"] = float(
+                group_mean_sum / len(group_means)
+            )
+
+    return metrics
+
+
+def _rollout_drift_gate_violations(
+    *,
+    mean_abs_diff: float,
+    max_abs_diff: float,
+    p99_abs_diff: float,
+    importance_ratio_outside_clip_fraction: float,
+    mean_threshold: float,
+    max_threshold: float,
+    p99_threshold: float,
+    importance_ratio_outside_clip_threshold: float,
+) -> list[tuple[str, float, float]]:
+    """Return every enabled rollout/actor drift threshold violation.
+
+    Negative thresholds disable their check. Values exactly on an enabled
+    threshold pass, preserving the existing mean/max gate boundary semantics.
+    """
+    checks = (
+        ("mean_abs_diff", mean_abs_diff, mean_threshold),
+        ("max_abs_diff", max_abs_diff, max_threshold),
+        ("p99_abs_diff", p99_abs_diff, p99_threshold),
+        (
+            "importance_ratio_outside_clip_fraction",
+            importance_ratio_outside_clip_fraction,
+            importance_ratio_outside_clip_threshold,
+        ),
+    )
+    nonfinite_thresholds = [
+        (name, float(threshold))
+        for name, _value, threshold in checks
+        if not math.isfinite(float(threshold))
+    ]
+    if nonfinite_thresholds:
+        details = ", ".join(
+            f"{name}={threshold}" for name, threshold in nonfinite_thresholds
+        )
+        raise ValueError(
+            "rollout drift thresholds must be finite (negative disables): "
+            + details
+        )
+    return [
+        (name, float(value), float(threshold))
+        for name, value, threshold in checks
+        if float(threshold) >= 0.0 and float(value) > float(threshold)
+    ]
+
+
+def _rollout_drift_nonfinite_fields(
+    *,
+    rollout_log_probs: torch.Tensor,
+    current_log_probs: torch.Tensor,
+    identity_mask: torch.Tensor,
+    signed_logprob_delta: torch.Tensor,
+    importance_ratio: torch.Tensor,
+    aggregate_statistics: Optional[Mapping[str, torch.Tensor]] = None,
+) -> dict[str, int]:
+    """Count non-finite values participating in the behavior identity gate.
+
+    Logprobs are checked only where ``identity_mask`` is true; padding and
+    tokens without a behavior-backend logprob are deliberately ignored.
+    ``signed_logprob_delta`` and ``importance_ratio`` are the already-masked
+    one-dimensional tensors used by the gate.  Keeping this check explicit
+    prevents NaN comparisons from making threshold gates fail open.
+    """
+    if rollout_log_probs.shape != current_log_probs.shape:
+        raise ValueError(
+            "rollout/current logprob shape mismatch: "
+            f"{tuple(rollout_log_probs.shape)} vs {tuple(current_log_probs.shape)}"
+        )
+    if identity_mask.shape != rollout_log_probs.shape:
+        raise ValueError(
+            "identity_mask/logprob shape mismatch: "
+            f"{tuple(identity_mask.shape)} vs {tuple(rollout_log_probs.shape)}"
+        )
+
+    valid_mask = identity_mask.bool()
+    valid_count = int(valid_mask.sum().item())
+    if signed_logprob_delta.numel() != valid_count:
+        raise ValueError(
+            "signed_logprob_delta must contain exactly the masked tokens: "
+            f"expected {valid_count}, got {signed_logprob_delta.numel()}"
+        )
+    if importance_ratio.numel() != valid_count:
+        raise ValueError(
+            "importance_ratio must contain exactly the masked tokens: "
+            f"expected {valid_count}, got {importance_ratio.numel()}"
+        )
+
+    tensors: list[tuple[str, torch.Tensor]] = [
+        ("rollout_log_probs", torch.masked_select(rollout_log_probs, valid_mask)),
+        ("current_log_probs", torch.masked_select(current_log_probs, valid_mask)),
+        ("signed_logprob_delta", signed_logprob_delta.reshape(-1)),
+        ("importance_ratio", importance_ratio.reshape(-1)),
+    ]
+    if aggregate_statistics:
+        tensors.extend(
+            (f"aggregate/{name}", value.reshape(-1))
+            for name, value in aggregate_statistics.items()
+        )
+
+    nonfinite: dict[str, int] = {}
+    for name, value in tensors:
+        if not torch.is_tensor(value):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        count = int((~torch.isfinite(value)).sum().item())
+        if count:
+            nonfinite[name] = count
+    return nonfinite
+
+
+def _should_skip_zero_advantage_grpo_actor_update(
+    *,
+    adv_estimator: Any,
+    advantages: torch.Tensor,
+    effective_mask: torch.Tensor,
+    exp_mask: Optional[torch.Tensor] = None,
+    teacher_mask: Optional[torch.Tensor] = None,
+    zero_atol: float = 0.0,
+) -> tuple[bool, dict[str, float]]:
+    """Decide whether a signal-free, pure-GRPO actor update must be skipped.
+
+    The guard is intentionally trainer-side: not calling ``update_actor`` is
+    the only reliable way to prevent a numerically non-zero KL term or AdamW
+    weight decay from changing an otherwise signal-free actor.  "Pure" means
+    that no effective token is marked as replay/teacher data.  Later in
+    training this also defers a possible KL-only pull toward the reference
+    policy; that regularization resumes on the next informative batch, while
+    the no-signal batch can never cause an optimizer-only parameter drift.
+    """
+    if not torch.is_tensor(advantages) or advantages.dim() != 2:
+        raise ValueError("advantages must be a rank-2 tensor")
+    if effective_mask.shape != advantages.shape:
+        raise ValueError(
+            "effective_mask/advantages shape mismatch: "
+            f"{tuple(effective_mask.shape)} vs {tuple(advantages.shape)}"
+        )
+    if zero_atol < 0.0:
+        raise ValueError("zero_atol must be non-negative")
+
+    estimator_value = getattr(adv_estimator, "value", adv_estimator)
+    estimator_name = str(estimator_value).lower().rsplit(".", 1)[-1]
+    is_grpo = estimator_name == "grpo"
+    valid_mask = effective_mask.bool()
+
+    def _aligned_auxiliary_mask(mask: Optional[torch.Tensor], name: str) -> torch.Tensor:
+        if mask is None:
+            return torch.zeros_like(valid_mask)
+        if not torch.is_tensor(mask) or mask.dim() != 2:
+            raise ValueError(f"{name} must be a rank-2 tensor when provided")
+        if mask.shape[0] != advantages.shape[0] or mask.shape[1] < advantages.shape[1]:
+            raise ValueError(
+                f"{name} cannot align to advantages: "
+                f"{tuple(mask.shape)} vs {tuple(advantages.shape)}"
+            )
+        return mask[:, -advantages.shape[1] :].bool()
+
+    auxiliary_mask = _aligned_auxiliary_mask(exp_mask, "exp_mask")
+    auxiliary_mask |= _aligned_auxiliary_mask(teacher_mask, "teacher_mask")
+    has_auxiliary_tokens = bool(torch.any(auxiliary_mask & valid_mask).item())
+    is_pure_grpo = is_grpo and not has_auxiliary_tokens
+
+    effective_advantages = torch.masked_select(advantages, valid_mask)
+    nonfinite_count = int((~torch.isfinite(effective_advantages)).sum().item())
+    if nonfinite_count:
+        raise RuntimeError(
+            "non-finite effective advantages detected before actor optimizer: "
+            f"count={nonfinite_count}"
+        )
+
+    valid_tokens = int(effective_advantages.numel())
+    abs_max = (
+        float(effective_advantages.abs().max().item())
+        if valid_tokens
+        else 0.0
+    )
+    no_effective_advantage = abs_max <= float(zero_atol)
+    should_skip = is_pure_grpo and no_effective_advantage
+    return should_skip, {
+        "is_grpo": float(is_grpo),
+        "is_pure_grpo": float(is_pure_grpo),
+        "has_auxiliary_tokens": float(has_auxiliary_tokens),
+        "effective_tokens": float(valid_tokens),
+        "effective_advantage_abs_max": abs_max,
+        "zero_atol": float(zero_atol),
+    }
+
+
+def _atomic_torch_save(payload: object, output_path: str) -> None:
+    """Atomically persist a small diagnostic payload on the local filesystem."""
+    output_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    temporary_path = f"{output_path}.tmp-{uuid.uuid4().hex}"
+    try:
+        torch.save(payload, temporary_path)
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def _save_rollout_identity_gate_artifact(
+    *,
+    config: Any,
+    global_step: int,
+    batch: DataProto,
+    actor_old_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    identity_mask: torch.Tensor,
+    failure_kind: str,
+    diagnostics: Mapping[str, Any],
+) -> str:
+    """Persist the exact failing identity-gate batch and return its path."""
+    rollout_data_dir = config.trainer.get("rollout_data_dir", None)
+    if not rollout_data_dir:
+        default_local_dir = config.trainer.get("default_local_dir", ".")
+        rollout_data_dir = os.path.join(str(default_local_dir), "rollout_log")
+    artifact_path = os.path.join(
+        str(rollout_data_dir),
+        f"identity_gate_failure_step_{int(global_step)}.pt",
+    )
+    tensor_keys = (
+        "prompts",
+        "responses",
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "step_ids",
+        "group_ids",
+        "rollout_log_probs",
+        "rollout_log_probs_mask",
+        "context_raw_prompt_tokens",
+        "context_managed_prompt_tokens",
+        "context_compressed_turns",
+        "context_dropped_turns",
+        "context_clipped_observations",
+        "context_selected_decision_step",
+    )
+    artifact_tensors = {
+        key: batch.batch[key].detach().cpu()
+        for key in tensor_keys
+        if key in batch.batch.keys() and torch.is_tensor(batch.batch[key])
+    }
+    artifact_tensors.update(
+        {
+            "actor_old_log_probs": actor_old_log_probs.detach().cpu(),
+            "response_mask": response_mask.detach().cpu(),
+            "identity_mask": identity_mask.detach().cpu(),
+        }
+    )
+    metadata = {
+        "global_step": int(global_step),
+        "failure_kind": str(failure_kind),
+        "model_path": str(config.actor_rollout_ref.model.path),
+        "temperature": float(config.actor_rollout_ref.rollout.temperature),
+        "max_model_len": int(config.actor_rollout_ref.rollout.max_model_len),
+        "prompt_length": int(config.actor_rollout_ref.rollout.prompt_length),
+        "response_length": int(config.actor_rollout_ref.rollout.response_length),
+    }
+    metadata.update(dict(diagnostics))
+    _atomic_torch_save(
+        {
+            # Keep schema_version=1 so the existing offline replay tools can
+            # consume both threshold and non-finite failure artifacts.
+            "schema_version": 1,
+            "metadata": metadata,
+            "tensors": artifact_tensors,
+        },
+        artifact_path,
+    )
+    return artifact_path
+
+
+def _rollout_drift_metrics_by_relative_position(
+    signed_logprob_delta: torch.Tensor,
+    response_mask: torch.Tensor,
+    identity_mask: torch.Tensor,
+    *,
+    clip_low: float,
+    clip_high: float,
+) -> dict[str, float]:
+    """Summarize rollout/actor drift over relative response position.
+
+    The three buckets use each token's center position within its own valid
+    response, so variable-length and right-padded responses remain comparable.
+    ``identity_mask`` may exclude tokens without a rollout logprob; those
+    tokens do not contribute metrics, but ``response_mask`` still determines
+    the relative position of the tokens that remain.
+
+    This helper performs reductions only on logprobs already computed for the
+    behavior-policy identity gate. It does not participate in gate decisions.
+    """
+    if signed_logprob_delta.shape != response_mask.shape:
+        raise ValueError(
+            "signed_logprob_delta/response_mask shape mismatch: "
+            f"{tuple(signed_logprob_delta.shape)} vs {tuple(response_mask.shape)}"
+        )
+    if identity_mask.shape != response_mask.shape:
+        raise ValueError(
+            "identity_mask/response_mask shape mismatch: "
+            f"{tuple(identity_mask.shape)} vs {tuple(response_mask.shape)}"
+        )
+
+    response_valid = response_mask.bool()
+    identity_valid = identity_mask.bool() & response_valid
+    bucket_count = len(_ROLLOUT_DRIFT_POSITION_BUCKETS)
+
+    # The token-center convention gives intuitive behavior for short samples:
+    # a one-token response is mid; two-token responses are early/late; and
+    # three-token responses contribute once to each bucket.
+    token_ordinal = response_valid.long().cumsum(dim=-1) - 1
+    response_lengths = response_valid.sum(dim=-1, keepdim=True).clamp_min(1)
+    relative_center = (
+        token_ordinal.to(torch.float32) + 0.5
+    ) / response_lengths.to(torch.float32)
+    bucket_ids = torch.floor(relative_center * bucket_count).long()
+    bucket_ids = bucket_ids.clamp_(min=0, max=bucket_count - 1)
+
+    # Zero excluded entries before arithmetic: NaN * 0 is still NaN, so merely
+    # multiplying by a bucket mask would let ignored padding contaminate sums.
+    delta = torch.where(
+        identity_valid,
+        signed_logprob_delta.float(),
+        torch.zeros_like(signed_logprob_delta, dtype=torch.float32),
+    )
+    abs_delta = delta.abs()
+    ratio = torch.exp(torch.clamp(delta, -20.0, 20.0))
+    ratio_outside_clip = (ratio < float(clip_low)) | (ratio > float(clip_high))
+
+    # Build all reductions on device, then transfer the tiny 3x6 summary once.
+    # This avoids one host synchronization per metric.
+    bucket_stats = []
+    for bucket_idx, bucket_name in enumerate(_ROLLOUT_DRIFT_POSITION_BUCKETS):
+        bucket_mask = identity_valid & (bucket_ids == bucket_idx)
+        token_count = bucket_mask.sum()
+        denominator = token_count.clamp_min(1).to(torch.float32)
+        bucket_mask_float = bucket_mask.to(torch.float32)
+        bucket_stats.append(
+            torch.stack(
+                (
+                    token_count.to(torch.float32),
+                    (delta * bucket_mask_float).sum() / denominator,
+                    (abs_delta * bucket_mask_float).sum() / denominator,
+                    abs_delta.masked_fill(~bucket_mask, float("-inf")).max(),
+                    (ratio * bucket_mask_float).sum() / denominator,
+                    (
+                        ratio_outside_clip.to(torch.float32)
+                        * bucket_mask_float
+                    ).sum()
+                    / denominator,
+                )
+            )
+        )
+
+    bucket_stats_cpu = torch.stack(bucket_stats).detach().cpu().tolist()
+    metrics: dict[str, float] = {}
+    for bucket_name, stats in zip(
+        _ROLLOUT_DRIFT_POSITION_BUCKETS, bucket_stats_cpu, strict=True
+    ):
+        token_count = int(stats[0])
+        prefix = f"training/rollout_logprob_drift_{bucket_name}"
+        metrics[f"{prefix}_tokens"] = float(token_count)
+        if token_count == 0:
+            continue
+        metrics.update(
+            {
+                f"{prefix}_signed_mean": stats[1],
+                f"{prefix}_abs_mean": stats[2],
+                f"{prefix}_abs_max": stats[3],
+                f"{prefix}_ratio_mean": stats[4],
+                f"{prefix}_ratio_outside_clip_fraction": stats[5],
+            }
+        )
+    return metrics
 
 
 def compute_teacher_effect_metrics(batch: DataProto, entropys: Optional[torch.Tensor] = None) -> dict:
@@ -706,9 +1592,12 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"  # ⭐ Ensure the hybrid engine is supported
+        # external_vllm: rollout runs on standalone vllm serve processes (ExternalLLMServerManager),
+        # the actor_rollout worker group only hosts the FSDP actor (no colocated engine).
+        self.external_rollout_mode = config.actor_rollout_ref.rollout.name == "external_vllm"
+        assert self.hybrid_engine or self.external_rollout_mode, "Currently, only support hybrid engine or external_vllm rollout"  # ⭐ Ensure the hybrid engine is supported
 
-        if self.hybrid_engine:
+        if self.hybrid_engine or self.external_rollout_mode:
             assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"  # ⭐ Ensure ActorRollout role is present in the mapping
 
         self.role_worker_mapping = role_worker_mapping
@@ -755,6 +1644,68 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
         self._create_dataloader_from_manager(collate_fn, shuffle_trainset)  # ⭐ Create dataloader from the provided manager
 
+    def _persist_identity_failure_training_state(self) -> None:
+        """Best-effort persistence of the exact pre-update failure state.
+
+        The identity gate deliberately raises before the optimizer step.  A
+        normal periodic checkpoint may therefore be many steps behind the
+        failure, and external vLLM servers are not durable storage.  When the
+        corresponding trainer flags are enabled, retain both a resumable verl
+        checkpoint (model/optimizer/RNG/dataloader) and a single-file bf16 actor
+        export suitable for direct offline vLLM replay.
+
+        Persistence errors are logged independently.  They must never mask the
+        original numerical failure or allow the optimizer to continue.
+        """
+        trainer_config = self.config.trainer
+        global_step = int(self.global_steps)
+
+        if bool(
+            trainer_config.get(
+                "export_actor_weights_on_identity_failure", False
+            )
+        ):
+            rollout_data_dir = trainer_config.get("rollout_data_dir", None)
+            if not rollout_data_dir:
+                rollout_data_dir = os.path.join(
+                    str(trainer_config.get("default_local_dir", ".")),
+                    "rollout_log",
+                )
+            actor_export_dir = os.path.join(
+                str(rollout_data_dir),
+                f"identity_gate_failure_step_{global_step}_actor_weights",
+            )
+            try:
+                self.actor_rollout_wg.save_rollout_weights(actor_export_dir)
+                logger.error(
+                    "saved identity-gate pre-update actor weights to "
+                    f"{actor_export_dir}"
+                )
+            except Exception as export_error:
+                logger.exception(
+                    "failed to export identity-gate pre-update actor weights: "
+                    f"{export_error}"
+                )
+
+        if bool(
+            trainer_config.get("save_checkpoint_on_identity_failure", False)
+        ):
+            try:
+                self._save_checkpoint()
+                checkpoint_dir = os.path.join(
+                    str(trainer_config.default_local_dir),
+                    f"global_step_{global_step}",
+                )
+                logger.error(
+                    "saved identity-gate pre-update training checkpoint to "
+                    f"{checkpoint_dir}"
+                )
+            except Exception as checkpoint_error:
+                logger.exception(
+                    "failed to save identity-gate pre-update training "
+                    f"checkpoint: {checkpoint_error}"
+                )
+
 
     def init_workers(self):
         """
@@ -775,7 +1726,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # create actor and rollout
-        if self.hybrid_engine:
+        if self.hybrid_engine or self.external_rollout_mode:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
@@ -818,6 +1769,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            _install_wandb_secret_scrub(worker_dict_cls)
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls,
                                                 device_name=self.device_name, **wg_kwargs)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
@@ -842,11 +1794,17 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
         if self.config.actor_rollout_ref.rollout.mode == "async":
-            from agentevolver.module.trainer.ae_async_llm_server_manager import BaAsyncLLMServerManager
             self.async_rollout_mode = True
-            self.async_rollout_manager = BaAsyncLLMServerManager(
-                config=self.config,
-                worker_group=self.actor_rollout_wg)  # ⭐ Create the asynchronous rollout manager
+            if self.external_rollout_mode:
+                from agentevolver.module.trainer.external_llm_server_manager import ExternalLLMServerManager
+                self.async_rollout_manager = ExternalLLMServerManager(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wg)  # ⭐ Rollout on external vllm servers + per-step weight sync
+            else:
+                from agentevolver.module.trainer.ae_async_llm_server_manager import BaAsyncLLMServerManager
+                self.async_rollout_manager = BaAsyncLLMServerManager(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wg)  # ⭐ Create the asynchronous rollout manager
 
         self.reward_fn = parse_reward_from_dataproto
         self.val_reward_fn = parse_reward_from_dataproto
@@ -893,37 +1851,83 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             max_train_tasks = self.config.data.get("max_train_tasks", None)
             shuffle = self.config.data.get("shuffle", True) # by default, shuffle the train tasks
             seed = self.config.data.get("seed", 2026)
+            # `data.seed` shuffles the full training split and keeps the first
+            # `max_train_tasks`, so on its own it decides BOTH the optimization
+            # randomness and *which* tasks are ever seen. With max_train_tasks=800
+            # out of ~2.4k (ALFWorld) / ~7.2k (WebShop) that makes two seeds train on
+            # largely disjoint curricula, which is not what "seed variance" usually
+            # means. `data.task_seed` pins the task draw so replicates share one
+            # curriculum and only the run-time randomness differs; it defaults to
+            # `data.seed`, so existing configs behave exactly as before.
+            task_seed = self.config.data.get("task_seed", None)
+            task_seed = seed if task_seed is None else int(task_seed)
             self.train_task_manager.load_tasks_from_environment(
                 env_client,
                 env_type=env_type,
                 split="train",
                 max_tasks=max_train_tasks,
                 shuffle=shuffle,
-                seed=seed,
+                seed=task_seed,
             )
-            train_source = f"env(split=train, max_train_tasks={max_train_tasks}, shuffle={shuffle}, seed={seed})"
+            # load_tasks_from_environment seeds the global RNG with whatever it was
+            # given; restore the run's own seed so downstream randomness still differs
+            # between replicates that share a task draw.
+            random.seed(seed)
+            train_source = (f"env(split=train, max_train_tasks={max_train_tasks}, "
+                            f"shuffle={shuffle}, task_seed={task_seed}, seed={seed})")
         
+        # A deterministic validation prefix is useful for controlled A/B
+        # canaries. Unlike train-task subsampling, validation never shuffles
+        # before applying this cap.
+        max_val_tasks = self.config.data.get("max_val_tasks", None)
+        if max_val_tasks is not None:
+            max_val_tasks = int(max_val_tasks)
+            if max_val_tasks <= 0:
+                raise ValueError("data.max_val_tasks must be positive or null")
+
         # load val dataset
         if self.config.data.val_files is not None:
             val_seed_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
             assert isinstance(val_seed_dataset,RLHFDataset), "train_dataset must be RLHFDataset"
             self.val_task_manager.load_tasks_from_dataset(val_seed_dataset,env_type=env_type)
-            val_source = f"files({self.config.data.val_files})"
+            if max_val_tasks is not None:
+                del self.val_task_manager.seed_tasks[max_val_tasks:]
+            val_source = (
+                f"files({self.config.data.val_files}, "
+                f"max_val_tasks={max_val_tasks})"
+            )
         else:
             num_loaded_val_tasks = 0
             val_source = "env(unknown)"
             if 'val_on_test' in os.environ.get("DEBUG_ARG",'') or (self.config.data.val_type == 'test_normal' and self.config.env_service.env_type == "appworld"):
                 logger.warning("using test_normal as val dataset")
-                num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=env_type,split="test_normal", shuffle=False)
-                val_source = "env(split=test_normal)"
+                num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(
+                    env_client,
+                    env_type=env_type,
+                    split="test_normal",
+                    max_tasks=max_val_tasks,
+                    shuffle=False,
+                )
+                val_source = (
+                    "env(split=test_normal, "
+                    f"max_val_tasks={max_val_tasks})"
+                )
             else:
                 # For AlfWorld, val and dev both return test set (200 tasks)
                 # So we only need to load once to avoid duplicates
                 if env_type == "alfworld":
                     # Only load from 'val' split (which now returns test set)
                     try:
-                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(env_client,env_type=env_type,split="val", shuffle=False)
-                        val_source = "env(split=val)"
+                        num_loaded_val_tasks += self.val_task_manager.load_tasks_from_environment(
+                            env_client,
+                            env_type=env_type,
+                            split="val",
+                            max_tasks=max_val_tasks,
+                            shuffle=False,
+                        )
+                        val_source = (
+                            f"env(split=val, max_val_tasks={max_val_tasks})"
+                        )
                     except:
                         logger.warning(f"failed to load val dataset from environment, split=val")
                 else:
@@ -936,11 +1940,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                 env_client,
                                 env_type=env_type,
                                 split=split,
+                                max_tasks=max_val_tasks,
                                 shuffle=False,
                             )
                             num_loaded_val_tasks += loaded
                             if loaded > 0:
-                                val_source = f"env(split={split})"
+                                val_source = (
+                                    f"env(split={split}, "
+                                    f"max_val_tasks={max_val_tasks})"
+                                )
                                 break
                         except Exception:
                             logger.warning(
@@ -1561,7 +2569,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
     ##################
     # ANNI
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        sample_metadata: Optional[Mapping[str, list]] = None,
+    ):
         """
         Dumps rollout/validation samples as JSONL.
 
@@ -1589,6 +2605,18 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
+        if sample_metadata:
+            for key, values in sample_metadata.items():
+                if key in base_data:
+                    raise ValueError(
+                        f"duplicate generation dump field {key!r}"
+                    )
+                if len(values) != n:
+                    raise ValueError(
+                        f"generation metadata {key!r} has {len(values)} "
+                        f"rows for {n} samples"
+                    )
+                base_data[key] = values
 
         lines = []
         for i in range(n):
@@ -2190,6 +3218,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         sample_outputs = []
         sample_scores = []
         sample_success_rates = []
+        validation_sample_metadata: dict[str, list] = defaultdict(list)
         # Summary counters (help interpret what val metrics actually average over)
         n_val_tasks = 0
 
@@ -2246,7 +3275,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 print("=" * 10 + "start validate rollout" + "=" * 10)
                 trajectories = self.env_manager.rollout(tasks, task_exp_configs, mode="validate", epoch=f"test.1.{i}")  # ⭐ Execute the rollout to generate trajectories
                 print("=" * 10 + "end validate rollout" + "=" * 10)
-                test_output_gen_batch = self.env_manager.to_dataproto(trajectories)
+                test_output_gen_batch = self.env_manager.to_dataproto(
+                    trajectories, optimizer_batch=False
+                )
                 # test_output_gen_batch_padded = self.explorer_manager.rollout(test_gen_batch_padded)
                 # test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
                 self.async_rollout_manager.sleep()
@@ -2254,6 +3285,37 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             # unpad
             # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print("validation generation end")
+
+            # Persist the same sample-aligned context/termination contract as
+            # the generated text. Without this, a validation score cannot show
+            # whether the configured long-context policy ever activated.
+            validation_rollout_audit = _validation_rollout_audit(
+                test_output_gen_batch
+            )
+            for audit_name, audit_values in validation_rollout_audit.items():
+                reward_extra_infos_dict[audit_name].extend(audit_values)
+            output_extras = list(
+                test_output_gen_batch.non_tensor_batch.get("extras", [])
+            )
+            if len(output_extras) != len(test_output_gen_batch):
+                raise RuntimeError(
+                    "validation extras cannot align to rollout outputs: "
+                    f"{len(output_extras)} vs {len(test_output_gen_batch)}"
+                )
+            for extra in output_extras:
+                extra = extra or {}
+                validation_sample_metadata["task_id"].append(
+                    str(extra.get("task_id", ""))
+                )
+                validation_sample_metadata["rollout_id"].append(
+                    str(extra.get("rollout_id", ""))
+                )
+                validation_sample_metadata["episode_end_reason"].append(
+                    extra.get("episode_end_reason")
+                )
+                validation_sample_metadata["decision_audit"].append(
+                    list(extra.get("decision_audit") or [])
+                )
 
             # Store original inputs
             input_ids = test_output_gen_batch.batch["prompts"]
@@ -2325,6 +3387,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                sample_metadata=validation_sample_metadata,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -2435,16 +3498,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        from omegaconf import OmegaConf
-
-        from agentevolver.utils.tracking import Tracking
-
-        tracker = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
-        )
+        tracker = getattr(self, "_tracking", None)
+        if tracker is None:
+            raise RuntimeError(
+                "Mandatory W&B tracker is missing. AgentEvolverRayPPOTrainer.fit() "
+                "must be entered through the canonical TaskRunner, which creates "
+                "the online run before GPU worker initialization and owns its "
+                "success/failure finalization."
+            )
 
         self.global_steps = 0
 
@@ -2530,7 +3591,22 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
-                            self.async_rollout_manager.wake_up()
+                            synced_for_generation = (
+                                self.async_rollout_manager.wake_up()
+                            )
+                            if self.external_rollout_mode:
+                                metrics[
+                                    "external_rollout/synced_for_generation"
+                                ] = float(bool(synced_for_generation))
+                                for sync_name, sync_value in (
+                                    self.async_rollout_manager.get_sync_metrics().items()
+                                ):
+                                    phase_name = sync_name.replace(
+                                        "external_rollout/",
+                                        "external_rollout/generation_",
+                                        1,
+                                    )
+                                    metrics[phase_name] = sync_value
                             # gen_batch_output = self.explorer_manager.rollout(gen_batch)
 
                             tasks = [Task(
@@ -2810,7 +3886,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             else:
                                 all_trajectories = trajectories
                             
-                            gen_batch_output = self.env_manager.to_dataproto(all_trajectories)
+                            gen_batch_output = self.env_manager.to_dataproto(
+                                all_trajectories, optimizer_batch=True
+                            )
                             
                             # update metrics about experience manager
                             exp_mask_ratio = gen_batch_output.batch["exp_mask"].float().mean()
@@ -2826,6 +3904,14 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             print(f"gen_batch_output.info batch.keys={gen_batch_output.batch.keys()}")
                             num_term_traj = sum([traj.is_terminated  for traj in trajectories])
                             num_not_none_traj = sum([len(traj.steps)>0  for traj in trajectories])
+                            num_malformed_action_traj = sum(
+                                1
+                                for traj in trajectories
+                                if (getattr(traj, "metadata", None) or {}).get(
+                                    "episode_end_reason"
+                                )
+                                == "malformed_action"
+                            )
 
                             # gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
@@ -3068,8 +4154,96 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             except Exception:
                                 pass
 
+                        if all(
+                            key in batch.batch.keys()
+                            for key in (
+                                "decision_count",
+                                "length_truncated_decision_count",
+                                "has_length_truncated_decision",
+                            )
+                        ):
+                            length_diagnostics = (
+                                _length_truncation_batch_diagnostics(
+                                    decision_count=batch.batch[
+                                        "decision_count"
+                                    ],
+                                    length_truncated_decision_count=batch.batch[
+                                        "length_truncated_decision_count"
+                                    ],
+                                    has_length_truncated_decision=batch.batch[
+                                        "has_length_truncated_decision"
+                                    ],
+                                )
+                            )
+                            metrics.update(length_diagnostics)
+                            length_fraction_threshold = float(
+                                self.config.actor_rollout_ref.rollout.get(
+                                    "length_truncation_max_decision_fraction",
+                                    -1.0,
+                                )
+                            )
+                            if (
+                                not math.isfinite(length_fraction_threshold)
+                                or length_fraction_threshold > 1.0
+                            ):
+                                raise ValueError(
+                                    "length_truncation_max_decision_fraction "
+                                    "must be finite and <= 1; negative disables"
+                                )
+                            observed_length_fraction = length_diagnostics[
+                                "rollout/length_truncated_decision_fraction"
+                            ]
+                            if (
+                                length_fraction_threshold >= 0.0
+                                and observed_length_fraction
+                                > length_fraction_threshold
+                            ):
+                                raise RuntimeError(
+                                    "generation-length circuit breaker fired "
+                                    "before optimizer: decision_fraction="
+                                    f"{observed_length_fraction:.6f} > "
+                                    f"{length_fraction_threshold:.6f}"
+                                )
+
+                        use_rollout_log_probs_as_old = bool(
+                            self.config.actor_rollout_ref.rollout.get(
+                                "use_rollout_log_probs_as_old", False
+                            )
+                        )
+                        responses_for_behavior = batch.batch["responses"]
+                        response_length_for_behavior = responses_for_behavior.size(1)
+                        response_mask_for_behavior = batch.batch[
+                            "attention_mask"
+                        ][:, -response_length_for_behavior:]
+                        if self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                            response_loss_mask_for_behavior = batch.batch[
+                                "loss_mask"
+                            ][:, -response_length_for_behavior:]
+                        else:
+                            response_loss_mask_for_behavior = (
+                                response_mask_for_behavior
+                            )
+                        expected_onpolicy_behavior_mask = (
+                            _expected_onpolicy_behavior_mask(
+                                response_mask=response_mask_for_behavior,
+                                response_loss_mask=response_loss_mask_for_behavior,
+                                sample_extras=batch.non_tensor_batch.get(
+                                    "extras", None
+                                ),
+                            )
+                        )
+                        if (
+                            use_rollout_log_probs_as_old
+                            and torch.any(expected_onpolicy_behavior_mask)
+                            and "rollout_log_probs" not in batch.batch.keys()
+                        ):
+                            raise RuntimeError(
+                                "use_rollout_log_probs_as_old=true but the batch "
+                                "contains no rollout_log_probs tensor; refusing to "
+                                "fall back to actor-recomputed PPO denominators"
+                            )
+
                         if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
                             actor_old_log_probs = batch.batch["old_log_probs"]
                             attention_mask = batch.batch["attention_mask"]
@@ -3077,20 +4251,399 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             response_length = responses.size(1)
                             response_mask = attention_mask[:, -response_length:]
 
-                            rollout_probs = torch.exp(rollout_old_log_probs)
-                            actor_probs = torch.exp(actor_old_log_probs)
-                            rollout_probs_diff = torch.abs(rollout_probs - actor_probs)
-                            rollout_probs_diff = torch.masked_select(rollout_probs_diff, response_mask.bool())
-                            rollout_probs_diff_max = torch.max(rollout_probs_diff)
-                            rollout_probs_diff_mean = torch.mean(rollout_probs_diff)
-                            rollout_probs_diff_std = torch.std(rollout_probs_diff)
-                            metrics.update(
-                                {
-                                    "training/rollout_probs_diff_max": rollout_probs_diff_max.detach().item(),
-                                    "training/rollout_probs_diff_mean": rollout_probs_diff_mean.detach().item(),
-                                    "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
-                                }
+                            if (
+                                use_rollout_log_probs_as_old
+                                and "rollout_log_probs_mask"
+                                not in batch.batch.keys()
+                            ):
+                                raise RuntimeError(
+                                    "use_rollout_log_probs_as_old=true but "
+                                    "rollout_log_probs_mask is missing; refusing "
+                                    "to infer behavior-token coverage"
+                                )
+                            rollout_mask = batch.batch.get(
+                                "rollout_log_probs_mask",
+                                torch.ones_like(response_mask),
                             )
+                            if rollout_mask.shape != response_mask.shape:
+                                raise RuntimeError(
+                                    "rollout_log_probs_mask/response shape mismatch: "
+                                    f"{tuple(rollout_mask.shape)} vs "
+                                    f"{tuple(response_mask.shape)}"
+                                )
+                            missing_onpolicy_behavior = (
+                                expected_onpolicy_behavior_mask
+                                & ~rollout_mask.bool()
+                            )
+                            if (
+                                use_rollout_log_probs_as_old
+                                and torch.any(missing_onpolicy_behavior)
+                            ):
+                                missing_count = int(
+                                    missing_onpolicy_behavior.sum().item()
+                                )
+                                affected_rows = int(
+                                    missing_onpolicy_behavior.any(dim=-1).sum().item()
+                                )
+                                raise RuntimeError(
+                                    "partial rollout behavior-logprob coverage for "
+                                    "on-policy trainable tokens: "
+                                    f"missing_tokens={missing_count}, "
+                                    f"affected_samples={affected_rows}; refusing "
+                                    "mixed actor/vLLM PPO denominators"
+                                )
+                            provided_behavior_mask = (
+                                response_mask.bool() & rollout_mask.bool()
+                            )
+                            unexpected_behavior_tokens = (
+                                provided_behavior_mask
+                                & ~expected_onpolicy_behavior_mask
+                            )
+                            if (
+                                use_rollout_log_probs_as_old
+                                and torch.any(unexpected_behavior_tokens)
+                            ):
+                                raise RuntimeError(
+                                    "rollout behavior-logprob mask covers tokens "
+                                    "outside the freshly sampled on-policy loss "
+                                    "contract; refusing to overwrite replay/teacher "
+                                    "or non-trainable denominators"
+                                )
+                            identity_mask = (
+                                expected_onpolicy_behavior_mask
+                                if use_rollout_log_probs_as_old
+                                else provided_behavior_mask
+                            )
+                            if torch.any(identity_mask):
+                                signed_logprob_delta_dense = (
+                                    actor_old_log_probs - rollout_old_log_probs
+                                )
+                                signed_logprob_delta = torch.masked_select(
+                                    signed_logprob_delta_dense,
+                                    identity_mask,
+                                )
+                                ratio = torch.exp(
+                                    torch.clamp(signed_logprob_delta, -20, 20)
+                                )
+
+                                def _persist_identity_gate_failure(
+                                    failure_kind: str,
+                                    diagnostics: Mapping[str, Any],
+                                ) -> None:
+                                    try:
+                                        artifact_path = (
+                                            _save_rollout_identity_gate_artifact(
+                                                config=self.config,
+                                                global_step=self.global_steps,
+                                                batch=batch,
+                                                actor_old_log_probs=actor_old_log_probs,
+                                                response_mask=response_mask,
+                                                identity_mask=identity_mask,
+                                                failure_kind=failure_kind,
+                                                diagnostics=diagnostics,
+                                            )
+                                        )
+                                        logger.error(
+                                            "saved rollout/actor identity failure "
+                                            f"artifact to {artifact_path}"
+                                        )
+                                    except Exception as artifact_error:
+                                        # Artifact IO must never turn a numerical
+                                        # hard-stop into a continued optimizer step.
+                                        logger.exception(
+                                            "failed to save rollout/actor identity "
+                                            f"artifact: {artifact_error}"
+                                        )
+                                    self._persist_identity_failure_training_state()
+
+                                nonfinite_fields = _rollout_drift_nonfinite_fields(
+                                    rollout_log_probs=rollout_old_log_probs,
+                                    current_log_probs=actor_old_log_probs,
+                                    identity_mask=identity_mask,
+                                    signed_logprob_delta=signed_logprob_delta,
+                                    importance_ratio=ratio,
+                                )
+                                if nonfinite_fields:
+                                    _persist_identity_gate_failure(
+                                        "nonfinite_token_values",
+                                        {"nonfinite_fields": nonfinite_fields},
+                                    )
+                                    raise RuntimeError(
+                                        "rollout/actor behavior-policy logprob identity "
+                                        "gate found non-finite token values before "
+                                        f"aggregation: {nonfinite_fields}"
+                                    )
+
+                                rollout_probs = torch.exp(rollout_old_log_probs)
+                                actor_probs = torch.exp(actor_old_log_probs)
+                                prob_diff = torch.masked_select(
+                                    torch.abs(rollout_probs - actor_probs),
+                                    identity_mask,
+                                )
+                                logprob_diff = torch.abs(signed_logprob_delta)
+                                clip_low = 1.0 - float(
+                                    self.config.actor_rollout_ref.actor.get(
+                                        "clip_ratio_low", 0.2
+                                    )
+                                )
+                                clip_high = 1.0 + float(
+                                    self.config.actor_rollout_ref.actor.get(
+                                        "clip_ratio_high", 0.2
+                                    )
+                                )
+                                quantile_levels = torch.tensor(
+                                    [0.5, 0.9, 0.95, 0.99],
+                                    device=logprob_diff.device,
+                                    dtype=logprob_diff.dtype,
+                                )
+                                diff_quantiles = torch.quantile(
+                                    logprob_diff.float(), quantile_levels.float()
+                                )
+                                ratio_outside_clip = (
+                                    (ratio < clip_low) | (ratio > clip_high)
+                                ).float().mean()
+
+                                aggregate_statistics = {
+                                    "prob_diff_max": prob_diff.max(),
+                                    "prob_diff_mean": prob_diff.mean(),
+                                    "prob_diff_std": prob_diff.std(unbiased=False),
+                                    "logprob_diff_mean": logprob_diff.mean(),
+                                    "logprob_diff_max": logprob_diff.max(),
+                                    "signed_delta_mean": signed_logprob_delta.mean(),
+                                    "logprob_diff_quantiles": diff_quantiles,
+                                    "importance_ratio_mean": ratio.mean(),
+                                    "importance_ratio_min": ratio.min(),
+                                    "importance_ratio_max": ratio.max(),
+                                    "importance_ratio_outside_clip_fraction": ratio_outside_clip,
+                                }
+                                nonfinite_fields = _rollout_drift_nonfinite_fields(
+                                    rollout_log_probs=rollout_old_log_probs,
+                                    current_log_probs=actor_old_log_probs,
+                                    identity_mask=identity_mask,
+                                    signed_logprob_delta=signed_logprob_delta,
+                                    importance_ratio=ratio,
+                                    aggregate_statistics=aggregate_statistics,
+                                )
+                                if nonfinite_fields:
+                                    _persist_identity_gate_failure(
+                                        "nonfinite_aggregate_values",
+                                        {"nonfinite_fields": nonfinite_fields},
+                                    )
+                                    raise RuntimeError(
+                                        "rollout/actor behavior-policy logprob identity "
+                                        "gate found non-finite aggregate values before "
+                                        f"threshold evaluation: {nonfinite_fields}"
+                                    )
+
+                                logprob_diff_mean = (
+                                    aggregate_statistics["logprob_diff_mean"]
+                                    .detach()
+                                    .item()
+                                )
+                                logprob_diff_max = (
+                                    aggregate_statistics["logprob_diff_max"]
+                                    .detach()
+                                    .item()
+                                )
+                                logprob_diff_p99 = (
+                                    diff_quantiles[3].detach().item()
+                                )
+                                ratio_outside_clip_fraction = (
+                                    ratio_outside_clip.detach().item()
+                                )
+                                position_drift_metrics = (
+                                    _rollout_drift_metrics_by_relative_position(
+                                        signed_logprob_delta_dense,
+                                        response_mask,
+                                        identity_mask,
+                                        clip_low=clip_low,
+                                        clip_high=clip_high,
+                                    )
+                                )
+                                metrics.update(
+                                    {
+                                        "training/rollout_probs_diff_max": prob_diff.max().detach().item(),
+                                        "training/rollout_probs_diff_mean": prob_diff.mean().detach().item(),
+                                        "training/rollout_probs_diff_std": prob_diff.std(unbiased=False).detach().item(),
+                                        "training/rollout_logprobs_diff_max": logprob_diff_max,
+                                        "training/rollout_logprobs_diff_mean": logprob_diff_mean,
+                                        "training/rollout_logprobs_valid_tokens": identity_mask.sum().detach().item(),
+                                        "training/rollout_logprobs_signed_delta_mean": signed_logprob_delta.mean().detach().item(),
+                                        "training/rollout_logprobs_diff_p50": diff_quantiles[0].detach().item(),
+                                        "training/rollout_logprobs_diff_p90": diff_quantiles[1].detach().item(),
+                                        "training/rollout_logprobs_diff_p95": diff_quantiles[2].detach().item(),
+                                        "training/rollout_logprobs_diff_p99": logprob_diff_p99,
+                                        "training/rollout_importance_ratio_mean": ratio.mean().detach().item(),
+                                        "training/rollout_importance_ratio_min": ratio.min().detach().item(),
+                                        "training/rollout_importance_ratio_max": ratio.max().detach().item(),
+                                        "training/rollout_importance_ratio_outside_clip_fraction": ratio_outside_clip_fraction,
+                                    }
+                                )
+                                metrics.update(position_drift_metrics)
+
+                                logger.warning(
+                                    "rollout/actor behavior identity diagnostics: "
+                                    f"abs_logprob mean={logprob_diff_mean:.6f} "
+                                    f"p50/p90/p95/p99="
+                                    f"{diff_quantiles[0].item():.6f}/"
+                                    f"{diff_quantiles[1].item():.6f}/"
+                                    f"{diff_quantiles[2].item():.6f}/"
+                                    f"{diff_quantiles[3].item():.6f} "
+                                    f"max={logprob_diff_max:.6f}; "
+                                    f"signed_mean={signed_logprob_delta.mean().item():.6f}; "
+                                    f"ratio mean/min/max={ratio.mean().item():.6f}/"
+                                    f"{ratio.min().item():.6f}/{ratio.max().item():.6f}; "
+                                    f"outside_clip={ratio_outside_clip.item():.6f} "
+                                    f"tokens={identity_mask.sum().item()}"
+                                )
+
+                                position_summaries = []
+                                for bucket_name in _ROLLOUT_DRIFT_POSITION_BUCKETS:
+                                    prefix = (
+                                        "training/rollout_logprob_drift_"
+                                        f"{bucket_name}"
+                                    )
+                                    token_count = int(
+                                        position_drift_metrics[f"{prefix}_tokens"]
+                                    )
+                                    if token_count == 0:
+                                        position_summaries.append(
+                                            f"{bucket_name}[n=0]"
+                                        )
+                                        continue
+                                    position_summaries.append(
+                                        f"{bucket_name}[n={token_count}] "
+                                        f"signed={position_drift_metrics[f'{prefix}_signed_mean']:.6f} "
+                                        f"abs={position_drift_metrics[f'{prefix}_abs_mean']:.6f} "
+                                        f"max={position_drift_metrics[f'{prefix}_abs_max']:.6f} "
+                                        f"ratio={position_drift_metrics[f'{prefix}_ratio_mean']:.6f} "
+                                        f"outside_clip="
+                                        f"{position_drift_metrics[f'{prefix}_ratio_outside_clip_fraction']:.6f}"
+                                    )
+                                logger.warning(
+                                    "rollout/actor drift by relative response position: "
+                                    + "; ".join(position_summaries)
+                                )
+
+                                mean_threshold = float(
+                                    self.config.actor_rollout_ref.rollout.get(
+                                        "rollout_logprob_drift_mean_threshold",
+                                        -1.0,
+                                    )
+                                )
+                                max_threshold = float(
+                                    self.config.actor_rollout_ref.rollout.get(
+                                        "rollout_logprob_drift_max_threshold",
+                                        -1.0,
+                                    )
+                                )
+                                p99_threshold = float(
+                                    self.config.actor_rollout_ref.rollout.get(
+                                        "rollout_logprob_drift_p99_threshold",
+                                        -1.0,
+                                    )
+                                )
+                                importance_ratio_outside_clip_threshold = float(
+                                    self.config.actor_rollout_ref.rollout.get(
+                                        "rollout_importance_ratio_outside_clip_threshold",
+                                        -1.0,
+                                    )
+                                )
+                                gate_violations = _rollout_drift_gate_violations(
+                                    mean_abs_diff=logprob_diff_mean,
+                                    max_abs_diff=logprob_diff_max,
+                                    p99_abs_diff=logprob_diff_p99,
+                                    importance_ratio_outside_clip_fraction=(
+                                        ratio_outside_clip_fraction
+                                    ),
+                                    mean_threshold=mean_threshold,
+                                    max_threshold=max_threshold,
+                                    p99_threshold=p99_threshold,
+                                    importance_ratio_outside_clip_threshold=(
+                                        importance_ratio_outside_clip_threshold
+                                    ),
+                                )
+                                if gate_violations:
+                                    _persist_identity_gate_failure(
+                                        "threshold_violation",
+                                        {
+                                            "mean_abs_diff": logprob_diff_mean,
+                                            "max_abs_diff": logprob_diff_max,
+                                            "p99_abs_diff": logprob_diff_p99,
+                                            "importance_ratio_outside_clip_fraction": (
+                                                ratio_outside_clip_fraction
+                                            ),
+                                            "mean_threshold": mean_threshold,
+                                            "max_threshold": max_threshold,
+                                            "p99_threshold": p99_threshold,
+                                            "importance_ratio_outside_clip_threshold": (
+                                                importance_ratio_outside_clip_threshold
+                                            ),
+                                        },
+                                    )
+                                    violation_summary = ", ".join(
+                                        f"{name}={value:.6f} (limit={threshold:g})"
+                                        for name, value, threshold in gate_violations
+                                    )
+                                    raise RuntimeError(
+                                        "rollout/actor behavior-policy logprob identity gate failed; "
+                                        f"violations: {violation_summary}. Ensure vLLM uses "
+                                        "--logprobs-mode processed_logprobs and the exact "
+                                        "model/tokenizer/template/weights contract."
+                                    )
+
+                                if use_rollout_log_probs_as_old:
+                                    # PPO's denominator must be the probability
+                                    # emitted by the behavior backend that sampled
+                                    # the token. Actor recomputation remains an
+                                    # identity check, not a substitute for it.
+                                    batch.batch["old_log_probs"] = torch.where(
+                                        identity_mask,
+                                        rollout_old_log_probs.detach(),
+                                        actor_old_log_probs,
+                                    )
+                                    metrics[
+                                        "training/behavior_logprobs_from_rollout"
+                                    ] = 1.0
+                            elif (
+                                use_rollout_log_probs_as_old
+                                and torch.any(expected_onpolicy_behavior_mask)
+                            ):
+                                raise RuntimeError(
+                                    "use_rollout_log_probs_as_old=true but the batch "
+                                    "contains no valid rollout logprob tokens"
+                                )
+
+                        if "context_managed_prompt_tokens" in batch.batch.keys():
+                            raw_tokens = batch.batch["context_raw_prompt_tokens"].float()
+                            managed_tokens = batch.batch[
+                                "context_managed_prompt_tokens"
+                            ].float()
+                            valid_context = raw_tokens >= 0
+                            if torch.any(valid_context):
+                                raw_valid = raw_tokens[valid_context]
+                                managed_valid = managed_tokens[valid_context]
+                                metrics.update(
+                                    {
+                                        "context/raw_prompt_tokens_mean": raw_valid.mean().detach().item(),
+                                        "context/managed_prompt_tokens_mean": managed_valid.mean().detach().item(),
+                                        "context/managed_prompt_tokens_max": managed_valid.max().detach().item(),
+                                        "context/token_reduction_ratio_mean": (
+                                            1.0
+                                            - managed_valid
+                                            / raw_valid.clamp_min(1.0)
+                                        ).mean().detach().item(),
+                                        "context/dropped_turns_mean": batch.batch[
+                                            "context_dropped_turns"
+                                        ][valid_context].float().mean().detach().item(),
+                                        "context/clipped_observations_total": batch.batch[
+                                            "context_clipped_observations"
+                                        ][valid_context].sum().detach().item(),
+                                        "context/selected_decision_step_mean": batch.batch[
+                                            "context_selected_decision_step"
+                                        ][valid_context].float().mean().detach().item(),
+                                    }
+                                )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -3284,6 +4837,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                         teacher_task2trajectories=self.exp_manager.teacher_task2trajectories,
                                         env_type=str(self.config.env_service.env_type),
                                         match_mode=_sc_cfg.get("match_mode", "hash"),
+                                        match_dropout=float(_sc_cfg.get("match_dropout", 0.0) or 0.0),
+                                        soft_sim_threshold=float(_sc_cfg.get("soft_sim_threshold", 0.5) or 0.5),
+                                        obs_noise_p=float(_sc_cfg.get("obs_noise_p", 0.0) or 0.0),
+                                        shuffle_progress=bool(_sc_cfg.get("shuffle_progress", False)),
                                     )
                                 else:
                                     logger.warning(
@@ -3332,7 +4889,12 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
                                 _sc_env_type = str(self.config.env_service.env_type)
                                 _sc_task_ids = batch.non_tensor_batch.get("task_ids", None)
-                                _sc_messages = batch.non_tensor_batch.get("messages", None)
+                                # raw (pre-compression) observations: the progress map is
+                                # keyed on the environment's own text, which context
+                                # compression rewrites in "messages"
+                                _sc_messages = batch.non_tensor_batch.get("messages_raw", None)
+                                if _sc_messages is None:
+                                    _sc_messages = batch.non_tensor_batch.get("messages", None)
                                 _sc_bs = batch.batch["token_level_rewards"].shape[0]
 
                                 # Teacher exclusion: SC should help on-policy exploration, not inflate
@@ -3530,7 +5092,9 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             _sl_eta = float(_sc_step_cfg.get("eta", 0.1))
                             _sl_step_ids = batch.batch.get("step_ids", None)
                             _sl_task_ids = batch.non_tensor_batch.get("task_ids", None)
-                            _sl_messages = batch.non_tensor_batch.get("messages", None)
+                            _sl_messages = batch.non_tensor_batch.get("messages_raw", None)
+                            if _sl_messages is None:
+                                _sl_messages = batch.non_tensor_batch.get("messages", None)
 
                             if _sl_step_ids is not None and _sl_task_ids is not None and _sl_messages is not None:
                                 _sl_rewards = batch.batch["token_level_rewards"]
@@ -4088,6 +5652,101 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     if evaluator != 'env':
                                         batch.batch["advantages"][i] *= 0.5  # ⭐ Apply decay factor to synthetic data
 
+                    # A pure GRPO batch with exactly zero effective advantages
+                    # has no task learning signal.  Calling update_actor anyway
+                    # can move an initially actor==ref model through KL roundoff,
+                    # entropy regularization, or AdamW weight decay.  Decide on
+                    # the exact mask used by actor.update_policy and skip the RPC
+                    # entirely when the guard fires.
+                    actor_update_skipped_zero_advantage = False
+                    zero_advantage_guard_enabled = bool(
+                        self.config.actor_rollout_ref.actor.get(
+                            "skip_zero_advantage_grpo_update", False
+                        )
+                    )
+                    actor_update_allowed_by_warmup = (
+                        self.config.trainer.critic_warmup <= self.global_steps
+                    )
+                    metrics[
+                        "training/actor_zero_advantage_guard_enabled"
+                    ] = float(zero_advantage_guard_enabled)
+                    metrics[
+                        "training/actor_update_skipped_zero_advantage"
+                    ] = 0.0
+                    metrics[
+                        "training/actor_update_skipped_critic_warmup"
+                    ] = float(not actor_update_allowed_by_warmup)
+                    if actor_update_allowed_by_warmup:
+                        guard_advantages = batch.batch["advantages"]
+                        guard_response_length = guard_advantages.shape[-1]
+                        if self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                            guard_effective_mask = batch.batch["loss_mask"][
+                                :, -guard_response_length:
+                            ]
+                        else:
+                            guard_effective_mask = batch.batch["attention_mask"][
+                                :, -guard_response_length:
+                            ]
+                        (
+                            zero_advantage_skip_candidate,
+                            zero_advantage_guard_stats,
+                        ) = _should_skip_zero_advantage_grpo_actor_update(
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            advantages=guard_advantages,
+                            effective_mask=guard_effective_mask,
+                            exp_mask=batch.batch.get("exp_mask", None),
+                            teacher_mask=batch.batch.get("teacher_mask", None),
+                            zero_atol=0.0,
+                        )
+                        # Non-finite advantages are rejected by the helper for
+                        # every run. Only the semantic choice to skip an exactly
+                        # zero GRPO optimizer step is opt-in.
+                        actor_update_skipped_zero_advantage = (
+                            zero_advantage_guard_enabled
+                            and zero_advantage_skip_candidate
+                        )
+                        metrics.update(
+                            {
+                                "training/grpo_zero_advantage_guard_pure_batch": zero_advantage_guard_stats[
+                                    "is_pure_grpo"
+                                ],
+                                "training/effective_advantage_tokens": zero_advantage_guard_stats[
+                                    "effective_tokens"
+                                ],
+                                "training/effective_advantage_abs_max": zero_advantage_guard_stats[
+                                    "effective_advantage_abs_max"
+                                ],
+                                "training/actor_update_skipped_zero_advantage": float(
+                                    actor_update_skipped_zero_advantage
+                                ),
+                                "training/actor_zero_advantage_skip_candidate": float(
+                                    zero_advantage_skip_candidate
+                                ),
+                            }
+                        )
+                        if actor_update_skipped_zero_advantage:
+                            logger.warning(
+                                "skipping actor optimizer: pure GRPO batch has "
+                                "zero effective task advantage; global_step remains "
+                                "a consumed-batch counter and rollout weights remain current"
+                            )
+
+                    # ``global_steps`` counts consumed training batches, not
+                    # optimizer applications.  These metrics make a skipped
+                    # batch explicit; external rollout weights are marked stale
+                    # only in the actual update branch below.
+                    actor_update_applied = (
+                        actor_update_allowed_by_warmup
+                        and not actor_update_skipped_zero_advantage
+                    )
+                    metrics["training/actor_update_applied"] = float(
+                        actor_update_applied
+                    )
+                    if self.external_rollout_mode:
+                        metrics[
+                            "training/external_rollout_weights_marked_stale"
+                        ] = 0.0
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -4096,7 +5755,7 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if actor_update_applied:
                         # update actor
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
@@ -4109,6 +5768,13 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)  # ⭐ Update the actor with the new batch
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        # ⭐ external_vllm: mark rollout weights stale; next wake_up() syncs them
+                        if self.external_rollout_mode:
+                            self.async_rollout_manager.notify_weights_updated()
+                            metrics[
+                                "training/external_rollout_weights_marked_stale"
+                            ] = 1.0
 
                         # ------------------------------------------------------------------
                         # ⭐ Gradient-direction diagnostics (teacher vs on-policy)
@@ -4234,11 +5900,60 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
                         "training/num_not_none_traj": num_not_none_traj,
-                        "training/num_term_traj": num_term_traj
+                        "training/num_term_traj": num_term_traj,
+                        "rollout/malformed_action_count": num_malformed_action_traj,
                     }
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # Low-cardinality online behavior telemetry. These helpers
+                # inspect only aligned on-policy rows and emit additive counts
+                # alongside every fraction/mean, so both console and W&B can
+                # aggregate them without averaging unequal denominators.
+                try:
+                    env_params = getattr(
+                        self.config.env_service, "env_params", None
+                    )
+                    action_format = (
+                        getattr(env_params, "action_format", "react")
+                        if env_params is not None
+                        else "react"
+                    )
+                    metrics.update(
+                        _rollout_behavior_batch_diagnostics(
+                            messages=batch.non_tensor_batch.get(
+                                "messages", None
+                            ),
+                            sample_extras=batch.non_tensor_batch.get(
+                                "extras", None
+                            ),
+                            action_format=str(action_format),
+                        )
+                    )
+                except Exception as behavior_telemetry_error:
+                    logger.warning(
+                        "Failed to compute rollout behavior telemetry: "
+                        f"{behavior_telemetry_error}"
+                    )
+                try:
+                    metrics.update(
+                        _task_family_reward_batch_diagnostics(
+                            group_ids=batch.non_tensor_batch.get(
+                                "uid", None
+                            ),
+                            sample_extras=batch.non_tensor_batch.get(
+                                "extras", None
+                            ),
+                            sample_rewards=batch.batch.get(
+                                "token_level_scores", None
+                            ),
+                        )
+                    )
+                except Exception as family_telemetry_error:
+                    logger.warning(
+                        "Failed to compute task-family reward telemetry: "
+                        f"{family_telemetry_error}"
+                    )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # U1 fix (mid-term cleanup): track on-policy success EMA so that
@@ -4282,5 +5997,3 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                 assert isinstance(self.train_dataset._mixture_strategy,UnifiedMixtureStrategy)
                 self.train_dataset._mixture_strategy._synthetic_ratio-=1/5 # initial 1, 0 at about epoch 5 (about step 30)
             self.train_dataset.update()  # ⭐ Update the training dataset for the next iteration
-
-

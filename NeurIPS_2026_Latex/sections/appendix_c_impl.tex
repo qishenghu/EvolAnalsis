@@ -1,0 +1,153 @@
+% ============================================================================
+% Appendix: Implementation Details
+% ============================================================================
+
+\section{Implementation Details}
+\label{app:impl}
+
+This appendix provides implementation details for DUET beyond the main method description.
+We focus on algorithmic choices needed for reproducibility, and omit code-level configuration names.
+
+\subsection{Density-ratio discriminator}
+\label{app:disc}
+
+DUET estimates the teacher--student density ratio with a lightweight discriminator.
+The discriminator is a three-layer MLP with hidden width 64 and $\tanh$ activations.
+Its input consists of sequence-level features computed from each rollout, including summary statistics of token log-probabilities, low-probability tail ratios, KL-to-reference statistics, and response length.
+When high-dimensional hidden features are used, we first apply a LayerNorm projection with dropout before concatenating them with scalar features.
+
+The discriminator is trained with binary cross-entropy to distinguish on-policy samples from teacher-replay samples.
+Training batches are class-balanced between the two sources, and we use label smoothing with coefficient $0.1$.
+The optimizer is Adam with learning rate $3\times 10^{-4}$ and weight decay $0.005$.
+Discriminator examples are drawn from a rolling buffer of recent on-policy and teacher samples.
+To emphasize recent policy behavior while retaining stability, older samples are down-weighted exponentially by age and the weights are normalized to preserve the loss scale.
+
+We delay applying the density-ratio weights until the discriminator has accumulated a sufficient buffer of examples.
+Before this warmup completes, teacher samples are trained without DR3 weighting and behavior cloning remains at its cold-start strength.
+This avoids applying unreliable density-ratio estimates during the first few actor updates.
+
+For inference, we use a smoothed copy of the discriminator parameters to compute $\hat w$.
+This reduces short-term feedback between discriminator updates and the actor loss that consumes the resulting weights.
+We also apply a temperature to discriminator logits before converting them into density ratios, which prevents over-confident early predictions from producing unstable replay weights.
+
+\subsection{Replay-weight clipping and stabilization}
+\label{app:ratio_clip}
+
+The raw density-ratio estimate
+\[
+\hat w(s,a)=\frac{D_\phi(s,a)}{1-D_\phi(s,a)}
+\]
+can be noisy early in training.
+We therefore clip the effective teacher replay multiplier used in the actor loss.
+The clipping threshold is adapted to keep the effective sample size of teacher weights within a stable range.
+Concretely, we maintain a dual variable that increases when the effective sample size falls below a target fraction of the teacher batch and decreases otherwise.
+The resulting upper bound prevents a small number of teacher samples from dominating the policy-gradient update.
+
+In distributed training, discriminator features and labels are synchronized across workers before discriminator updates.
+The discriminator parameters and scalar statistics used by the actor loss are also synchronized across workers.
+This ensures that all ranks apply consistent replay weights and behavior-cloning coefficients.
+
+\subsection{Adaptive behavior-cloning coefficient}
+\label{app:bc_schedule}
+
+The behavior-cloning coefficient $\mu(t)$ is driven by discriminator accuracy rather than by a fixed step-indexed schedule.
+Let $\bar d_t$ be an exponential moving average of discriminator accuracy, and let $d_{\rm floor}$ denote the accuracy threshold below which the discriminator is treated as uninformative.
+We map discriminator accuracy to the BC coefficient with
+\begin{equation}
+g_t
+=
+\mathrm{clip}
+\left(
+\frac{1-\bar d_t}{1-d_{\rm floor}},
+0,
+1
+\right),
+\qquad
+\mu(t)
+=
+\mu_{\min}
++
+(\mu_{\max}-\mu_{\min})g_t .
+\label{eq:appendix_bc_schedule}
+\end{equation}
+Thus, BC remains strong while the discriminator is near chance and decays as the discriminator becomes informative.
+During discriminator warmup, we treat accuracy as chance-level so that $\mu(t)$ stays at $\mu_{\max}$.
+
+We use token-level cross-entropy on teacher trajectories as the BC objective.
+No additional token-level weighting is applied inside the BC loss, so $\mu(t)$ is the only coefficient controlling the strength of behavior cloning.
+The hyperparameters used in the 1.5B experiments are shown in Table~\ref{tab:bc_hparams}.
+
+\begin{table}[h]
+\centering
+\caption{
+\textbf{Adaptive BC hyperparameters.}
+$\mu_{\max}$ and $\mu_{\min}$ are the maximum and minimum BC coefficients.
+$d_{\rm floor}$ is the discriminator-accuracy threshold used in Eq.~\eqref{eq:appendix_bc_schedule}.
+}
+\label{tab:bc_hparams}
+\begin{tabular}{lcccc}
+\toprule
+Setting & $\mu_{\max}$ & $\mu_{\min}$ & $d_{\rm floor}$ & EMA decay \\
+\midrule
+1.5B-ALFWorld & 0.30 & 0.05 & 0.40 & 0.50 \\
+1.5B-WebShop  & 0.30 & 0.10 & 0.60 & 0.20 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{State Channel implementation}
+\label{app:state_channel_impl}
+
+The State Channel builds a progress potential $\Phi$ from successful teacher trajectories.
+For each teacher trajectory, observations are assigned normalized progress values according to their relative position in the trajectory.
+These values are aggregated across the teacher cache to form a map from environment states to progress scores in $[0,1]$.
+States that cannot be matched to the teacher cache receive progress value $0$.
+
+State matching is environment dependent.
+For ALFWorld, observations are represented with a compact state key derived from the text observation.
+For WebShop, the state key additionally uses product and attribute information, since progress depends on matching user-specified constraints such as product type, brand, price, and other attributes.
+This makes the progress map more robust to surface-form variation in WebShop observations.
+
+For an on-policy trajectory $\tau=(s_0,a_0,\ldots,s_T)$, the progress score is the mean potential over visited states:
+\begin{equation}
+P(\tau)
+=
+\frac{1}{T+1}\sum_{t=0}^{T}\Phi(s_t).
+\label{eq:appendix_progress_score}
+\end{equation}
+We use $\lambda=0.20$ for the shaping coefficient and add the bonus $\lambda P(\tau)$ to the trajectory reward.
+The bonus is applied only to on-policy rollouts.
+Teacher trajectories keep their original success reward, since adding progress bonuses to already-successful teacher samples would increase their advantages and partially counteract DR3.
+
+The State Channel bonus is added to the on-policy reward used by the policy-gradient update, but it is not used to shift the teacher baseline.
+This keeps state-level shaping separate from the Action Channel correction.
+
+\subsection{Asymmetric baseline separation}
+\label{app:baseline_sep_impl}
+
+DUET uses the asymmetric baseline rule described in Section~\ref{sec:action_channel}.
+For on-policy samples, the reward baseline is the mean reward of the on-policy subgroup:
+\begin{equation}
+\hat A^{o,(i)}
+=
+\frac{R^{o,(i)}-\mu^o}{\sigma^o}.
+\label{eq:appendix_on_policy_adv}
+\end{equation}
+For teacher samples, the baseline is the pooled group mean:
+\begin{equation}
+\hat A^{\beta,(i)}
+=
+\frac{R^{\beta,(i)}-\mu_{\rm pool}}{\sigma^o}.
+\label{eq:appendix_teacher_adv}
+\end{equation}
+Both subgroups are scaled by the on-policy standard deviation $\sigma^o$.
+This choice avoids the zero-variance problem caused by success-filtered teacher batches, where all teacher rewards are often identical.
+It also ensures that teacher rewards do not shift the on-policy baseline, while teacher samples still receive positive advantage when the student is weak.
+
+\subsection{Training system}
+\label{app:software}
+
+Training uses a distributed PPO-style RL loop with fully sharded data-parallel policy training.
+Rollout generation is served asynchronously, and environment interaction is parallelized across separate actor pools.
+The student policy, rollout workers, discriminator, and reward computation are synchronized once per actor update.
+All methods in the main experiments use the same training infrastructure, teacher cache, optimization budget, and evaluation protocol.

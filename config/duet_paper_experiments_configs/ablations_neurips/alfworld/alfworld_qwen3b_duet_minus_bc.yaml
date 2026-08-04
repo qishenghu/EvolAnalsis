@@ -42,7 +42,7 @@ algorithm:
       soft_penalty_mode: additive
 actor_rollout_ref:
   model:
-    path: /mnt/workspace/qisheng/HLE_QA_workflow/EvolAnalsis/models/Qwen/Qwen2.5-3B-Instruct
+    path: /data/shared_models/Qwen2.5-3B-Instruct
     use_remove_padding: true
     enable_gradient_checkpointing: true
   actor:

@@ -1,0 +1,62 @@
+% Appendix B: Hyperparameter sensitivity for the adaptive cold-start coefficient mu(t)
+% Source: 1.5B-WebShop sweep (analysis_reports/1.5b_master_experiment_table.md, swC_02 family).
+% Single seed; val@100 strict success rate over 200 tasks; locked infrastructure.
+% Anchor cell (SOTA, bold): peak=0.30, valley=0.10, d_floor=0.6, ema_alpha=0.2.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Variant & $\mu_{\max}$ & $\mu_{\min}$ & $d_{\text{floor}}$ & val@100 SR \\
+\midrule
+\multicolumn{5}{l}{\textit{Vary $d_{\text{floor}}$ (peak=0.30, valley=0.10, $\alpha$=0.2)}} \\
+\midrule
+swC\_01 (early cliff)        & 0.30 & 0.10 & 0.4 & \phantom{0}2.0\% \\
+swB\_01 (default cliff)      & 0.30 & 0.10 & 0.5 & 21.5\% \\
+\textbf{swC\_02 (SOTA)}      & \textbf{0.30} & \textbf{0.10} & \textbf{0.6} & \textbf{36.0\%} \\
+\midrule
+\multicolumn{5}{l}{\textit{Vary $\mu_{\min}$ (peak=0.30, $d_{\text{floor}}$=0.5, $\alpha$=0.2)}} \\
+\midrule
+swA\_07 ($\mu_{\min}$=0.05)  & 0.30 & 0.05 & 0.5 & \phantom{0}5.5\% \\
+swB\_01 ($\mu_{\min}$=0.10)  & 0.30 & 0.10 & 0.5 & 21.5\% \\
+swC\_03 ($\mu_{\min}$=0.12)  & 0.30 & 0.12 & 0.5 & 13.5\% \\
+swB\_02 ($\mu_{\min}$=0.15)  & 0.30 & 0.15 & 0.5 & \phantom{0}2.0\% \\
+\midrule
+\multicolumn{5}{l}{\textit{Vary $\mu_{\max}$ (valley=0.05, $d_{\text{floor}}$=0.5, $\alpha$=0.5)}} \\
+\midrule
+swA\_02 ($\mu_{\max}$=0.20)  & 0.20 & 0.05 & 0.5 & 15.0\% \\
+swA\_01 ($\mu_{\max}$=0.30)  & 0.30 & 0.05 & 0.5 & \phantom{0}3.0\% \\
+swA\_03 ($\mu_{\max}$=0.40)  & 0.40 & 0.05 & 0.5 & \phantom{0}5.5\% \\
+\bottomrule
+\end{tabular}
+\caption{Hyperparameter sensitivity of the adaptive BC coefficient $\mu(t)$ on
+1.5B-WebShop (val@100 strict success rate, 200 evaluation tasks,
+100 training steps, identical locked infrastructure across all rows). Each
+block isolates one knob around a fixed companion setting. The SOTA cell
+(\textbf{swC\_02}) achieves 36.0\% strict SR at
+$(\mu_{\max},\mu_{\min},d_{\text{floor}})=(0.30,0.10,0.6)$.}
+\label{tab:app-mu-sensitivity}
+\end{table}
+
+% --- Discussion paragraph (LaTeX-ready) ---
+
+\paragraph{Sensitivity discussion.}
+The mini-sweep in Table~\ref{tab:app-mu-sensitivity} shows that the $\mu(t)$
+schedule is genuinely sensitive on 1.5B-WebShop, especially to
+$d_{\text{floor}}$: dropping it from $0.6$ to $0.5$ roughly halves strict
+success ($36.0\%\!\rightarrow\!21.5\%$), and dropping it to $0.4$ collapses
+it ($2.0\%$). The valley $\mu_{\min}$ has an interior optimum near $0.10$:
+$0.05$ loses the late-training anchor ($5.5\%$) and $0.15$ over-regularizes
+($2.0\%$). The peak $\mu_{\max}$ is flatter between $0.20$ and $0.40$,
+suggesting that peak \emph{duration} (controlled by $d_{\text{floor}}$)
+matters more than peak height. The substantive conclusion is that
+1.5B-WebShop is sensitive to the duration of the BC safety net, especially
+$d_{\text{floor}}$, which is consistent with our framing of BC as a
+cold-start safety mechanism rather than a theoretically calibrated quantity.
+The companion settings also differ across blocks (in particular the
+$\mu_{\max}$ block uses $\mu_{\min}=0.05$ because no clean single-knob
+$\mu_{\max}$ sweep was run at the SOTA companion setting). We do not claim
+that the schedule is hyperparameter-free or that the SOTA cell sits inside a
+wide flat region; the table is a robustness landscape, not a precise
+response surface.

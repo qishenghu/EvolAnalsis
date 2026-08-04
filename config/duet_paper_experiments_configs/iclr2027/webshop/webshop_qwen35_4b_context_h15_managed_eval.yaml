@@ -1,0 +1,49 @@
+# Controlled long-horizon validation canary.  This arm uses the production
+# WebShop context policy (four recent turns, 512-token old observations).
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - /duet_paper_experiments_configs/iclr2027/webshop/webshop_qwen35_4b_grpo_snapshot_gate@_global_
+  - _self_
+
+trainer:
+  experiment_name: webshop_qwen35_4b_context_h15_managed_eval_v4_serial
+  val_before_train: true
+  val_only: true
+  resume_mode: disable
+  validation_data_dir: experiments/webshop/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/webshop/${trainer.experiment_name}/rollout_log
+
+actor_rollout_ref:
+  rollout:
+    # The causal A/B is serialized onto one replica.  Greedy GPU execution can
+    # otherwise diverge when the same prompt is co-batched with a different
+    # set of requests, invalidating the pre-treatment identity check.
+    external_server_addresses:
+      - 127.0.0.1:8211
+    max_env_worker: 1
+    max_trajectory_resubmits: 0
+    val_kwargs:
+      n: 1
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      do_sample: false
+      seed: 2025
+    multi_turn:
+      max_steps: 15
+
+data:
+  max_val_tasks: 16
+  validation_shuffle: false
+  val_batch_size: 1
+  dataloader_num_workers: 0
+
+thread_pool:
+  max_workers: 1
+
+task_manager:
+  env_profile: cookbook/env_profiles/webshop.json

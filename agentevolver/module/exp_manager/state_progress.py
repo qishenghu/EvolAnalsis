@@ -631,9 +631,39 @@ class ExpertProgressMap:
         teacher_task2trajectories: Dict[str, list],
         env_type: str = "alfworld",
         match_mode: str = "hash",
+        match_dropout: float = 0.0,
+        soft_sim_threshold: float = 0.5,
+        obs_noise_p: float = 0.0,
+        shuffle_progress: bool = False,
     ):
         self.env_type = env_type
         self.match_mode = match_mode
+        # Rebuttal diagnostics (NeurIPS 2026), all default-off = paper behavior:
+        # - match_dropout: deterministically remove a fraction of teacher state
+        #   keys at build time (md5-hashed so all ranks build identical maps).
+        # - obs_noise_p: word-level dropout applied to the observation seen by
+        #   the MATCHER only (policy input untouched), simulating noisy/partial
+        #   observations where exact matching breaks. Deterministic per string.
+        # - match_mode "soft": TF-IDF cosine similarity matching over the same
+        #   teacher state map (exact-hit fast path first); returns the progress
+        #   of the best match above soft_sim_threshold, else 0.
+        # - shuffle_progress: permute the progress values among a task's own state
+        #   keys. Hit rate, the value distribution, and hence the magnitude of the
+        #   shaping bonus are all preserved; only the correspondence between a state
+        #   and how far along it is gets destroyed. This is the matched-magnitude
+        #   control asked for by reviewer y9x6 ("is the gain from the teacher-derived
+        #   progress map, or just from a dense bonus of this size?").
+        self.match_dropout = float(match_dropout or 0.0)
+        self.soft_sim_threshold = float(soft_sim_threshold or 0.5)
+        self.obs_noise_p = float(obs_noise_p or 0.0)
+        self.shuffle_progress = bool(shuffle_progress)
+        # task_id -> [(token->tfidf_weight, vector_norm, progress)]
+        self._soft_profiles: Dict[str, list] = {}
+        # task_id -> (token->idf, default_idf_for_unseen_tokens)
+        self._soft_idf: Dict[str, tuple] = {}
+        # value >= 0: matched progress; value < 0: cached miss
+        self._soft_cache: Dict[Tuple[str, str], float] = {}
+        self._soft_last_matched: bool = False
         # task_id -> {normalized_obs_string -> progress_float}
         self.progress_maps: Dict[str, Dict[str, float]] = {}
         # For stage mode: just track which task_ids have teacher data
@@ -690,6 +720,24 @@ class ExpertProgressMap:
                     progress_map[obs] = max(progress_map.get(obs, 0.0), progress)
                 total_states += T
 
+            if self.match_dropout > 0.0 and progress_map:
+                import hashlib
+                thresh = int(self.match_dropout * 10000)
+                progress_map = {
+                    obs: p for obs, p in progress_map.items()
+                    if int(hashlib.md5(f"scdrop|{task_id}|{obs}".encode()).hexdigest(), 16) % 10000 >= thresh
+                }
+
+            if self.shuffle_progress and len(progress_map) > 1:
+                import hashlib
+                import random
+                # Seeded per task so every rank builds the identical permutation.
+                seed = int(hashlib.md5(f"scshuf|{task_id}".encode()).hexdigest()[:8], 16)
+                keys = sorted(progress_map)
+                vals = [progress_map[k] for k in keys]
+                random.Random(seed).shuffle(vals)
+                progress_map = dict(zip(keys, vals))
+
             if progress_map:
                 self.progress_maps[task_id] = progress_map
                 total_tasks += 1
@@ -699,7 +747,38 @@ class ExpertProgressMap:
             f"[State Channel] Built ExpertProgressMap: "
             f"{total_tasks} tasks, {total_states} total expert observations, "
             f"{total_keys} unique state keys"
+            + (f" (match_dropout={self.match_dropout:.2f} applied)" if self.match_dropout > 0 else "")
         )
+
+        if self.match_mode == "soft":
+            import math
+            from collections import Counter
+            for task_id, pmap in self.progress_maps.items():
+                df: Dict[str, int] = {}
+                toks_list = []
+                for obs, prog in pmap.items():
+                    toks = Counter(obs.split())
+                    toks_list.append((toks, prog))
+                    for tok in toks:
+                        df[tok] = df.get(tok, 0) + 1
+                n_docs = max(len(toks_list), 1)
+                idf = {t: math.log((n_docs + 1) / (c + 1)) + 1.0 for t, c in df.items()}
+                default_idf = math.log(n_docs + 1) + 1.0  # tokens never seen in this task
+                profiles = []
+                for toks, prog in toks_list:
+                    weighted = {t: c * idf[t] for t, c in toks.items()}
+                    norm = math.sqrt(sum(v * v for v in weighted.values()))
+                    if norm > 0:
+                        profiles.append((weighted, norm, prog))
+                self._soft_profiles[task_id] = profiles
+                self._soft_idf[task_id] = (idf, default_idf)
+            logger.info(
+                f"[State Channel] soft mode: TF-IDF profiles built for "
+                f"{len(self._soft_profiles)} tasks "
+                f"(threshold={self.soft_sim_threshold}, obs_noise_p={self.obs_noise_p})"
+            )
+        elif self.obs_noise_p > 0:
+            logger.info(f"[State Channel] obs_noise_p={self.obs_noise_p} active (matcher-side only)")
 
     # ------------------------------------------------------------------
     # Core lookups
@@ -725,6 +804,87 @@ class ExpertProgressMap:
             return True
         return task_id in self.progress_maps
 
+    def _apply_obs_noise(self, obs: str) -> str:
+        """Word-level dropout on the matcher's view of the observation.
+
+        Deterministic per input string (md5-seeded) so results are reproducible
+        and identical across ranks. The policy never sees this corruption.
+        """
+        import hashlib
+        import random
+        seed = int(hashlib.md5(("obsnoise|" + obs).encode()).hexdigest()[:8], 16)
+        rng = random.Random(seed)
+        kept = [w for w in obs.split() if rng.random() >= self.obs_noise_p]
+        return " ".join(kept) if kept else obs
+
+    def _soft_potential(self, task_id: str, observation: str) -> float:
+        """Best TF-IDF cosine match against the task's teacher states.
+
+        Sets `_soft_last_matched` so callers can distinguish "matched, progress
+        happens to be 0.0" from "no candidate above threshold".
+        """
+        import math
+        from collections import Counter
+        self._soft_last_matched = False
+        profiles = self._soft_profiles.get(task_id)
+        if not profiles:
+            return 0.0
+        idf, default_idf = self._soft_idf.get(task_id, ({}, 1.0))
+        q = Counter(observation.split())
+        # True TF-IDF cosine: query weighted with the same per-task idf.
+        # Tokens unseen in this task's teacher states get max idf — they cannot
+        # match any candidate, so they only penalize similarity (novel states
+        # stay below threshold).
+        q_w = {t: c * idf.get(t, default_idf) for t, c in q.items()}
+        q_norm = math.sqrt(sum(v * v for v in q_w.values()))
+        if q_norm == 0:
+            return 0.0
+        best_sim, best_prog = 0.0, 0.0
+        for weighted, norm, prog in profiles:
+            dot = 0.0
+            for t, w in q_w.items():
+                cw = weighted.get(t)
+                if cw is not None:
+                    dot += w * cw
+            sim = dot / (q_norm * norm)
+            if sim > best_sim:
+                best_sim, best_prog = sim, prog
+        if best_sim >= self.soft_sim_threshold:
+            self._soft_last_matched = True
+            return best_prog
+        self._soft_last_matched = False
+        return 0.0
+
+    def _lookup(self, task_id: str, observation: str) -> Optional[float]:
+        """Map-based lookup. Returns None on a MISS.
+
+        Progress 0.0 is a legitimate value (the first state of a trajectory), so
+        callers must not use `> 0` as a hit test. Both get_potential() and the
+        coverage diagnostics go through here, which keeps the reported coverage
+        consistent with the matching operator actually in use (exact vs soft,
+        with or without observation noise).
+        """
+        pmap = self.progress_maps.get(task_id)
+        if pmap is None:
+            return None
+        if self.obs_noise_p > 0.0:
+            observation = self._apply_obs_noise(observation)
+        hit = pmap.get(observation)
+        if hit is not None:
+            return hit
+        if self.match_mode != "soft":
+            return None
+        key = (task_id, observation)
+        cached = self._soft_cache.get(key)
+        if cached is not None:
+            return None if cached < 0.0 else cached
+        val = self._soft_potential(task_id, observation)  # 0.0 also means "no match"
+        matched = self._soft_last_matched
+        if len(self._soft_cache) > 500_000:
+            self._soft_cache.clear()
+        self._soft_cache[key] = val if matched else -1.0
+        return val if matched else None
+
     def get_potential(self, task_id: str, observation: str) -> float:
         """Φ(s): return the state progress value in [0, 1], or 0.0 if unmatched."""
         if self.match_mode == "stage":
@@ -738,10 +898,8 @@ class ExpertProgressMap:
         if self.match_mode == "sciworld_stage":
             task_type = self._task_type_map.get(task_id, "generic")
             return sciworld_stage_potential(observation, task_type)
-        pmap = self.progress_maps.get(task_id)
-        if pmap is None:
-            return 0.0
-        return pmap.get(observation, 0.0)
+        val = self._lookup(task_id, observation)
+        return 0.0 if val is None else val
 
     def compute_trajectory_progress(
         self, task_id: str, observations: List[str],
@@ -793,9 +951,12 @@ class ExpertProgressMap:
             # Stage/attribute_aware/sciworld_stage mode: every observation is classified
             matched = len(observations) if self.has_task(task_id) else 0
         else:
-            pmap = self.progress_maps.get(task_id, {})
-            # Check key existence (not > 0) since the first state has progress=0.0
-            matched = sum(1 for obs in observations if obs in pmap)
+            # Goes through the same lookup path as get_potential (honours the
+            # active matching operator and any observation noise), and treats a
+            # progress of 0.0 as a hit — the first state of a trajectory has
+            # progress 0.0.
+            matched = sum(1 for obs in observations
+                          if self._lookup(task_id, obs) is not None)
         return {
             "coverage": matched / len(observations),
             "matched": matched,

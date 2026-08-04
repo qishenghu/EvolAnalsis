@@ -60,6 +60,11 @@ class Sample(BaseModel):
     rollout_id: str = 0
     minor_index_id: int = 0
     messages: List[dict] = []
+    # Pre-compression view of the same turns. Context management rewrites
+    # `messages` (that is what the policy conditions on and what we train
+    # over), but the State Channel keys its progress map off the *original*
+    # observation text, so it must not see the rewritten version.
+    messages_raw: List[dict] = []
     extras: Dict[str, Any] = {}
     input_ids: List[int] = None
     prompt_ids: List[int] = None

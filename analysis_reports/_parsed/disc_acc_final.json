@@ -1,0 +1,99 @@
+{
+  "mappings": {
+    "linear_floor_0.3": {
+      "pearson_r": 0.9092555355796293,
+      "mae_vs_target": 0.014167428571428563,
+      "at_step1": 0.3,
+      "at_step10": 0.12257142857142854,
+      "at_step25": 0.05,
+      "at_step50": 0.05,
+      "at_step100": 0.05
+    },
+    "linear_floor_0.5": {
+      "pearson_r": 0.9745045908393513,
+      "mae_vs_target": 0.0066452,
+      "at_step1": 0.3,
+      "at_step10": 0.17159999999999995,
+      "at_step25": 0.05760000000000005,
+      "at_step50": 0.05,
+      "at_step100": 0.05
+    },
+    "linear_floor_0.7": {
+      "pearson_r": 0.9645419295773566,
+      "mae_vs_target": 0.012367999999999999,
+      "at_step1": 0.3,
+      "at_step10": 0.28599999999999987,
+      "at_step25": 0.09600000000000007,
+      "at_step50": 0.05,
+      "at_step100": 0.05
+    },
+    "percentile": {
+      "pearson_r": 0.9719363397456535,
+      "mae_vs_target": 0.011375244534172171,
+      "at_step1": 0.3,
+      "at_step10": 0.21541856425184275,
+      "at_step25": 0.10391098173623177,
+      "at_step50": 0.055082398234658894,
+      "at_step100": 0.05559102931280023
+    }
+  },
+  "alf_self_adjust": {
+    "ws_v24": {
+      "disc_acc_mean": 0.9013333333333335,
+      "disc_acc_step25": 0.9039999999999999,
+      "disc_acc_step100": 0.9863333333333334,
+      "implied_mu_mean": 0.08062440000000004,
+      "implied_mu_step25": 0.05760000000000005,
+      "implied_mu_step100": 0.05
+    },
+    "ws_v1": {
+      "disc_acc_mean": 0.8461341666666666,
+      "disc_acc_step25": 0.7228,
+      "disc_acc_step100": 0.9876666666666667,
+      "implied_mu_mean": 0.09913200000000005,
+      "implied_mu_step25": 0.16632,
+      "implied_mu_step100": 0.05
+    },
+    "ws_v12": {
+      "disc_acc_mean": 0.8217471666666666,
+      "disc_acc_step25": 0.7076,
+      "disc_acc_step100": 0.8996666666666666,
+      "implied_mu_mean": 0.10572900000000002,
+      "implied_mu_step25": 0.17543999999999998,
+      "implied_mu_step100": 0.06020000000000003
+    },
+    "ws_v36": {
+      "disc_acc_mean": 0.8782668333333334,
+      "disc_acc_step25": 0.7698,
+      "disc_acc_step100": 0.9963333333333333,
+      "implied_mu_mean": 0.09001800000000004,
+      "implied_mu_step25": 0.13811999999999997,
+      "implied_mu_step100": 0.05
+    },
+    "ws_v38": {
+      "disc_acc_mean": 0.8184228333333333,
+      "disc_acc_step25": 0.7050000000000001,
+      "disc_acc_step100": 0.9663333333333334,
+      "implied_mu_mean": 0.10724320000000004,
+      "implied_mu_step25": 0.17699999999999996,
+      "implied_mu_step100": 0.05
+    },
+    "alf_v24": {
+      "disc_acc_mean": 0.9105911666666667,
+      "disc_acc_step25": 0.9642,
+      "disc_acc_step100": 0.9996666666666667,
+      "implied_mu_mean": 0.07962960000000002,
+      "implied_mu_step25": 0.05,
+      "implied_mu_step100": 0.05
+    },
+    "alf_v1": {
+      "disc_acc_mean": 0.9029010000000001,
+      "disc_acc_step25": 0.8632,
+      "disc_acc_step100": 1.0,
+      "implied_mu_mean": 0.0782732,
+      "implied_mu_step25": 0.08208000000000001,
+      "implied_mu_step100": 0.05
+    }
+  },
+  "ws_sanity": {}
+}

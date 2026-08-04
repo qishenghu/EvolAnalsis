@@ -33,6 +33,13 @@ class SimpleCompletionCallback(CompletionCallback):
             return []
         return [TokenAndProb(token) for token in content]
 
+    @staticmethod
+    def _finish_reason_value(value: Any) -> str | None:
+        """Return the wire value while tolerating enum-like SDK objects."""
+        if value is None:
+            return None
+        return str(getattr(value, "value", value))
+
     def _should_use_react_tags(self) -> bool:
         env_params = getattr(self.config.env_service, "env_params", None)
         if env_params is None:
@@ -59,29 +66,39 @@ class SimpleCompletionCallback(CompletionCallback):
         if "content" not in message:
             message["content"] = ""
 
-        finish_reason = getattr(choice, "finish_reason", None)
+        finish_reason = self._finish_reason_value(
+            getattr(choice, "finish_reason", None)
+        )
+        # ``length`` is a completed rollout event, not a transport error.  Keep
+        # the partial token stream exactly as returned and let the environment
+        # score the (normally malformed/incomplete) action as a failure.
+        truncated_by_length = finish_reason == "length"
         stop_reason = getattr(choice, "stop_reason", None)
         original_content = message["content"]
+        tokens = self._extract_tokens(choice)
+        if original_content == "" or not tokens:
+            raise RuntimeError(
+                "rollout returned an empty completion or omitted per-token IDs/logprobs; "
+                "refusing to fabricate a trainable assistant turn"
+            )
         message["content"] = self._maybe_close_action_tag(message["content"], stop_reason)
-        if message["content"] == "" or finish_reason != "stop":
+        if finish_reason != "stop":
             logger.warning(str(finish_reason))
-            logger.bind(bad_case=True).error('empty content or non-stop finish reason')
+            logger.bind(bad_case=True).error('non-stop finish reason')
             logger.bind(bad_case=True).error(str(choice))
-            if message["content"] == "":
-                # Preserve the assistant turn so the caller never falls back
-                # to the previous user message when stop handling is unusual.
-                message["content"] = "im_end"
 
         t = {
             "role": message["role"],
             "request_id": completions.id,
             "content": message["content"],
+            # Content before deterministic environment-facing stop-tag repair.
+            # This text and ``tokens`` describe the same sampled event.
+            "sampled_content": original_content,
             "finish_reason": finish_reason,
+            "truncated_by_length": truncated_by_length,
             "stop_reason": stop_reason,
         }
-        tokens = [] if message["content"] != original_content else self._extract_tokens(choice)
-        if tokens:
-            t["tokens"] = tokens
+        t["tokens"] = tokens
         messages.append(t)
 
     def postprocess(self, batch: DataProto, batch_conversations: List[List[Dict[str, str]]], n: int) -> DataProto:

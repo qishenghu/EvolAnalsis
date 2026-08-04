@@ -1,0 +1,32 @@
+% ============================================================================
+% Ablation Table — Full component ablations
+% All four DUET components ablated at 1.5B scale (val@100, 200 eval tasks).
+% ============================================================================
+
+\begin{table}[t]
+\centering
+\caption{\textbf{Component ablations (1.5B).} Each row removes one DUET component while keeping all others at the full DUET configuration; val@$100$ strict success rate on $200$ evaluation tasks. The rightmost column shows the marginal contribution $\Delta$ averaged across environments. Baseline separation is universally critical; the State Channel and DR3 are both important but environment-dependent, with SC contributing more on ALFWorld and DR3 more on WebShop.}
+\label{tab:ablation}
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.02}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Variant} & \textbf{Component removed} & \textbf{1.5B-AF} & \textbf{1.5B-WS} & \textbf{Avg.\ $\Delta$} \\
+\midrule
+\rowcolor{gray!12}
+\textbf{DUET (full)}    & ---                       & \textbf{47.5\%}          & \textbf{36.0\%}          & ---          \\
+\midrule
+w/o baseline sep.\ & Advantage normalization    & \phantom{0}0.0\%$^\star$ & \phantom{0}0.0\%$^\star$ & $-$41.8\,pp  \\
+w/o DR3 weighting  & Density-ratio correction   & 47.5\%                   & \phantom{0}9.5\%         & $-$13.3\,pp  \\
+w/o State Channel  & Progress reward shaping    & 31.0\%                   & \phantom{0}1.0\%         & $-$25.8\,pp  \\
+w/o BC             & Cold-start imitation       & 34.0\%                   & 16.5\%                   & $-$16.5\,pp  \\
+\midrule
+OnPolicy GRPO      & (no teacher data)          & \phantom{0}1.0\%         & \phantom{0}0.5\%         & ---          \\
+\bottomrule
+\end{tabular}
+\vspace{2pt}
+
+\raggedright
+\footnotesize
+$^\star$ Both 1.5B settings collapse to $0\%$ within the first $\sim 30$ training steps when baseline separation is removed.
+\end{table}

@@ -34,7 +34,9 @@ class EnvClient:
         Returns:
             Dict: The JSON response from the API.
         """
-        url = f"{self.base_url}/{endpoint}"  # ⭐ Constructs the full URL for the request
+        # endpoint may or may not carry a leading slash; urllib3 2.7+ no longer
+        # collapses the resulting "//path", which the env service 404s on.
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"  # ⭐ Constructs the full URL for the request
         data = {
             "env_type": env_type,
             "task_id": task_id,

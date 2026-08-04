@@ -7,12 +7,26 @@ via vLLM inference engine (Qwen, Llama, DeepSeek, Mistral, etc.)
 Also provides the factory function create_teacher_llm() for creating Teacher LLM instances.
 """
 
+import os
 import threading
 from typing import List, Dict, Any, Optional, Tuple
 
 from loguru import logger
+from transformers import PreTrainedTokenizerBase
 
 from .base_teacher_llm import BaseTeacherLLM
+
+
+if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):
+    setattr(
+        PreTrainedTokenizerBase,
+        "all_special_tokens_extended",
+        property(
+            lambda self: self.convert_ids_to_tokens(self.all_special_ids)
+            if not hasattr(self, "_cached_special_tokens_extended")
+            else self._cached_special_tokens_extended
+        ),
+    )
 
 
 class VLLMTeacherLLM(BaseTeacherLLM):
@@ -103,15 +117,90 @@ class VLLMTeacherLLM(BaseTeacherLLM):
         
         # ⭐ 添加线程锁保护 vLLM 调用（vLLM 在高并发下可能不是完全线程安全的）
         self._llm_lock = threading.Lock()
+
+        # Micro-batching. The lock above serializes generation, and each caller
+        # passes a single prompt, so with N worker threads vLLM still decodes one
+        # sequence at a time — the GPU runs at a small fraction of its throughput.
+        # When VLLM_TEACHER_MICROBATCH > 1, callers instead park their prompt on a
+        # queue; whichever thread acquires the lock drains up to that many pending
+        # prompts and issues ONE llm.generate([...]) for all of them, then hands
+        # each result back to its owner. Same lock, same thread-safety property,
+        # just a batched call. Set to 1 (or unset) for the original behaviour.
+        self._microbatch = int(os.environ.get("VLLM_TEACHER_MICROBATCH", "1"))
+        self._mb_wait_s = float(os.environ.get("VLLM_TEACHER_MICROBATCH_WAIT", "0.05"))
+        self._mb_pending: "list" = []
+        self._mb_cv = threading.Condition()
+        if self._microbatch > 1:
+            logger.info(f"[VLLMTeacherLLM] micro-batching enabled: up to "
+                        f"{self._microbatch} prompts per generate() call")
         
         logger.info(f"[VLLMTeacherLLM] Initialized with model={model_path}, "
                    f"tp={tensor_parallel_size}, gpu_mem={gpu_memory_utilization}, "
                    f"max_num_seqs={max_num_seqs}, enforce_eager=True (disabled CUDA Graph for multi-GPU stability), "
                    f"collect_log_prob={collect_log_prob}")
     
+    def _generate_microbatched(self, prompt, sampling_params):
+        """Park this prompt and let one thread issue a batched generate() for all
+        pending prompts. Returns this caller's own RequestOutput.
+
+        Only one thread ever calls llm.generate at a time (same guarantee the
+        plain lock gives), but it carries up to `_microbatch` sequences, so vLLM
+        can decode them together instead of one at a time.
+        """
+        slot = {"prompt": prompt, "params": sampling_params, "out": None, "err": None}
+        with self._mb_cv:
+            self._mb_pending.append(slot)
+
+        while True:
+            # Try to become the batch leader.
+            if self._llm_lock.acquire(timeout=self._mb_wait_s):
+                try:
+                    with self._mb_cv:
+                        if slot["out"] is not None or slot["err"] is not None:
+                            batch = []            # someone else already served us
+                        else:
+                            batch = self._mb_pending[: self._microbatch]
+                            self._mb_pending = self._mb_pending[len(batch):]
+                    if batch:
+                        # One generate() for the whole batch. Sampling params are
+                        # identical across teacher-collection callers; if a caller
+                        # ever differs, fall back to per-slot calls.
+                        same = all(s["params"] is batch[0]["params"]
+                                   or (s["params"].temperature == batch[0]["params"].temperature
+                                       and s["params"].max_tokens == batch[0]["params"].max_tokens)
+                                   for s in batch)
+                        try:
+                            if same:
+                                outs = self.llm.generate([s["prompt"] for s in batch], batch[0]["params"])
+                                # vLLM returns outputs in input order; if that ever
+                                # stops holding, results would be silently misrouted
+                                # between threads, so verify the count first.
+                                if len(outs) != len(batch):
+                                    raise RuntimeError(
+                                        f"vLLM returned {len(outs)} outputs for {len(batch)} prompts")
+                                for s, o in zip(batch, outs):
+                                    s["out"] = o
+                            else:
+                                for s in batch:
+                                    s["out"] = self.llm.generate([s["prompt"]], s["params"])[0]
+                        except Exception as e:                      # noqa: BLE001
+                            for s in batch:
+                                s["err"] = e
+                        with self._mb_cv:
+                            self._mb_cv.notify_all()
+                finally:
+                    self._llm_lock.release()
+
+            with self._mb_cv:
+                if slot["out"] is not None:
+                    return slot["out"]
+                if slot["err"] is not None:
+                    raise slot["err"]
+                self._mb_cv.wait(timeout=self._mb_wait_s)
+
     def __call__(
-        self, 
-        messages: List[Dict[str, str]], 
+        self,
+        messages: List[Dict[str, str]],
         **kwargs
     ) -> Tuple[str, Optional[Dict]]:
         """
@@ -142,8 +231,11 @@ class VLLMTeacherLLM(BaseTeacherLLM):
             # ⭐ 使用锁保护 vLLM 调用（确保线程安全）
             # 注意：虽然这会降低并发性能，但可以避免 vLLM 内部状态冲突
             # vLLM 的 generate() 在高并发多线程环境下可能出现内部状态冲突
-            with self._llm_lock:
-                outputs = self.llm.generate([prompt], sampling_params)
+            if self._microbatch > 1:
+                outputs = [self._generate_microbatched(prompt, sampling_params)]
+            else:
+                with self._llm_lock:
+                    outputs = self.llm.generate([prompt], sampling_params)
             
             if not outputs or len(outputs) == 0:
                 raise ValueError("vLLM returned empty outputs")
@@ -277,4 +369,3 @@ def create_teacher_llm(config: Dict[str, Any]) -> BaseTeacherLLM:
     else:
         raise ValueError(f"Unsupported teacher LLM type: {llm_type}. "
                         f"Supported types: 'openai', 'vllm'")
-

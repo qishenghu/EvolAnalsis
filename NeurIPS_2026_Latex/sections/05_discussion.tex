@@ -1,0 +1,42 @@
+% ============================================================================
+% Discussion and Limitations
+% ============================================================================
+
+\section{Discussion and Limitations}
+\label{sec:discussion}
+
+\paragraph{When DUET helps most.}
+DUET is designed for the regime where teacher replay is most useful but also most likely to bias the update: sparse-reward training with weak student policies.
+In this regime, the on-policy reward stream contains few successful rollouts, so teacher trajectories provide necessary guidance.
+At the same time, directly mixing high-reward teacher rollouts into GRPO can distort the group baseline and over-emphasize off-policy actions.
+The empirical results follow this pattern: DUET gives its largest gains on the 1.5B students, where on-policy GRPO nearly collapses, and smaller but still positive gains on the 3B students, where the on-policy stream is already more informative.
+
+\paragraph{Which components are load-bearing.}
+The ablations suggest that the components play different roles.
+Baseline separation is the most consistently important mechanism: removing it collapses both 1.5B settings, matching the baseline-contamination failure mode analyzed in Section~\ref{sec:action_channel}.
+The State Channel provides dense exploration guidance and is especially helpful when task progress can be inferred from intermediate observations.
+DR3 is more environment-dependent.
+It has a large effect on WebShop, where the teacher--student mismatch persists over longer and more diverse interactions, but a smaller marginal effect on ALFWorld, where baseline separation and cold-start imitation already close much of the gap.
+This suggests that DUET should be viewed as a framework for separating teacher signals, rather than as a claim that every component contributes equally in every environment.
+
+\paragraph{Dependence on teacher data.}
+DUET assumes access to a cache of successful teacher trajectories.
+The quality, diversity, and filtering of this cache can affect all three sources of teacher influence: the action replay signal, the density-ratio estimate, and the state-progress map.
+A narrow teacher cache may bias the State Channel toward a limited set of solution paths, while a noisy or weak teacher cache may provide unreliable progress signals.
+Our experiments use successful trajectories from a stronger teacher model, which matches the intended cold-start setting but does not cover cases where teacher demonstrations are suboptimal, heterogeneous, or adversarially filtered.
+
+\paragraph{Limits of the current density-ratio correction.}
+Our DR3 implementation estimates a trajectory-level replay weight and applies it uniformly to the teacher tokens in that trajectory.
+This is a coarse approximation.
+A token-level or step-level density ratio could focus the correction on teacher actions that are unlikely under the current student, and might reduce the need for a separate behavior-cloning bridge.
+We leave this finer-grained correction to future work.
+
+\paragraph{Limits of the State Channel.}
+The State Channel relies on matching on-policy observations to states seen in successful teacher trajectories.
+This works naturally in environments where progress can be recognized from textual observations or structured attributes, but it may be less reliable when observations are highly aliased, noisy, or only weakly correlated with task completion.
+In such settings, a learned progress model or uncertainty-aware shaping rule may be needed.
+
+\paragraph{Scope of evaluation.}
+Our evaluation focuses on two representative interactive LLM-agent settings: embodied text interaction and web navigation. 
+These settings capture sparse rewards, multi-turn interaction, and teacher-guided cold start, which are the main conditions DUET is designed for. 
+The magnitude of the gains may vary with horizon length, teacher quality, and how much progress information is exposed in the environment state.

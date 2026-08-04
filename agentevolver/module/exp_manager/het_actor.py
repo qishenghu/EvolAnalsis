@@ -51,6 +51,246 @@ __all__ = ['HETDataParallelPPOActor']
 from verl.workers.actor.dp_actor import DataParallelPPOActor
 
 
+def _loss_metric_sum_and_weight(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    loss_agg_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return micro-batch-invariant statistics for a logged loss metric.
+
+    ``agg_loss`` returns one scalar per micro-batch.  Averaging those scalars
+    gives every micro-batch equal weight, which is wrong when dynamic batching
+    produces different batch sizes or when response lengths differ.  Logging
+    instead accumulates an explicit numerator and weight whose unit follows the
+    configured loss aggregation contract:
+
+    * ``token-mean``: valid response tokens;
+    * ``seq-mean-token-{mean,sum}``: response sequences;
+    * ``seq-mean-token-sum-norm``: the unnormalized masked sum plus the fixed
+      response width.  Unlike the mean modes, that width is not an additive
+      weight; the caller must sum numerators across micro-batches/ranks and
+      divide by the width exactly once per PPO epoch, matching ``agg_loss``.
+
+    The returned tensors are detached float64 scalars.  This helper is only for
+    metrics; it must never be used as the optimization loss.
+    """
+    if loss_mat.shape != loss_mask.shape:
+        raise ValueError(
+            "loss metric shape mismatch: "
+            f"loss_mat={tuple(loss_mat.shape)}, loss_mask={tuple(loss_mask.shape)}"
+        )
+    if loss_mat.ndim != 2:
+        raise ValueError(
+            f"loss metrics require [batch, response] tensors, got {tuple(loss_mat.shape)}"
+        )
+
+    # Keep the token-sized temporary in fp32 and only accumulate into fp64;
+    # materializing a full fp64 [batch, response] tensor is unnecessary for a
+    # logging-only statistic on long-context runs.
+    values = loss_mat.detach().to(dtype=torch.float32)
+    mask = loss_mask.detach().to(device=values.device, dtype=torch.float32)
+    masked_values = values * mask
+    masked_sum = torch.sum(masked_values, dtype=torch.float64)
+
+    if loss_agg_mode == "token-mean":
+        return masked_sum, torch.sum(mask, dtype=torch.float64)
+
+    sequence_count = torch.tensor(
+        float(loss_mat.shape[0]),
+        device=values.device,
+        dtype=torch.float64,
+    )
+    if loss_agg_mode == "seq-mean-token-sum":
+        return masked_sum, sequence_count
+    if loss_agg_mode == "seq-mean-token-mean":
+        token_counts = torch.sum(mask, dim=-1, dtype=torch.float64)
+        # Empty responses are not expected in actor training.  Treating their
+        # contribution as zero keeps metric collection side-effect-free if one
+        # nevertheless reaches this path.
+        sequence_means = torch.sum(
+            masked_values,
+            dim=-1,
+            dtype=torch.float64,
+        ) / token_counts.clamp_min(1.0)
+        return torch.sum(sequence_means), sequence_count
+    if loss_agg_mode == "seq-mean-token-sum-norm":
+        response_width = loss_mat.shape[-1]
+        if response_width <= 0:
+            raise ValueError("response width must be positive")
+        response_width_tensor = torch.tensor(
+            float(response_width),
+            device=values.device,
+            dtype=torch.float64,
+        )
+        return masked_sum, response_width_tensor
+
+    raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+
+
+def _distributed_weighted_mean(
+    metric_sum: torch.Tensor,
+    metric_weight: torch.Tensor,
+    *,
+    process_group=None,
+) -> float:
+    """Compute a weighted mean across the actor data-parallel group.
+
+    For Ulysses, callers pass the mesh's ``dp`` group so identical SP replicas
+    are counted once.  With no sequence parallelism, ``None`` intentionally
+    means the default world group because every FSDP rank owns a distinct data
+    shard.
+    """
+    stats = torch.stack(
+        (
+            metric_sum.detach().to(dtype=torch.float64),
+            metric_weight.detach().to(
+                device=metric_sum.device,
+                dtype=torch.float64,
+            ),
+        )
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            stats,
+            op=torch.distributed.ReduceOp.SUM,
+            group=process_group,
+        )
+    total_weight = float(stats[1].item())
+    if total_weight <= 0.0:
+        raise ValueError(
+            f"weighted metric has non-positive global weight: {total_weight}"
+        )
+    return float((stats[0] / stats[1]).item())
+
+
+def _distributed_normalized_sum(
+    metric_sum: torch.Tensor,
+    normalizer: torch.Tensor,
+    *,
+    process_group=None,
+) -> float:
+    """Sum a metric across DP ranks, then apply one shared normalizer.
+
+    This is the distributed form of VERL's
+    ``seq-mean-token-sum-norm`` aggregation.  The normalizer is deliberately
+    not all-reduced: it is the common padded response width (times the number
+    of PPO epochs when callers average repeated passes), not a per-rank count.
+    """
+    total = metric_sum.detach().to(dtype=torch.float64).clone()
+    denominator = normalizer.detach().to(
+        device=metric_sum.device,
+        dtype=torch.float64,
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            total,
+            op=torch.distributed.ReduceOp.SUM,
+            group=process_group,
+        )
+    denominator_value = float(denominator.item())
+    if denominator_value <= 0.0:
+        raise ValueError(
+            f"normalized metric has non-positive denominator: {denominator_value}"
+        )
+    return float((total / denominator).item())
+
+
+def _logprobs_with_fp32_temperature(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+    inplace_backward: bool = True,
+) -> torch.Tensor:
+    """Apply temperature after the bf16 logits are promoted to fp32.
+
+    vLLM's ``processed_logprobs`` promotes logits to fp32 before applying
+    temperature. Upstream verl instead performs ``bf16.div_(temperature)``;
+    with Qwen3.5's 248K vocabulary that rounding alone is measurable in PPO's
+    behavior-policy denominator. FlashAttention's CE kernel exposes
+    ``logit_scale`` and performs the multiply after an fp32 load, so use it
+    without materializing a full fp32 logits tensor.
+    """
+    temperature = float(temperature)
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    batch_shape = logits.shape[:-1]
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_labels = labels.reshape(-1)
+    if flat_logits.is_cuda:
+        from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
+
+        losses, _ = cross_entropy_loss(
+            flat_logits,
+            flat_labels,
+            logit_scale=1.0 / temperature,
+            inplace_backward=inplace_backward,
+        )
+        return (-losses).view(*batch_shape)
+
+    # Test/debug fallback. Production Qwen training always takes the fused
+    # CUDA path above, which avoids the large fp32 materialization here.
+    scaled = flat_logits.float() / temperature
+    selected = torch.log_softmax(scaled, dim=-1).gather(
+        -1, flat_labels.unsqueeze(-1)
+    )
+    return selected.squeeze(-1).view(*batch_shape)
+
+
+def _entropy_with_fp32_temperature(
+    logits: torch.Tensor,
+    temperature: float,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Memory-bounded entropy under the same fp32 temperature contract."""
+    temperature = float(temperature)
+    if temperature <= 0:
+        raise ValueError(f"temperature must be positive, got {temperature}")
+    flat = logits.reshape(-1, logits.shape[-1])
+    chunks = []
+    for start in range(0, flat.shape[0], chunk_size):
+        scaled = flat[start : start + chunk_size].float() / temperature
+        probs = torch.softmax(scaled, dim=-1)
+        chunks.append(
+            torch.logsumexp(scaled, dim=-1)
+            - torch.sum(probs * scaled, dim=-1)
+        )
+    return torch.cat(chunks).view(*logits.shape[:-1])
+
+
+def _crop_single_item_left_padding(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Remove left padding before a Qwen3.5 GDN micro-forward.
+
+    The upstream Qwen3.5 padding helper currently skips masking when batch size
+    is one.  Since all production scorer micro-batches are deliberately size
+    one, leaving nonzero pad embeddings in front of the prompt changes the GDN
+    recurrent state relative to vLLM's unpadded request.  Cropping is exact and
+    also avoids doing 32K work for another sample's longer prompt.
+    """
+    if input_ids.ndim != 2 or input_ids.size(0) != 1:
+        raise RuntimeError(
+            "the exact Qwen3.5 scorer requires micro_batch_size_per_gpu=1"
+        )
+    if attention_mask.shape != input_ids.shape:
+        raise ValueError(
+            "attention_mask/input_ids shape mismatch: "
+            f"{tuple(attention_mask.shape)} vs {tuple(input_ids.shape)}"
+        )
+    valid_positions = torch.nonzero(attention_mask[0], as_tuple=False).flatten()
+    if valid_positions.numel() == 0:
+        raise ValueError("attention_mask contains no valid tokens")
+    first_valid = int(valid_positions[0].item())
+    input_ids = input_ids[:, first_valid:]
+    attention_mask = attention_mask[:, first_valid:]
+    if position_ids.ndim not in (2, 3) or position_ids.size(0) != 1:
+        raise ValueError(f"unexpected position_ids shape: {tuple(position_ids.shape)}")
+    position_ids = position_ids[..., first_valid:]
+    return input_ids, attention_mask, position_ids, first_valid
+
+
 class HETDataParallelPPOActor(DataParallelPPOActor):
     def __init__(self, **kwargs):
         """
@@ -70,6 +310,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         self._dr3_hidden_hook_handle = None
         self._dr3_hidden_last: torch.Tensor | None = None  # per-token hidden (shape depends on rmpad)
         self._dr3_pooled_hidden: torch.Tensor | None = None  # (bs, H)
+        # Set by the worker for Ulysses.  ``None`` is the correct group for
+        # ordinary FSDP data parallelism (the default world group).
+        self._metric_data_parallel_group = None
 
     def _dr3_hidden_enabled(self) -> bool:
         """
@@ -169,6 +412,131 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
         Override verl's _forward_micro_batch ONLY when DR³ hidden features are enabled.
         Otherwise, defer to parent implementation to avoid affecting other functionality.
         """
+        if (
+            not self._dr3_hidden_enabled()
+            and bool(self.config.get("behavior_logprob_fp32_temperature", False))
+        ):
+            if self.use_remove_padding:
+                raise RuntimeError(
+                    "behavior_logprob_fp32_temperature requires "
+                    "model.use_remove_padding=false for Qwen3.5 GDN"
+                )
+            if self.use_fused_kernels:
+                raise RuntimeError(
+                    "behavior_logprob_fp32_temperature needs unfused model logits"
+                )
+            if self.use_ulysses_sp:
+                raise RuntimeError(
+                    "Qwen3.5 GDN does not support the remove-padding path required "
+                    "by Ulysses sequence parallelism"
+                )
+
+            response_ids = micro_batch["responses"]
+            response_length = response_ids.size(-1)
+            if response_length <= 0:
+                raise ValueError("responses must contain at least one token")
+
+            multi_modal_inputs = {}
+            if "multi_modal_inputs" in micro_batch.keys():
+                for key in micro_batch["multi_modal_inputs"][0].keys():
+                    multi_modal_inputs[key] = torch.cat(
+                        [inputs[key] for inputs in micro_batch["multi_modal_inputs"]],
+                        dim=0,
+                    )
+
+            # Qwen3.5 uses hybrid Gated DeltaNet/full attention. Score each
+            # micro-batch as the exact unpadded request seen by vLLM, and ask HF
+            # to project only the final actual_R+1 hidden states through the
+            # 248K-token lm_head. Those positions are the final prompt token
+            # plus all valid response tokens; dropping the last logit therefore
+            # aligns exactly with ``responses``.
+            with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                input_ids = micro_batch["input_ids"]
+                attention_mask = micro_batch["attention_mask"]
+                position_ids = micro_batch["position_ids"]
+                response_attention_mask = attention_mask[:, -response_length:]
+                if response_attention_mask.size(0) != 1:
+                    raise RuntimeError(
+                        "the exact Qwen3.5 scorer requires "
+                        "micro_batch_size_per_gpu=1"
+                    )
+                valid_response_length = int(response_attention_mask.sum().item())
+                if valid_response_length <= 0:
+                    raise ValueError("response attention mask contains no valid token")
+                expected_response_mask = (
+                    torch.arange(
+                        response_length,
+                        device=response_attention_mask.device,
+                    )
+                    < valid_response_length
+                ).to(response_attention_mask.dtype).unsqueeze(0)
+                if not torch.equal(response_attention_mask, expected_response_mask):
+                    raise ValueError(
+                        "response attention mask must be a contiguous valid prefix"
+                    )
+
+                trailing_padding = response_length - valid_response_length
+                if trailing_padding:
+                    input_ids = input_ids[:, :-trailing_padding]
+                    attention_mask = attention_mask[:, :-trailing_padding]
+                    position_ids = position_ids[..., :-trailing_padding]
+                (
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                    _left_padding,
+                ) = _crop_single_item_left_padding(
+                    input_ids,
+                    attention_mask,
+                    position_ids,
+                )
+                if not bool(torch.all(attention_mask)):
+                    raise RuntimeError(
+                        "exact Qwen3.5 scorer failed to remove all sequence padding"
+                    )
+                if input_ids.size(-1) < valid_response_length + 1:
+                    raise ValueError(
+                        "input_ids must include at least one prompt token before responses"
+                    )
+                if position_ids.dim() == 3:  # qwen2vl/qwen3.5 mrope
+                    position_ids = position_ids.transpose(0, 1)
+
+                output = self.actor_module(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    **multi_modal_inputs,
+                    use_cache=False,
+                    return_dict=True,
+                    logits_to_keep=valid_response_length + 1,
+                )
+                tail_logits = output.logits
+                expected_shape = (
+                    response_ids.size(0),
+                    valid_response_length + 1,
+                )
+                if tail_logits.ndim != 3 or tail_logits.shape[:2] != expected_shape:
+                    raise RuntimeError(
+                        "model did not honor logits_to_keep=response_length+1: "
+                        f"expected prefix {expected_shape}, got {tuple(tail_logits.shape)}"
+                    )
+                response_logits = tail_logits[:, :-1, :]
+                valid_log_probs = _logprobs_with_fp32_temperature(
+                    response_logits,
+                    response_ids[:, :valid_response_length],
+                    temperature=temperature,
+                    inplace_backward=not calculate_entropy,
+                )
+                log_probs = F.pad(valid_log_probs, (0, trailing_padding))
+                entropy = None
+                if calculate_entropy:
+                    valid_entropy = _entropy_with_fp32_temperature(
+                        response_logits,
+                        temperature=temperature,
+                    )
+                    entropy = F.pad(valid_entropy, (0, trailing_padding))
+            return entropy, log_probs
+
         if not self._dr3_hidden_enabled():
             self._dr3_pooled_hidden = None
             return super()._forward_micro_batch(micro_batch=micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
@@ -729,6 +1097,12 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        # ``actor/kl_loss`` used to be overwritten on every micro-batch and the
+        # worker collector only retained rank0 meta_info.  Keep explicit
+        # numerator/weight statistics so the final logged value is independent
+        # of micro-batch boundaries and can be reduced exactly across DP ranks.
+        kl_metric_sum: torch.Tensor | None = None
+        kl_metric_weight: torch.Tensor | None = None
         # ------------------------------------------------------------------
         # DR³ step-level diagnostics (avoid micro-batch confusion when micro_bsz=1)
         # ------------------------------------------------------------------
@@ -2368,7 +2742,31 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate KL divergence loss
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] = kl_loss.detach().item()
+                        micro_kl_sum, micro_kl_weight = _loss_metric_sum_and_weight(
+                            kld,
+                            response_mask,
+                            loss_agg_mode,
+                        )
+                        if kl_metric_sum is None:
+                            kl_metric_sum = micro_kl_sum
+                            kl_metric_weight = micro_kl_weight
+                        else:
+                            kl_metric_sum = kl_metric_sum + micro_kl_sum
+                            if loss_agg_mode == "seq-mean-token-sum-norm":
+                                # All splits of one padded training batch must
+                                # share the same fixed response width.  Keep it
+                                # once rather than treating it as an additive
+                                # sequence weight.
+                                if not torch.equal(
+                                    kl_metric_weight,
+                                    micro_kl_weight,
+                                ):
+                                    raise ValueError(
+                                        "seq-mean-token-sum-norm response width "
+                                        "changed across actor micro-batches"
+                                    )
+                            else:
+                                kl_metric_weight = kl_metric_weight + micro_kl_weight
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
@@ -2514,6 +2912,35 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, data)
+
+        if self.config.use_kl_loss:
+            if kl_metric_sum is None or kl_metric_weight is None:
+                raise RuntimeError("KL loss is enabled but no KL metric samples were collected")
+            if self.config.loss_agg_mode == "seq-mean-token-sum-norm":
+                # Report the mean of the per-epoch full-batch KL values.  Each
+                # epoch contributes global_masked_sum / response_width, so the
+                # combined denominator is width * number_of_epochs (not the
+                # number of micro-batches, sequences, or DP ranks).
+                kl_metric_value = _distributed_normalized_sum(
+                    kl_metric_sum,
+                    kl_metric_weight * float(self.config.ppo_epochs),
+                    process_group=getattr(
+                        self,
+                        "_metric_data_parallel_group",
+                        None,
+                    ),
+                )
+            else:
+                kl_metric_value = _distributed_weighted_mean(
+                    kl_metric_sum,
+                    kl_metric_weight,
+                    process_group=getattr(
+                        self,
+                        "_metric_data_parallel_group",
+                        None,
+                    ),
+                )
+            metrics["actor/kl_loss"] = [kl_metric_value]
 
         # ------------------------------------------------------------------
         # Finalize per-step aggregated grad_dir metrics (log once per update_policy call)

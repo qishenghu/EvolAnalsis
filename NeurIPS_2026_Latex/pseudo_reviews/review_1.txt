@@ -1,0 +1,74 @@
+作为 NeurIPS 审稿人，我会给这篇论文：
+
+**评分：6 / 10，Weak Accept / Borderline Accept**
+**信心：3 / 5**
+
+这篇论文提出 DUET，用双通道方式利用 teacher trajectories：Action Channel 处理 teacher action 的 replay bias，包括 baseline separation 和 density-ratio correction；State Channel 利用 teacher observation 构建 progress map 做 reward shaping。论文在 ALFWorld 和 WebShop、Qwen2.5-1.5B/3B 两个学生模型上报告了稳定提升，主结果显示 DUET 在四个设置中都优于复现的 GRPO、LUFFY、CHORD、SFT+GRPO，平均超过最强 baseline 13.0pp，1.5B 冷启动设置提升 17.5pp。
+
+**优点**
+
+论文的问题动机清晰：直接把高成功率 teacher rollouts 混入 GRPO group 会污染 group baseline，并引入 off-policy mismatch。这个诊断是合理的，也比单纯“加 demonstrations”更有方法论价值。方法设计也比较完整，baseline separation、DR3、BC warmup、State Channel 分工明确，论文还通过 ablation 显示 baseline separation 移除后 1.5B 两个环境都崩到 0%，State Channel 和 BC 也有明显贡献。
+
+实验结果有吸引力，尤其是在冷启动场景。1.5B-ALFWorld 从最强 baseline 30.0% 提到 47.5%，1.5B-WebShop 从 18.5% 提到 36.0%，这是实质性提升。论文也展示了训练曲线、discriminator accuracy、teacher gradient share、density ratio 衰减等动态分析，支撑“teacher influence 自适应衰减”的叙述。
+
+**主要问题**
+
+最大问题是实验覆盖仍偏窄。只有两个环境、两个较小学生模型、同一 Qwen 系列 teacher/student。论文自己也承认还没有验证 7B+、其他 agent benchmark 或跨模型族的情况。对于 NeurIPS 来说，如果核心 claim 是“principled experience replay for LLM agents”，目前证据更像是对两个环境上的有效工程组合，而不是足够广泛的原则性结论。
+
+第二，方法组件较多，且有一定调参敏感性。附录里的 adaptive BC schedule 在 1.5B-WebShop 上对 `dfloor` 和 `µmin` 非常敏感，例如 strict SR 可从 36.0% 掉到 21.5%、5.5% 或 2.0%。这削弱了“data-derived rather than hand-tuned schedules”的说服力，因为虽然不是 step-indexed schedule，但仍有关键超参数需要仔细调。
+
+第三，理论表述有些过强。DR3 用 classifier-based density ratio 是合理启发，但 teacher cache 是 success-filtered，作者也承认它校正的是 empirical replay distribution，而不是精确 teacher likelihood。State Channel 也不是严格的 potential-based shaping，论文承认不保证 policy invariance。因此方法是有原则启发的实用近似，而不是严格无偏或严格 policy-preserving 的算法。
+
+第四，baseline 公平性需要更多细节支撑。论文说 LUFFY/CHORD 是同协议复现，但这些方法可能对 100-step budget、teacher ratio、BC schedule 等敏感。若没有充分调参或原作者数字对照，DUET 的优势可能部分来自更精细的工程调优。尤其 DUET 的附录包含大量稳定机制和 cell-specific SOTA hyperparameters，而 baselines 的调参空间说明不够充分。
+
+**建议给作者的改进**
+
+我会建议作者补充至少一个更大模型或跨模型族实验，例如 7B student 或非 Qwen teacher/student；补充更多环境，如 SciWorld、BabyAI 或 code-agent；并给出更公平的 compute/hyperparameter tuning budget 对比。还应把 DR3 和 State Channel 的理论 claim 收敛为“bias-mitigating heuristic / practical correction”，避免暗示严格 off-policy correction 或 policy invariance。
+
+**最终判断**
+
+这篇论文有明确问题、合理方法、不错的实证提升，尤其 baseline contamination 的诊断和 baseline separation 的效果很有价值。但当前泛化性、调参敏感性和理论严谨性不足，使我不会给强接收。
+
+**推荐分：6/10。**
+
+
+行文写作：
+从写作上看，我会评价为：
+
+**整体文笔：清楚、专业、结构完整，但略显“过度包装”和模板化。**
+如果按 NeurIPS 论文写作标准，我会给 **7/10** 左右；不会因为写作本身拒稿，但写作也还没到特别锋利、自然、有说服力的程度。
+
+**优点很明显。**
+
+论文的主线比较顺：先指出 teacher replay 在 GRPO 中不是“无害 supervision”，然后提出两个 bias，再用 Action Channel / State Channel 去对应解决。这个 narrative 是成立的，读者能很快知道作者想解决什么问题。Abstract 和 Introduction 的定位也比较清楚，贡献点编号清晰，实验段落基本按“主结果—学习效率—消融—动态分析”的顺序展开，符合 NeurIPS 读者习惯。
+
+术语命名也比较统一。比如 **baseline contamination**、**distribution mismatch**、**Action Channel**、**State Channel**、**DR3** 这些概念在文中反复出现，降低了理解成本。图 1 的 overview 也帮助读者把方法模块串起来。
+
+**主要写作问题是：有些地方写得太“像论文模板”，说服力反而被削弱。**
+
+比如文中多次出现类似“principled”“orthogonal”“non-interfering”“data-derived rather than hand-tuned”“complementary signals”这样的高层措辞。这些词本身没问题，但重复频率偏高，会让读者感觉作者在不断强调方法的优雅性，而不是让证据自然地支撑它。尤其是“principled”这个词略危险，因为方法里 DR3 和 State Channel 都是近似启发式，严格性没有那么强。
+
+另一个问题是部分句子太满。比如论文常用这种结构：
+
+> “DUET decomposes teacher utilization into an Action Channel ... and a State Channel ... operating orthogonally on non-overlapping sample subsets.”
+
+这种句子信息密度高，但抽象名词很多，读起来有点堆概念。更好的写法可以先用一句朴素话解释：teacher actions 用来学怎么做，teacher observations 用来判断是否接近成功；然后再引入两个 channel。现在的写法偏“概念先行”，对非本方向读者不够友好。
+
+**还有一些明显的 polish 问题。**
+
+文中有多个未替换的引用占位符，比如 Introduction 和方法部分多次出现 **“§??”**，Related Work 里也有 **“?”** 引用。这在正式投稿中是比较扣分的，会给人未完全打磨的印象。
+
+部分表述也有轻微不一致。例如主文说所有 teacher-influence terms 都由 data-derived signals 控制，而附录又显示 adaptive BC schedule 对 `dfloor`、`µmin` 很敏感。这不是纯写作问题，但在行文上会让 claim 显得过强。建议把“rather than hand-tuned schedules”改成更克制的说法，比如“reduces reliance on fixed step-indexed schedules”。
+
+**我最欣赏的写作点**是它把方法动机讲成了一个“偏差诊断 → 模块化修正”的故事，而不是简单堆 tricks。这种 framing 对审稿人是友好的。
+
+**我最不喜欢的写作点**是过度使用概念标签和强修辞，导致论文有一点“包装感”。如果作者把语言压实一点，少说“principled/orthogonal/complementary”，多说“具体会造成什么梯度问题、这个模块具体如何改变 estimator”，说服力会更强。
+
+我的写作评分大概是：
+
+**Clarity：7.5/10**
+**Organization：8/10**
+**Style / prose：6.5/10**
+**Claim calibration：6/10**
+
+总体来说，**行文是合格偏好的 NeurIPS 写作，但需要降调、去模板化、修掉占位符，并让 claim 更克制。**

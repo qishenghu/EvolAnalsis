@@ -45,6 +45,10 @@
 \usepackage[table]{xcolor}  % colors + \rowcolor for tables
 \usepackage{multirow}       % \multirow in tables
 \usepackage{enumitem}       % itemize/enumerate with [leftmargin=...] options
+\usepackage{graphicx}       % \includegraphics for figures
+
+% Strip advisor margin comments by default (no-op).
+\providecommand{\wenya}[1]{}
 
 
 \title{DUET: Principled Experience Replay for LLM Agent Reinforcement Learning}
@@ -88,13 +92,8 @@
 
 % ============================================================================
 % Section 2: Related Work
-% TODO: write related-work section. Should cover:
-%   - On-policy RL for LLM agents (GRPO, RLHF lineage, ReAct-style frameworks)
-%   - Teacher mixing / experience replay (LUFFY, CHORD)
-%   - Distillation and density-ratio methods
-%   - Reward shaping in RL (Ng et al. 1999 and follow-ups)
 % ============================================================================
-% \input{sections/02_related_work}
+\input{sections/02_related_work}
 
 
 % ============================================================================
@@ -105,31 +104,20 @@
 
 % ============================================================================
 % Section 4: Experiments
-% TODO: write experiments section. Will include:
-%   - Setup (envs, models, baselines, metric)
-%   - Main results (\input{tables/main_results})
-%   - Component ablations
-%   - Auto-fade dynamics figures
 % ============================================================================
-% \input{sections/04_experiments}
+\input{sections/04_experiments}
 
-\input{tables/main_results}  % placeholder so Table~1 can be referenced now
 
 % ============================================================================
 % Section 5: Discussion / Limitations
-% TODO: discuss
-%   - Single-seed caveat
-%   - LUFFY reproducibility
-%   - When DUET helps most (cold-start regime)
 % ============================================================================
-% \input{sections/05_discussion}
+\input{sections/05_discussion}
 
 
 % ============================================================================
 % Section 6: Conclusion
-% TODO
 % ============================================================================
-% \input{sections/06_conclusion}
+\input{sections/06_conclusion}
 
 
 % ============================================================================
@@ -143,28 +131,12 @@
 
 
 % ============================================================================
-% References
-% TODO: switch to bibtex once .bib file is set up. For now, manual entries.
+% References (bibtex)
 % ============================================================================
-\section*{References}
-
-\medskip
-
 {
 \small
-
-% --- Placeholder bibtex keys used in section files (TODO: bibtex) ---
-% TODO_grpo       — Shao et al. (2024). DeepSeekMath / GRPO.
-% TODO_luffy      — LUFFY (cite original work).
-% TODO_chord      — CHORD (cite original work).
-% TODO_alfworld   — Shridhar et al. (2021). ALFWorld.
-% TODO_webshop    — Yao et al. (2022). WebShop.
-% TODO_react      — Yao et al. (2023). ReAct.
-% TODO_ng1999     — Ng, Harada \& Russell (1999). Policy invariance under reward
-%                   transformations: theory and application to reward shaping.
-
-[1]~Placeholder reference --- to be replaced with bibtex entries.
-
+\bibliographystyle{plainnat}
+\bibliography{sections/duet_references}
 }
 
 
@@ -172,16 +144,11 @@
 
 \appendix
 
-\section{Technical appendices and supplementary material}
-% TODO: appendix sections will include:
-%   - LUFFY reproducibility study (3.5\% / 38.0\% / 49.5\% three-way comparison)
-%   - Hyperparameter sensitivity tables
-%   - Additional training-dynamics figures
-%   - Implementation details
+\input{sections/appendix}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-\newpage
+\clearpage
 \input{checklist.tex}
 
 

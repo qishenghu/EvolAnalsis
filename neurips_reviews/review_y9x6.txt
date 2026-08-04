@@ -1,0 +1,50 @@
+Official Review of Submission32282 by Reviewer y9x6
+Official Reviewby Reviewer y9x626 Jun 2026, 13:06 (modified: 24 Jul 2026, 22:59)Program Chairs, Senior Area Chairs, Area Chairs, Reviewers Submitted, Reviewer y9x6, AuthorsRevisions
+Summary:
+This work addresses the challenge of using successful teacher trajectories in reinforcement learning for LLM agents in sparse-reward environments. In these settings, on-policy GRPO-style training struggles because the student rarely succeeds early in training, meaning there is little positive reward signal. The paper argues that mixing teacher trajectories into the same GRPO rollout group is problematic for two reasons: first, successful teacher rollouts can suppress the credit assigned to rare successful student rollouts; second, teacher actions are off-policy.
+
+Contribution Type: General: Most submissions will fall into this type.
+Strengths And Weaknesses:
+Strengths
+
+The central framing is novel: teacher trajectories are decomposed into action-level supervision and state-level progress guidance. This is a more principled view than simply mixing teacher demonstrations into RL batches or using them as supervised fine-tuning data. The baseline-contamination argument is also a strong conceptual contribution. It identifies a concrete failure mode in teacher-mixed GRPO that is easy to miss but plausible in sparse-reward cold-start settings.
+
+The method is technically coherent. Baseline separation directly addresses the group-normalisation issue. Density-ratio repair is a reasonable approximation when exact teacher likelihoods are unavailable. The State Channel is also intuitively well-motivated: successful trajectories contain intermediate progress states, not just final actions.
+
+Weaknesses
+
+The largest concern is generalisation. DUET is evaluated on ALFWorld and WebShop, which are both structured text-based environments. The State Channel depends on matching student states to teacher-visited states. This may work well when states are textual/discrete but it is less clear whether the method would transfer to noisier, more open-ended, partially observable environments.
+
+A second concern is the density-ratio repair mechanism. The discriminator-based estimate is only an approximation of the missing teacher-student correction. Since the teacher cache is success-filtered, the learned discriminator may capture not only policy mismatch, but also trajectory-quality differences between successful teacher rollouts and student rollouts. As a result, it is unclear whether DR3 should be interpreted as a principled density-ratio estimator or as a learned heuristic weighting mechanism. This does not undermine the empirical usefulness of DR3, but it weakens the strength of the paper’s theoretical interpretation.
+
+Minor concerns The behaviour-cloning component is adaptive, but it still provides a strong source of direct imitation supervision. Therefore, an important question is whether the observed gains arise primarily from the proposed replay-correction framework or from the additional imitation signal itself. In other words, does DUET outperform prior methods because of its separation and correction mechanisms, or because it receives more effective supervised guidance from teacher trajectories? Additional analysis isolating these effects would strengthen the paper’s central claims.
+
+The method depends on a successful teacher trajectory cache. The paper could more clearly explain how sensitive DUET is to teacher quality, cache diversity, cache size, and the success-filtering process.
+
+The comparison to broader off-policy RL or replay methods could be expanded. The current baselines are relevant, but additional comparisons or discussion would help position DUET more strongly.
+
+Quality: 3: good
+Clarity: 3: good
+Significance: 3: good
+Originality: 2: not good
+Questions:
+The paper appears to report results from a single training run due to computational cost. Given the high variance often observed in sparse-reward RL for LLM agents, how robust are the reported improvements across random seeds? Could the authors provide multi-seed results on at least a representative subset of settings, or report confidence intervals, to demonstrate that the gains are statistically reliable rather than artifacts of training variance?
+How sensitive is DUET to the number of teacher trajectories and the teacher-student mixing ratio?
+How large is the teacher trajectory cache, and how diverse are the successful trajectories within it?
+A cache-size ablation would be useful: how does DUET perform with small, medium, and large teacher caches?
+A teacher-quality ablation would be useful: what happens if the teacher is only moderately stronger, noisy, or partially suboptimal?
+A comparison against simpler reward-shaping baselines would help isolate the value of using teacher-derived progress maps.
+A comparison against alternative off-policy correction methods would help evaluate whether DR3 is the best choice.
+Limitations:
+DUET assumes access to a successful teacher trajectory cache. This is a meaningful assumption, because collecting and filtering high-quality teacher rollouts may be expensive. It also assumes that state matching is reliable. This is plausible in ALFWorld and WebShop, but may be harder in visual, real-world embodied settings.
+
+DUET introduces additional system complexity. The discriminator must be trained and synchronised, density-ratio weights must be computed and stabilised, and the State Channel requires a progress map. In larger-scale distributed RL systems, these extra moving parts may introduce engineering overhead and new failure modes.
+
+Rating: 3: Borderline reject: Technically solid paper where reasons to reject, e.g., limited evaluation, outweigh reasons to accept, e.g., good evaluation. Please use sparingly.
+Confidence: 3: You are fairly confident in your assessment. It is possible that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work. Math/other details were not carefully checked.
+Ethical Concerns: NO or VERY MINOR ethics concerns only
+Paper Formatting Concerns:
+No
+
+Code Of Conduct Acknowledgement: Yes
+Responsible Reviewing Acknowledgement: Yes

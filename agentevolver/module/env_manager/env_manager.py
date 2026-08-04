@@ -32,6 +32,146 @@ from beast_logger import register_logger
 from agentevolver.module.exp_manager.exp_manager import TaskExpConfig, TrajExpConfig
 
 
+def _sample_uid(sample: Sample) -> str:
+    """Return the UID used by GRPO (group_ids is built from data_id)."""
+    if not hasattr(sample, "data_id"):
+        raise RuntimeError("sample is missing data_id required for GRPO grouping")
+    return str(sample.data_id)
+
+
+def _align_samples_by_complete_uid_groups(
+    samples: List[Sample],
+    world_size: int,
+    *,
+    expected_group_size: Optional[int] = None,
+    require_divisible: bool = True,
+    batch_label: str = "batch",
+) -> List[Sample]:
+    """Align a batch without ever splitting a GRPO UID group.
+
+    expected_group_size is intentionally supplied only for a pure on-policy
+    GRPO training batch. Replay/teacher mixtures can have a different per-UID
+    composition, so they use the same whole-group alignment but do not inherit
+    the pure-GRPO cardinality assertion.
+
+    When alignment is needed, dynamic programming selects the largest number
+    of samples whose complete UID groups sum to a multiple of world_size.
+    Ties are resolved by the groups' first-appearance order. We deliberately do
+    not pad/resample: duplicating an on-policy rollout would change the GRPO
+    group statistics while pretending to provide another independent sample.
+    """
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+    if expected_group_size is not None and expected_group_size <= 0:
+        raise ValueError(
+            f"expected_group_size must be positive, got {expected_group_size}"
+        )
+    if not samples:
+        if require_divisible:
+            raise RuntimeError(f"{batch_label} contains no samples")
+        return []
+
+    # Plain dict preserves first-appearance order on all supported Pythons.
+    uid_to_samples: Dict[str, List[Sample]] = {}
+    for sample in samples:
+        uid_to_samples.setdefault(_sample_uid(sample), []).append(sample)
+
+    if expected_group_size is not None:
+        malformed = [
+            (uid, len(group))
+            for uid, group in uid_to_samples.items()
+            if len(group) != expected_group_size
+        ]
+        if malformed:
+            details = ", ".join(
+                f"uid={uid!r}:count={count}" for uid, count in malformed
+            )
+            raise RuntimeError(
+                "pure on-policy GRPO group integrity violation before optimizer: "
+                f"each UID must contain exactly rollout.n={expected_group_size} "
+                f"samples; {details}"
+            )
+
+    # Validation never reaches an optimizer and must retain every requested
+    # task. Its final partial DP batch is legitimate; do not silently turn an
+    # N-task evaluation into floor(N/world_size)*world_size tasks merely because
+    # a divisible subset happens to exist.
+    if not require_divisible:
+        return list(samples)
+
+    if len(samples) % world_size == 0:
+        return list(samples)
+
+    group_items = list(uid_to_samples.items())
+
+    # remainder -> (kept sample count, tuple(group indices)). Retaining only the
+    # best candidate for each remainder is sufficient because future group
+    # sizes depend on neither the path nor the already-selected UIDs.
+    states: Dict[int, Tuple[int, Tuple[int, ...]]] = {0: (0, ())}
+    for group_index, (_uid, group) in enumerate(group_items):
+        group_size = len(group)
+        next_states = dict(states)
+        for kept_count, kept_indices in list(states.values()):
+            candidate_count = kept_count + group_size
+            candidate_indices = kept_indices + (group_index,)
+            remainder = candidate_count % world_size
+            incumbent = next_states.get(remainder)
+            if (
+                incumbent is None
+                or candidate_count > incumbent[0]
+                or (
+                    candidate_count == incumbent[0]
+                    and candidate_indices < incumbent[1]
+                )
+            ):
+                next_states[remainder] = (candidate_count, candidate_indices)
+        states = next_states
+
+    kept_count, kept_indices = states[0]
+    if kept_count == 0:
+        message = (
+            f"{batch_label} has {len(samples)} samples across "
+            f"{len(group_items)} complete UID groups, but no non-empty complete-"
+            f"group subset is divisible by world_size={world_size}"
+        )
+        raise RuntimeError(message + "; refusing to enter the optimizer")
+
+    kept_uids = {group_items[index][0] for index in kept_indices}
+    aligned = [sample for sample in samples if _sample_uid(sample) in kept_uids]
+    if len(aligned) != kept_count or len(aligned) % world_size != 0:
+        raise AssertionError(
+            "internal complete-group alignment error: "
+            f"selected={kept_count}, materialized={len(aligned)}, "
+            f"world_size={world_size}"
+        )
+
+    kept_index_set = set(kept_indices)
+    dropped_uids = [
+        uid for index, (uid, _group) in enumerate(group_items)
+        if index not in kept_index_set
+    ]
+    logger.warning(
+        f"[{batch_label}] Deterministically trimmed {len(samples) - len(aligned)} "
+        f"samples as {len(dropped_uids)} complete UID group(s) to align with "
+        f"world_size={world_size}; dropped_uids={dropped_uids}"
+    )
+    return aligned
+
+
+_FINISH_REASON_CODE = {
+    None: -1,
+    "stop": 0,
+    "length": 1,
+}
+
+
+def _finish_reason_code(reason) -> int:
+    """Compact tensor representation; reserve 2 for known nonstandard values."""
+    if reason is not None:
+        reason = str(getattr(reason, "value", reason))
+    return _FINISH_REASON_CODE.get(reason, 2)
+
+
 def init_logger(experiment_name):
     """
     Initializes the logger with the given experiment name and sets up the logging environment.
@@ -188,6 +328,42 @@ class ParallelEnvManager(object):
         else:
             return llm_chat
 
+    def _sampling_params_for_mode(
+        self, mode: Literal["sample", "validate"]
+    ) -> dict:
+        """Build the exact per-request sampling contract for one rollout mode."""
+        sampling_params = dict(
+            n=1,
+            max_completion_tokens=self.rollout_config.response_length,
+            temperature=self.rollout_config.temperature,
+            top_p=self.rollout_config.top_p,
+        )
+        stop_sequences = self._cfg_to_list(
+            self.rollout_config.get("stop_sequences", None)
+        )
+        if stop_sequences:
+            sampling_params["stop"] = stop_sequences
+
+        if mode == "validate":
+            val_kwargs = self.rollout_config.val_kwargs
+            sampling_params["temperature"] = val_kwargs.temperature
+            sampling_params["top_k"] = val_kwargs.top_k
+            sampling_params["top_p"] = val_kwargs.top_p
+            # vLLM accepts an OpenAI-compatible per-request seed.  Keep it in
+            # the explicit validation request even for temperature-zero runs,
+            # so a future sampling-policy change cannot silently drop it.
+            validation_seed = val_kwargs.get("seed", None)
+            if validation_seed is not None:
+                sampling_params["seed"] = int(validation_seed)
+            val_stop_sequences = self._cfg_to_list(
+                val_kwargs.get("stop_sequences", None)
+            )
+            sampling_params["stop"] = (
+                val_stop_sequences if val_stop_sequences else stop_sequences
+            )
+
+        return sampling_params
+
     @staticmethod
     def _cfg_to_list(value):
         if value is None:
@@ -272,21 +448,7 @@ class ParallelEnvManager(object):
             try:
 
                 # TODO add try exception
-                sampling_params = dict(
-                    n=1,
-                    max_completion_tokens=self.rollout_config.response_length,
-                    temperature=self.rollout_config.temperature,
-                    top_p=self.rollout_config.top_p)
-                stop_sequences = self._cfg_to_list(self.rollout_config.get("stop_sequences", None))
-                if stop_sequences:
-                    sampling_params["stop"] = stop_sequences
-
-                if mode == "validate":
-                    sampling_params["temperature"] = self.rollout_config.val_kwargs.temperature
-                    sampling_params["top_k"] = self.rollout_config.val_kwargs.top_k
-                    sampling_params["top_p"] = self.rollout_config.val_kwargs.top_p
-                    val_stop_sequences = self._cfg_to_list(self.rollout_config.val_kwargs.get("stop_sequences", None))
-                    sampling_params["stop"] = val_stop_sequences if val_stop_sequences else stop_sequences
+                sampling_params = self._sampling_params_for_mode(mode)
 
                 llm_chat_fn = self.get_llm_chat_fn(sampling_params)
                 reward_caculator=grader_manager.get_calculator(task.evaluator, task=task)
@@ -300,6 +462,12 @@ class ParallelEnvManager(object):
 
                 env_worker = EnvWorker(task=task, thread_index=thread_index, config=self.config, tokenizer=self.tokenizer)
                 trajectory: Trajectory = env_worker.execute(data_id=data_id, rollout_id=rollout_id, traj_exp_config=traj_exp_config, agent_flow=agent_flow, tmux=tmux, stop=stop) # ⭐ Execute the task and generate the trajectory
+                if trajectory.metadata is None:
+                    trajectory.metadata = {}
+                # Validation usually uses val_kwargs.n=1, whereas training uses
+                # rollout.n. Preserve the mode so only optimizer-bound pure
+                # GRPO batches receive the strict rollout.n cardinality check.
+                trajectory.metadata["rollout_mode"] = mode
                 return trajectory
 
             except Exception as e:
@@ -339,6 +507,12 @@ class ParallelEnvManager(object):
         else:
             base_rollout_n = self.rollout_config.val_kwargs.n if mode == "validate" else self.rollout_n
         future_to_params: Dict[Future, Tuple[Task, TrajExpConfig, str, str, str, int, dict, list[bool]]] = {}
+        max_trajectory_resubmits = int(
+            self.rollout_config.get("max_trajectory_resubmits", 2)
+        )
+        if max_trajectory_resubmits < 0:
+            raise ValueError("max_trajectory_resubmits must be non-negative")
+        resubmit_counts: Dict[Tuple[str, str], int] = {}
 
         # ⭐ Experience Replay: 计算每个 task 的实际 on-policy rollout 数量
         # 如果 task 有 n_offpolicy_trajectories，则减少相应的 on-policy rollout
@@ -393,6 +567,13 @@ class ParallelEnvManager(object):
                         # if the result has metadata error, try to recover
                         if 'error' in result.metadata:
                             error_msg = result.metadata['error']
+                            retry_key = (params[2], params[3])
+                            resubmit_counts[retry_key] = resubmit_counts.get(retry_key, 0) + 1
+                            if resubmit_counts[retry_key] > max_trajectory_resubmits:
+                                raise RuntimeError(
+                                    "trajectory retry budget exhausted for "
+                                    f"data_id={params[2]} rollout_id={params[3]}: {error_msg}"
+                                )
                             logger.warning(f"Task {params[1]}-{params[2]} failed with metadata error: {error_msg}. Retrying... \n Task: {params[0]}")
                             # as most errors are internet error or quota, we wait before resubmit it
                             time.sleep(30)
@@ -405,12 +586,25 @@ class ParallelEnvManager(object):
                             continue
 
                         # 5. if the task is successful, add it to the result list
+                        result.metadata["expected_group_rollouts"] = int(
+                            task_rollout_counts[int(params[2])]
+                        )
                         traj_cmt_array.append(result)
                         pbar.update(1) # update progress bar when success
 
                     except Exception as e:
                         # handle the uncaught exception
-                        logger.error(f"Task {params[1]}-{params[2]} raised an exception: {e}. Retrying... \n Task: {params[0]}")
+                        retry_key = (params[2], params[3])
+                        resubmit_counts[retry_key] = resubmit_counts.get(retry_key, 0) + 1
+                        if resubmit_counts[retry_key] > max_trajectory_resubmits:
+                            raise RuntimeError(
+                                "trajectory retry budget exhausted for "
+                                f"data_id={params[2]} rollout_id={params[3]}"
+                            ) from e
+                        logger.error(
+                            f"Task {params[1]}-{params[2]} raised an exception: {e}. "
+                            f"Retrying {resubmit_counts[retry_key]}/{max_trajectory_resubmits}... \n Task: {params[0]}"
+                        )
                         # resubmit, and reset tmux and stop
                         thread_index=params[5]
                         for k in tmux: tmux[k][thread_index] = 0
@@ -429,7 +623,9 @@ class ParallelEnvManager(object):
 
 
     # TODO: define an extra class for trajectory-dataproto converting.
-    def to_dataproto(self, cmt_array) -> DataProto:
+    def to_dataproto(
+        self, cmt_array, *, optimizer_batch: Optional[bool] = None
+    ) -> DataProto:
         """
         Converts a list of trajectories into a DataProto object.
 
@@ -440,7 +636,9 @@ class ParallelEnvManager(object):
             DataProto: The resulting DataProto object after conversion.
         """
         # Step 1: Convert trajectories to samples: tokenizing
-        samples = self.trajectories_to_samples(cmt_array)  # ⭐ Tokenize the trajectories to create samples
+        samples = self.trajectories_to_samples(
+            cmt_array, optimizer_batch=optimizer_batch
+        )  # ⭐ Tokenize the trajectories to create samples
 
         # Step 2: Convert samples to DataProto: padding
         dataproto = self.samples_to_dataproto(samples)  # ⭐ Pad the samples and convert them to DataProto
@@ -671,13 +869,35 @@ class ParallelEnvManager(object):
             # Apply the same sliding-window compression as on-policy rollouts
             # so that DR3 discriminator sees a consistent format.
             cmt._compress_old_context()
-            
+            # Thinking mode: strip history <think> blocks exactly like on-policy
+            # rollouts, so the DR3 discriminator cannot separate teacher vs
+            # student on formatting alone (no-op unless strip_think_in_history).
+            n_think_stripped = cmt._strip_history_think()
+
             # 标记为 experience replay
             cmt.metadata["is_experience_replay"] = True
             cmt.metadata["old_log_probs"] = traj.metadata.get("old_log_probs")
             cmt.metadata["policy_version"] = traj.metadata.get("policy_version")
             cmt.metadata["entropy"] = traj.metadata.get("entropy")
             cmt.metadata["task_id"] = task_id
+            # Preserve completion termination provenance when an online
+            # trajectory enters replay. A historical 10K length failure must
+            # never become an unobservable "unknown" sample.
+            for termination_key in (
+                "decision_finish_reasons",
+                "decision_truncated_by_length",
+                "decision_count",
+                "length_truncated_decision_count",
+                "has_length_truncated_decision",
+                "selected_finish_reason",
+                "selected_truncated_by_length",
+                "length_truncation_terminated",
+                "length_truncation_step",
+            ):
+                if termination_key in traj.metadata:
+                    cmt.metadata[termination_key] = copy.deepcopy(
+                        traj.metadata[termination_key]
+                    )
             
             # ⭐ Teacher Experience: 传递 teacher 特有的 metadata
             cmt.metadata["is_teacher"] = traj.metadata.get("is_teacher", False)
@@ -697,7 +917,22 @@ class ParallelEnvManager(object):
                             accumulated_token_ids.extend(turn_info["token_ids"])
                     if accumulated_token_ids:
                         cmt.metadata["teacher_token_ids"] = accumulated_token_ids
-            
+
+                # ⭐ Thinking teachers: stripping history <think> tokens breaks the
+                # per-token correspondence between the recorded log_probs/token_ids
+                # and the retokenized trajectory. The react_tags 72B teacher has no
+                # think blocks (unaffected), and the DR3 path needs no teacher
+                # log-probs — but per-token alignment is NOT yet supported here.
+                if n_think_stripped > 0 and (
+                    traj.metadata.get("log_probs") or traj.metadata.get("log_probs_per_turn")
+                ):
+                    logger.warning(
+                        f"[convert_offpolicy_to_cmt] strip_think_in_history removed <think> blocks "
+                        f"from {n_think_stripped} history turn(s) of a teacher trajectory that carries "
+                        f"log_probs; per-token log-prob alignment for thinking teachers is not yet "
+                        f"supported and the aligned values will be unreliable (task_id={task_id})."
+                    )
+
             cmt_array.append(cmt)
         
         return cmt_array
@@ -715,6 +950,105 @@ class ParallelEnvManager(object):
                   'is_experience_replay', and 'old_log_probs' corresponding to their respective 
                   values in the comment's metadata.
         """
+        finish_reasons = list(
+            cmt.metadata.get("decision_finish_reasons") or []
+        )
+        finish_reasons = [
+            None
+            if reason is None
+            else str(getattr(reason, "value", reason))
+            for reason in finish_reasons
+        ]
+        length_flags = [
+            bool(value)
+            for value in (
+                cmt.metadata.get("decision_truncated_by_length") or []
+            )
+        ]
+        if len(length_flags) < len(finish_reasons):
+            length_flags.extend(
+                reason == "length"
+                for reason in finish_reasons[len(length_flags) :]
+            )
+
+        selected_step = cmt.metadata.get("selected_decision_step")
+        try:
+            selected_index = int(selected_step)
+        except (TypeError, ValueError):
+            selected_index = -1
+
+        if "selected_finish_reason" in cmt.metadata:
+            selected_finish_reason = cmt.metadata.get("selected_finish_reason")
+            if selected_finish_reason is not None:
+                selected_finish_reason = str(
+                    getattr(selected_finish_reason, "value", selected_finish_reason)
+                )
+        elif 0 <= selected_index < len(finish_reasons):
+            selected_finish_reason = finish_reasons[selected_index]
+        elif finish_reasons:
+            # Legacy transcript samples train over the full episode rather than
+            # one snapshot. The last decision is the terminal completion.
+            selected_finish_reason = finish_reasons[-1]
+        else:
+            selected_finish_reason = None
+
+        if "selected_truncated_by_length" in cmt.metadata:
+            selected_truncated_by_length = bool(
+                cmt.metadata.get("selected_truncated_by_length")
+            )
+        elif 0 <= selected_index < len(length_flags):
+            selected_truncated_by_length = length_flags[selected_index]
+        elif length_flags:
+            selected_truncated_by_length = length_flags[-1]
+        else:
+            selected_truncated_by_length = selected_finish_reason == "length"
+
+        decision_count = int(
+            cmt.metadata.get("decision_count", len(finish_reasons)) or 0
+        )
+        length_truncated_decision_count = int(
+            cmt.metadata.get(
+                "length_truncated_decision_count", sum(length_flags)
+            )
+            or 0
+        )
+
+        decision_context_stats = [
+            dict(snapshot.context_stats)
+            for snapshot in getattr(cmt, "decision_snapshots", [])
+        ]
+        decision_audit = []
+        for snapshot in getattr(cmt, "decision_snapshots", []):
+            stop_reason = snapshot.stop_reason
+            if stop_reason is not None:
+                stop_reason = str(getattr(stop_reason, "value", stop_reason))
+            decision_audit.append(
+                {
+                    "step_index": int(snapshot.step_index),
+                    "prompt_tokens": len(snapshot.prompt_token_ids),
+                    "prompt_hash": snapshot.prompt_hash,
+                    "raw_prompt_hash": snapshot.raw_prompt_hash,
+                    "completion_tokens": len(snapshot.completion_token_ids),
+                    "completion_hash": cmt.context_policy.ids_hash(
+                        snapshot.completion_token_ids
+                    ),
+                    "template_hash": snapshot.template_hash,
+                    "context_stats": dict(snapshot.context_stats),
+                    "finish_reason": snapshot.finish_reason,
+                    "truncated_by_length": bool(
+                        snapshot.truncated_by_length
+                    ),
+                    "stop_reason": stop_reason,
+                }
+            )
+        # Legacy/non-snapshot trajectories may still expose one selected
+        # context record. Keep it auditable without pretending that it covers
+        # every environment decision.
+        if not decision_context_stats:
+            selected_context_stats = cmt.metadata.get("context_stats")
+            if isinstance(selected_context_stats, dict) and selected_context_stats:
+                decision_context_stats = [dict(selected_context_stats)]
+
         extras = {
             "add_exp": cmt.metadata.get("add_exp", None),  # ⭐ Retrieves the 'add_exp' value from metadata
             "task_train_expmode": cmt.metadata.get("task_train_exp_mode", None),  # ⭐ Retrieves the 'task_train_exp_mode' value from metadata
@@ -726,17 +1060,67 @@ class ParallelEnvManager(object):
             "policy_version": cmt.metadata.get("policy_version"),
             "entropy": cmt.metadata.get("entropy"),
             "task_id": cmt.task_id,  # ⭐ 保存 task_id 用于后续处理
+            "rollout_id": cmt.rollout_id,
+            # Trusted low-cardinality task telemetry source. This comes from
+            # the environment reset response, not query-text inference.
+            "env_type": cmt.metadata.get("env_type"),
+            "environment_task_type": cmt.metadata.get(
+                "environment_task_type"
+            ),
             # ⭐ Teacher Experience: 传递 teacher 特有字段
             "is_teacher": cmt.metadata.get("is_teacher", False),
             "has_log_prob": cmt.metadata.get("has_log_prob", False),
             "teacher_log_probs": cmt.metadata.get("teacher_log_probs"),  # 累积的 log_probs
             "teacher_log_probs_per_turn": cmt.metadata.get("teacher_log_probs_per_turn"),  # 分轮的 log_probs
             "teacher_token_ids": cmt.metadata.get("teacher_token_ids"),  # 累积的 token_ids（用于精确对齐）
+            # Exact per-decision rollout/training contract.
+            "snapshot_training": cmt.metadata.get("snapshot_training", False),
+            "selected_decision_step": cmt.metadata.get("selected_decision_step"),
+            "context_stats": cmt.metadata.get("context_stats"),
+            "decision_context_stats": decision_context_stats,
+            "decision_audit": decision_audit,
+            "rollout_log_probs": cmt.metadata.get("rollout_log_probs"),
+            "prompt_hash": cmt.metadata.get("prompt_hash"),
+            "raw_prompt_hash": cmt.metadata.get("raw_prompt_hash"),
+            "template_hash": cmt.metadata.get("template_hash"),
+            "rollout_mode": cmt.metadata.get("rollout_mode"),
+            "expected_group_rollouts": cmt.metadata.get(
+                "expected_group_rollouts"
+            ),
+            # Completion termination contract. Ordered lists preserve every
+            # environment decision; scalar fields refer to the selected
+            # snapshot (or the terminal decision in legacy transcript mode).
+            "finish_reason": selected_finish_reason,
+            "truncated_by_length": selected_truncated_by_length,
+            "decision_finish_reasons": finish_reasons,
+            "decision_truncated_by_length": length_flags,
+            "decision_count": decision_count,
+            "length_truncated_decision_count": (
+                length_truncated_decision_count
+            ),
+            "has_length_truncated_decision": bool(
+                cmt.metadata.get(
+                    "has_length_truncated_decision",
+                    length_truncated_decision_count > 0,
+                )
+            ),
+            "episode_end_reason": cmt.metadata.get("episode_end_reason"),
+            "context_overflow_step": cmt.metadata.get(
+                "context_overflow_step"
+            ),
+            "context_overflow_prompt_tokens": cmt.metadata.get(
+                "context_overflow_prompt_tokens"
+            ),
         }
         return extras
 
 
-    def trajectories_to_samples(self, cmt_array: List) -> List[Sample]:
+    def trajectories_to_samples(
+        self,
+        cmt_array: List,
+        *,
+        optimizer_batch: Optional[bool] = None,
+    ) -> List[Sample]:
         """
         Converts a list of trajectories into a list of samples, ensuring the number of samples is divisible by the total number of GPUs across all nodes.
 
@@ -749,38 +1133,106 @@ class ParallelEnvManager(object):
         # Step 1: Conversion
         sample_arr_final = []
         for cmt in cmt_array:
-            extras = self.get_extra(cmt)
             # cc: message returned by the new env will be tagged as initialization, with no loss-mask
             sample_arr = cmt.group_tokenize()  # ⭐ Tokenize the trajectory into samples
+            # group_tokenize may attach exact-decision metadata, so extract
+            # extras only after the immutable training sample has been chosen.
+            extras = self.get_extra(cmt)
             for sample in sample_arr:
                 sample.extras = extras  # ⭐ Add extra information to each sample
             sample_arr_final += sample_arr
 
-        # Step 2: Make sample count "world_size"-friendly when possible.
-        #
-        # NOTE:
-        # Historically we *removed* `remainder = len(samples) % world_size` samples so the count is divisible.
-        # However, when `len(samples) < world_size`, `remainder == len(samples)` and we would remove *all* samples,
-        # causing downstream `max()` on empty lists during validation (common on the last val batch).
-        # In that small-batch case we keep samples as-is.
+        # Step 2: Align optimizer-bound batches using complete GRPO UID groups.
+        # Random sample-level deletion corrupts GRPO whenever it removes only
+        # part of a UID group. Validation may remain non-divisible when no
+        # complete-group alignment exists: it never reaches the optimizer, and
+        # val_kwargs.n commonly differs from rollout.n.
         world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
-        remainder = len(sample_arr_final) % world_size
-        if remainder != 0:
-            if len(sample_arr_final) < world_size:
-                logger.warning(
-                    f"[trajectories_to_samples] Got only {len(sample_arr_final)} samples (< world_size={world_size}); "
-                    f"skip trimming-to-divisor to avoid producing an empty batch."
-                )
-            else:
-                import random
-                remove_indices = random.sample(range(len(sample_arr_final)), remainder)
-                # Sort in reverse order to avoid index shifting during removal
-                remove_indices.sort(reverse=True)
-                for idx in remove_indices:
-                    sample_arr_final.pop(idx)  # ⭐ Remove samples to make the total number divisible by world size
+        rollout_modes = {
+            sample.extras.get("rollout_mode")
+            for sample in sample_arr_final
+            if sample.extras.get("rollout_mode") is not None
+        }
+        inferred_optimizer_batch = "sample" in rollout_modes
+        is_optimizer_batch = (
+            inferred_optimizer_batch
+            if optimizer_batch is None
+            else bool(optimizer_batch)
+        )
+        has_offpolicy_or_teacher = any(
+            sample.extras.get("is_experience_replay", False)
+            or sample.extras.get("is_teacher", False)
+            for sample in sample_arr_final
+        )
+        adv_estimator = str(
+            OmegaConf.select(self.config, "algorithm.adv_estimator", default="")
+        ).lower()
+        is_pure_onpolicy_grpo = (
+            is_optimizer_batch
+            and adv_estimator.endswith("grpo")
+            and not has_offpolicy_or_teacher
+            and rollout_modes == {"sample"}
+        )
 
-        # Randomly remove some samples, so that the number of samples is divisible by 8
-        return sample_arr_final
+        expected_snapshot_group_size = None
+        if is_pure_onpolicy_grpo:
+            uid_to_samples: Dict[str, List[Sample]] = {}
+            for sample in sample_arr_final:
+                uid_to_samples.setdefault(_sample_uid(sample), []).append(sample)
+            snapshot_only = True
+            expected_sizes = set()
+            malformed_rollout_groups = []
+            for uid, group in uid_to_samples.items():
+                declared = {
+                    int(
+                        sample.extras.get("expected_group_rollouts")
+                        or self.rollout_n
+                    )
+                    for sample in group
+                }
+                if len(declared) != 1:
+                    raise RuntimeError(
+                        "inconsistent expected rollout cardinality inside UID "
+                        f"group {uid!r}: {sorted(declared)}"
+                    )
+                expected_rollouts = next(iter(declared))
+                expected_sizes.add(expected_rollouts)
+                unique_rollouts = {str(sample.rollout_id) for sample in group}
+                if len(unique_rollouts) != expected_rollouts:
+                    malformed_rollout_groups.append(
+                        (uid, len(unique_rollouts), expected_rollouts)
+                    )
+                snapshot_only = snapshot_only and all(
+                    bool(sample.extras.get("snapshot_training", False))
+                    for sample in group
+                )
+            if malformed_rollout_groups:
+                details = ", ".join(
+                    f"uid={uid!r}:unique_rollouts={actual},expected={expected}"
+                    for uid, actual, expected in malformed_rollout_groups
+                )
+                raise RuntimeError(
+                    "pure on-policy GRPO rollout integrity violation before "
+                    f"optimizer: {details}"
+                )
+            # Exact decision snapshots produce one trainable Sample per
+            # rollout, so sample cardinality must also match. Legacy context
+            # managers may emit multiple decision samples per rollout; their
+            # rollout-level integrity was checked above without a false reject.
+            if snapshot_only and len(expected_sizes) == 1:
+                expected_snapshot_group_size = next(iter(expected_sizes))
+
+        return _align_samples_by_complete_uid_groups(
+            sample_arr_final,
+            world_size,
+            expected_group_size=expected_snapshot_group_size,
+            require_divisible=is_optimizer_batch,
+            batch_label=(
+                "pure on-policy GRPO training batch"
+                if is_pure_onpolicy_grpo
+                else "mixed/replay or validation batch"
+            ),
+        )
 
     def samples_to_dataproto(self, samples: list[Sample]) -> DataProto:
         """
@@ -801,6 +1253,7 @@ class ParallelEnvManager(object):
         prompt_loss_mask, response_loss_mask = [], []
         prompt_exp_mask_list, response_exp_mask_list = [], []  # List of binary masks indicating whether to consider off_clip_high for each sample in the batch
         messages = []
+        messages_raw = []
         reward_scores = []
         task_ids = []
         rollout_ids = []
@@ -822,38 +1275,13 @@ class ParallelEnvManager(object):
                     f"greater than max_prompt_length {self.config.data.max_prompt_length}."
                 )
 
-            # If response is longer than expected, truncate instead of crashing the whole batch.
-            #
-            # In multi-turn environments (e.g., SciWorld), the response segment may include many env/user tokens
-            # (loss_mask=0) in addition to assistant tokens (loss_mask=1). Length overflows are therefore common
-            # when max_steps is large or observations are verbose.
-            #
-            # Previously we raised here, which made training unstable (whole batches dropped).
             if len(sample.response_ids) > self.config.data.max_response_length:
-                logger.warning(
-                    f"Sample {sample.request_id} has response_ids length {len(sample.response_ids)} "
-                    f"greater than max_response_length {self.config.data.max_response_length}."
+                raise RuntimeError(
+                    f"Sample {getattr(sample, 'request_id', 'unknown')} has response_ids "
+                    f"length {len(sample.response_ids)} greater than max_response_length "
+                    f"{self.config.data.max_response_length}; refusing to attach a "
+                    "trajectory reward to a silently truncated prefix"
                 )
-                # Ensure Sample truncation parameters match current config, then truncate.
-                try:
-                    sample.max_prompt_len = self.config.data.max_prompt_length
-                    sample.max_response_len = self.config.data.max_response_length
-                    sample.max_model_len = self.config.data.max_prompt_length + self.config.data.max_response_length
-                    sample.truncate_output_ids()
-                except Exception as _e:
-                    logger.warning(f"Failed to truncate overlong sample {sample.request_id}: {_e}")
-                # Hard guard: if still overlong, hard-truncate response-related arrays.
-                if len(sample.response_ids) > self.config.data.max_response_length:
-                    max_r = self.config.data.max_response_length
-                    sample.response_ids = sample.response_ids[:max_r]
-                    sample.response_attention_mask = sample.response_attention_mask[:max_r]
-                    sample.response_position_ids = sample.response_position_ids[:max_r]
-                    sample.response_loss_mask = sample.response_loss_mask[:max_r]
-                    # Rebuild concatenated fields
-                    sample.input_ids = sample.prompt_ids + sample.response_ids
-                    sample.attention_mask = sample.prompt_attention_mask + sample.response_attention_mask
-                    sample.position_ids = sample.prompt_position_ids + sample.response_position_ids
-                    sample.loss_mask = sample.prompt_loss_mask + sample.response_loss_mask
 
             # ------------- shuchang 0714: append step_ids and steps_texts ------------
             resp_ids = sample.response_ids
@@ -885,6 +1313,7 @@ class ParallelEnvManager(object):
             response_loss_mask.append(torch.tensor(sample.response_loss_mask, dtype=torch.int))
 
             messages.append({"messages": sample.messages})
+            messages_raw.append({"messages": getattr(sample, "messages_raw", None) or sample.messages})
             reward_scores.append(sample.reward_scores)
             extras.append(sample.extras)
 
@@ -1043,9 +1472,120 @@ class ParallelEnvManager(object):
         prompt_teacher_mask = torch.zeros_like(prompt_ids, dtype=torch.int)
         teacher_mask_full = torch.cat((prompt_teacher_mask, teacher_mask), dim=-1)
 
+        # Preserve the behavior-policy log-probabilities returned by vLLM.  The
+        # actor-side recomputation remains useful, but only as an identity/drift
+        # check; it is not evidence that the sampled conditional was correct.
+        rollout_log_probs_list = []
+        rollout_log_probs_mask_list = []
+        has_rollout_log_probs = False
+        for sample in samples:
+            raw_log_probs = sample.extras.get("rollout_log_probs")
+            response_length = len(sample.response_ids)
+            if raw_log_probs is None:
+                if sample.extras.get("snapshot_training", False):
+                    raise RuntimeError(
+                        "snapshot sample is missing rollout log-probabilities"
+                    )
+                rollout_log_probs_list.append(
+                    torch.zeros(response_length, dtype=torch.float32)
+                )
+                rollout_log_probs_mask_list.append(
+                    torch.zeros(response_length, dtype=torch.int)
+                )
+                continue
+            raw_log_probs = list(raw_log_probs)
+            if len(raw_log_probs) != response_length:
+                raise RuntimeError(
+                    "rollout log-probability/token mismatch: "
+                    f"{len(raw_log_probs)} != {response_length}"
+                )
+            has_rollout_log_probs = True
+            rollout_log_probs_list.append(
+                torch.tensor(raw_log_probs, dtype=torch.float32)
+            )
+            rollout_log_probs_mask_list.append(
+                torch.tensor(sample.response_loss_mask, dtype=torch.int)
+            )
+
+        rollout_log_probs = pad_sequence(
+            rollout_log_probs_list, batch_first=True, padding_value=0.0
+        )
+        rollout_log_probs = pad_sequence_to_length(
+            rollout_log_probs, max_response_length_this_batch, 0.0
+        )
+        rollout_log_probs_mask = pad_sequence(
+            rollout_log_probs_mask_list, batch_first=True, padding_value=0
+        )
+        rollout_log_probs_mask = pad_sequence_to_length(
+            rollout_log_probs_mask, max_response_length_this_batch, 0
+        )
+
+        # Completion termination is sample-level state. Keeping the selected
+        # values as tensors makes them survive padding, validation dispatch and
+        # balance/reorder; the ordered per-decision audit trail remains in the
+        # non-tensor batch and ``extras``.
+        finish_reasons = []
+        truncated_by_length = []
+        decision_counts = []
+        length_truncated_decision_counts = []
+        has_length_truncated_decision = []
+        decision_finish_reasons = []
+        decision_truncated_by_length = []
+        for sample in samples:
+            sample_extras = sample.extras or {}
+            reason = sample_extras.get("finish_reason")
+            if reason is not None:
+                reason = str(getattr(reason, "value", reason))
+            is_length = bool(
+                sample_extras.get("truncated_by_length", False)
+            ) or reason == "length"
+            all_reasons = list(
+                sample_extras.get("decision_finish_reasons") or []
+            )
+            all_reasons = [
+                None
+                if item is None
+                else str(getattr(item, "value", item))
+                for item in all_reasons
+            ]
+            all_length_flags = [
+                bool(item)
+                for item in (
+                    sample_extras.get("decision_truncated_by_length") or []
+                )
+            ]
+            if len(all_length_flags) < len(all_reasons):
+                all_length_flags.extend(
+                    item == "length"
+                    for item in all_reasons[len(all_length_flags) :]
+                )
+            decision_count = int(
+                sample_extras.get("decision_count", len(all_reasons)) or 0
+            )
+            length_count = int(
+                sample_extras.get(
+                    "length_truncated_decision_count",
+                    sum(all_length_flags),
+                )
+                or 0
+            )
+
+            finish_reasons.append(reason)
+            truncated_by_length.append(is_length)
+            decision_counts.append(decision_count)
+            length_truncated_decision_counts.append(length_count)
+            has_length_truncated_decision.append(
+                bool(
+                    sample_extras.get(
+                        "has_length_truncated_decision", length_count > 0
+                    )
+                )
+            )
+            decision_finish_reasons.append(all_reasons)
+            decision_truncated_by_length.append(all_length_flags)
+
         # Construct the batch using TensorDict
-        batch = TensorDict(
-            {
+        batch_fields = {
                 "prompts": prompt_ids,
                 "responses": response_ids,
                 "input_ids": input_ids,
@@ -1057,9 +1597,154 @@ class ParallelEnvManager(object):
                 "group_ids": group_ids,   # ★ add groupid
                 "recorded_old_log_probs": recorded_old_log_probs,  # ⭐ Experience Replay: 历史策略的 old_log_probs
                 "teacher_mask": teacher_mask_full,  # ⭐ Teacher Experience: 标记 teacher 轨迹位置
-            },
-            batch_size=len(samples),
+                "finish_reason_code": torch.tensor(
+                    [_finish_reason_code(reason) for reason in finish_reasons],
+                    dtype=torch.long,
+                ),
+                "truncated_by_length": torch.tensor(
+                    truncated_by_length, dtype=torch.bool
+                ),
+                "decision_count": torch.tensor(
+                    decision_counts, dtype=torch.long
+                ),
+                "length_truncated_decision_count": torch.tensor(
+                    length_truncated_decision_counts, dtype=torch.long
+                ),
+                "has_length_truncated_decision": torch.tensor(
+                    has_length_truncated_decision, dtype=torch.bool
+                ),
+        }
+        if has_rollout_log_probs:
+            batch_fields["rollout_log_probs"] = rollout_log_probs
+            batch_fields["rollout_log_probs_mask"] = rollout_log_probs_mask
+
+        context_stats = [sample.extras.get("context_stats") for sample in samples]
+        if any(isinstance(stats, dict) for stats in context_stats):
+            for stat_name in (
+                "raw_prompt_tokens",
+                "managed_prompt_tokens",
+                "compressed_turns",
+                "dropped_turns",
+                "clipped_observations",
+            ):
+                batch_fields[f"context_{stat_name}"] = torch.tensor(
+                    [
+                        int(stats.get(stat_name, -1))
+                        if isinstance(stats, dict)
+                        else -1
+                        for stats in context_stats
+                    ],
+                    dtype=torch.long,
+                )
+            batch_fields["context_selected_decision_step"] = torch.tensor(
+                [
+                    int(sample.extras.get("selected_decision_step", -1))
+                    for sample in samples
+                ],
+                dtype=torch.long,
+            )
+
+        # Trajectory-wide context audit. Snapshot training deliberately uses
+        # one immutable decision for the loss, but validation must still prove
+        # whether management activated at any environment decision rather than
+        # only at the selected snapshot.
+        context_decision_counts = []
+        context_active_decision_counts = []
+        context_max_raw_prompt_tokens = []
+        context_max_managed_prompt_tokens = []
+        context_total_dropped_turns = []
+        context_total_clipped_observations = []
+        decision_context_stats_batch = []
+        for sample in samples:
+            raw_stats = list(
+                (sample.extras or {}).get("decision_context_stats") or []
+            )
+            normalized_stats = [
+                dict(stats) for stats in raw_stats if isinstance(stats, dict)
+            ]
+            valid_stats = [
+                stats
+                for stats in normalized_stats
+                if int(stats.get("raw_prompt_tokens", -1)) >= 0
+                and int(stats.get("managed_prompt_tokens", -1)) >= 0
+            ]
+            active_count = sum(
+                int(
+                    int(stats.get("raw_prompt_tokens", -1))
+                    != int(stats.get("managed_prompt_tokens", -1))
+                    or int(stats.get("compressed_turns", 0)) > 0
+                    or int(stats.get("dropped_turns", 0)) > 0
+                    or int(stats.get("clipped_observations", 0)) > 0
+                )
+                for stats in valid_stats
+            )
+            context_decision_counts.append(len(valid_stats))
+            context_active_decision_counts.append(active_count)
+            context_max_raw_prompt_tokens.append(
+                max(
+                    (int(stats["raw_prompt_tokens"]) for stats in valid_stats),
+                    default=-1,
+                )
+            )
+            context_max_managed_prompt_tokens.append(
+                max(
+                    (
+                        int(stats["managed_prompt_tokens"])
+                        for stats in valid_stats
+                    ),
+                    default=-1,
+                )
+            )
+            context_total_dropped_turns.append(
+                sum(int(stats.get("dropped_turns", 0)) for stats in valid_stats)
+            )
+            context_total_clipped_observations.append(
+                sum(
+                    int(stats.get("clipped_observations", 0))
+                    for stats in valid_stats
+                )
+            )
+            decision_context_stats_batch.append(normalized_stats)
+
+        batch_fields.update(
+            {
+                "context_decision_count": torch.tensor(
+                    context_decision_counts, dtype=torch.long
+                ),
+                "context_active_decision_count": torch.tensor(
+                    context_active_decision_counts, dtype=torch.long
+                ),
+                "context_any_management_active": torch.tensor(
+                    [count > 0 for count in context_active_decision_counts],
+                    dtype=torch.bool,
+                ),
+                "context_max_raw_prompt_tokens": torch.tensor(
+                    context_max_raw_prompt_tokens, dtype=torch.long
+                ),
+                "context_max_managed_prompt_tokens": torch.tensor(
+                    context_max_managed_prompt_tokens, dtype=torch.long
+                ),
+                "context_total_dropped_turns": torch.tensor(
+                    context_total_dropped_turns, dtype=torch.long
+                ),
+                "context_total_clipped_observations": torch.tensor(
+                    context_total_clipped_observations, dtype=torch.long
+                ),
+            }
         )
+
+        batch = TensorDict(batch_fields, batch_size=len(samples))
+
+        decision_finish_reasons_array = np.empty(len(samples), dtype=object)
+        decision_finish_reasons_array[:] = decision_finish_reasons
+        decision_truncated_by_length_array = np.empty(
+            len(samples), dtype=object
+        )
+        decision_truncated_by_length_array[:] = (
+            decision_truncated_by_length
+        )
+        decision_context_stats_array = np.empty(len(samples), dtype=object)
+        decision_context_stats_array[:] = decision_context_stats_batch
 
         return DataProto(
             batch=batch,
@@ -1067,8 +1752,16 @@ class ParallelEnvManager(object):
                 "task_ids": np.array(task_ids),
                 "rollout_ids": np.array(rollout_ids),
                 "messages": np.array(messages),
+                # pre-compression view; the State Channel hashes these
+                "messages_raw": np.array(messages_raw),
                 "reward_scores": np.array(reward_scores),
                 "extras": np.array(extras),
-                "steps": np.array(steps_texts_list, dtype=object)
+                "steps": np.array(steps_texts_list, dtype=object),
+                "finish_reasons": np.array(finish_reasons, dtype=object),
+                "decision_finish_reasons": decision_finish_reasons_array,
+                "decision_truncated_by_length": (
+                    decision_truncated_by_length_array
+                ),
+                "decision_context_stats": decision_context_stats_array,
             }
         )

@@ -129,7 +129,7 @@ k. **共享默认超参 run**:两环境用同一套 μ 默认值跑 1–2 seeds�
 - 本地 Qwen3.5-122B(第二教师):独立 conda env `teacher35`(vllm≥0.17),TP=8 约 31GB/卡权重,**预订硬日期窗口**(建议 8/9–8/10,当前 Llama run 结束后)而非"排在其后"。
 - Progress-map smoke test:构建后打印 per-task key 数与 on-policy hit-rate(复用 `validate_teacher_for_training.py`,新增 D1 小项)。
 
-### 3.2 学生侧:双 lane(v1.1 关键变更)
+### 3.2 学生侧:双 lane(v1.1 关键变更;**2026-07-31 路线已定,见文末补记**)
 
 **Lane-1(现栈,W1 第 1 天启动)**:**Qwen3-4B 在现有 duet 栈直接开跑**——vllm 0.8.5/transformers 4.53 支持 Qwen3,config 模板已在 repo(注意:现有 6 个模板是 duet/luffy/chord/onpolicy/state_channel/action_channel,**SFT→RL 与 BC-only 两行需新写 config**,S)。它同时充当:teacher 数据/协议/成本的全链路 pilot + Gate-1 失败时的现成 headline。W1 每一天都在产出,不押注升级成功。
 
@@ -221,3 +221,107 @@ Reasoning 学生四项必改(两 lane 通用,file:line 已核实):
 ---
 
 *维护约定:本文件为 ICLR 转投总纲,每周日更新进度与 Gate 状态。三份评审原文见 session 工作流输出(可追溯)。实验协议细则与 provenance 规范落地后在 `docs/` 单独成文。*
+
+---
+
+## 补记 2026-07-31:Infra 路线定案(四路调研后)
+
+原 §3.2 的"duet2 全栈升级(新 verl)"被四路技术调研修正为**方案 (b):vendor 旧 verl + rollout 外置**,依据:
+
+1. **R1**:rollout 是 verl colocated hybrid engine(sleep/wake 共卡),但 env_manager 的消费面只有 OpenAI chat completions + `token_id:` logprobs + 5 个 manager 属性——rollout 外置的接缝天然干净。
+2. **R3**:fork 对 verl 内部依赖 ~8000 行(het_fsdp_worker 78% 是 verl 0.4 快照,chat-scheduler 栈在 2026 verl 已被删除)→ 全量升级 15–25 人日、高回归风险;方案 (b) 7–12 人日,DUET 全部机制代码字节不动(正确性零重验)。
+3. **R2**:vllm 0.17 与 transformers 5.x 官方互斥,verl v0.8.0(vllm 0.20.2)才支持 Qwen3.5 FSDP——但方案 (b) 下训练环境**不装 vllm**,torch 自由选 2.9(flash-attn 官方 wheel 线),vllm 0.20.2 独立环境 `vllm2` 服务 rollout + 122B teacher。全量 verl 升级降级为 deadline 后技术债。
+4. **R4**:Qwen3.5 模板天然剥离历史 think(rollout 侧零改动);enable_thinking **默认关**,用 patch 模板的模型目录(`Qwen3.5-*-think`)根治;GDN hybrid 的 KV 极便宜(4B 32KB/token),`max_model_len 32768` 下 4×A100 双 lane 显存可行;**teacher 轨迹必须同步剥离 think**(防判别器格式捷径——即 §3.4 风险的第一道工程防线);`</action>` stop 必须删除改解析期截取(think 中复述会误停)。
+
+组件:`duet2`(torch 2.9 + transformers 5.5.1 + vendored verl 0.4 + fla/causal-conv1d + flash-attn)、`vllm2`(vllm 0.20.2)、`external/verl_t5x_patches/`(5 处断点补丁,版本控制)、`ExternalLLMServerManager` + 每步权重同步(vLLM 0.17+ 原生 RL weight-sync API 优先,checkpoint-reload 兜底)、`strip_think_in_history` 上下文管理。首发目标(用户 2026-07-31 指定):**Qwen3.5-4B GRPO baseline × {alfworld, webshop, sciworld},每实验 4 卡,双 lane 并行**(GRPO 无 teacher 依赖,是新栈理想首发)。
+
+---
+
+## 补记 2026-07-31(下午):Reasoning-Context Budget —— 新增的方法轴
+
+新栈首发暴露出一个此前没有预料到的设计问题,调研 + 实测后它变成了 ICLR 版的一条**可扫描方法轴**,而不只是工程妥协。
+
+### 问题
+
+Qwen3.5 的 chat template 在 rollout 时自动剥离历史轮 `<think>`。为保持训练序列与 rollout 条件一致,我们最初也在训练侧剥离(`strip_think_in_history: true`)。后果是**历史轮的 action token 带梯度、但它们自己那一轮的 think 被剥掉**:rollout 采样自 `π(a | ctx, think)`,训练却在优化 `π(a | ctx)`,条件分布不一致 → 有偏梯度,把模型往"不思考直接动作"推。
+
+### 三个端点的实测证据(ALFWorld Qwen3.5-4B GRPO,同 seed 同配置)
+
+| 设置 | step-5 SR | step-5 KL | 带梯度 token 占比 | 结局 |
+|---|---|---|---|---|
+| **B=0**(全剥离) | 29.7% | 0.197 | 8.6% | **step 15 崩溃**(SR→0,全部撞 30 轮上限,动作死循环) |
+| **B=1024**(主设定) | 32.8% | 0.005 | 19.1% | 运行中 |
+| **B=−1**(keep-all) | 35.9% | 0.004 | 28.5% | **step 6 OOM,物理不可行** |
+
+两端各自失败的机制不同——一端是有偏梯度,一端是 Qwen3.5 的 248K 词表撞显存墙(单个 32768-token 微批的 logits = 16.3GB)。中间值不是折中,是唯一可行解。
+
+另一条独立证据:keep-all 在 **step 1** 的 SR 就是 57.8% vs 全剥离的 31.2%——这不是训练效果,是 **rollout 能力本身**的差异,量化了"丢弃历史推理"对 agentic 任务的伤害(方向与 arXiv 2606.00135 在 BFCL multi-turn 上的 +2~5% 一致,幅度更大)。
+
+### 实现
+
+- `reasoning_context_budget`(token 单位;`0` 全剥离 / `-1` 全保留 / `N>0` 保留最近 N 个推理 token),从最近一轮往回累计,整轮 all-or-nothing;**延迟剥离**(一轮今天在窗口内、几轮后滑出才剥)。`cmt_linear.py:_strip_history_think`。
+- 配套 `-thinkraw` 模板(历史轮原样输出 content),因为预算窗口是**数据依赖**的,静态 jinja 的 `loop.index0 > X` 表达不了;它同时避免了 `-thinkhist` 对已剥离轮渲染出空 `<think></think>` 块的伪影。
+- 同一规则同时作用于 student rollout、student 训练序列、teacher 轨迹(`env_manager.py` 的同一调用点),保证师生格式对称。
+- 附带修掉:三处 think 解析条件挂错(挂在剥离开关而非 thinking 模式上);teacher 的 off-policy loss_mask 绕过 header blackout(`get_loss_mask(force_training=True)`)——那几个 logp≈0 的模板 token 会把 teacher 的 log-prob 统计往 on-policy 方向拉,而 DR3 正是用这组统计估密度比。
+
+### 关键实测:DR3 的"长度捷径"不存在(推翻调研假设)
+
+调研断言 teacher(10.1 轮/2407 tok)与 student(23.5 轮/5814 tok)"单靠长度就近乎完美分离",要求优先做 DR3 特征硬化。实测(`scripts/diagnose_dr3_length_separability.py`,教师 n=400,真实 tokenizer):
+
+- **仅用 response length 的 teacher/student AUC = 0.558**(0.5 = 不可分)
+- 教师 assistant token 中位数 1015(p90 2794),学生均值 ~1326(std 723),分布高度重叠
+- 调研的 5814 是**旧配置下含环境观测的 response_length 全量**,而 DR3 聚合的是 assistant token;口径对齐后捷径消失
+
+**结论:DR3 特征硬化不做**。该脚本保留为论文中"格式/长度检测器证伪 gate"的出数工具,每个新配置复算。
+
+### 教师数据的赌注(新量化)
+
+DeepSeek-v4-pro 教师轨迹里 **85.2% 的 assistant token 是 think**(中位数 821/1015)。B=0 时 BC 通道只能克隆约 15% 的教师内容——我们花钱采的推理教师被退化成动作串模仿;B=1024 覆盖教师推理的绝大部分(教师 think 中位数 821 < 1024),BC 信号约 ×6。**这是 B 这条轴对 DUET 特有的价值,与学生侧的信用分配同等重要。**
+
+### 论文口径
+
+B 刻画一个双边 trade-off:B→0 时信用分配饥饿 + BC 通道被掏空;B→∞ 时序列长度爆炸(大词表下直接不可行),且判别器可见的跨家族风格证据单调增加。DUET 能"测量"这个 trade-off,因为 DR3 的 `disc_acc` 就是师生可区分度的显式读数。我们主动报告长度-AUC gate(当前 0.558)作为判别器未退化成格式检测器的证据。
+
+### 训练稳定性与显存定尺寸(2026-07-31 傍晚的实操结论)
+
+**熵坍缩是这个设定的主要稳定性风险,且 clip-higher 挡不住。** 两条 lane 在 `clip_ratio_high: 0.28`(DAPO 非对称裁剪,本来就开着)下仍然坍缩:WebShop 熵 0.344→0.09、response 8136→1623、SR 峰值 37.5%(step 18)后掉到 0.0%;ALFWorld 熵 0.302→0.186、SR 59.4%→0.0%(step 15)。与 RAGEN/StarPO 记录的多轮 RL think 坍缩同形。对策:`entropy_coeff: 0` → **0.005**(三个环境统一,对所有方法一视同仁)。早期信号正面:WebShop step-5 熵 0.374 vs 无正则时的 0.324(且后者在下滑)。监控已加**熵 <0.15 实时告警**——之前是事后翻日志才发现,这是监控设计的疏漏。
+
+**显存定尺寸必须用实测分布,不能照搬 32K 默认。** Qwen3.5 的 248K 词表让单微批 logits 成为峰值主导项(32768 tokens × 248320 × 2B = 16.3GB)。按实测 response 长度重新定尺寸:
+
+| 环境 | 实测 mean / max / 截断率 | max_model_len | 峰值 logits |
+|---|---|---|---|
+| ALFWorld | 2894–4656 / 12427 / 1.6% | 32768 → **18432** | 16.3G → 9.2G |
+| WebShop | 1623–4756 / 11815 / 1.6% | 32768 → **16384** | 16.3G → 8.1G |
+
+配套:`entropy_from_logits_with_chunking` + `entropy_checkpointing` 打开;rollout server `GPU_MEM_UTIL` 0.32 → **0.16**(13GB/卡)。**注意:开启 `entropy_coeff>0` 本身会增加显存**(熵项需 logits 参与反向)——同一配置在 `entropy_coeff: 0` 下能跑到 step 15,加了熵正则后 step 2 就 OOM,两个因素叠加才暴露。
+
+**运维教训**:停环境服务时必须确认底层引擎一起退出。`start_env_*.sh stop` 按端口杀,但 AgentGym 引擎与 env_service 包装层监听**不同端口**,只停包装层会留下孤儿——昨日 rebuttal 期的辅助 ALFWorld 引擎(18011)独占 35GB 主机内存活了一整天,叠加双 lane 权重同步峰值触发 OS OOM killer,杀掉 Ray agent 导致训练退出。另:新环境的 AgentGym 端口一律选 **ephemeral 区间(32768+)之外**(SciWorld 已从 36004 改到 26004),否则会被训练的 Ray worker 抢占。
+
+### 主因订正:`/no_think` 与 thinking 提示词冲突(2026-07-31 夜)
+
+前面记录的"熵坍缩"**不是根因**。直接读真实 rollout 文本后发现:`thinking_mode: native_qwen3` 会让 `agent_flow.py:73` 给**每条环境观测**追加 `/no_think`,而 `-thinkraw` 模板的生成提示词又强制以 `<think>\n` 开头。两个指令正面冲突,模型产出畸形轮次(裸 `im_end` 文本),环境判 `Invalid action format` 并终止 episode → response 坍缩(WebShop 5137→348 token)、SR→0。
+
+**Qwen3.5 已取消 `/think` `/no_think` 软开关**(调研 S1 核实),所以这段文本对它既无效又有害。修复:新增 `THINKING_MODE_NATIVE_QWEN35`(原生思考、不注入软开关),三个环境配置切换;`native_qwen3` 保持原行为以复现旧实验。
+
+文本级验收(WebShop 第一批 64 条真实 rollout):`/no_think` 0/64(修复前每条观测都有)、`<think>`/`</think>`/`<action>` 64/64 完整、`Invalid action format` 0/64(修复前导致立即终止)、输出 1175→20688 字符。
+
+**次生关系**:熵正则一度让崩溃提前(正则推高多样性 → 模型更倾向真的思考 → 更频繁撞冲突),这解释了"加了正则反而更快崩"的反直觉现象。`entropy_coeff: 0.005` 保留(推理模型多轮 RL 的标准防护),但它不再承担救火职责。
+
+**方法论教训(已固化进监控)**:指标只能告诉你"崩了",真实文本才能告诉你"为什么"。此前我 grep `env_manager.py` 没找到 `add_nothink` 调用点(实际在 `agent_flow.py`),又查了一个不含观测文本的 dump 文件,据此错误地否定了调研提出的该风险。现监控每 5 步从 rollout dump 直接统计畸形轮次率,格式健康度成为一等指标。
+
+### 教师采集脚本的数据截断 bug(已修)
+
+`scripts/collect_teacher_trajectories.py` 收尾写入用 `mode='w'`,而周期 checkpoint 已把轨迹写盘并清空缓冲区 → 收尾时把先前全部结果截断。ALFWorld 首轮因此丢失 ~5100 条(约 11 小时采集、$70-100 API 费用),文件只剩最后 38 条。只在"跑完整轮"时触发,历史分批采集从未暴露。修复:收尾一律 `mode='a'`。**任何长采集任务上线前必须验证"跑完后文件行数 ≥ 中途行数"。**
+
+### 执行次序修正(2026-08-01,用户指示)
+
+**每个 benchmark 先定上下文管理方案 → 用 GRPO 验证有效 → 再用同一套 rollout 上下文采集教师数据。** 不能反过来。
+
+理由:即使回放时对教师轨迹施加与学生相同的变换(`convert_offpolicy_to_cmt` 已保证格式对称),教师当初**选动作时看到的是完整观测**;学生若在压缩上下文下训练,回放出的上下文里缺少那些信息,BC 通道等于在克隆"从可见上下文推不出来的动作"——系统性噪声,而非随机噪声。唯一的根治办法是让教师采集时也在同样的压缩上下文下行动。
+
+据此,2026-08-01 停止了 ALFWorld 的 DeepSeek 采集(已得 4000 条,完整观测),存为
+`data/teacher_trajectories/deepseek_v4/alfworld_dsv4pro_fullctx_4000.jsonl` 并在同目录 README 说明保留理由(若最终不启用压缩,它们即是正确的教师集;启用则需按新上下文重采)。
+
+**连带要求**:选定的压缩方案必须能同时落到 `scripts/collect_teacher_trajectories.py` 的采集路径(它自建 minimal config + CMT),否则师生上下文无法对齐。这一条已作为方案的硬性验收标准。
+
+**教师采集的成本分层(2026-08-01)**:上下文方案的**验证阶段一律用 `deepseek/deepseek-v4-flash`**(输入 $0.09/输出 $0.18 每 M token,约为 v4-pro 的 1/5),只在方案定稿、要产出最终教师集时才考虑 v4-pro。切换模型时需重跑一次 50 任务试点确认成功率(v4-pro 试点为 50/50);若 flash 成功率明显偏低,再评估是否值得为最终集付 pro 的价钱。

@@ -16,14 +16,38 @@ mkdir -p "$RAY_TMPDIR"
 LOGDIR="$SCRIPT_DIR/logs"
 mkdir -p "$LOGDIR"
 
+# Preserve the outgoing environment logs instead of truncating them. These files
+# used to be overwritten by every queue launch, so a finished run's environment
+# could never be audited afterwards — which is exactly the evidence we wanted when
+# a result looked wrong. Rotate by timestamp; the queue log gives the run/time map.
+ENV_ARCHIVE="$LOGDIR/env_archive"
+mkdir -p "$ENV_ARCHIVE"
+for _old in "$LOGDIR/webshop_agentgym.log" "$LOGDIR/webshop_envservice.log"; do
+    if [ -s "$_old" ]; then
+        mv "$_old" "$ENV_ARCHIVE/$(basename "$_old" .log)_$(date +%Y%m%d_%H%M%S).log" 2>/dev/null || true
+    fi
+done
+
 kill_port() {
     local port=$1
     local pids=$(lsof -ti:$port 2>/dev/null)
-    if [ -n "$pids" ]; then
-        echo "Killing processes on port $port: $pids"
-        echo "$pids" | xargs kill 2>/dev/null || true
-        sleep 1
-    fi
+    local pid args
+    for pid in $pids; do
+        args=$(ps -p "$pid" -o args= 2>/dev/null)
+        # The ephemeral port range on this host is 32768-60999, which OVERLAPS the
+        # service ports below. vLLM/Ray actors bind RANDOM ports in that range, so a
+        # blind kill-by-port can take down a running training job. Never kill a
+        # process that looks like training infrastructure.
+        case "$args" in
+            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*)
+                echo "  REFUSING to kill PID $pid on port $port (training process): ${args:0:80}"
+                continue
+                ;;
+        esac
+        echo "Killing process on port $port: $pid"
+        kill "$pid" 2>/dev/null || true
+    done
+    sleep 1
 }
 
 if [ "${1:-}" = "stop" ]; then

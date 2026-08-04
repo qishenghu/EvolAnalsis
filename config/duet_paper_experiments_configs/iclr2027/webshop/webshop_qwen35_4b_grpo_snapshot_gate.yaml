@@ -1,0 +1,256 @@
+# Qwen3.5-4B WebShop causal context gate (lane B, GPUs 4-7).
+# Exact decision snapshots are shared with the ALFWorld gate; only the
+# benchmark's deterministic observation policy differs.
+defaults:
+  - /ppo_trainer
+  - /agentevolver
+  - _self_
+
+trainer:
+  experiment_name: webshop_qwen35_4b_grpo_snapshot_32k_gate_v7_repaired
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  total_training_steps: 2
+  save_freq: 1000
+  test_freq: 1000
+  # The repaired-path canary records a matched serial baseline before either
+  # update; the historical v6 run had only a separately launched baseline.
+  val_before_train: true
+  resume_mode: disable
+  validation_data_dir: experiments/webshop/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/webshop/${trainer.experiment_name}/rollout_log
+  logger: [console]
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  grpo:
+    teacher_baseline_separation:
+      enable: false
+      teacher_baseline: all_mean
+      non_teacher_baseline: non_teacher_mean
+      std_source: non_teacher
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: strict
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: additive
+
+actor_rollout_ref:
+  model:
+    path: /data/shared_models/Qwen3.5-4B-think
+    # Qwen3.5's hybrid Gated DeltaNet cannot use verl's rmpad/Ulysses patch.
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+  actor:
+    behavior_logprob_fp32_temperature: true
+    # Pure-GRPO batches with exactly zero task advantage must not execute a
+    # KL/AdamW-only optimizer step. This is opt-in because other experiments
+    # may intentionally use entropy/DR3 auxiliary objectives on such batches.
+    skip_zero_advantage_grpo_update: true
+    optim:
+      lr: 1.0e-06
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 2
+    ppo_max_token_len_per_gpu: 32768
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    use_dr3: false
+    use_chord: false
+    use_uniform_mix: false
+    teacher_use_log_prob: false
+    teacher_policy_shaping_enable: false
+    teacher_use_clip: false
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: true
+    thinking_mode: native_qwen35
+    enable_request_id: false
+    prompt_length: 22528
+    response_length: 10240
+    max_model_len: 32768
+    # Hitting 10K means the model did not finish a valid action. Keep all
+    # sampled tokens/logprobs, terminate the episode, and score it as failure.
+    length_truncation_reward: -0.1
+    # Individual 10K failures remain trainable negatives; a sustained hit rate
+    # above 10% indicates a broken prompt/action contract and halts the update.
+    length_truncation_max_decision_fraction: 0.10
+    temperature: 0.6
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: external_vllm
+    external_server_addresses:
+      - 127.0.0.1:8211
+      - 127.0.0.1:8212
+      - 127.0.0.1:8213
+      - 127.0.0.1:8214
+    external_request_timeout: 1200
+    external_sleep_between_steps: true
+    # The external servers run compiled/CUDA-graph mode.  Qwen3.5 fixed-token
+    # replay found no numerical benefit from eager mode, while it reduced
+    # decode throughput.  Keep the resolved trainer contract consistent with
+    # the explicit ENFORCE_EAGER=0 launcher setting.
+    enforce_eager: false
+    use_rollout_log_probs_as_old: true
+    # Qwen3.5 GDN full teacher-force and recurrent decode are not bit-identical
+    # even within one BF16 backend.  Gate the calibrated distribution and tail
+    # instead of requiring an impossible near-zero maximum.  PPO still uses
+    # the actual sampled vLLM logprob as its behavior-policy denominator.
+    rollout_logprob_drift_mean_threshold: 0.02
+    rollout_logprob_drift_p99_threshold: 0.25
+    rollout_importance_ratio_outside_clip_threshold: 0.01
+    rollout_logprob_drift_max_threshold: 0.75
+    max_trajectory_resubmits: 0
+    mode: async
+    # Must match the separately launched external server contract.
+    gpu_memory_utilization: 0.25
+    n: 2
+    log_prob_max_token_len_per_gpu: 32768
+    val_kwargs:
+      n: 1
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      do_sample: false
+      seed: 2025
+    # One outstanding environment request avoids the treatment-independent
+    # greedy divergence observed under dynamic co-batching on A100.
+    max_env_worker: 1
+    context_template: linear
+    context_template_train_sp_action: false
+    # A 4K per-observation safety cap covers the observed WebShop maximum
+    # (~3.2K tokens); the full managed prompt still has a 22.5K budget.
+    max_env_len: 4096
+    sparse: true
+    context_management:
+      enabled: true
+      max_prompt_tokens: 22528
+      # Four full turns cover the common search -> results -> product ->
+      # options/buy chain. Older product prose is compacted below.
+      recent_turns: 4
+      min_recent_turns: 1
+      # Old product pages are verbose, but current query/page/clickables are
+      # never cropped. Structural page-state extraction is a later ablation.
+      history_observation_max_tokens: 512
+      recent_observation_max_tokens: -1
+      allow_current_observation_truncation: false
+      # The official Qwen3.5 template strips historical think blocks. Keep the
+      # canonical action history; the current turn still has the full 10K cap.
+      reasoning_history_tokens: 0
+      snapshot_training: true
+      snapshot_selection: token_weighted
+      snapshot_selection_seed: 2025
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 3
+      tool_config_path: ''
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 32768
+
+critic:
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+
+data:
+  train_batch_size: 2
+  max_prompt_length: 22528
+  max_response_length: 10240
+  filter_overlong_prompts: true
+  truncation: error
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  max_val_tasks: 32
+  validation_shuffle: false
+  dataloader_num_workers: 0
+  val_type: val
+  max_train_tasks: 800
+  shuffle: true
+  seed: 2025
+  task_seed: 2026
+
+env_service:
+  env_type: webshop
+  env_url: http://127.0.0.1:8083
+  env_params:
+    action_format: react_tags
+    enable_action_sanitizer: true
+    invalid_action_penalty: -0.05
+    invalid_action_penalty_cap: -0.1
+    max_consecutive_invalid_actions: 2
+    terminate_on_invalid_action: false
+    invalid_action_final_reward: -0.1
+
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 3
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/webshop.json
+
+exp_manager:
+  train_rollout_mode: woexp
+  val_rollout_mode: woexp
+  rollout_ratio: 0
+  train_sample_mode: alldiscard
+  train_sample_keepratio: 0.0
+  experience_template: 'Some Related Experience: <EXP>{}</EXP>'
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: http://127.0.0.1:8124
+    workspace_id: webshop_qwen35_4b_snapshot_gate
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  experience_replay:
+    enable: false
+  teacher_experience:
+    enable: false
+  state_channel:
+    enable: false
+
+attribution_driven_credit_assignment:
+  enable: false
+
+thread_pool:
+  max_workers: 1

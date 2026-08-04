@@ -145,7 +145,22 @@ local_vector_store/
 ExGRPO/
 
 analysis/
-docs/
+# 2026-08-04 H200 migration: version research/handoff/teacher docs (ICLR 2027
+# work continues cross-server); img/papers payloads stay ignored.
+docs/*
+!docs/research/
+!docs/neurips2026/
+!docs/teacher/
+!docs/design/
+!docs/guidelines/
+
+# H200 migration: local rollout-server sync payloads (27G safetensors), never commit
+tmp_rollout_sync/
+
+# LaTeX build artifacts (PDF is committed as a reference snapshot; rebuild via build.sh)
+NeurIPS_2026_Latex/*.aux
+NeurIPS_2026_Latex/*.out
+NeurIPS_2026_Latex/*.bbl
 
 AgentGym/agentenv-searchqa/retrieve_data/
 AgentGym/agentenv-searchqa/agentenv_searchqa/queries/

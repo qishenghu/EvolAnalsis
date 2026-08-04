@@ -208,10 +208,15 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: 1
 
     # calculate entropy with chunking to reduce memory peak
-    entropy_from_logits_with_chunking: False
+    entropy_from_logits_with_chunking: True
 
     # recompute entropy
-    entropy_checkpointing: False
+    entropy_checkpointing: True
+
+    # Match vLLM processed_logprobs: promote bf16 logits before applying
+    # temperature. The local HET actor implements this without allocating the
+    # complete fp32 vocabulary tensor.
+    behavior_logprob_fp32_temperature: false
 
     # checkpoint configs
     checkpoint:
@@ -285,6 +290,10 @@ actor_rollout_ref:
     # actor_rollout_ref.ref: FSDP config same as actor. For models larger than 7B, it’s recommended to turn on offload for ref by default
     strategy: fsdp
 
+    # Keep reference-policy logprobs on the same numerical contract as the
+    # actor (notably vLLM-compatible fp32 temperature scaling for Qwen3.5).
+    behavior_logprob_fp32_temperature: ${actor_rollout_ref.actor.behavior_logprob_fp32_temperature}
+
     # config for FSDP strategy
     fsdp_config:
 
@@ -325,10 +334,10 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size}
 
     # calculate entropy with chunking to reduce memory peak
-    entropy_from_logits_with_chunking: False
+    entropy_from_logits_with_chunking: True
 
     # recompute entropy
-    entropy_checkpointing: False
+    entropy_checkpointing: True
 
   # Rollout model config.
   rollout:

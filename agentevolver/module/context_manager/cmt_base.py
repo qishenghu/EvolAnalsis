@@ -4,11 +4,27 @@ import uuid as uuid_gen
 from loguru import logger
 
 
+def chat_template_ids(tokenizer, messages, **kwargs) -> List[int]:
+    """apply_chat_template(tokenize=True) as a plain list of ids.
+
+    transformers 5.x returns a BatchEncoding here where 4.x returned a list, so
+    every length comparison and slice downstream needs the ids unwrapped.
+    """
+    out = tokenizer.apply_chat_template(messages, tokenize=True, **kwargs)
+    if hasattr(out, "input_ids") or isinstance(out, dict):
+        out = out["input_ids"]
+    if out and isinstance(out[0], (list, tuple)):  # batched shape
+        out = out[0]
+    return list(out)
+
+
 THINKING_MODE_NONE = "none"
 THINKING_MODE_PROMPT_GUIDED = "prompt_guided"     # Qwen 2.5: prompt-based <think> hints
 THINKING_MODE_NATIVE_QWEN3 = "native_qwen3"       # Qwen 3: native thinking with /no_think control
+THINKING_MODE_NATIVE_QWEN35 = "native_qwen35"     # Qwen 3.5: native thinking, no /think soft switches
 
-VALID_THINKING_MODES = {THINKING_MODE_NONE, THINKING_MODE_PROMPT_GUIDED, THINKING_MODE_NATIVE_QWEN3}
+VALID_THINKING_MODES = {THINKING_MODE_NONE, THINKING_MODE_PROMPT_GUIDED,
+                        THINKING_MODE_NATIVE_QWEN3, THINKING_MODE_NATIVE_QWEN35}
 
 
 def resolve_thinking_mode(config) -> str:
@@ -47,21 +63,103 @@ def resolve_thinking_mode(config) -> str:
         return THINKING_MODE_NONE
 
 
+def _is_thinking_chatml_template(tokenizer) -> bool:
+    """
+    True for chatml-style templates with native <think> handling (Qwen3 / Qwen3.5).
+    These templates raise TemplateError on assistant-only or system-only message
+    lists and re-render assistant turns with an injected <think> block, so
+    incremental tokenization must avoid dummy-prefix round-trips for them.
+    """
+    chat_template = getattr(tokenizer, "chat_template", None) or ""
+    return ("<|im_start|>" in chat_template) and ("</think>" in chat_template)
+
+
+def _is_sampled_turn(text_content: str) -> bool:
+    """True when this assistant text still carries its reasoning block.
+
+    History turns have their think stripped by the reasoning-context budget and
+    must render verbatim; sampled turns (closed or not) must be rebuilt with the
+    forced '<think>' prefix.
+    """
+    return ("</think>" in text_content) or text_content.startswith("<think>")
+
+
+def auto_tokenize_message(tokenizer, role: str, content: str) -> List[int]:
+    """
+    Tokenize a single history message incrementally (chat-template formatting
+    included), without access to the full conversation prefix.
+
+    - Thinking chatml templates (Qwen3.5): assistant/system messages are rendered
+      literally as '<|im_start|>{role}\\n{content}<|im_end|>\\n', byte-identical to
+      the template's history branch. A dummy-prefix round-trip would either raise
+      TemplateError (assistant-only prefix) or inject an empty <think> block
+      (user-prefix dummy renders the appended assistant as a final turn).
+    - Other templates: incremental tokenization against a [user] dummy prefix
+      (user->assistant and user->user appends are prefix-consistent; renders the
+      same increments as the legacy assistant-only dummy on Qwen2.5/Llama).
+    """
+    if _is_thinking_chatml_template(tokenizer) and role in ("assistant", "system"):
+        # mirror the template's `render_content(...)|trim` on the literal path
+        text_content = str(content).strip()
+        if role == "assistant" and _is_sampled_turn(text_content):
+            # The generation prompt forces '<|im_start|>assistant\n<think>\n', so a
+            # sampled turn's training tokens MUST start with that exact prefix or we
+            # score it under a context the policy never saw. Turns that fail to close
+            # </think> used to fall through to the literal branch, silently dropping
+            # the two forced tokens: the loss mask then trained the first content
+            # token, teaching the model to emit its own '<think>' after the prompt
+            # already opened one — which makes closing even less likely. Measured on
+            # alfworld_qwen35_4b_grpo_v3: prefix mismatch 27% -> 99.5% while reward
+            # went 0.50 -> 0.00, crossing 50% exactly at the collapse step.
+            if "</think>" in text_content:
+                reasoning = (
+                    text_content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n").strip()
+                )
+                post = text_content.split("</think>")[-1].lstrip("\n")
+                text = f"<|im_start|>assistant\n<think>\n{reasoning}\n</think>\n\n{post}<|im_end|>\n"
+            else:
+                # unclosed think: keep the body verbatim, only restore the prefix
+                body = text_content.split("<think>")[-1].lstrip("\n")
+                text = f"<|im_start|>assistant\n<think>\n{body}<|im_end|>\n"
+        else:
+            text = f"<|im_start|>{role}\n{text_content}<|im_end|>\n"
+        return tokenizer(text, return_tensors="pt", padding=False)["input_ids"][0].tolist()
+    dummy_msg = [{"role": "user", "content": "dummy text"}]
+    text_from = tokenizer.apply_chat_template(dummy_msg, tokenize=False)
+    text_to = tokenizer.apply_chat_template(
+        dummy_msg + [{"role": role, "content": content}], tokenize=False
+    )
+    tokens_from = tokenizer(text_from, return_tensors="pt", padding=False)["input_ids"][0].tolist()
+    tokens_to = tokenizer(text_to, return_tensors="pt", padding=False)["input_ids"][0].tolist()
+    return tokens_to[len(tokens_from):]
+
+
 def extract_assistant_header_tokens(tokenizer) -> List[int]:
     """
     Dynamically extract the assistant role header tokens from the tokenizer's chat template.
     Works for both Qwen 2.5 (<|im_start|>assistant\\n) and Qwen 3 (same format).
     This replaces the hardcoded tokenizer.encode("<|im_start|>assistant\\n").
+
+    The generation prompt is preferred: it is the exact forced (non-generated)
+    prefix of every LLM turn's token_arr (see `save_llm_output`), which is what
+    the loss-mask blackout must match. For thinking templates (Qwen3/Qwen3.5)
+    the re-rendered history header differs from the generation prompt, so the
+    render-based extraction below is only a fallback.
     """
     try:
+        no_gen = chat_template_ids(tokenizer, [{"role": "user", "content": "test"}], add_generation_prompt=False
+        )
+        with_gen = chat_template_ids(tokenizer, [{"role": "user", "content": "test"}], add_generation_prompt=True
+        )
+        if len(with_gen) > len(no_gen) and with_gen[:len(no_gen)] == no_gen:
+            return with_gen[len(no_gen):]
+
         user_only = [{"role": "user", "content": "test"}]
-        user_tokens = tokenizer.apply_chat_template(
-            user_only, tokenize=True, add_generation_prompt=False
+        user_tokens = chat_template_ids(tokenizer, user_only, add_generation_prompt=False
         )
 
         with_assistant = [{"role": "user", "content": "test"}, {"role": "assistant", "content": "x"}]
-        full_tokens = tokenizer.apply_chat_template(
-            with_assistant, tokenize=True, add_generation_prompt=False
+        full_tokens = chat_template_ids(tokenizer, with_assistant, add_generation_prompt=False
         )
 
         # Find 'x' token position to isolate the assistant header
@@ -78,22 +176,18 @@ def extract_assistant_header_tokens(tokenizer) -> List[int]:
 
         # Fallback: use apply_chat_template with generation prompt to extract header
         logger.warning("Dynamic assistant header extraction found empty header, using generation prompt fallback")
-        no_gen = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=False
+        no_gen = chat_template_ids(tokenizer, [{"role": "user", "content": "test"}], add_generation_prompt=False
         )
-        with_gen = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=True
+        with_gen = chat_template_ids(tokenizer, [{"role": "user", "content": "test"}], add_generation_prompt=True
         )
         if len(with_gen) > len(no_gen):
             return with_gen[len(no_gen):]
         raise ValueError("Cannot extract assistant header tokens from tokenizer")
     except Exception as e:
         logger.warning(f"Failed to dynamically extract assistant header tokens: {e}, using generation prompt fallback")
-        no_gen = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=False
+        no_gen = chat_template_ids(tokenizer, [{"role": "user", "content": "test"}], add_generation_prompt=False
         )
-        with_gen = tokenizer.apply_chat_template(
-            [{"role": "user", "content": "test"}], tokenize=True, add_generation_prompt=True
+        with_gen = chat_template_ids(tokenizer, [{"role": "user", "content": "test"}], add_generation_prompt=True
         )
         if len(with_gen) > len(no_gen):
             return with_gen[len(no_gen):]
@@ -248,13 +342,9 @@ class ExtendedMessage:
             self.generate_content_for_future(tokenizer=tokenizer, clip=True, clip_token_limit=clip_token_limit)  # ⭐ Generates future content with or without clipping
         self.eos_token_id = tokenizer.eos_token_id
         if token_generator == 'auto':
-            dummy_msg = [ {"role": "assistant",  "content": "dummy text"} ]
-            self.token_arr, _ = self.get_inc_simple(
-               text_frag_from=tokenizer.apply_chat_template(dummy_msg, tokenize=False),
-               text_frag_to=tokenizer.apply_chat_template(dummy_msg +
-                    [ {"role": self.role,  "content": self.content_for_future} ], tokenize=False),
-               tokenizer=tokenizer
-            )  # ⭐ Automatically generates tokens for the message
+            self.token_arr = auto_tokenize_message(
+                tokenizer, self.role, self.content_for_future
+            )  # ⭐ Automatically generates tokens for the message (template-aware, see auto_tokenize_message)
 
 
     @property
@@ -310,12 +400,19 @@ class ExtendedMessage:
         self._content_for_future = _content
 
 
-    def get_loss_mask(self, blackout_token_combo):
+    def get_loss_mask(self, blackout_token_combo, force_training: bool = False):
         """
         Generates a loss mask for the token array, blacking out specific token combinations and everything after the EOS token.
 
         Args:
             blackout_token_combo (list): A list of token IDs that should be blacked out in the first encounter.
+            force_training (bool): Treat the message as trainable even when
+                ``need_training`` is False. Used for replayed teacher turns,
+                which must carry loss but need the *same* header/EOS blackout as
+                on-policy turns — otherwise teacher sequences keep a handful of
+                near-zero-logprob template tokens that on-policy ones drop, which
+                shifts exactly the log-prob statistics DR3 estimates its density
+                ratio from.
 
         Returns:
             list: A binary mask where 1 indicates the token contributes to the loss, and 0 indicates it does not.
@@ -335,6 +432,15 @@ class ExtendedMessage:
             index = find_sublist_indices(arr, token_ids, reverse=False)
             if index >= 0:
                 for i in range(index, index+len(token_ids)): mask[i] = 0  # ⭐ Blackout the specific token IDs
+            else:
+                # Thinking templates (Qwen3.5): history assistant turns are re-rendered
+                # without the '<think>\n' part of the generation prompt, so the full
+                # combo is absent. Blackout the longest combo prefix matching at the
+                # start of the message ('<|im_start|>assistant\n') instead.
+                k = 0
+                while k < len(token_ids) and k < len(arr) and arr[k] == token_ids[k]:
+                    k += 1
+                for i in range(k): mask[i] = 0
             return mask
 
         def blackout_everything_after_eos_but_keep_eos(mask, token_arr, eos_token_id):
@@ -355,7 +461,7 @@ class ExtendedMessage:
                     mask[i] = 0  # ⭐ Blackout everything after the EOS token
             return mask
 
-        if self.need_training:
+        if self.need_training or force_training:
             msg_token_mask = [1] * len(self.token_arr)
             msg_token_mask = blackout_specific_token_ids_first_encounter(msg_token_mask, self.token_arr, blackout_token_combo)
             msg_token_mask = blackout_everything_after_eos_but_keep_eos(mask=msg_token_mask, token_arr=self.token_arr, eos_token_id=self.eos_token_id)

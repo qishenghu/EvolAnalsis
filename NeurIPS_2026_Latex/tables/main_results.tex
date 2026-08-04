@@ -1,44 +1,30 @@
 % ============================================================================
-% Main Results Table — DUET* vs External Baselines
+% Main Results Table — DUET vs External Baselines
 % 4 settings: 1.5B AlfWorld, 1.5B WebShop, 3B AlfWorld, 3B WebShop
-% Metric: val@100 success rate (strict, score >= 1.0)
-% ============================================================================
-%
-% Required packages (add to preamble of neurips_2026.tex):
-%   \usepackage{booktabs}
-%   \usepackage{multirow}
-%   \usepackage{xcolor}
-%   \usepackage[table]{xcolor}
-%
-% Usage in main.tex:
-%   \input{tables/main_results.tex}
+% Metric: val@100 strict success rate (score >= 1.0), n=200 tasks, single seed.
+% Bold rule: best per column in bold; strongest non-DUET baseline per column
+%            underlined; Δ row reports gain over the underlined cell.
 % ============================================================================
 
 \begin{table}[t]
 \centering
-\caption{Main results: \textbf{DUET\textsuperscript{*} achieves SOTA across all four (model size $\times$ environment) settings}, surpassing the strongest baseline by an average of \textbf{+13.0pp} success rate at val@100. All numbers are strict success rate ($\text{score} \geq 1.0$, val@100). Best per column in \textbf{bold}; second-best \underline{underlined}. Improvements ($\Delta$) computed against the strongest non-DUET baseline.}
+\caption{\textbf{Main results} (strict success rate, val@$100$, $200$-task validation split). Best per column in \textbf{bold}; strongest non-DUET baseline \underline{underlined}; $\Delta$ row reports DUET's gain over the underlined cell. Baseline numbers are our reproductions under the same protocol.}
 \label{tab:main_results}
-\setlength{\tabcolsep}{6pt}
-\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.02}
 \begin{tabular}{lcccc}
 \toprule
 \textbf{Method} & \textbf{1.5B-ALFWorld} & \textbf{1.5B-WebShop} & \textbf{3B-ALFWorld} & \textbf{3B-WebShop} \\
 \midrule
-OnPolicy GRPO       & 1.0\%             & 0.5\%             & 47.0\%            & 2.0\%$^\dagger$   \\
-SFT (no RL)         & ---               & 7.0\%             & ---               & ---               \\
-LUFFY               & 5.5\%             & 5.5\%             & 61.5\%            & 38.0\%            \\
-CHORD               & 27.0\%            & 11.5\%            & \underline{67.0\%} & \underline{39.0\%} \\
-SFT $+$ GRPO        & \underline{30.0\%} & \underline{18.5\%} & 59.5\%            & 24.0\%            \\
+OnPolicy GRPO       & \phantom{0}1.0\%   & \phantom{0}0.5\%   & 47.0\%             & \phantom{0}2.0\%   \\
+LUFFY               & \phantom{0}5.5\%   & \phantom{0}5.5\%   & 61.5\%             & 38.0\%             \\
+CHORD               & 27.0\%             & 11.5\%             & \underline{67.0\%} & \underline{39.0\%} \\
+SFT $+$ GRPO        & \underline{30.0\%} & \underline{18.5\%} & 59.5\%             & 24.0\%             \\
 \midrule
 \rowcolor{gray!12}
-\textbf{DUET\textsuperscript{*} (Ours)} & \textbf{47.5\%} & \textbf{36.0\%} & \textbf{77.5\%} & \textbf{45.5\%} \\
+\textbf{DUET (Ours)} & \textbf{47.5\%}   & \textbf{36.0\%}    & \textbf{77.5\%}    & \textbf{45.5\%}    \\
 \midrule
-$\Delta$ over best baseline & $+17.5$pp & $+17.5$pp & $+10.5$pp & $+6.5$pp \\
+$\Delta$ vs strongest baseline & $+17.5$pp & $+17.5$pp & $+10.5$pp & $+6.5$pp \\
 \bottomrule
 \end{tabular}
-\vspace{2pt}
-
-\raggedright
-\footnotesize
-$^\dagger$ OnPolicy GRPO collapses on 3B-WebShop without expert guidance.
 \end{table}

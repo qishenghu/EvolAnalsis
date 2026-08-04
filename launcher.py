@@ -1,6 +1,7 @@
 # from best_logger import print_dict
 import subprocess
 import argparse
+import glob
 import shutil
 import time
 import sys
@@ -9,9 +10,21 @@ import signal
 import shlex
 from dotenv import load_dotenv
 from agentevolver.utils.daemon import LaunchCommandWhenAbsent
+from agentevolver.utils.tracking import (
+    enforce_online_wandb_config,
+    preflight_wandb_online,
+)
 
 load_dotenv()
 BACK_TARGETS = os.environ.get('BACK_TARGETS', './config,./agentevolver').split(',')
+EXTRA_BACK_TARGETS = (
+    ('./external/config_fallback', 'external/config_fallback'),
+    ('./external/verl_t5x_patches', 'external/verl_t5x_patches'),
+    ('./cookbook/env_profiles', 'cookbook/env_profiles'),
+)
+RUNTIME_FILES = ('./launcher.py', './start_rollout_servers.sh', './env_config.sh')
+REQUIRED_EXPERIMENT_LOGGERS = ('console', 'wandb')
+CANONICAL_TRAINING_TARGET = 'agentevolver.main_ppo'
 
 
 def _replace_placeholder_in_config(config_obj, placeholder: str, replacement: str):
@@ -33,12 +46,61 @@ def _replace_placeholder_in_config(config_obj, placeholder: str, replacement: st
 
     return _walk(config_obj)
 
+
+def _ensure_required_experiment_loggers(config_obj):
+    """Keep local logs and W&B enabled for every future launcher run.
+
+    The launcher writes an immutable executable YAML for each run. Enforcing the
+    policy here covers legacy configs that still say ``logger: [console]``
+    without rewriting their historical source files.
+    """
+
+    trainer_config = config_obj.setdefault('trainer', {})
+    configured_loggers = trainer_config.get('logger', [])
+    if isinstance(configured_loggers, str):
+        configured_loggers = [configured_loggers]
+    elif configured_loggers is None:
+        configured_loggers = []
+    else:
+        configured_loggers = list(configured_loggers)
+
+    for required_logger in REQUIRED_EXPERIMENT_LOGGERS:
+        if required_logger not in configured_loggers:
+            configured_loggers.append(required_logger)
+    trainer_config['logger'] = configured_loggers
+    return config_obj
+
+
+def _preflight_required_wandb(config_obj):
+    """Enforce and verify online W&B for every launcher target."""
+
+    config_obj = enforce_online_wandb_config(config_obj)
+    trainer_config = config_obj['trainer']
+    preflight_wandb_online(
+        project_name=trainer_config['project_name'],
+        experiment_name=trainer_config['experiment_name'],
+        https_proxy=trainer_config.get('wandb_proxy'),
+    )
+    return config_obj
+
+
+def _require_canonical_training_target(target):
+    """Reject targets that cannot prove the mandatory W&B run lifecycle."""
+
+    if target != CANONICAL_TRAINING_TARGET:
+        raise RuntimeError(
+            "launcher --target only supports "
+            f"{CANONICAL_TRAINING_TARGET!r}. A custom target cannot guarantee "
+            "creation and success/failure finalization of the mandatory online "
+            "W&B run."
+        )
+
 def parse_args():
     parser = argparse.ArgumentParser(description='The launcher of agentevolver.')
     parser.add_argument(
         '--target',
         type=str,
-        default='agentevolver.main_ppo',
+        default=CANONICAL_TRAINING_TARGET,
         required=False,
         help='Target script to run (default: agentevolver.main_ppo)'
     )
@@ -243,6 +305,7 @@ def _kill_processes_by_keyword(keyword: str, exclude_substrings=None, grace_seco
 
 def main():
     args = parse_args()
+    _require_canonical_training_target(args.target)
 
     # Optionally kill existing processes before starting
     if getattr(args, 'python_killer', False):
@@ -271,6 +334,12 @@ def main():
             else:
                 exp_name = exp_name.replace('|', '-')
 
+            # Run before source backups, companion services, Ray, or GPUs.  A
+            # custom ``--target`` therefore cannot use the launcher to bypass
+            # mandatory online/authenticated W&B.
+            config['trainer']['experiment_name'] = exp_name
+            config = _preflight_required_wandb(config)
+
             print('----------------------------------------')
             backup_dir = os.path.join('launcher_record', exp_name, 'backup')
             yaml_backup_dst = os.path.join('launcher_record', exp_name, 'yaml_backup.yaml')
@@ -295,6 +364,78 @@ def main():
             for backup_target in BACK_TARGETS:
                 print(f"Copying {backup_target} to {os.path.join(backup_dir, os.path.basename(backup_target))}")
                 shutil.copytree(backup_target, os.path.join(backup_dir, os.path.basename(backup_target)), dirs_exist_ok=True)
+            for backup_target, relative_dst in EXTRA_BACK_TARGETS:
+                backup_dst = os.path.join(backup_dir, relative_dst)
+                print(f"Copying {backup_target} to {backup_dst}")
+                os.makedirs(os.path.dirname(backup_dst), exist_ok=True)
+                shutil.copytree(backup_target, backup_dst, dirs_exist_ok=True)
+            runtime_dir = os.path.join(backup_dir, 'runtime_files')
+            os.makedirs(runtime_dir, exist_ok=True)
+            for runtime_file in RUNTIME_FILES:
+                print(f"Copying {runtime_file} to {runtime_dir}")
+                shutil.copy2(runtime_file, runtime_dir)
+
+            # Bind the training record to the external rollout processes that
+            # actually sampled its data. Keep both the immutable launch
+            # manifest and the per-server startup logs (the latter contain the
+            # measured KV-cache capacity and max 32K concurrency).
+            rollout_cfg = (
+                config.get('actor_rollout_ref', {}).get('rollout', {})
+            )
+            rollout_addresses = rollout_cfg.get(
+                'external_server_addresses', []
+            ) or []
+            copied_manifests = set()
+            for address in rollout_addresses:
+                try:
+                    port = int(str(address).rsplit(':', 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                server_log = os.path.join('logs', f'rollout_server_{port}.log')
+                if os.path.isfile(server_log):
+                    shutil.copy2(server_log, runtime_dir)
+                manifest_candidates = glob.glob(
+                    os.path.join('logs', f'rollout_servers_{port}_*.manifest')
+                )
+                if manifest_candidates:
+                    latest_manifest = max(
+                        manifest_candidates, key=os.path.getmtime
+                    )
+                    if latest_manifest not in copied_manifests:
+                        shutil.copy2(latest_manifest, runtime_dir)
+                        copied_manifests.add(latest_manifest)
+
+            # Record the exact training-side dependency set and repository
+            # identity. The backed-up source itself remains authoritative when
+            # the live worktree is dirty.
+            with open(
+                os.path.join(runtime_dir, 'training_environment.txt'),
+                'w',
+                encoding='utf-8',
+            ) as environment_file:
+                subprocess.run(
+                    [sys.executable, '-m', 'pip', 'freeze'],
+                    stdout=environment_file,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    check=False,
+                )
+            with open(
+                os.path.join(runtime_dir, 'git_identity.txt'),
+                'w',
+                encoding='utf-8',
+            ) as git_file:
+                for git_args in (
+                    ['git', 'rev-parse', 'HEAD'],
+                    ['git', 'status', '--short'],
+                ):
+                    subprocess.run(
+                        git_args,
+                        stdout=git_file,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        check=False,
+                    )
 
             ## 3. copy yaml to back up
             yaml_backup_src = yaml_path
@@ -305,13 +446,43 @@ def main():
             # now, replace the trainer.experiment_name
             with open(yaml_path, 'r') as file:
                 config = yaml.safe_load(file)
+            config = _ensure_required_experiment_loggers(config)
             config['trainer']['experiment_name'] = exp_name
+            config = enforce_online_wandb_config(config)
+            print(
+                "Experiment tracking backends:",
+                ", ".join(config['trainer']['logger']),
+            )
             # scan all config item in config recursively, find string "${trainer.experiment_name}", replace with `exp_name`
             config = _replace_placeholder_in_config(
                 config,
                 placeholder="${trainer.experiment_name}",
                 replacement=exp_name,
             )
+            # Resolve Hydra defaults from the immutable launcher backup. The
+            # previous relative search path silently consumed live config files.
+            backup_abs = os.path.abspath(backup_dir)
+            config.setdefault('hydra', {})['searchpath'] = [
+                f"file://{os.path.join(backup_abs, 'external', 'config_fallback')}",
+                f"file://{os.path.join(backup_abs, 'config')}",
+            ]
+            # Ray workers execute from the immutable backup. Keep generated
+            # artifacts in the actual run root and bind relative input assets
+            # to the backed-up copies.
+            run_root = os.path.abspath('./')
+            trainer_cfg = config.setdefault('trainer', {})
+            for output_key in (
+                'default_local_dir',
+                'rollout_data_dir',
+                'validation_data_dir',
+            ):
+                output_path = trainer_cfg.get(output_key)
+                if isinstance(output_path, str) and not os.path.isabs(output_path):
+                    trainer_cfg[output_key] = os.path.join(run_root, output_path)
+            task_cfg = config.get('task_manager', {})
+            env_profile = task_cfg.get('env_profile')
+            if isinstance(env_profile, str) and not os.path.isabs(env_profile):
+                task_cfg['env_profile'] = os.path.join(backup_abs, env_profile)
 
             # replace all
             with open(yaml_path, 'w') as file:
@@ -326,6 +497,22 @@ def main():
         jieba_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "jieba")
         os.makedirs(jieba_cache_dir, exist_ok=True)
         env["JIEBA_CACHE_DIR"] = jieba_cache_dir
+        # `python -m` normally puts the live cwd first on sys.path. Use safe
+        # path mode and put the captured source tree first so the recorded code
+        # is the code that actually executes.
+        env["PYTHONSAFEPATH"] = "1"
+        env["DUET_LAUNCH_BACKUP_DIR"] = os.path.abspath(backup_dir)
+        env["DUET_ENFORCE_BACKUP_SOURCE"] = "1"
+        backup_python_path = os.path.abspath(backup_dir)
+        repo_python_path = os.path.abspath('./')
+        inherited_python_path = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = os.pathsep.join(
+            path for path in (
+                backup_python_path,
+                repo_python_path,
+                inherited_python_path,
+            ) if path
+        )
         
         if args.db:
             env["RAY_DEBUG_POST_MORTEM"] = "1"
@@ -386,6 +573,7 @@ def main():
         # let's begin the training process
         cmd = [
             sys.executable,
+            '-P',
             '-m',
             args.target,
             '--config-path',

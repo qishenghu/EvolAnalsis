@@ -875,7 +875,9 @@ def main():
     # 保存剩余轨迹（线程安全）
     with write_lock:
         if collected_trajectories:
-            mode = 'a' if args.resume else 'w'
+            # 必须 append：周期性 checkpoint 已把之前的轨迹写盘并清空缓冲区，
+            # 这里用 'w' 会把它们全部截断掉（曾丢失 ~5100 条已采集轨迹）
+            mode = 'a'
             with open(output_file, mode) as f:
                 for traj in collected_trajectories:
                     f.write(json.dumps(traj, ensure_ascii=False) + '\n')

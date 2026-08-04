@@ -1,0 +1,10 @@
+% ============================================================================
+% Appendix B — Hyperparameter sensitivity for the adaptive BC coefficient mu(t)
+% ============================================================================
+
+\section{Hyperparameter sensitivity: adaptive BC schedule}
+\label{app:sensitivity}
+
+A natural concern with any adaptive schedule is that it may be brittle to its hyperparameters --- in DUET's case, the adaptive coefficient $\mu(t)$ in Eq.~\eqref{eq:mu_schedule} introduces three knobs ($\mu_{\max}, \mu_{\min}, d_{\text{floor}}$) that govern the cold-start safety net. We mini-sweep each knob around the SOTA cell on 1.5B-WebShop, the setting where the safety net is most contended (cold-start signal is mixed with long-horizon exploration noise).
+
+\input{tables/app_sensitivity}

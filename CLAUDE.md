@@ -25,8 +25,10 @@ This repo is three things at once: the training framework (`agentevolver/`, `env
 # Environment (conda env name is 'duet' on current servers; configured in env_config.sh)
 conda activate duet
 
-# ALL shell scripts source env_config.sh — the single place for conda envs, paths,
-# ports, TMPDIR/RAY_TMPDIR, and wandb key. On a new server, edit ONLY that file.
+# ALL shell scripts source env_config.sh for conda envs, paths, ports, and
+# TMPDIR/RAY_TMPDIR. Keep W&B credentials out of tracked files: put them in the
+# gitignored .env (loaded by launcher.py) or authenticate through ~/.netrc.
+# Future launcher runs enforce trainer.logger=[console, wandb].
 
 # Environment services (must run before training)
 bash start_env_alfworld.sh          # AgentGym :36001 + env_service :8081

@@ -57,6 +57,8 @@ data:
   train_files: null
   val_files: null
   val_batch_size: 256
+  # Optional deterministic prefix cap for validation canaries. null = full set.
+  max_val_tasks: null
   # shuchang: 'val' or 'test_norm' for easy switching to test test_norm
   val_type: "val"
 
@@ -76,6 +78,17 @@ actor_rollout_ref:
     log_prob_micro_batch_size_per_gpu: 1
     tensor_model_parallel_size: 1
     name: vllm
+    # External rollout servers (ICLR2027 Qwen3.5 stack): when name is
+    # "external_vllm", rollout requests go to these OpenAI-compatible vLLM
+    # servers instead of the colocated engine. Empty list = colocated (default).
+    external_server_addresses: []
+    # Thinking models (Qwen3.5): drop <think> blocks from earlier assistant
+    # turns when rebuilding multi-turn context. Off for non-thinking students.
+    strip_think_in_history: false
+    # reasoning-context budget in tokens for hybrid-thinking students:
+    # 0 = strip every history <think>, -1 = keep all, N>0 = keep the most
+    # recent N reasoning tokens (needs the -thinkraw chat template).
+    reasoning_context_budget: -1
     mode: async
     gpu_memory_utilization: 0.6
     n: 8
@@ -98,6 +111,10 @@ actor_rollout_ref:
     context_template_train_sp_action: false
     max_env_len: 4096
     sliding_window_size: -1  # -1=disabled (full history); >0=keep N recent LLM turns full, compress older ones to action-only (EPO style)
+    # cap for out-of-window observations, in characters (-1 = keep whole).
+    # ALFWorld does not need it (hint stripping already removes ~62%); WebShop does
+    # (its tokens live in the page body, which stripping barely touches).
+    history_obs_max_chars: -1
     sparse: true
   actor:
     # clip range high for off-policy samples
@@ -148,7 +165,8 @@ trainer:
   n_gpus_per_node: 8
   nnodes: 1
   critic_warmup: 0
-  logger: ["console"]
+  # Future experiments keep a local log and stream metrics to Weights & Biases.
+  logger: ["console", "wandb"]
   project_name: "appworld_qwen25-7b"
   experiment_name: "appworld_qwen25-7b_baseline"
   save_freq: 10000

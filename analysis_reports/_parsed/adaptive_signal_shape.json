@@ -1,0 +1,103 @@
+{
+  "mu_knee_true": 23,
+  "candidates": [
+    {
+      "key": "dr3/disc_acc",
+      "mapping": "inverse",
+      "ws_v24_signal_knee": 25,
+      "ws_v24_direction": "increasing",
+      "ws_v24_implied_mu_at_step1": 0.3,
+      "ws_v24_implied_mu_at_step25": 0.10391098173623177,
+      "ws_v24_implied_mu_at_step100": 0.05559102931280023,
+      "ws_v24_mae_vs_target": 0.011375244534172171,
+      "alf_v24_mu_at_step25_cross": 0.06858068453918024,
+      "alf_v24_mu_mean_cross": 0.08794027888633274,
+      "alf_v24_raw_step25": 0.968,
+      "ws_v24_raw_step25": 0.904
+    },
+    {
+      "key": "chord/sft_loss",
+      "mapping": "direct",
+      "ws_v24_signal_knee": 56,
+      "ws_v24_direction": "decreasing",
+      "ws_v24_implied_mu_at_step1": 0.3,
+      "ws_v24_implied_mu_at_step25": 0.15076555757562482,
+      "ws_v24_implied_mu_at_step100": 0.05,
+      "ws_v24_mae_vs_target": 0.04082791382822596,
+      "alf_v24_mu_at_step25_cross": 0.05,
+      "alf_v24_mu_mean_cross": 0.05440562504107068,
+      "alf_v24_raw_step25": 0.182,
+      "ws_v24_raw_step25": 0.81
+    },
+    {
+      "key": "chord/log_prob_mean",
+      "mapping": "inverse",
+      "ws_v24_signal_knee": 56,
+      "ws_v24_direction": "increasing",
+      "ws_v24_implied_mu_at_step1": 0.3,
+      "ws_v24_implied_mu_at_step25": 0.15076555757562482,
+      "ws_v24_implied_mu_at_step100": 0.05,
+      "ws_v24_mae_vs_target": 0.040827913828225953,
+      "alf_v24_mu_at_step25_cross": 0.05,
+      "alf_v24_mu_mean_cross": 0.05440562504107068,
+      "alf_v24_raw_step25": -0.182,
+      "ws_v24_raw_step25": -0.81
+    },
+    {
+      "key": "duet/teacher_gradient_share",
+      "mapping": "direct",
+      "ws_v24_signal_knee": 24,
+      "ws_v24_direction": "decreasing",
+      "ws_v24_implied_mu_at_step1": 0.3,
+      "ws_v24_implied_mu_at_step25": 0.06866240650642652,
+      "ws_v24_implied_mu_at_step100": 0.06878343378597536,
+      "ws_v24_mae_vs_target": 0.04344627599060826,
+      "alf_v24_mu_at_step25_cross": 0.3,
+      "alf_v24_mu_mean_cross": 0.2773672330743349,
+      "alf_v24_raw_step25": 0.281,
+      "ws_v24_raw_step25": 0.148
+    },
+    {
+      "key": "actor/kl_loss",
+      "mapping": "inverse",
+      "ws_v24_signal_knee": 99,
+      "ws_v24_direction": "increasing",
+      "ws_v24_implied_mu_at_step1": 0.3,
+      "ws_v24_implied_mu_at_step25": 0.24072500068435027,
+      "ws_v24_implied_mu_at_step100": 0.05,
+      "ws_v24_mae_vs_target": 0.08806017491993103,
+      "alf_v24_mu_at_step25_cross": 0.2670724863814295,
+      "alf_v24_mu_mean_cross": 0.25098985564771475,
+      "alf_v24_raw_step25": 0.027,
+      "ws_v24_raw_step25": 0.246
+    },
+    {
+      "key": "duet/group_reward_variance_mean",
+      "mapping": "direct",
+      "ws_v24_signal_knee": 66,
+      "ws_v24_direction": "decreasing",
+      "ws_v24_implied_mu_at_step1": 0.24778907844852727,
+      "ws_v24_implied_mu_at_step25": 0.2168033683289588,
+      "ws_v24_implied_mu_at_step100": 0.07919036162146398,
+      "ws_v24_mae_vs_target": 0.0646791156313794,
+      "alf_v24_mu_at_step25_cross": 0.20750765529308834,
+      "alf_v24_mu_mean_cross": 0.2674615412656751,
+      "alf_v24_raw_step25": 0.099,
+      "ws_v24_raw_step25": 0.104
+    },
+    {
+      "key": "dr3/w_off_mean",
+      "mapping": "direct",
+      "ws_v24_signal_knee": 47,
+      "ws_v24_direction": "decreasing",
+      "ws_v24_implied_mu_at_step1": 0.3,
+      "ws_v24_implied_mu_at_step25": 0.23663760061326178,
+      "ws_v24_implied_mu_at_step100": 0.08639644819215538,
+      "ws_v24_mae_vs_target": 0.06047966973297564,
+      "alf_v24_mu_at_step25_cross": 0.20309984668455355,
+      "alf_v24_mu_mean_cross": 0.12399903778586947,
+      "alf_v24_raw_step25": 0.831,
+      "ws_v24_raw_step25": 0.868
+    }
+  ]
+}

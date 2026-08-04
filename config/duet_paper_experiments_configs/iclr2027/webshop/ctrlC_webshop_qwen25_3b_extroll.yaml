@@ -1,0 +1,233 @@
+# ============================================================================
+# CONTROL C (ICLR2027 collapse triage) — "OLD MODEL, NEW ROLLOUT PATH".
+#
+# PURPOSE: isolate the bespoke external-vLLM rollout + per-step weight sync
+# from everything else. This file is a byte-for-byte copy of the known-good
+# NeurIPS-era baseline
+#     config/duet_paper_experiments_configs/webshop/webshop_3b_onpolicy.yaml
+# (Qwen2.5-3B-Instruct, pure GRPO, thinking_mode: none, dozens of stable
+# 100-step runs in 2026-04/05) with EXACTLY THREE deltas:
+#
+#   1. actor_rollout_ref.rollout.name:  vllm  ->  external_vllm
+#      + external_server_addresses 127.0.0.1:8211-8214   <-- THE VARIABLE
+#   2. model.path repointed to /data/shared_models/Qwen2.5-3B-Instruct
+#      (the old /data/code/... path does not exist on this server)
+#   3. run bookkeeping: unique experiment_name, 25 steps, no checkpointing
+#      (save_freq/test_freq pushed past the horizon; a save would crash on
+#      the missing generation_config.json, cf. webshop_qwen35_4b_grpo_v3)
+#
+# Everything else — lr, kl_loss_coef, entropy_coeff 0, clip ranges, n=8,
+# train_batch_size 8, temperature 0.6, response_length 512, stop_sequences
+# ['</action>'], seed 2026 — is IDENTICAL to the known-good baseline.
+#
+# READOUT (watch to >= step 20):
+#   collapses  -> the fault is in OUR new code path (external rollout /
+#                 weight sync / context manager), not in Qwen3.5.
+#   stays flat/rising -> the new rollout path is exonerated; the fault lives
+#                 in {thinking integration, Qwen3.5 model, new length regime,
+#                 hyperparameters}.
+#
+# Lane B (GPUs 4-7), rollout servers 8211-8214 must serve Qwen2.5-3B-Instruct:
+#   MODEL_DIR=/data/shared_models/Qwen2.5-3B-Instruct GPUS=4,5,6,7 \
+#   BASE_PORT=8211 GPU_MEM_UTIL=0.30 MAX_MODEL_LEN=25580 \
+#   bash start_rollout_servers.sh start
+# ============================================================================
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+trainer:
+  experiment_name: ctrlC_webshop_qwen25_3b_extroll
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  total_training_steps: 25
+  save_freq: 1000
+  test_freq: 1000
+  val_before_train: false
+  validation_data_dir: experiments/webshop/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/webshop/${trainer.experiment_name}/rollout_log
+  logger:
+  - console
+  - wandb
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  grpo:
+    teacher_baseline_separation:
+      enable: false
+      teacher_baseline: all_mean
+      non_teacher_baseline: non_teacher_mean
+      std_source: non_teacher
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: strict
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: additive
+actor_rollout_ref:
+  model:
+    path: /data/shared_models/Qwen2.5-3B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+  actor:
+    optim:
+      lr: 1.0e-06
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    use_dr3: false
+    use_chord: false
+    use_uniform_mix: false
+    teacher_use_log_prob: false
+    teacher_policy_shaping_enable: false
+    teacher_use_clip: false
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: false
+    thinking_mode: none
+    enable_request_id: false
+    prompt_length: 25068
+    response_length: 512
+    max_model_len: 25580
+    temperature: 0.6
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    # ---- THE ONLY ALGORITHMIC DELTA vs the known-good baseline ----
+    name: external_vllm
+    external_server_addresses:
+    - 127.0.0.1:8211
+    - 127.0.0.1:8212
+    - 127.0.0.1:8213
+    - 127.0.0.1:8214
+    # ---------------------------------------------------------------
+    mode: async
+    gpu_memory_utilization: 0.5
+    n: 8
+    log_prob_max_token_len_per_gpu: 25580
+    stop_sequences:
+    - </action>
+    val_kwargs:
+      n: 1
+      stop_sequences:
+      - </action>
+    max_env_worker: 32
+    context_template: linear
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ''
+    sliding_window_size: 3
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 25580
+critic:
+  ppo_max_token_len_per_gpu: 25580
+  forward_max_token_len_per_gpu: 25580
+data:
+  train_batch_size: 8
+  max_prompt_length: 1500
+  max_response_length: 24080
+  filter_overlong_prompts: true
+  truncation: error
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  val_type: val
+  max_train_tasks: 800
+  shuffle: true
+  seed: 2026
+env_service:
+  env_type: webshop
+  env_url: http://127.0.0.1:8083
+  env_params:
+    action_format: react_tags
+    enable_action_sanitizer: true
+    invalid_action_penalty: -0.05
+    invalid_action_penalty_cap: -0.1
+    max_consecutive_invalid_actions: 2
+    terminate_on_invalid_action: false
+    invalid_action_final_reward: -0.1
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/webshop.json
+exp_manager:
+  train_rollout_mode: woexp
+  val_rollout_mode: woexp
+  rollout_ratio: 0
+  train_sample_mode: alldiscard
+  train_sample_keepratio: 0.0
+  experience_template: '
+
+
+    Some Related Experience to help you to complete the task:<EXP>{}</EXP>
+
+
+    '
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: http://127.0.0.1:8124
+    workspace_id: ctrlC_webshop_qwen25_3b_extroll
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  experience_replay:
+    enable: false
+  teacher_experience:
+    enable: false
+  state_channel:
+    enable: false
+attribution_driven_credit_assignment:
+  enable: false
+thread_pool:
+  max_workers: 8

@@ -1,0 +1,43 @@
+% ============================================================================
+% Appendix A — LUFFY 3-way reproducibility study + cross-infra comparison
+% ============================================================================
+
+\section{LUFFY reproducibility on 3B-WebShop}
+\label{app:luffy_repro}
+
+Table~\ref{tab:main_results} reports LUFFY at $38.0\%$ on 3B-WebShop, taken from our most-careful reproduction on $4 \times$ L20X-144GB. For full transparency, we report all three reproductions we observed:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Source} & \textbf{Hardware} & \textbf{val@100 SR (strict)} \\
+\midrule
+\citet{yan2025luffy} (paper)        & not stated            & $49.5\%$  \\
+This work                           & $4 \times$ L20X-144GB & $38.0\%$  \\
+This work                           & $4 \times$ A100-80GB  & $\phantom{0}3.5\%$ ($\geq 0.9$: $11.5\%$) \\
+\bottomrule
+\end{tabular}
+\caption{Three independent reproductions of LUFFY on 3B-WebShop. Code, configs, teacher data, and seeds are identical across our two reproductions; only the GPU hardware differs.}
+\label{tab:luffy_3way}
+\end{table}
+
+To localize whether the $34.5$pp cross-infrastructure spread is a property of LUFFY specifically or of the cold-start, sparse-reward 3B-WebShop setting more broadly, we report in Table~\ref{tab:cross_infra} the same 3B-WebShop cell run with DUET on the two hardware configurations.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method (3B-WebShop)} & \textbf{4 $\times$ A100-80GB} & \textbf{4 $\times$ L20X-144GB} \\
+\midrule
+LUFFY & \phantom{0}$3.5\%$ & $38.0\%$ \\
+DUET  &           $44.0\%$ & $45.5\%$ \\
+\bottomrule
+\end{tabular}
+\caption{Cross-infrastructure stability on the same cell. DUET reproduces within $\pm 1.5$pp across the two hardware configurations; LUFFY does not.}
+\label{tab:cross_infra}
+\end{table}
+
+The cross-infrastructure spread is specific to LUFFY in this comparison: DUET reproduces within $\pm 1.5$pp on the same hardware pair. We were not able to fully isolate the cross-infrastructure root cause within our compute budget; likely candidates include GPU-class differences in numerical precision (BF16 vs.\ FP16 matmul accumulation paths under FSDP), vLLM scheduler timing differences on tensor-parallel rollouts that interact with the asynchronous training loop, and small-magnitude floating-point drift across $100$ training steps that, in a sparse-reward, hard-exploration setting like 3B-WebShop, can determine whether the policy escapes the cold-start basin or not. Whatever the source, the implication for our reported numbers is conservative: we use the LUFFY L20X $38.0\%$ in Table~\ref{tab:main_results}, which is least flattering to DUET's lead.

@@ -1,3 +1,4 @@
+import copy
 import random
 import re
 import numpy as np
@@ -740,15 +741,58 @@ class ExperienceManager(object):
         """
         from agentevolver.schema.trajectory import Reward
         
+        schema_version = traj_dict.get("schema_version")
+        is_openrouter_v2 = schema_version == "openrouter_teacher_trajectory_v2"
+
         # 获取 task_id（用于后续存储）
         task_id = traj_dict.get("task_id", "")
+
+        if is_openrouter_v2:
+            required = {
+                "contract_sha256": str,
+                "rollout_id": str,
+                "messages": list,
+                "decision_trace": list,
+            }
+            malformed = [
+                key
+                for key, expected_type in required.items()
+                if not isinstance(traj_dict.get(key), expected_type)
+                or not traj_dict.get(key)
+            ]
+            if malformed:
+                raise ValueError(
+                    "openrouter teacher v2 record is missing non-empty fields: "
+                    + ", ".join(sorted(malformed))
+                )
+            contract_sha256 = str(traj_dict["contract_sha256"])
+            if not re.fullmatch(r"[0-9a-f]{64}", contract_sha256):
+                raise ValueError(
+                    "openrouter teacher v2 contract_sha256 must be a lowercase "
+                    "SHA-256 digest"
+                )
+            if any(
+                not isinstance(message, dict)
+                or message.get("role") not in {"system", "user", "assistant"}
+                or not isinstance(message.get("content"), str)
+                for message in traj_dict["messages"]
+            ):
+                raise ValueError(
+                    "openrouter teacher v2 messages must be role/content mappings"
+                )
+            if any(not isinstance(item, dict) for item in traj_dict["decision_trace"]):
+                raise ValueError(
+                    "openrouter teacher v2 decision_trace must contain mappings"
+                )
         
         # 创建 Trajectory 对象
         # 注意：Trajectory 类没有 task_id 属性，使用 data_id 存储
         traj = Trajectory(
             data_id=traj_dict.get("data_id", task_id),  # 使用 task_id 作为 data_id
             rollout_id=traj_dict.get("rollout_id", ""),
-            steps=traj_dict.get("messages", []),  # ⭐ Multi-turn 对话历史
+            steps=copy.deepcopy(traj_dict.get("messages", [])),  # ⭐ Multi-turn 对话历史
+            query=traj_dict.get("query", ""),
+            is_terminated=bool(traj_dict.get("is_terminated", False)),
         )
         
         # ⭐ 将 task_id 存储到 metadata 中
@@ -758,25 +802,60 @@ class ExperienceManager(object):
         reward_val = traj_dict.get("reward", 0.0)
         # Default success heuristic: positive reward indicates success.
         # (If traj_dict already has an explicit success flag, respect it.)
-        success = traj_dict.get("success", reward_val > 0)
+        success = bool(traj_dict.get("success", reward_val > 0))
+        success_rate = (
+            float(traj_dict.get("success_rate", 1.0 if success else 0.0))
+            if is_openrouter_v2
+            else (1.0 if success else 0.0)
+        )
         traj.reward = Reward(
             outcome=reward_val if success else 0.0,
-            success_rate=1.0 if success else 0.0,
+            success_rate=success_rate,
         )
         
         # 设置 metadata
-        traj.metadata = traj_dict.get("metadata", {})
+        traj.metadata = copy.deepcopy(traj_dict.get("metadata") or {})
         traj.metadata["is_teacher"] = True
         traj.metadata["is_experience_replay"] = True  # 标记为 off-policy
         traj.metadata["teacher_model"] = traj_dict.get("teacher_model", 
                                                         traj.metadata.get("teacher_model", "unknown"))
+
+        # The v2 OpenRouter format is an auditable snapshot source rather than
+        # a behavior-policy token stream.  Keep every field needed to replay
+        # the raw event log under the student's StructuredContextPolicy.  Use
+        # explicit copies so callers cannot mutate the parsed JSON record after
+        # it has entered the replay buffer.
+        if is_openrouter_v2:
+            traj.metadata.update(
+                {
+                    "schema_version": schema_version,
+                    "contract_sha256": traj_dict["contract_sha256"],
+                    # Short alias retained for downstream/config manifests that
+                    # name the contract field without its digest suffix.
+                    "contract_sha": traj_dict["contract_sha256"],
+                    "decision_trace": copy.deepcopy(traj_dict["decision_trace"]),
+                    "raw_messages": copy.deepcopy(traj_dict["messages"]),
+                    "rollout_id": traj.rollout_id,
+                    "is_terminated": traj.is_terminated,
+                    "success_rate": success_rate,
+                    "has_log_prob": False,
+                }
+            )
         
         # ⭐ 处理 log_prob（关键）
         # 检查轨迹数据中是否包含 log_prob
         log_probs = (traj_dict.get("log_probs") or 
                      traj_dict.get("metadata", {}).get("old_log_probs"))
         
-        if log_probs and len(log_probs) > 0:
+        if is_openrouter_v2:
+            # OpenRouter collection does not expose the student's vLLM token
+            # log-probability contract.  Never let an incidental/forged legacy
+            # field opt an API trajectory into importance-ratio training.
+            traj.metadata.pop("log_probs", None)
+            traj.metadata.pop("log_probs_per_turn", None)
+            traj.metadata.pop("old_log_probs", None)
+            traj.metadata["has_log_prob"] = False
+        elif log_probs and len(log_probs) > 0:
             # ⭐ 保存到 log_probs 字段（供 _align_teacher_log_probs 使用）
             # 注意：这是累积的 log_probs，只包含 LLM 生成的 token
             traj.metadata["log_probs"] = log_probs
@@ -1447,4 +1526,3 @@ class ExperienceWorker(object):
 
         
         return experience, cleaned_message
-

@@ -1,4 +1,5 @@
 # shuchang: 0809
+from agentevolver.module.context_manager.cmt_base import chat_template_ids, _is_thinking_chatml_template
 # FIXME: This file is step_parser.py, function: parse model's response_id into steps, unify all modules that need steps
 from dataclasses import dataclass
 from typing import List, Dict, Tuple
@@ -43,17 +44,22 @@ def _extract_role_header_tokens(tokenizer, role: str) -> List[int]:
     If extraction fails, throw an exception directly
     """
     try:
+        if _is_thinking_chatml_template(tokenizer):
+            # Thinking templates re-render turns depending on their position (the
+            # final assistant turn gets an injected <think> block, history turns do
+            # not), so diffing message lists does not isolate a stable header. The
+            # history branch is a fixed literal, so tokenize it directly.
+            return tokenizer(f"<|im_start|>{role}\n", add_special_tokens=False)["input_ids"]
+
         if role == "assistant":
             # Compare differences between without assistant reply vs with assistant reply
             user_only = [{"role": "user", "content": ""}]
-            user_tokens = tokenizer.apply_chat_template(
-                user_only, tokenize=True, add_generation_prompt=False
+            user_tokens = chat_template_ids(tokenizer, user_only, add_generation_prompt=False
             )
             
             # Complete dialog with assistant
             full_dialog = [{"role": "user", "content": ""}, {"role": "assistant", "content": "x"}]
-            full_tokens = tokenizer.apply_chat_template(
-                full_dialog, tokenize=True, add_generation_prompt=False
+            full_tokens = chat_template_ids(tokenizer, full_dialog, add_generation_prompt=False
             )
             
             # Find the position of "x" (using safe subsequence search)
@@ -81,14 +87,10 @@ def _extract_role_header_tokens(tokenizer, role: str) -> List[int]:
         else:
             # For user and other roles: use multi-turn diff to get pure role header
             # (avoids including system message prefix that single-message templates add)
-            one_turn = tokenizer.apply_chat_template(
-                [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}],
-                tokenize=True, add_generation_prompt=False
+            one_turn = chat_template_ids(tokenizer, [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}], add_generation_prompt=False
             )
-            two_turn = tokenizer.apply_chat_template(
-                [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
-                 {"role": role, "content": "x"}],
-                tokenize=True, add_generation_prompt=False
+            two_turn = chat_template_ids(tokenizer, [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"},
+                 {"role": role, "content": "x"}], add_generation_prompt=False
             )
             # The added part is: role_footer(assistant) + role_header(user/role) + "x" + role_footer
             added_part = two_turn[len(one_turn):]

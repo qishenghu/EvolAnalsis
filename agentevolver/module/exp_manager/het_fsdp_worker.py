@@ -41,7 +41,6 @@ from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.activation_offload import enable_activation_offloading
-from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.debug.performance import _timer, reduce_timing
 from verl.utils.device import get_device_id, get_device_name, get_nccl_backend, get_torch_device, is_cuda_available, is_npu_available
@@ -66,6 +65,8 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+
+from .fsdp_checkpoint_manager import SafeFSDPCheckpointManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -224,7 +225,12 @@ class HETActorRolloutRefWorker(Worker):
         """
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        try:  # AutoModelForVision2Seq removed in transformers 5.x
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            AutoModelForVision2Seq = None
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -269,17 +275,34 @@ class HETActorRolloutRefWorker(Worker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                actor_module_class = AutoModelForVision2Seq
-            else:
-                actor_module_class = AutoModelForCausalLM
+            # `_model_mapping` is private API and AutoModelForVision2Seq is removed in
+            # transformers 5.x; fall back to AutoModelForCausalLM, then to the class named
+            # in config.architectures (e.g. Qwen3_5ForConditionalGeneration), then AutoModel.
+            actor_module_class = AutoModelForCausalLM
+            if AutoModelForVision2Seq is not None:
+                try:
+                    if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                        actor_module_class = AutoModelForVision2Seq
+                except AttributeError:
+                    pass
 
-            actor_module = actor_module_class.from_pretrained(
+            _from_pretrained_kwargs = dict(
                 pretrained_model_name_or_path=local_path,
                 torch_dtype=torch_dtype,
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
-            )  # ⭐ Loads the model from the specified path with the given configuration
+            )
+            try:
+                actor_module = actor_module_class.from_pretrained(**_from_pretrained_kwargs)  # ⭐ Loads the model from the specified path with the given configuration
+            except (ValueError, KeyError):
+                import transformers as _hf_transformers
+
+                _archs = getattr(actor_model_config, "architectures", None) or []
+                _fallback_cls = getattr(_hf_transformers, _archs[0], None) if _archs else None
+                if _fallback_cls is None:
+                    from transformers import AutoModel as _fallback_cls
+                print(f"AutoModelForCausalLM cannot load {_archs}, falling back to {_fallback_cls.__name__}")
+                actor_module = _fallback_cls.from_pretrained(**_from_pretrained_kwargs)
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -495,6 +518,17 @@ class HETActorRolloutRefWorker(Worker):
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 
+        elif rollout_name == "external_vllm":
+            # Rollout runs on standalone vllm serve processes managed by
+            # ExternalLLMServerManager; nothing to build here — no vllm import,
+            # no sharding manager. The FSDP actor module stays available for
+            # weight export via save_rollout_weights().
+            from verl.workers.sharding_manager.base import BaseShardingManager
+
+            rollout = None
+            rollout_sharding_manager = BaseShardingManager()
+            log_gpu_memory_usage("After building external_vllm (no-op) rollout", logger=logger)
+
         elif rollout_name in ["sglang", "sglang_async"]:
             if rollout_name == "sglang_async":
                 warnings.warn(
@@ -543,7 +577,7 @@ class HETActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        from verl.workers.actor import DataParallelPPOActor
+        from .het_actor import HETDataParallelPPOActor
 
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
@@ -604,8 +638,14 @@ class HETActorRolloutRefWorker(Worker):
                 self.config.actor.use_fused_kernels = use_fused_kernels
             ##################
             # ANNI
-            from .het_actor import HETDataParallelPPOActor
             self.actor = HETDataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
+            if self.ulysses_device_mesh is not None:
+                # Metrics computed after Ulysses all-gathers are identical on
+                # every SP rank.  Reduce them along the orthogonal DP dimension
+                # so each response is counted exactly once.
+                self.actor._metric_data_parallel_group = self.ulysses_device_mesh[
+                    "dp"
+                ].get_group()
             # self.actor = DataParallelPPOActor(config=self.config.actor, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer)
             ##################
 
@@ -629,11 +669,14 @@ class HETActorRolloutRefWorker(Worker):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
                 self.config.ref.use_fused_kernels = use_fused_kernels
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+            self.ref_policy = HETDataParallelPPOActor(
+                config=self.config.ref,
+                actor_module=self.ref_module_fsdp,
+            )
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
-            self.checkpoint_manager = FSDPCheckpointManager(
+            self.checkpoint_manager = SafeFSDPCheckpointManager(
                 model=self.actor_module_fsdp,
                 optimizer=self.actor.actor_optimizer,
                 lr_scheduler=self.actor_lr_scheduler,
@@ -646,7 +689,7 @@ class HETActorRolloutRefWorker(Worker):
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
 
             checkpoint_contents = OmegaConf.create({"load_contents": ["model"], "save_contents": []})
-            self.checkpoint_manager = FSDPCheckpointManager(
+            self.checkpoint_manager = SafeFSDPCheckpointManager(
                 model=self.actor_module_fsdp,
                 optimizer=None,
                 lr_scheduler=None,
@@ -926,6 +969,54 @@ class HETActorRolloutRefWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_rollout_weights(self, local_path):
+        """
+        Exports the current actor weights as bf16 safetensors (HF weight names) for
+        external rollout servers (rollout.name == "external_vllm").
+
+        Gathers the full FSDP state dict (rank0-only, CPU-offloaded) and writes a
+        single `model.safetensors` under `local_path` on rank 0. External vllm
+        servers hot-reload it via the RolloutWeightReloadExtension collective_rpc.
+
+        Args:
+            local_path (str): Directory to write `model.safetensors` into.
+
+        Returns:
+            bool: True (used to block the caller until all ranks are done).
+        """
+        assert self._is_actor
+
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+            state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, state_dict_config):
+                state_dict = self.actor_module_fsdp.state_dict()
+        else:
+            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+            options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            state_dict = get_model_state_dict(self.actor_module_fsdp, options=options)
+            if self.rank != 0:
+                state_dict = {}
+
+        if self.rank == 0 and state_dict:
+            os.makedirs(local_path, exist_ok=True)
+            # cast to bf16 with copy=True: breaks tensor aliasing (e.g. tied embeddings)
+            # so safetensors serialization never sees shared storage
+            state_dict = {k: v.detach().to(torch.bfloat16, copy=True) if v.is_floating_point() else v.detach().clone() for k, v in state_dict.items()}
+            save_file(state_dict, os.path.join(local_path, "model.safetensors"))
+            logger.info(f"save_rollout_weights: wrote {len(state_dict)} tensors to {local_path}/model.safetensors")
+        dist.barrier()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return True
+
 
 # ================================= Async related workers =================================
 class HETAsyncActorRolloutRefWorker(HETActorRolloutRefWorker):
@@ -939,8 +1030,9 @@ class HETAsyncActorRolloutRefWorker(HETActorRolloutRefWorker):
         self.vllm_dp_rank = int(os.environ["RANK"]) // self.vllm_tp_size
         self.vllm_tp_rank = int(os.environ["RANK"]) % self.vllm_tp_size
 
-        # used for sleep/wake_up
-        rollout.sharding_manager = rollout_sharding_manager
+        # used for sleep/wake_up (external_vllm mode has no local rollout object)
+        if rollout is not None:
+            rollout.sharding_manager = rollout_sharding_manager
 
         return rollout, rollout_sharding_manager
 

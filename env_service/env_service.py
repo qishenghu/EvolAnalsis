@@ -13,6 +13,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import importlib
+import math
 import os
 import sys
 import time
@@ -32,6 +33,80 @@ from .registry import Registry
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+_RAY_NUM_CPUS_ENV = "ENV_SERVICE_RAY_NUM_CPUS"
+_RAY_OBJECT_STORE_MEMORY_ENV = "ENV_SERVICE_RAY_OBJECT_STORE_MEMORY"
+_RAY_INCLUDE_DASHBOARD_ENV = "ENV_SERVICE_RAY_INCLUDE_DASHBOARD"
+
+
+def _optional_positive_number_from_env(name: str) -> Optional[float]:
+    """Parse an optional, finite, positive Ray numeric setting."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive number") from error
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return int(value) if value.is_integer() else value
+
+
+def _optional_positive_integer_from_env(name: str) -> Optional[int]:
+    """Parse an optional, positive integer Ray byte setting."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = int(raw_value, 10)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _optional_boolean_from_env(name: str) -> Optional[bool]:
+    """Parse an optional boolean without silently accepting typos."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be one of true/false, yes/no, on/off, or 1/0",
+    )
+
+
+def _ray_init_kwargs_from_env(ray_temp_dir: str) -> Dict[str, Any]:
+    """Build Ray init options while preserving the historical defaults.
+
+    The resource-related options are deliberately opt-in.  Existing launchers
+    that set none of the ``ENV_SERVICE_RAY_*`` variables still execute the
+    equivalent of ``ray.init(_temp_dir=ray_temp_dir)``.
+    """
+    kwargs: Dict[str, Any] = {"_temp_dir": ray_temp_dir}
+
+    num_cpus = _optional_positive_number_from_env(_RAY_NUM_CPUS_ENV)
+    if num_cpus is not None:
+        kwargs["num_cpus"] = num_cpus
+
+    object_store_memory = _optional_positive_integer_from_env(
+        _RAY_OBJECT_STORE_MEMORY_ENV,
+    )
+    if object_store_memory is not None:
+        kwargs["object_store_memory"] = object_store_memory
+
+    include_dashboard = _optional_boolean_from_env(_RAY_INCLUDE_DASHBOARD_ENV)
+    if include_dashboard is not None:
+        kwargs["include_dashboard"] = include_dashboard
+
+    return kwargs
 
 
 def ensure_env(name: str, rel_path: str) -> None:
@@ -140,9 +215,12 @@ class EnvService:
         )
 
         if not ray.is_initialized():
-            ray_temp_dir = os.environ.get("RAY_TMPDIR", os.path.join(os.path.expanduser("~"), "ray_tmp"))
+            ray_temp_dir = os.environ.get(
+                "RAY_TMPDIR",
+                os.path.join(os.path.expanduser("~"), "ray_tmp"),
+            )
             os.makedirs(ray_temp_dir, exist_ok=True)
-            ray.init(_temp_dir=ray_temp_dir)
+            ray.init(**_ray_init_kwargs_from_env(ray_temp_dir))
         self.env_actors = {}
         self.remote_env = {}
         self.last_access_time = {}

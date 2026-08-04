@@ -1,0 +1,19 @@
+% ============================================================================
+% Related Work — DUET (NeurIPS 2026)
+% Rewritten to foreground teacher replay, estimator bias, and dual-channel use
+% of demonstrations while keeping the section compact.
+% ============================================================================
+
+\section{Related Work}
+
+\paragraph{Group-based RL for interactive LLM agents.}
+LLM agents are increasingly trained in multi-turn, sparse-reward environments~\citep{shridhar2020alfworld,yao2022webshop,yao2022react}. GRPO~\citep{shao2024deepseekmath}, building on PPO~\citep{schulman2017ppo} and RLHF~\citep{ouyang2022training}, replaces a learned critic with group-relative rewards and has become a practical backbone. Recent agent-RL work adds unified environments~\citep{xi2024agentgym}, stability analysis~\citep{wang2025ragen}, and finer-grained credit assignment~\citep{feng2025gigpo}. DUET is complementary to these on-policy advances: it studies how cached teacher trajectories should enter a GRPO-style update without corrupting on-policy credit.
+
+\paragraph{Teacher replay beyond imitation.}
+Demonstrations have long been used for cold-start exploration in imitation, demonstration-augmented, and offline-to-online RL~\citep{ross2011dagger,hester2018deep,nair2020awac,kostrikov2022iql}. For LLM post-training, LUFFY mixes off-policy reasoning traces with on-policy GRPO rollouts~\citep{yan2025luffy}, while CHORD reframes SFT as a dynamically weighted auxiliary objective inside on-policy RL~\citep{zhang2025chord}. These methods show that expert data helps weak learners, but mainly use teacher trajectories as action or token sequences. DUET instead treats demonstrations as structured interaction experience: teacher actions provide a corrected replay signal, while teacher states provide progress guidance.
+
+\paragraph{Correcting off-policy teacher actions.}
+Direct teacher mixing is not benign supervision inside group-normalized policy gradients. Successful teacher rollouts can shift the group baseline, and teacher actions are off-policy. Classical off-policy policy gradients therefore motivate behavior--target correction~\citep{degris2012offpolicy}. When exact teacher likelihoods are unavailable, density-ratio estimation is a standard surrogate~\citep{sugiyama2012density}; binary classifiers estimate distributional differences in generative modeling and adversarial imitation~\citep{goodfellow2014generative,ho2016gail}. DUET applies this principle narrowly: a discriminator-based replay weight approximates teacher--student correction, while baseline separation prevents teacher rewards from suppressing on-policy successes.
+
+\paragraph{State progress and reward shaping.}
+Teacher trajectories also contain environment states, not only output actions. In ALFWorld and WebShop, intermediate observations can reveal progress toward household or product-search goals~\citep{shridhar2020alfworld,yao2022webshop}. Reward shaping offers a natural lens: potential-based shaping preserves optimal policies under $F=\gamma\Phi(s')-\Phi(s)$~\citep{ng1999policy}. DUET uses a coarser empirical progress potential built from successful teacher state visitation. The bonus is applied only to on-policy rollouts, keeping state guidance separate from corrected teacher-action replay.

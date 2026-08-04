@@ -1,0 +1,132 @@
+# NeurIPS 2026 审稿意见：DUET
+
+---
+
+## Summary
+
+本文针对 LLM agent RL 中 GRPO-style 训练的冷启动问题，提出 DUET 框架。核心 insight 是：将 teacher trajectory 直接混入 student rollout group 会引入两个系统性偏差——(1) baseline contamination：teacher 的高 reward 抬高 group baseline，压制 successful student rollout 的 advantage；(2) distribution mismatch：当 teacher likelihood 不可得时，标准 GRPO 没有机制衰减 teacher 影响。DUET 通过 Action Channel (baseline separation + 判别器学到的 density ratio + adaptive BC) 与 State Channel (基于 teacher 观测构建 progress potential 进行 reward shaping) 解决之。在 ALFWorld/WebShop × Qwen2.5-1.5B/3B 四个 setting 上较最强 baseline 平均提升 13.0pp。
+
+---
+
+## Scores
+
+| 维度 | 评分 |
+|---|---|
+| Soundness | **2 (fair)** |
+| Presentation | **2 (fair)** |
+| Contribution | **3 (good)** |
+| Overall | **5 (Borderline accept, leaning weak accept)** |
+| Confidence | **4** |
+
+---
+
+## Strengths
+
+**(S1) Bias diagnosis 是真正有价值的 insight。** 论文不只是"加一个 trick"，而是从估计量层面说清楚 teacher-mixed GRPO 的两个系统性偏差。Baseline contamination 这一点尤其犀利：Table 2 显示去掉 baseline separation 两个 1.5B setting 都直接坍塌到 0%，这种 dramatic 的 ablation 结果对论点是强有力的支撑。Appendix E.1 的 advantage 分布可视化（μ_on 从 0.02 → -0.04 → -0.17）很好地证实了 contamination 机制。
+
+**(S2) Dual-channel 分解概念清晰。** 把 teacher trajectory 拆成 action 信号（policy gradient）和 state 信号（reward shaping）是简单但 portable 的视角，且作者明确论证了两个 channel 在 batch 中作用于不相交子集（teacher samples vs. on-policy samples），避免相互干扰。这种 separation 之于 design 的清晰度是论文的一个亮点。
+
+**(S3) Data-driven fade-out 的实验证据。** Figure 3 三个 panel（discriminator accuracy, teacher gradient share, mean ŵ）共同验证了"无需 hand-tuned schedule，teacher 影响随 student 改进自动衰减"的核心 claim，这比 CHORD 的 step-indexed schedule 更 principled。
+
+**(S4) 在 cold-start regime 的提升显著。** 1.5B 上 +17.5pp 不是边际改进，而且与论点（biases 在弱 base model 上 compound）方向一致。
+
+---
+
+## Weaknesses
+
+**(W1) 单 seed、无 error bar，但论文自己承认 cold-start regime 高方差。** 这是最严重的问题。Appendix D 明确写道 "the cold-start regime is high-variance on 1.5B agents"，但主表 Table 1 与 Table 2 全部是单次运行的 val@100 数字。考虑到 Appendix A 的 mini-sweep 显示 1.5B-WebShop 上仅改 d_floor 从 0.5 到 0.6 就从 21.5% 跳到 36.0%（即 SOTA cell），单 seed 的 17.5pp 提升的统计稳健性是值得怀疑的。**至少应在 1.5B 两个 cell 上跑 3 个 seed 报告 mean ± std。** 在没有 error bar 的情况下，"DUET 是 best in all four cells" 这个 claim 的强度被显著削弱。
+
+**(W2) DR3 在 ALFWorld 上贡献为零，这削弱了论文的"两个偏差"叙事。** Table 2 显示 1.5B-ALFWorld 上去掉 DR3 性能仍是 47.5%（与 full DUET 完全一致）。论文解释是"短 horizon 下 baseline separation + BC 已经关闭了 gap"——这个解释合理，但它实际上意味着 DR3 在两个测试环境的一半设置中没有可观测的边际贡献。如果 DR3 只在长 horizon 上有用，那么"distribution mismatch 是普遍存在的第二个偏差"这一框架性论断就站不住脚——更准确的说法应该是"在长 horizon 环境中存在第二个偏差"。**建议在 §5 更突出地讨论 DR3 的 scope，并避免在 abstract/intro 中把两个 bias 平等表述。**
+
+**(W3) Density ratio 的语义被论文自己 caveat 掉了。** 第 162-164 行明确写道："since our teacher cache is success-filtered, ŵ corrects the empirical replay distribution rather than recovering exact teacher likelihoods; we use it as a bias-mitigating replay weight rather than claiming exact off-policy evaluation." 这是诚实的，但也意味着 §3.3 中 "ŵ → π_θ/π_β" 的 limit 在 success-filtered cache 下不成立——分类器学到的是 π_θ vs. successful-π_β 的密度比，而非 π_θ vs. π_β 本身。这个 gap 应该在正文（而非脚注式的一句话）中被更清晰地承认，否则有 over-claim 之嫌。
+
+**(W4) Hyperparameter sensitivity 令人担忧。** Appendix A 的 sweep 实际上揭示了 1.5B-WebShop SOTA cell 是个相当窄的山峰：d_floor 0.4→0.5→0.6 对应 2.0%→21.5%→36.0%；μ_min 0.05→0.10→0.15 对应 5.5%→21.5%→2.0%。论文把这归因为 "1.5B-WebShop is sensitive to the duration of the BC safety net"，但读者会担心 Table 1 报告的 36.0% 是否本质上是 hyperparameter tuning 在单 seed 上找到的 lucky configuration。**配合 W1，这一点放大了主结果的稳健性疑虑。**
+
+**(W5) 大量 broken references (§??, [?])。** Lines 125, 149, 225, 277, 286, 378, 438 多处出现 "§??"，line 27 与 34 出现 "[?]"。这显然是 LaTeX `\ref` 失败但作者未在提交前修复——对 NeurIPS submission 是不专业的，且实质性影响阅读：例如 §3.5 引用 Eq. (??) 指代 µ(t)，读者无法定位对应公式。类似问题也出现在 Appendix B.4 引用 Eq. (??)。Presentation 评分主要因此从 3 降到 2。
+
+**(W6) State Channel 的 potential-based shaping 论证较弱。** §3.4 援引 Ng et al. 1999 的 potential-based shaping 来获得理论 backing，但随即 caveat："we do not claim exact policy invariance"——因为实际使用的是 trajectory-level mean 而非严格的 F = γΦ(s') - Φ(s)。事实上 Appendix B.4 透露 step-wise 严格不变形式 (compute_step_deltas) 已实现但未使用，原因是 "the empirical Φ map is too sparse on on-policy trajectories to give a stable per-step signal"。这意味着 State Channel 在理论上是 ad-hoc 的；与 Ng-Harada-Russell 的 connection 实质上是 motivational 而非 formal。**论文应该更直接地把 SC 定位为 heuristic exploration bonus，而不是 potential-based shaping 的近似。**
+
+**(W7) Evaluation scope 偏窄。** 仅 ALFWorld + WebShop 两个 benchmark，且都是 well-trodden 环境。Discussion 自己承认需在 7B+ 与 SciWorld/BabyAI 上验证。在 LLM agent RL 这个领域，2 environments × 2 model sizes 处于"够发表但不够 conclusive"的边界。
+
+**(W8) Baseline 复现可能不公平。** Figure 2 caption 写道 "For 3B-WebShop the CHORD baseline uses the user-validated configuration whose val@100 matches the number reported in Table 1"——这暗示其他 cell 的 CHORD 复现可能没有同等的 hyperparameter validation。考虑到 W4 显示 hyperparameter 对 1.5B 设置极为敏感，是否所有 baseline 都得到同等强度的 tuning 是关键问题。
+
+**(W9) "Adaptive BC" 实质上仍是 schedule。** 论文反复强调 "data-driven fade-out without hand-tuned schedules"，但 µ(t) 由 (µ_max, µ_min, d_floor, α_d) 四个超参控制，且 Appendix A 显示这些超参对结果有 30+pp 的影响。"由 discriminator accuracy 驱动" 不等于 "schedule-free"——只是把 schedule 的形式从 step 索引换成 disc_acc 索引。这个 framing 有点 oversell。
+
+---
+
+## Detailed Comments / Questions
+
+**Q1.** 请在 Rebuttal 中提供 1.5B 两个 cell 在至少 3 个 seed 下的 DUET 与最强 baseline (CHORD/SFT+GRPO) 的 mean ± std。这是判断 +17.5pp 是否 robust 的最关键证据。
+
+**Q2.** Density ratio 是基于 success-filtered teacher 训练的。如果把 teacher cache 改成 unfiltered (含 R=0 的 trajectory，类似 LUFFY 的设定)，DR3 的行为会如何变化？这能澄清 ŵ 究竟在校正什么。
+
+**Q3.** Table 2 的 "w/o BC" 行 (-13.5pp AF, -19.5pp WS) 与 "w/o DR3" 行 (0pp AF, -26.5pp WS) 的 marginal contribution 差异不小，且作者承认 BC 与 DR3 通过 µ(t) 耦合。能否在 Appendix 里报告 "w/o BC && w/o DR3" 的联合 ablation？这能区分两个机制是 substitutable 还是 complementary。
+
+**Q4.** Figure 8 显示 3B-ALFWorld 上 Pick Two 任务 GRPO (51%) 反超 DUET (38%)。这是个值得正视的 negative finding：teacher demonstration 在某些 task type 上可能 hurt。能否分析为何 SC 的 progress map 在 Pick Two 上无效？
+
+**Q5.** 关于 baseline separation：teacher subgroup 的 advantage 用 (R^β - µ^β) / σ^o 计算，但 teacher 是 success-filtered 的，所以 R^β = 1 恒成立，即 µ^β = 1，导致 Â^β = 0。这是否意味着 teacher 样本对 policy gradient 的贡献完全来自 BC loss 与 clip 边界处的 ratio？如是，那么 Eq. (3) 中的 PG term 实际上几乎不起作用，"DR3 attenuate teacher gradient" 的 narrative 就更多是关于 BC 的衰减——请澄清。
+
+**Q6.** SC 的 Φ 在 OOD state 取 0，意味着探索性 state 不被奖励。这与 RL 中 exploration bonus 的常规设计（reward novelty/uncertainty）相反。是否有 setting 下这个设计反而抑制了探索？
+
+---
+
+## Recommendation
+
+**Borderline accept (5/10)。** 论文有一个真正的 insight (baseline contamination) 与对应的 dramatic empirical 验证（去掉就坍塌到 0%），这个核心贡献是 publishable 的。但单 seed、broken references、DR3 在一半 setting 上无效、hyperparameter 敏感性等问题让稳健性打了折扣。如果 rebuttal 提供 multi-seed 结果且修复 §?? 引用，我愿意提到 6；如果 multi-seed 结果显著缩小了 gap，我会降到 4。
+
+**对作者的建议（如可修订）：**
+1. 在主表加 mean ± std (≥3 seeds)。
+2. 修复所有 §?? 与 [?]。
+3. 把 DR3 的 scope claim 从"修正第二个 universal bias"调整为"修正长 horizon 下持续存在的 mismatch"。
+4. 把 SC 重新 frame 为 progress-guided exploration bonus，淡化与 Ng et al. 1999 的形式连接（或在 Appendix 实测严格的 step-wise 形式作为对比）。
+5. 对 Pick Two 等 negative case 在 Discussion 中正面展开。
+
+
+行文写作：
+# 写作与行文评估
+
+总体上：**结构清晰、逻辑链扎实，但 prose 层面偏"工程报告体"，缺乏让人记住的句子，且存在几类反复出现的小毛病。** 在 NeurIPS submission 中算 above-average 但不到 polished 的水准。下面分层评一下。
+
+---
+
+## 优点
+
+**(1) Argument architecture 是这篇论文写作上最强的部分。** Intro 走的是 "现象 → 诊断 → 方案" 的三段论：先指出 teacher replay 的吸引力（cold-start remedy），再点出两个具体 bias（baseline contamination + distribution mismatch），最后引出 dual-channel 设计。这个 logical flow 在第 36-69 行非常紧凑，没有 padding。Method 部分 §3.2 用一句话锁定全文的 design principle —— "decompose teacher utilization by signal type" —— 然后 §3.3/§3.4 严格按这个原则展开，结构上的 coherence 是这篇论文的写作长板。
+
+**(2) 关键句的"打点"位置选得好。** 例如 §3.2 末尾 "the State Channel excludes teacher samples, whose already-maximal rewards would otherwise inflate advantages and counteract the Action Channel's density-ratio correction" —— 一句话同时解释了 design choice 与避免的失败模式，是高密度的好句子。Table 2 caption 里 "Baseline separation is universally critical; the State Channel and DR3 are both important but environment-dependent" 也是 takeaway-friendly 的总结句，让 skim reader 能直接抓到结论。
+
+**(3) Honest 的 hedging。** 第 162-164 行 "we use it as a bias-mitigating replay weight rather than claiming exact off-policy evaluation"、§3.4 的 "we do not claim exact policy invariance"、§5 的 "DR3 is most important when the teacher–student distribution gap persists over longer horizons" —— 这种主动 caveat 自己 claim 范围的写法在 ML 论文里其实不常见，体现出比较成熟的学术品味。审稿人会因为这些句子对作者增加信任。
+
+**(4) Section 之间的 cross-reference 网组织得不错。** 几乎每个 method 决策都能追溯到 §1/§2 的某个 motivation，每个 ablation 都能追溯到 §3 的某个 mechanism。即使 §?? 全部 broken，读者顺着语境也能猜到指向何处——说明语义上的 reference 网本身是 robust 的，只是 LaTeX 编译没跟上。
+
+---
+
+## 主要问题
+
+**(1) Sentence-level rhythm 单调，长句过多。** 这是最显眼的写作问题。打开任意一段，平均句长都在 25-35 词，且大量 "X, Y, and Z" 的三元并列结构。例如 Abstract 的 "First, successful teacher rollouts contaminate the group baseline, suppressing the advantages assigned to successful on-policy student rollouts and thereby discouraging exploration"——这一句 26 词，三层嵌套（contaminate → suppressing → discouraging），读起来需要回读。整个 Abstract 七句话有六句超过 25 词，没有一句短句作为节奏切换。**好的技术 prose 需要长短句交错**：长句承载 mechanism，短句承载 takeaway。这篇论文几乎全是长句，导致信息密度高但记忆点稀薄。
+
+**(2) Hedging 词过载。** 与（优点 3）的 honest hedging 一线之隔的，是 hedging 词的滥用。粗略数一下，全文 "naturally"、"essentially"、"effectively"、"genuinely"、"largely"、"substantially"、"primarily"、"deliberately"、"data-driven" 等修饰词出现频率很高。例如 §3.4 "This is inspired by potential-based reward shaping but uses a coarser trajectory-level form that is more robust to noise in the empirical Φ map" —— "inspired by"、"coarser"、"more robust" 三个 hedging 叠在一句话里，读起来像是作者一边写一边给自己买保险。**建议至少删掉一半的此类副词**，让句子更干净。
+
+**(3) "Principled" 这个词被透支了。** 标题、abstract、§3 标题、conclusion 反复出现 "principled"。但论文真正 principled 的部分只有 baseline separation（这是数学上干净的）；DR3 在 success-filtered cache 下不是真正的 importance ratio（作者自己承认）；State Channel 不是严格的 potential-based shaping（作者自己承认）。把"principled"作为关键词反复使用，反而让作者自己的 caveat 看起来像是在 walk back。**写作策略上，要么减少使用"principled"，要么把它的 scope 限定在 baseline separation 上。**
+
+**(4) Related Work 写得过于密集。** §2 三段，每段都把多个 reference 塞在一个长句里：例如 "following a longer tradition of demonstration-augmented [Hester et al., 2018, Ross et al., 2011] and offline-to-online RL [Nair et al., 2020, Kostrikov et al., 2022]" —— 引用堆砌但没有展开各自与 DUET 的具体关系。Related work 应该回答 "和 X 比，我们做了什么不同"，但这里大多停留在 "有 X 这一类工作"。第 97-99 行 "These methods motivate the importance of teacher data but treat it as supervision rather than as off-policy data inside a group-normalized estimator. The distinct estimator question — how teacher trajectories interact with group-relative advantages and the importance ratio — is what DUET targets" 是全段最有价值的两句话——**这种与 prior work 的具体差异化对比应该贯穿整个 §2**，而不是只出现一次。
+
+**(5) Caption 写得不够 "self-contained"。** Figure 1 caption 假设读者已经读过 §3.2/§3.3/§3.4，引用了 "the two biases from §??"（且这个 §?? 是 broken 的）。Table 2 caption 比较好，能独立读懂。NeurIPS 的 reviewer 经常先翻 figure 再读正文，**caption 应当能脱离正文表达完整 takeaway**。
+
+**(6) 中英 RL 论文常见的小毛病也在。** "Both biases are most acute in the cold-start regime where teacher replay is most needed" —— "most ... where ... most" 这种平行结构略显生硬；"By design, the two channels target non-overlapping subsets of the training batch and modify orthogonal quantities" —— "by design" + "orthogonal" 是 RL 写作里被用滥的组合，倾向于在没有严格定义的情况下营造数学感。这类小毛病单独看无伤大雅，但累加起来让 prose 显得 "AI-paper-flavored" 而不是个人风格鲜明。
+
+---
+
+## 一些可以直接照抄的微改建议
+
+§3.3 标题 "Action Channel" 下第一句 "The Action Channel addresses how teacher action trajectories contribute to the policy gradient, incorporating three mechanisms" 是典型的 "this section is about X" 句式，可以删掉，直接进入 Baseline separation 段。
+
+§5 "When DUET helps most" 段写得偏 defensive。把 "This is not a claim that DUET is irrelevant once the agent is competent; it is a claim that..." 这种 "我们不是说 X，我们是说 Y" 的结构换成正面表述会更有力。
+
+---
+
+## 总评
+
+**结构 4/5，句子层面 2.5/5，整体写作 3/5。** 这是一篇"读得下去、抓得住核心、但读完不会被某句话击中"的论文。argument 是清晰的，但 prose 缺少 voice。考虑到这是 NeurIPS submission，结构层面的优势会让它过 readability 这一关；但要在评审中获得"写作出色"的 positive comment，需要在句子节奏、hedging 削减这三个维度做一次 polish。
+
+如果要我给一个最 actionable 的建议：**重写 abstract，把所有句子砍到平均 18 词以下，加一句短的 takeaway 句作为节奏切换**。其他改动都是锦上添花，abstract 是 reviewer 形成第一印象的地方，性价比最高。

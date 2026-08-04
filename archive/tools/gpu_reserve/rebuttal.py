@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 
-PROC_NAME = "rebuttal"
+PROC_NAME = "rebuttal_exp"
 
 
 def ensure_process_name():

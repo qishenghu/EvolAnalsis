@@ -26,7 +26,9 @@ from agentevolver.module.task_manager.task_manager import TaskManager
 # non_console_mods = ["appworld_io"]
 # register_logger(non_console_mods=non_console_mods, auto_clean_mods=[], base_log_path="logs/agentevolver", debug=True)
 
+import inspect
 import os
+from contextlib import contextmanager
 import hydra
 import ray
 
@@ -34,6 +36,13 @@ from agentevolver.module.task_manager.env_profiles import EnvProfile
 from verl.trainer.ppo.reward import load_reward_manager
 
 from agentevolver.module.trainer.ae_ray_trainer import AgentEvolverRayPPOTrainer
+from agentevolver.utils.tracking import (
+    WANDB_SECRET_ENV_KEYS,
+    Tracking,
+    enforce_online_wandb_config,
+    get_wandb_runtime_env,
+    preflight_wandb_online,
+)
 
 from verl.trainer.ppo import core_algos
 if "kl_control" in os.environ.get("DEBUG_ARG",""):
@@ -154,38 +163,104 @@ def run_ppo(config) -> None:
     Returns:
         None
     """
+    # This contract must run even when connecting to an already initialized
+    # Ray cluster.  A direct ``python -m agentevolver.main_ppo`` invocation
+    # therefore cannot bypass the launcher's config normalization or select a
+    # local-only W&B mode.
+    enforce_online_wandb_config(config)
+    trainer_config = config.trainer if hasattr(config, "trainer") else config["trainer"]
+    preflight_wandb_online(
+        project_name=str(trainer_config.get("project_name")),
+        experiment_name=str(trainer_config.get("experiment_name")),
+        https_proxy=trainer_config.get("wandb_proxy"),
+    )
+    wandb_env_vars = get_wandb_runtime_env()
+
     if not ray.is_initialized():
         # this is for local ray cluster
-        # WandB configuration: use environment variables if set, otherwise use defaults
-        wandb_env_vars = {}
-        if os.environ.get("WANDB_API_KEY"):
-            wandb_env_vars["WANDB_API_KEY"] = os.environ.get("WANDB_API_KEY")
-        if os.environ.get("WANDB_BASE_URL"):
-            wandb_env_vars["WANDB_BASE_URL"] = os.environ.get("WANDB_BASE_URL")
-        # If WANDB_MODE is set, use it (e.g., "offline" for offline mode)
-        if os.environ.get("WANDB_MODE"):
-            wandb_env_vars["WANDB_MODE"] = os.environ.get("WANDB_MODE")
-        
         ray_temp_dir = os.environ.get("RAY_TMPDIR", os.path.join(os.path.expanduser("~"), "ray_tmp"))
         os.makedirs(ray_temp_dir, exist_ok=True)
-        ray.init(
-            runtime_env={"env_vars": {
+        ray_runtime_env = {"env_vars": {
                 "TOKENIZERS_PARALLELISM": "true",
                 "NCCL_DEBUG": "WARN",
                 "VLLM_LOGGING_LEVEL": "WARN",
                 "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                 "VLLM_USE_V1": "1",
-                **wandb_env_vars  # Add wandb env vars if set
-            }},
-            num_cpus=config.ray_init.num_cpus,
-            _temp_dir=ray_temp_dir,
-        )  # ⭐ Initialize the Ray cluster with the specified runtime environment and number of CPUs
+                "DUET_ENFORCE_BACKUP_SOURCE": os.environ.get(
+                    "DUET_ENFORCE_BACKUP_SOURCE", "0"
+                ),
+            }}
+        launch_backup_dir = os.environ.get("DUET_LAUNCH_BACKUP_DIR")
+        if launch_backup_dir:
+            if not os.path.isdir(launch_backup_dir):
+                raise RuntimeError(
+                    f"DUET_LAUNCH_BACKUP_DIR does not exist: {launch_backup_dir}"
+                )
+            # Ray packages this exact source tree and prepends it to every
+            # worker's import path. Merely setting driver PYTHONPATH does not
+            # prevent remote workers from importing the live cwd.
+            ray_runtime_env["working_dir"] = launch_backup_dir
+        # ray.init spawns local cluster processes that otherwise inherit the
+        # driver's complete environment even when runtime_env omits a key.
+        with _without_wandb_secret_environment():
+            ray.init(
+                runtime_env=ray_runtime_env,
+                num_cpus=config.ray_init.num_cpus,
+                _temp_dir=ray_temp_dir,
+            )  # ⭐ Initialize the Ray cluster with the specified runtime environment and number of CPUs
 
     max_model_len: int = config.actor_rollout_ref.rollout.max_model_len
     assert config.data.max_prompt_length + config.data.max_response_length <= max_model_len, f"max_prompt_length {config.data.max_prompt_length} + max_response_length {config.data.max_response_length} should be <= max_model_len {max_model_len}"  # ⭐ Ensure the sum of max prompt and response lengths does not exceed the max model length
 
-    runner = TaskRunner.remote()
+    # Online routing and credential-file paths are scoped to the actor that
+    # owns Tracking instead of the job-wide Ray runtime. Plaintext API-key env
+    # auth was rejected above. This branch also covers a reused Ray cluster.
+    runner = TaskRunner.options(
+        runtime_env={"env_vars": wandb_env_vars}
+    ).remote()
     ray.get(runner.run.remote(config))  # ⭐ Start the PPO training process by calling the run method on the TaskRunner actor
+
+
+@contextmanager
+def _without_wandb_secret_environment():
+    """Prevent newly spawned Ray infrastructure from inheriting credentials."""
+
+    missing = object()
+    previous_values = {
+        key: os.environ.get(key, missing) for key in WANDB_SECRET_ENV_KEYS
+    }
+    try:
+        for key in WANDB_SECRET_ENV_KEYS:
+            os.environ.pop(key, None)
+        yield
+    finally:
+        for key, previous_value in previous_values.items():
+            if previous_value is missing:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous_value
+
+
+def _finish_trainer_tracking(trainer, exit_code: int, suppress_errors: bool):
+    """Finish the TaskRunner-owned tracker with the true process outcome."""
+
+    tracker = getattr(trainer, "_tracking", None)
+    if tracker is None:
+        if suppress_errors:
+            return
+        raise RuntimeError("Training completed without the mandatory W&B tracker.")
+    if suppress_errors:
+        try:
+            tracker.finish(exit_code=exit_code)
+        except Exception as exc:
+            # Do not include SDK exception text: it can contain signed request
+            # details, and the original training exception must stay primary.
+            print(
+                "W&B failure finalization also failed "
+                f"({type(exc).__name__}); preserving the training error."
+            )
+        return
+    tracker.finish(exit_code=exit_code)
 
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
@@ -203,6 +278,29 @@ class TaskRunner:
         Args:
             config (dict): The configuration dictionary containing all the necessary parameters for the PPO setup.
         """
+        # Fail before touching a GPU if a Ray worker escaped the launcher's
+        # immutable source snapshot.
+        if os.environ.get("DUET_ENFORCE_BACKUP_SOURCE", "0") == "1":
+            trainer_source = os.path.realpath(
+                inspect.getsourcefile(AgentEvolverRayPPOTrainer) or ""
+            )
+            worker_root = os.path.realpath(os.getcwd())
+            try:
+                source_is_local = os.path.commonpath(
+                    [trainer_source, worker_root]
+                ) == worker_root
+            except ValueError:
+                source_is_local = False
+            if not source_is_local:
+                raise RuntimeError(
+                    "Ray worker imported live/unpinned AgentEvolver source: "
+                    f"source={trainer_source}, worker_root={worker_root}"
+                )
+            print(
+                "DUET_SOURCE_CONTRACT_OK "
+                f"source={trainer_source} worker_root={worker_root}"
+            )
+
         # print initial config
         from pprint import pprint
 
@@ -224,6 +322,9 @@ class TaskRunner:
         processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
 
         # vllm early verify
+        # NOTE: rollout.name == "external_vllm" intentionally skips this branch — the
+        # training env has no vllm installed (rollout runs on external vllm servers,
+        # see ExternalLLMServerManager) and verl.utils.vllm_utils imports vllm at module top.
         if config.actor_rollout_ref.rollout.name in ["vllm"]:
             from verl.utils.vllm_utils import is_version_ge
             if config.actor_rollout_ref.model.get('lora_rank', 0) > 0:
@@ -241,6 +342,7 @@ class TaskRunner:
             # ANNI
             from agentevolver.module.exp_manager.het_fsdp_worker import HETAsyncActorRolloutRefWorker, HETActorRolloutRefWorker
             actor_rollout_cls = HETAsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else HETActorRolloutRefWorker  # ⭐ Define the actor rollout class based on the mode
+            ref_policy_worker_cls = HETActorRolloutRefWorker
             # actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ####################
             ray_worker_group_cls = RayWorkerGroup
@@ -253,6 +355,7 @@ class TaskRunner:
                                                        CriticWorker)
 
             actor_rollout_cls = ActorRolloutRefWorker  # ⭐ Define the actor rollout class
+            ref_policy_worker_cls = ActorRolloutRefWorker
             ray_worker_group_cls = NVMegatronRayWorkerGroup
 
         else:
@@ -292,7 +395,7 @@ class TaskRunner:
 
         # use reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)  # ⭐ Add the reference policy worker to the mapping
+            role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_worker_cls)  # ⭐ Add the reference policy worker to the mapping
             mapping[Role.RefPolicy] = global_pool_id
 
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))  # ⭐ Load the reward manager for training
@@ -353,8 +456,27 @@ class TaskRunner:
             collate_fn=collate_fn,
             device_name=config.trainer.device,
         )  # ⭐ Initialize the PPO trainer with the given parameters
-        trainer.init_workers()  # ⭐ Initialize the workers for the trainer
-        trainer.fit()  # ⭐ Start the training process
+        # Start the online run before the expensive GPU actors.  ``fit`` also
+        # has a fallback initializer for callers that construct the trainer
+        # outside this entry point.
+        trainer._tracking = Tracking(
+            project_name=config.trainer.project_name,
+            experiment_name=config.trainer.experiment_name,
+            default_backend=config.trainer.logger,
+            config=OmegaConf.to_container(config, resolve=True),
+        )
+        try:
+            trainer.init_workers()  # ⭐ Initialize the workers for the trainer
+            trainer.fit()  # ⭐ Start the training process
+        except BaseException:
+            _finish_trainer_tracking(
+                trainer, exit_code=1, suppress_errors=True
+            )
+            raise
+        else:
+            _finish_trainer_tracking(
+                trainer, exit_code=0, suppress_errors=False
+            )
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     """

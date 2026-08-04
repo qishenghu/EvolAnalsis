@@ -5,11 +5,13 @@
 # ==============================================================================
 
 # --- Conda ---
-# Fall back to the project-local miniconda when CONDA_EXE is unset (e.g. fresh shell)
-if [ -z "${CONDA_EXE:-}" ]; then
-    export CONDA_PATH="${CONDA_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.local/miniconda3}"
-else
+# Try CONDA_EXE first, then well-known install locations
+if [ -n "${CONDA_EXE:-}" ]; then
     export CONDA_PATH="${CONDA_PATH:-$(dirname $(dirname $CONDA_EXE))}"
+elif [ -d "/data/home/$(whoami)/miniconda3" ]; then
+    export CONDA_PATH="${CONDA_PATH:-/data/home/$(whoami)/miniconda3}"
+else
+    export CONDA_PATH="${CONDA_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/.local/miniconda3}"
 fi
 export CONDA_ENV_DUET="${CONDA_ENV_DUET:-duet}"
 export CONDA_ENV_WEBSHOP="${CONDA_ENV_WEBSHOP:-agentenv-webshop}"
@@ -33,6 +35,11 @@ export ALFWORLD_BIN="${CONDA_PATH}/envs/${CONDA_ENV_ALFWORLD}/bin/alfworld"
 export WEBSHOP_SERVER_URL="${WEBSHOP_SERVER_URL:-http://127.0.0.1:36003}"
 export JAVA_HOME="${CONDA_PATH}/envs/${CONDA_ENV_WEBSHOP}/lib/jvm"
 export PATH="${JAVA_HOME}/bin:${PATH}"
+
+# --- Wandb ---
+# Use a mode-0600 ~/.netrc (or WANDB_CREDENTIALS_FILE), never this tracked
+# file or a plaintext WANDB_API_KEY/.env entry. Training rejects env API keys
+# so credentials cannot leak into Ray task arguments or GPU worker processes.
 
 # --- Create dirs ---
 mkdir -p "$TMPDIR" "$RAY_TMPDIR" 2>/dev/null || true

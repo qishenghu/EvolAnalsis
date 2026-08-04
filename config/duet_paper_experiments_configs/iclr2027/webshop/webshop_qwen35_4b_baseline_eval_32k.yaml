@@ -1,0 +1,23 @@
+# Deterministic pre-GRPO baseline evaluation for the Qwen3.5 4B 32K lane.
+# This is an overlay on the smoke-training contract: the actor's original
+# checkpoint is synchronized to all four external rollout servers, the fixed
+# 200-task WebShop validation split is evaluated, and fit returns before any
+# optimizer step or checkpoint write.
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - /duet_paper_experiments_configs/iclr2027/webshop/webshop_qwen35_4b_grpo_snapshot_gate@_global_
+  - _self_
+
+trainer:
+  experiment_name: webshop_qwen35_4b_baseline_eval_32k_v1
+  val_before_train: true
+  val_only: true
+  validation_data_dir: experiments/webshop/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/webshop/${trainer.experiment_name}/rollout_log
+
+task_manager:
+  env_profile: cookbook/env_profiles/webshop.json

@@ -99,6 +99,13 @@ class EnvWorker(object):
             traj_cmt.rollout_id = rollout_id
             traj_cmt.task_id = self.task_id
             traj_cmt.instance_id = self.instance_id
+            # Preserve the environment's canonical type for low-cardinality
+            # telemetry. Consumers must whitelist known values; never infer a
+            # family from the natural-language task query.
+            traj_cmt.metadata["env_type"] = self.env_type
+            environment_task_type = init_response.get("task_type")
+            if isinstance(environment_task_type, str) and environment_task_type.strip():
+                traj_cmt.metadata["environment_task_type"] = environment_task_type.strip()
             # traj_cmt.task_train_exp_mode = self.task.metadata.get("task_train_exp_mode")
             # traj_cmt.metadata["task_train_exp_mode"] = task_train_exp_mode
             assert self.task.query is not None

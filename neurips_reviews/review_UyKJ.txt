@@ -1,0 +1,43 @@
+Official Review of Submission32282 by Reviewer UyKJ
+Official Reviewby Reviewer UyKJ24 Jun 2026, 15:16 (modified: 24 Jul 2026, 22:59)Program Chairs, Senior Area Chairs, Area Chairs, Reviewers Submitted, Reviewer UyKJ, AuthorsRevisions
+Summary:
+This paper first points out that training small LLMs with RL is difficult because a weak student usually fails on its own, so it suffers from the cold-start problem that it gets almost no reward to learn from. Then this paper introduces two failure modes under the common fix of naive teacher experience replay in GRPO. Motivated by this, this paper proposes Dual-Channel Teacher Utilization (DUET), which splits each teacher trajectory into two separate channels, namely the Action Channel and the State Channel. The Action Channel is able to provide corrected action-level supervision, and the State Channel can give the student dense rewards for making teacher-like progress on its own. Empirically, DUET beats all baselines in every setting, even when the biggest gains on the weakest students cold-start is the worst.
+
+Contribution Type: General: Most submissions will fall into this type.
+Strengths And Weaknesses:
+Strengths
+The idea of this paper is clear and novel. The failure modes are clearly diagnosed. Each proposed component maps cleanly onto a specific failure mode, which makes the design feel clean.
+
+The two teacher fade-out paths are smart, in that the teacher influence recedes through reward progress and distributional progress.
+
+The ablation study is thorough, making the main claim convincing.
+
+Weaknesses
+Although the results are strong, the experiments only cover 2 envs, 1 family of LLM, and a single teacher, so I think the generalizability might be questionable. The pipeline also relies a lot on the quality of the teacher's experience. And the training seems hard because there are many hyperparameters to tune.
+
+One notable exception is the pick-two task at 3B, where GRPO outperforms all teacher-mixing methods. This suggests that teacher demonstrations may not always be beneficial for tasks requiring broad combinatorial exploration. I feel the reason behind the exception could be explained more clearly.
+
+DR3's theoretical justifcation is not strong enough, and the authors themselves call it a bias mitigating replay weight rather than an exact likelihood ratio, because the teacher cache is success-filtered.
+
+Quality: 3: good
+Clarity: 3: good
+Significance: 3: good
+Originality: 3: good
+Questions:
+The evaluation is limited, so could the authors provide any evidence that DUET can generalize to a different teacher or a non-Qwen student? And how does performance change when the teacher is weaker?
+
+Could the authors explain in more detail what might cause the exception in the Pick Two task?
+
+The teacher's data are all from successful trials, so how do the authors know that the discriminator is separating teacher from student, and not just success from failure?
+
+Limitations:
+yes
+
+Rating: 4: Borderline accept: Technically solid paper where reasons to accept outweigh reasons to reject, e.g., limited evaluation. Please use sparingly.
+Confidence: 3: You are fairly confident in your assessment. It is possible that you did not understand some parts of the submission or that you are unfamiliar with some pieces of related work. Math/other details were not carefully checked.
+Ethical Concerns: NO or VERY MINOR ethics concerns only
+Paper Formatting Concerns:
+NA. This should be fine.
+
+Code Of Conduct Acknowledgement: Yes
+Responsible Reviewing Acknowledgement: Yes

@@ -1,0 +1,18 @@
+% ============================================================================
+% Appendix E — Auxiliary signal-channel ablations (BC and SC)
+%
+% Note: We deliberately keep this section text-only at submission time, rather
+% than presenting a half-empty table with TBD cells. The two estimator
+% corrections (BS, DR3) are the paper's central methodological claims and are
+% fully ablated in the main paper (§4.3); BC and SC are framed as auxiliary
+% extensions in §3.6–§3.7.
+% ============================================================================
+
+\section{Scope of auxiliary signal-channel ablations}
+\label{app:bc_sc_ablations}
+
+Table~\ref{tab:ablation} in the main paper now reports ablations of all four components. Here we provide additional context on the BC and SC ablation results.
+
+\paragraph{BC ($-13.5$pp AF, $-19.5$pp WS).} BC serves as a cold-start safety net, providing dense token-level imitation before the DR3 discriminator has accumulated enough data to be reliable. Its contribution is consistent across both environments. Because BC and DR3 are coupled through the discriminator (BC decays as discriminator accuracy rises), the BC ablation also partially disrupts the DR3 warmup dynamic. The marginal contribution should therefore be interpreted as the value of having a cold-start bridge, not purely the value of imitation.
+
+\paragraph{SC ($-16.5$pp AF, $-35.0$pp WS).} The State Channel provides dense exploration guidance through progress-based reward shaping. Its larger contribution on WebShop ($-35.0$pp vs.\ $-16.5$pp on ALFWorld) reflects WebShop's richer state space, where the progress map can provide more granular signal. On WebShop, removing SC drops performance more than removing DR3 ($-35.0$ vs.\ $-26.5$pp), indicating that SC's dense reward is the primary driver of exploration improvement on this environment, with DR3 providing complementary gradient correction.

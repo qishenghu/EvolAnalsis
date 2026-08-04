@@ -1,0 +1,12 @@
+% ============================================================================
+% Conclusion — DUET (NeurIPS 2026)
+% ============================================================================
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+We studied teacher replay for reinforcement learning of LLM agents under GRPO-style training. 
+Although teacher trajectories provide valuable cold-start signal, directly mixing them with on-policy rollouts can bias group-relative advantage estimation and leave teacher-action gradients uncorrected when teacher likelihoods are unavailable. 
+DUET addresses these issues with two complementary uses of teacher data: corrected action-level replay through baseline separation and density-ratio weighting, and state-level guidance through progress-based reward shaping. 
+Experiments on ALFWorld and WebShop show that DUET improves over teacher-replay and imitation-based baselines across student model scales, especially when the student has little initial on-policy success. 
+We hope this perspective encourages future work to treat teacher demonstrations as structured interaction traces, rather than only as action sequences to imitate.

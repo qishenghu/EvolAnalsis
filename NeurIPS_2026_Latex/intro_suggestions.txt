@@ -1,0 +1,62 @@
+我读完 introduction 后的总体感觉：你的直觉是对的。现在这版不是“内容像 AI”，而是**句法和组织方式有点像 AI**：很多句子都在用 “X does Y; Z does W; therefore …” 的对称结构，破折号和冒号也比较密集，导致语言显得很“模板化”。核心问题其实不是英文水平，而是 introduction 里**方法动机、bias diagnosis、dual-channel design 三条线都想讲得很完整**，所以局部句子负担过重。论文的技术主线是清楚的：teacher replay 能缓解 cold start，但直接混进 GRPO 会带来 baseline contamination 和 distribution mismatch；DUET 用 Action Channel 处理 teacher actions，用 State Channel 从 teacher observations 中提取 progress signal。这个逻辑和后文 §3 的方法描述是一致的。
+
+下面是我建议的改法：
+
+1. **把 “two biases arise” 前的长句拆开**。不要一口气说 high-reward teacher、sparse-reward student、group-normalized PG。可以先说 teacher and student rollouts are normalized together，再说这 causes two problems。
+
+2. **distribution mismatch 那句要明确强调“无法做 exact importance correction 的现实原因”**。你想表达的是：teacher policy 可能是闭源的，或者 tokenizer / action space / logging format 不一致，所以拿不到 teacher likelihoods。现在原句只说 “teacher log-probabilities are unavailable”，略显抽象。
+
+3. **“Each step records two kinds of information” 可以保留一次，但 introduction 里要更短**。后文 §3.2 已经会正式展开，所以 intro 里不必再解释得太细。
+
+4. **“decompose teacher utilization by signal type” 可以换成更自然的 framing**。我建议用：
+   **“treat teacher trajectories as two complementary sources of supervision rather than as replayed actions alone.”**
+   这更贴近你的本意：不是为了“分解”而分解，而是为了更充分利用 teacher trajectories。
+
+5. **Action / State Channel 的句子要少用 “organizes around this distinction” 这种抽象表达**。可以更直接：
+   **“DUET uses teacher actions to correct and guide policy updates, and uses teacher states to shape exploration.”**
+
+6. **density-ratio discriminator 的描述应同时包含 distribution correction 和 attenuation**。现在只强调 attenuation，容易让人觉得只是 schedule replacement。更准确的写法是：
+   **“a discriminator-based density-ratio weight approximates the missing teacher–student correction and naturally reduces teacher-action gradients once the student distribution moves away from the replay distribution.”**
+   这样 reviewers 会更容易理解 DR3 的统计动机。
+
+7. **最后实验段和 contributions 要降低“模板感”**。不要每条 contribution 都用破折号连接长解释。可以用更短、更朴素的句子。
+
+---
+
+下面是一版我建议直接替换的 introduction。语气比原文更自然一些，也尽量保留你的技术主张。
+
+---
+
+## Revised Introduction
+
+Large language model (LLM) agents are increasingly trained with reinforcement learning (RL) to solve interactive tasks that require multi-turn decision making in external environments [Shridhar et al., 2020, Yao et al., 2022, ?]. Group-based policy-gradient methods such as GRPO [Shao et al., 2024] have become a practical backbone for this training. However, these methods remain difficult to use in sparse-reward settings. When a weak student agent rarely completes a task on its own, the on-policy rollout batch contains little positive signal, and the policy gradient has almost nothing to reinforce.
+
+A natural way to address this cold-start problem is to replay successful trajectories from a stronger teacher model. Recent methods follow this idea with promising results. LUFFY [Yan et al., 2025] mixes teacher demonstrations into GRPO rollout groups, while CHORD [?] combines teacher-mixed RL with a weighted imitation objective. These methods show that teacher data can substantially accelerate LLM-agent training. Most existing uses of teacher replay, however, treat the teacher trajectory mainly as an action sequence: the teacher’s outputs either enter the policy-gradient batch or serve as supervised targets.
+
+This view leaves part of the teacher trajectory unused. In an interactive environment, a successful trajectory contains both the teacher’s actions and the states that those actions reach. The actions show one way to solve the task. The resulting observations reveal what task progress looks like. These two signals are related but not identical: a student may benefit from knowing that a state is closer to success without being forced to imitate the exact action that the teacher took to get there. This distinction is especially important for LLM agents, where different reasoning traces or action sequences can lead to the same successful outcome.
+
+At the same time, even action-level teacher replay is not statistically benign in GRPO-style training. If teacher and student rollouts are normalized together, two problems appear. First, teacher rewards can contaminate the group baseline. Since replayed teacher trajectories are typically successful, their high rewards raise the group reward statistics and can reduce the advantages assigned to the few successful on-policy student rollouts. This weakens precisely the exploratory behavior that RL should reinforce. Second, teacher trajectories are off-policy. In principle, their gradients should be corrected by a teacher–student importance ratio. In practice, exact correction is often unavailable: the teacher may be a closed-source model, its token probabilities may not be logged, or its tokenizer and action representation may not align with the student’s. Directly replaying teacher trajectories therefore leaves an uncorrected distribution mismatch, and the teacher can continue to dominate training after its guidance is no longer appropriate. Both problems are most severe in the cold-start regime, where teacher replay is most useful.
+
+We propose DUET, a teacher-replay framework that uses teacher trajectories as two complementary sources of signal. The Action Channel determines how teacher outputs affect the policy update. It separates teacher and on-policy baselines to prevent teacher rewards from distorting on-policy credit assignment, and uses a discriminator-based density-ratio weight to approximate the missing teacher–student correction when exact likelihood ratios are unavailable. This weight also reduces the impact of teacher-action gradients as the student improves, so teacher influence is controlled by the estimated distribution gap rather than by a fixed training-step schedule. In parallel, the State Channel uses teacher observations to build a progress map over environment states. This map provides dense reward shaping for on-policy rollouts, guiding exploration toward teacher-like progress without requiring the student to copy teacher actions.
+
+The two channels therefore use different parts of the same teacher data for different purposes. Teacher actions provide corrected action-level supervision, while teacher states provide progress-based exploration guidance. Because the State Channel shapes only on-policy rollouts and the Action Channel corrects teacher-action gradients, DUET can combine both signals without reintroducing the baseline contamination that arises from naive teacher mixing.
+
+We evaluate DUET on ALFWorld and WebShop using Qwen2.5-1.5B/3B-Instruct students and a fixed Qwen2.5-72B-Instruct teacher cache. DUET achieves the highest success rate among all reproduced baselines in all four model-environment settings. The improvements are largest for the weaker 1.5B students, where cold start is most severe: DUET improves over the strongest prior baseline by 17.5 percentage points on both ALFWorld and WebShop. Ablations show that baseline separation is essential for stable training, while the density-ratio correction and State Channel provide complementary gains.
+
+Our contributions are:
+
+1. We identify two estimator-level problems in teacher-mixed GRPO: baseline contamination from high-reward teacher rollouts and distribution mismatch from off-policy teacher trajectories whose likelihoods may be unavailable.
+
+2. We propose DUET, a teacher-replay framework that uses teacher actions and teacher states through separate mechanisms: corrected action-level learning and progress-based reward shaping.
+
+3. We introduce a discriminator-based density-ratio correction for teacher-action gradients, together with baseline separation, to make teacher replay more compatible with group-normalized policy-gradient updates.
+
+4. We show empirically that DUET improves LLM-agent RL across two interactive environments and two student model scales, with the largest gains in the cold-start regime and ablations validating each component.
+
+---
+
+我还建议你把 title 或 method name 里的 “DUal Expert Trajectory utilization” 再想一下。现在 DUET 的 acronym 可以接受，但 “Expert Trajectory utilization” 稍微有点硬。如果不想改 acronym，可以考虑：
+
+**DUET: Dual-Channel Expert Trajectory Utilization for LLM-Agent Reinforcement Learning**
+
+这样比 “DUal Expert Trajectory utilization” 更自然，也更贴近 action/state channel 的设计。
