@@ -1,0 +1,190 @@
+#!/bin/bash
+# =============================================================================
+# Qwen3.5-4B GRPO throughput trial — GaaS H200 (2026-08-08).
+# Parameterized clone of run_train_smoke.pbs for short rollout-decode trials.
+#
+# Submit examples:
+#   qsub run_train_trial.pbs                                   # thr16 defaults
+#   qsub -v TRIAL_NAME=thr32_qwen35_4b_af,TRIAL_CONF=config/duet_paper_experiments_configs/iclr2027/train_h200/alfworld_qwen35_4b_grpo_thr32.yaml,TRIAL_MNS=32,TRIAL_GMU=0.45 run_train_trial.pbs
+#
+# Adds a 60s nvidia-smi sampler (per-GPU memory/util + compute-apps) so GPU
+# headroom for future co-located workloads (e.g. 32GB FAISS index) is measured.
+# Watch : tail -f /projects_vol/gp_wangwy/qisheng/duet_h200/logs/thr_q35af.live.log
+# =============================================================================
+#PBS -N thr_q35af
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=120:ngpus=4:mpiprocs=8:mem=2000gb
+#PBS -l walltime=4:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/thr_q35af.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+LIVELOG=$SCRATCH/logs/thr_q35af.live.log
+TRAINLOG=$SCRATCH/logs/thr_q35af.train.log
+EXPERIMENT_NAME="${TRIAL_NAME:-thr16_qwen35_4b_af}"
+SMOKE_CONF="${TRIAL_CONF:-config/duet_paper_experiments_configs/iclr2027/train_h200/alfworld_qwen35_4b_grpo_thr16.yaml}"
+TRIAL_MNS="${TRIAL_MNS:-16}"
+TRIAL_GMU="${TRIAL_GMU:-0.35}"
+# Packed recurrent decode: 0 = historical safe default; 1 = A100-era production
+# choice (drift floor identical per qwen35_context_management.md; the old FLA
+# packed bug was only ever avoided via MAX_NUM_SEQS, not this flag).
+TRIAL_PKD="${TRIAL_PKD:-0}"
+MODEL_DIR=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+BASE_PORT=8201
+mkdir -p "$(dirname "$LIVELOG")"
+
+exec > >(tee -a "$LIVELOG") 2>&1
+echo "######## THR_Q35AF  $(date '+%F %T')  job=${PBS_JOBID:-?}  host=$(hostname)  name=$EXPERIMENT_NAME mns=$TRIAL_MNS gmu=$TRIAL_GMU pkd=$TRIAL_PKD ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+
+# ---- training env = duet-train; AF env stack stays on the original duet ----
+export CONDA_ENV_DUET=duet-train
+source "$REPO/env_config.sh"
+# Unified job preamble — L1 GPU indices, L2 node-local scratch, L6 pidfile
+# healing, credential hygiene, L3/L4/L8 config gate. See docs/infra/LANDMINES.md.
+source "$REPO/scripts/duet_job_preamble.sh"
+duet_preamble_gpu 4                || exit 1
+duet_preamble_wandb require-online || exit 1
+
+duet_activate || { echo "ABORT: duet-train activation failed"; exit 1; }
+echo "trainer python: $(which python) ($(python -V 2>&1))"
+
+python - <<'EOF' || { echo "ABORT: duet-train stack acceptance failed"; exit 1; }
+import transformers, tokenizers, verl, pathlib
+assert transformers.__version__ == "5.14.1", transformers.__version__
+assert tokenizers.__version__ == "0.22.2", tokenizers.__version__
+assert "t5x-patch" in pathlib.Path(verl.__file__).read_text()
+import inspect
+from verl.workers.rollout import chat_scheduler as cs
+assert "P6" in inspect.getsource(cs.ChatCompletionScheduler._chat_completions_aiohttp)
+from transformers import AutoConfig
+cfg = AutoConfig.from_pretrained("/projects_vol/gp_wangwy/models/Qwen3.5-4B")
+print("acceptance OK:", transformers.__version__, tokenizers.__version__, cfg.model_type)
+EOF
+
+python -c "from agentevolver.utils.tracking import preflight_wandb_online; preflight_wandb_online(project_name='agentevolver', experiment_name='$EXPERIMENT_NAME')" \
+    || { echo "ABORT: W&B online preflight failed"; exit 1; }
+
+python config/validate_length_config.py "$SMOKE_CONF" || { echo "ABORT: length-contract validation failed"; exit 1; }
+
+STAMP=$(date +%Y%m%d_%H%M%S)
+for d in "checkpoints/agentevolver/$EXPERIMENT_NAME" "experiments/alfworld/$EXPERIMENT_NAME"; do
+    if [ -e "$d" ]; then
+        echo "archiving stale $d -> ${d}.pre_${STAMP}"
+        mv "$d" "${d}.pre_${STAMP}"
+    fi
+done
+
+# Config health gate (L3/L4/L8 + lane + val completeness), placed AFTER the
+# archive loop so the collision rule also proves the archive worked. Replaces
+# nothing this script had — trials never carried the p0 data-path/lane blocks,
+# which is precisely how a lane mismatch could go unnoticed here.
+# --allow-disable / --allow-sparse-ckpt: a throughput trial is a few steps long,
+# deliberately unresumable, and its outputs are archived above.
+duet_validate_train_config "$SMOKE_CONF" \
+    --allow-disable --allow-sparse-ckpt \
+    --lane-mns "$TRIAL_MNS" --lane-gmu "$TRIAL_GMU" \
+    --experiment-name "$EXPERIMENT_NAME" \
+    || { echo "ABORT: train config validation failed"; exit 1; }
+
+GPU_SAMPLER_PID=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$GPU_SAMPLER_PID" ] && kill "$GPU_SAMPLER_PID" 2>/dev/null
+    BASE_PORT=$BASE_PORT bash start_rollout_servers.sh stop 2>/dev/null || true
+    env -u CONDA_ENV_DUET bash start_env_alfworld.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------ [1] AlfWorld stack --
+# L2: node-local scratch (also sets TRITON_CACHE_DIR / VLLM_CACHE_ROOT). A
+# throughput trial is a handful of steps, far under the ~3000-reset mmap
+# ceiling, so it starts no sweeper — see docs/infra/LANDMINES.md L2.
+duet_preamble_tmp || exit 1
+echo "---- starting ALFWorld stack (original duet env) ----"
+env -u CONDA_ENV_DUET bash start_env_alfworld.sh || { echo "ABORT: alfworld stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8081/docs > /dev/null || { echo "ABORT: env_service 8081"; exit 1; }
+
+# --------------------------------------------- [2] external rollout servers --
+# L6: heal a stale pidfile left by a qdel'd predecessor (shared storage,
+# node-local PIDs); refuse to proceed if a genuinely live lane is listed.
+PIDFILE="$REPO/logs/rollout_servers_${BASE_PORT}.pids"
+duet_preamble_pidfile_heal "$PIDFILE" || exit 1
+
+echo "---- starting 4x TP1 rollout servers (vllm2 env, MNS=$TRIAL_MNS GMU=$TRIAL_GMU PKD=$TRIAL_PKD) ----"
+MODEL_DIR="$MODEL_DIR" \
+GPUS="$CUDA_VISIBLE_DEVICES" \
+BASE_PORT=$BASE_PORT \
+GPU_MEM_UTIL="$TRIAL_GMU" \
+MAX_MODEL_LEN=32768 \
+MAX_NUM_SEQS="$TRIAL_MNS" \
+VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE="$TRIAL_PKD" \
+WAIT_ATTEMPTS=900 \
+EXPERIMENT_TAG="$EXPERIMENT_NAME" \
+EXPERIMENT_CONFIG="$SMOKE_CONF" \
+bash start_rollout_servers.sh start || { echo "ABORT: rollout servers failed to come up"; exit 1; }
+
+MANIFEST=$(ls -t logs/rollout_servers_${BASE_PORT}_*.manifest 2>/dev/null | head -1)
+[ -n "$MANIFEST" ] || { echo "ABORT: no rollout manifest"; exit 1; }
+echo "rollout manifest: $MANIFEST"
+for field in \
+    "model_dir=$MODEL_DIR" \
+    "base_port=$BASE_PORT" \
+    "max_model_len=32768" \
+    "max_num_seqs=$TRIAL_MNS" \
+    "gpu_memory_utilization=$TRIAL_GMU" \
+    "logprobs_mode=processed_logprobs" \
+    "enforce_eager=0" \
+    "vllm_enable_fla_packed_recurrent_decode=$TRIAL_PKD" \
+    "health_verified_ports=8201 8202 8203 8204"; do
+    grep -aFxq "$field" "$MANIFEST" || { echo "ABORT: manifest lacks contract field: $field"; exit 1; }
+done
+echo "rollout contract manifest verified"
+
+SANITY=$(curl -sf --max-time 600 "http://127.0.0.1:${BASE_PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"models/Qwen3.5-4B","messages":[{"role":"user","content":"Reply with <action>\nlook\n</action> after thinking briefly."}],"max_tokens":512,"temperature":0.9}')
+echo "$SANITY" | grep -q "action" || { echo "ABORT: sanity completion malformed"; exit 1; }
+echo "sanity completion OK"
+
+# --------------------------------------------------- [3] GPU usage sampler --
+(
+    while true; do
+        echo "==== GPU_SAMPLE $(date '+%F %T') ===="
+        nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader
+        nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
+        sleep 60
+    done
+) >> "$SCRATCH/logs/thr_q35af.gpu.log" 2>&1 &
+GPU_SAMPLER_PID=$!
+echo "GPU sampler pid=$GPU_SAMPLER_PID -> $SCRATCH/logs/thr_q35af.gpu.log"
+
+# ------------------------------------------------------------ [4] training --
+LANE_RAY_TMPDIR="${RAY_TMPDIR}/afsmk"
+mkdir -p "$LANE_RAY_TMPDIR"
+echo "---- launching training: $EXPERIMENT_NAME  (RAY_TMPDIR=$LANE_RAY_TMPDIR) ----"
+set +e
+RAY_TMPDIR="$LANE_RAY_TMPDIR" \
+python launcher.py --conf "$SMOKE_CONF" > "$TRAINLOG" 2>&1
+rc=$?
+echo "---- training exited rc=$rc  $(date '+%F %T') ----"
+
+echo "---- step timing + drift summary ----"
+grep -aoE "step:[0-9]+ - .*" "$TRAINLOG" | while read -r line; do
+    s=$(echo "$line" | grep -oE "^step:[0-9]+")
+    t=$(echo "$line" | grep -oE "timing_s/step:[0-9.]+" | head -1)
+    g=$(echo "$line" | grep -oE "timing_s/gen:[0-9.]+" | head -1)
+    d=$(echo "$line" | grep -oE "training/rollout_probs_diff_mean:[0-9.]+" | head -1)
+    c=$(echo "$line" | grep -oE "training/rollout_importance_ratio_outside_clip_fraction:[0-9.]+" | head -1)
+    sr=$(echo "$line" | grep -oE "critic/success_onpolicy/mean:[0-9.]+" | head -1)
+    echo "$s  $t  $g  $d  $c  $sr"
+done
+echo "---- vLLM decode throughput distribution (server 8201, tokens/s) ----"
+grep -hoE "Avg generation throughput: [0-9.]+" logs/rollout_server_8201.log 2>/dev/null \
+    | grep -oE "[0-9.]+" | sort -n \
+    | awk '{a[NR]=$1} END {if (NR>0) printf "n=%d p50=%.1f p90=%.1f max=%.1f\n", NR, a[int(NR*0.5)], a[int(NR*0.9)], a[NR]}'
+echo "######## THR_Q35AF END rc=$rc  $(date '+%F %T') ########"
+exit "$rc"

@@ -1,0 +1,198 @@
+#!/bin/bash
+# =============================================================================
+# Qwen3.5-122B-A10B teacher collection — SciWorld + DeepSearch(新域,2026-08-07)
+# 结构克隆自 run_teacher122b_collect.pbs(AF/WS 版),差异:
+#   * 环境栈换成 sciworld(:26004/:8084)+ deepsearch(:25011/:8086,BM25 走
+#     agentenv-webshop env 的 pyserini + JDK,webshop 栈已在计算节点验证过 Java 可用)
+#   * 无 webshop 式 determinism gate(deepsearch 环境已做过逐字节确定性验证;
+#     sciworld 由 ScienceWorld 仿真按 task id 决定)
+#   * 契约单段式:pilot 50@2 过 gate 后直接全量 1600@8·16 workers(新契约无 4 次锁)
+#   * 122B 在两新域从未试过,pilot gate 阈值放宽:sciworld ≥0.20,deepsearch ≥0.10
+#
+# Submit : qsub run_teacher122b_newdomains.pbs
+# Watch  : tail -f /projects_vol/gp_wangwy/qisheng/duet_h200/logs/teach122b_nd.live.log
+# Abort  : touch /projects_vol/gp_wangwy/qisheng/duet_h200/logs/TEACH122B_ND_STOP
+#          (阶段间生效;绝不宽 pattern 杀进程)
+# =============================================================================
+#PBS -N teach122b_nd
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=120:ngpus=4:mpiprocs=8:mem=2000gb
+#PBS -l walltime=120:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/teach122b_nd.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+LIVELOG=$SCRATCH/logs/teach122b_nd.live.log
+STOPFILE=$SCRATCH/logs/TEACH122B_ND_STOP
+OUTDIR=$SCRATCH/teacher_data/qwen35_122b
+TEACHER_MODEL_DIR=/projects_vol/gp_wangwy/models/Qwen3.5-122B-A10B
+SERVED_NAME=qwen35-122b-a10b
+VLLM_PORT=8300
+mkdir -p "$(dirname "$LIVELOG")" "$OUTDIR/pilot"
+
+exec > >(tee -a "$LIVELOG") 2>&1
+echo "######## TEACH122B_ND  $(date '+%F %T')  job=${PBS_JOBID:-?}  host=$(hostname) ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+
+source "$REPO/env_config.sh"
+PF_EXPECT_NGPUS=4
+source "$REPO/scripts/h200_node_preflight.sh"
+if ! pf_run_all; then
+    echo "ABORT: preflight failed"; exit 1
+fi
+duet_activate || { echo "ABORT: duet env activation failed"; exit 1; }
+echo "collector python: $(which python) ($(python -V 2>&1))"
+
+VLLM_PY="$CONDA_PATH/envs/${CONDA_ENV_VLLM2}/bin/python"
+[ -x "$VLLM_PY" ] || { echo "ABORT: vllm2 env missing at $VLLM_PY"; exit 1; }
+
+export OPENROUTER_API_KEY=local-vllm
+export VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0
+# 两域 16+16 workers 并发打一个服务:排队上限直接给 32
+TEACH_MAX_NUM_SEQS="${TEACH_MAX_NUM_SEQS:-32}"
+
+VLLM_PID=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$VLLM_PID" ] && kill "$VLLM_PID" 2>/dev/null
+    bash start_env_sciworld.sh stop 2>/dev/null || true
+    bash start_env_deepsearch.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+check_stop() {
+    if [ -f "$STOPFILE" ]; then
+        echo "STOPFILE present — aborting between phases."
+        exit 2
+    fi
+}
+
+# ---------------------------------------------------------------- [1] vLLM ---
+export VLLM_CACHE_ROOT="/tmp/vllm_cache_$(id -un)"
+export TRITON_CACHE_DIR="/tmp/triton_cache_$(id -un)"
+mkdir -p "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR"
+
+start_vllm() {
+    local extra="$1"
+    echo "starting vLLM server (extra: ${extra:-none}) ..."
+    VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 \
+    "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+        --model "$TEACHER_MODEL_DIR" \
+        --served-model-name "$SERVED_NAME" \
+        --tensor-parallel-size 4 \
+        --max-model-len 32768 \
+        --max-num-seqs "$TEACH_MAX_NUM_SEQS" \
+        --gpu-memory-utilization 0.90 \
+        --port "$VLLM_PORT" \
+        $extra \
+        >> "$SCRATCH/logs/vllm_122b_nd.log" 2>&1 &
+    VLLM_PID=$!
+}
+
+wait_vllm() {
+    for i in $(seq 1 270); do
+        if ! kill -0 "$VLLM_PID" 2>/dev/null; then return 1; fi
+        if curl -sf --max-time 8 "http://127.0.0.1:$VLLM_PORT/v1/models" > /dev/null; then return 0; fi
+        sleep 10
+    done
+    echo "wait_vllm: 45-min cap reached; engine log tail:"
+    tail -5 "$SCRATCH/logs/vllm_122b_nd.log"
+    return 1
+}
+
+stop_vllm() { [ -n "$VLLM_PID" ] && kill "$VLLM_PID" 2>/dev/null; sleep 10; }
+
+VLLM_OK=0
+for ATTEMPT in "--reasoning-parser qwen3" "" "--enforce-eager"; do
+    start_vllm "$ATTEMPT"
+    if wait_vllm; then VLLM_OK=1; break; fi
+    echo "vLLM attempt failed (extra: ${ATTEMPT:-none}); escalating fallback"
+    stop_vllm
+done
+if [ "$VLLM_OK" != "1" ]; then
+    echo "ABORT: vLLM server failed all attempts — see $SCRATCH/logs/vllm_122b_nd.log"
+    tail -40 "$SCRATCH/logs/vllm_122b_nd.log"
+    exit 1
+fi
+echo "vLLM server up (pid=$VLLM_PID)"
+
+echo "---- teacher sanity completion ----"
+SANITY=$(curl -sf --max-time 600 "http://127.0.0.1:$VLLM_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$SERVED_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with <action>\\nlook\\n</action> after thinking briefly.\"}],\"max_tokens\":512,\"temperature\":0.6}")
+echo "$SANITY" | head -c 600; echo
+echo "$SANITY" | grep -q "action" || { echo "ABORT: sanity completion malformed"; exit 1; }
+check_stop
+
+# ---------------------------------------------------------- [2] env stacks ---
+echo "---- starting SciWorld stack ----"
+bash start_env_sciworld.sh || { echo "ABORT: sciworld stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8084/docs > /dev/null || { echo "ABORT: env_service 8084"; exit 1; }
+echo "---- starting DeepSearch stack ----"
+bash start_env_deepsearch.sh || { echo "ABORT: deepsearch stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8086/docs > /dev/null || { echo "ABORT: env_service 8086"; exit 1; }
+check_stop
+
+# ----------------------------------------------------------- [3] pilot 50 ---
+run_collector() {
+    local env=$1 envurl=$2 maxtasks=$3 attempts=$4 workers=$5 out=$6 tag=$7
+    python scripts/collect_openrouter_teacher_trajectories.py \
+        --config "config/duet_paper_experiments_configs/iclr2027/collect_h200/${env}_qwen35_4b_collect_h200.yaml" \
+        --env-url "$envurl" \
+        --task-file "data/${env}/task_ids_1600_seed2026.txt" \
+        --output "$out" \
+        --model "$SERVED_NAME" \
+        --api-base "http://127.0.0.1:$VLLM_PORT/v1" \
+        --api-key-env OPENROUTER_API_KEY \
+        --rollouts-per-task 1 \
+        --max-attempts-per-rollout "$attempts" \
+        --max-workers "$workers" \
+        ${maxtasks:+--max-tasks $maxtasks} \
+        --resume \
+        --wandb-run-name "teach122b_${env}_${tag}"
+}
+
+echo "---- pilot: 50 tasks per env, concurrent ----"
+run_collector sciworld   http://127.0.0.1:8084 50 2 8 "$OUTDIR/pilot/sciworld_pilot.jsonl"   pilot \
+    > "$SCRATCH/logs/teach122b_pilot_sciworld.log" 2>&1 &
+PILOT_SW=$!
+run_collector deepsearch http://127.0.0.1:8086 50 2 8 "$OUTDIR/pilot/deepsearch_pilot.jsonl" pilot \
+    > "$SCRATCH/logs/teach122b_pilot_deepsearch.log" 2>&1 &
+PILOT_DS=$!
+wait $PILOT_SW; RC_SW=$?
+wait $PILOT_DS; RC_DS=$?
+echo "pilot collectors done rc_sw=$RC_SW rc_ds=$RC_DS"
+
+echo "---- pilot acceptance gates ----"
+python scripts/accept_teacher_pilot.py traces \
+    --output "$OUTDIR/pilot/sciworld_pilot.jsonl" --min-sr 0.20 \
+    || { echo "ABORT: sciworld pilot gate failed"; exit 1; }
+python scripts/accept_teacher_pilot.py traces \
+    --output "$OUTDIR/pilot/deepsearch_pilot.jsonl" --min-sr 0.10 \
+    || { echo "ABORT: deepsearch pilot gate failed"; exit 1; }
+echo "PILOT GATES PASSED $(date '+%F %T')"
+check_stop
+
+# --------------------------------------------------------- [4] full 1600 ---
+echo "---- full campaign: 1600 tasks per env, concurrent, attempts=8 ----"
+run_collector sciworld   http://127.0.0.1:8084 "" 8 16 "$OUTDIR/sciworld_qwen35_122b_t1600_r1.jsonl"   full8 \
+    > "$SCRATCH/logs/teach122b_full_sciworld.log" 2>&1 &
+FULL_SW=$!
+run_collector deepsearch http://127.0.0.1:8086 "" 8 16 "$OUTDIR/deepsearch_qwen35_122b_t1600_r1.jsonl" full8 \
+    > "$SCRATCH/logs/teach122b_full_deepsearch.log" 2>&1 &
+FULL_DS=$!
+wait $FULL_SW; RC_SW=$?
+wait $FULL_DS; RC_DS=$?
+echo "full collectors done rc_sw=$RC_SW rc_ds=$RC_DS"
+
+echo "---- final counts ----"
+for f in "$OUTDIR"/sciworld_qwen35_122b_t1600_r1.jsonl "$OUTDIR"/deepsearch_qwen35_122b_t1600_r1.jsonl; do
+    [ -f "$f" ] && echo "$(wc -l < "$f") trajectories  $f"
+done
+echo "######## TEACH122B_ND END rc_sw=$RC_SW rc_ds=$RC_DS  $(date '+%F %T') ########"
+# rc=2 = 尝试预算内未全覆盖(正常结局);仅 rc=1 视为失败(2026-08-05 教训)。
+rc_ok() { [ "$1" = "0" ] || [ "$1" = "2" ]; }
+rc_ok "$RC_SW" && rc_ok "$RC_DS" && exit 0 || exit 1

@@ -1,0 +1,159 @@
+#!/bin/bash
+# =============================================================================
+# CATALYST 双试点(P-A 转写 / P-B 状态接管)— 2×H200,AF/WS 各占一卡并行
+# 预注册:docs/research/CATALYST_试点预注册_2026-08-08.md(判据先冻结)
+# 流程:
+#   [1] GPU0/GPU1 各起一个 Qwen3.5-4B vLLM(8000=AF 侧,8001=WS 侧)
+#   [2] 本节点起 AF/WS 环境栈
+#   [3] 重写臂素材:rewrite_hints.py(A2 = 学生腔调重写,汇率检验)
+#   [4] 每环境串行跑五臂:A0 裸考 / A1 原文提示 / A2 重写提示(各 n=8)
+#       + B50/B75 状态接管(各 n=4);两环境并行
+#   [5] 末尾就地汇总各臂 SR
+# 提交前提:collect_student_rollouts_hinted.py / collect_student_takeover.py
+#           冒烟通过(agent 交付)。
+# =============================================================================
+#PBS -N catalyst_pilot
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=48:ngpus=2:mem=400gb
+#PBS -l walltime=24:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/catalyst_pilot.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+PD=$SCRATCH/catalyst_pilots
+DATA=$PD/data
+STUDENT=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200
+mkdir -p $PD/pa $PD/pb $SCRATCH/logs
+exec > >(tee -a "$SCRATCH/logs/catalyst_pilot.live.log") 2>&1
+echo "######## CATALYST PILOTS start $(date '+%F %T') job=${PBS_JOBID:-?} ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+duet_activate || { echo "ABORT: duet env"; exit 1; }
+VLLM_PY="$CONDA_PATH/envs/${CONDA_ENV_VLLM2:-vllm2}/bin/python"
+export VLLM_CACHE_ROOT="/tmp/vllm_cache_$(id -un)"
+export TRITON_CACHE_DIR="/tmp/triton_cache_$(id -un)"
+export TMPDIR=/tmp/duet_tmp_$(id -un); mkdir -p "$TMPDIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR"
+
+VP0=""; VP1=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$VP0" ] && kill "$VP0" 2>/dev/null
+    [ -n "$VP1" ] && kill "$VP1" 2>/dev/null
+    bash start_env_alfworld.sh stop 2>/dev/null || true
+    bash start_env_webshop.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+start_student() {  # $1 gpu  $2 port
+    CUDA_VISIBLE_DEVICES=$1 VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 \
+    "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+        --model "$STUDENT" --served-model-name qwen35-4b-student \
+        --tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 16 \
+        --gpu-memory-utilization 0.85 --port $2 \
+        --reasoning-parser qwen3 \
+        >> "$SCRATCH/logs/vllm_pilot_gpu$1.log" 2>&1 &
+    echo $!
+}
+VP0=$(start_student 0 8000)
+VP1=$(start_student 1 8001)
+for port in 8000 8001; do
+    for i in $(seq 1 90); do
+        curl -sf --max-time 8 "http://127.0.0.1:$port/v1/models" >/dev/null && break
+        [ $i -eq 90 ] && { echo "ABORT: vLLM :$port timeout"; exit 1; }
+        sleep 10
+    done
+done
+echo "student vLLMs up (pids $VP0 $VP1)"
+
+bash start_env_alfworld.sh || { echo "ABORT: alfworld stack"; exit 1; }
+bash start_env_webshop.sh  || { echo "ABORT: webshop stack"; exit 1; }
+
+# ---- [3] A2 素材:学生腔调重写(两环境并行)----
+python scripts/rewrite_hints.py --hints-in "$DATA/alfworld_hints.json" \
+    --hints-out "$DATA/alfworld_hints_rw.json" \
+    --api-base http://127.0.0.1:8000/v1 --model qwen35-4b-student --workers 8 \
+    > "$SCRATCH/logs/rewrite_af.log" 2>&1 &
+RW0=$!
+python scripts/rewrite_hints.py --hints-in "$DATA/webshop_hints.json" \
+    --hints-out "$DATA/webshop_hints_rw.json" \
+    --api-base http://127.0.0.1:8001/v1 --model qwen35-4b-student --workers 8 \
+    > "$SCRATCH/logs/rewrite_ws.log" 2>&1 &
+RW1=$!
+wait $RW0 $RW1; echo "rewrite done rc=$?"
+
+export OPENROUTER_API_KEY=EMPTY
+rc_ok() { [ "$1" = "0" ] || [ "$1" = "2" ]; }
+
+run_env_arms() {   # $1 env  $2 env_port  $3 vllm_port
+    local env=$1 eport=$2 vport=$3 rc=0
+    local common="--config $CFG/${env}_qwen35_4b_collect_h200.yaml \
+        --env-url http://127.0.0.1:$eport \
+        --task-file $DATA/${env}_tasks120.txt \
+        --model qwen35-4b-student --api-base http://127.0.0.1:$vport/v1 \
+        --api-key-env OPENROUTER_API_KEY --max-workers 8 --resume"
+    # A0 裸考(n=8,成败全录)。走 hinted fork 的 none 模式而非母本:
+    # ①任务文件是子序列不是前缀,母本严格校验会拒收;②三臂同一代码路径,
+    # 臂间唯一差别=提示内容。attempts=3:轨迹一旦产出槽位即完成,额外
+    # 额度只在 infra 异常(env 500/API 硬失败)时消耗(agent 冒烟教训)。
+    python scripts/collect_student_rollouts_hinted.py $common \
+        --hint-key none \
+        --output "$PD/pa/${env}_a0.jsonl" \
+        --rollouts-per-task 8 --max-attempts-per-rollout 3 \
+        > "$SCRATCH/logs/pa_${env}_a0.log" 2>&1; rc=$?
+    rc_ok $rc || { echo "ABORT ${env} A0 rc=$rc"; return 1; }
+    echo "[$env] A0 done $(date '+%T')"
+    # A1 原文提示
+    python scripts/collect_student_rollouts_hinted.py $common \
+        --hints-file "$DATA/${env}_hints_rw.json" --hint-key raw \
+        --output "$PD/pa/${env}_a1.jsonl" \
+        --rollouts-per-task 8 --max-attempts-per-rollout 3 \
+        > "$SCRATCH/logs/pa_${env}_a1.log" 2>&1; rc=$?
+    rc_ok $rc || { echo "ABORT ${env} A1 rc=$rc"; return 1; }
+    echo "[$env] A1 done $(date '+%T')"
+    # A2 重写提示
+    python scripts/collect_student_rollouts_hinted.py $common \
+        --hints-file "$DATA/${env}_hints_rw.json" --hint-key rewritten \
+        --output "$PD/pa/${env}_a2.jsonl" \
+        --rollouts-per-task 8 --max-attempts-per-rollout 3 \
+        > "$SCRATCH/logs/pa_${env}_a2.log" 2>&1; rc=$?
+    rc_ok $rc || { echo "ABORT ${env} A2 rc=$rc"; return 1; }
+    echo "[$env] A2 done $(date '+%T')"
+    # P-B 状态接管
+    local tf=$SCRATCH/teacher_data/deepseek_v4_flash/${env}_dsv4flash_t1600_r1.jsonl
+    local tf2=$SCRATCH/teacher_data/deepseek_v4_flash/${env}_dsv4flash_t1600_topup8.jsonl
+    local tfargs="--teacher-files $tf"; [ -f "$tf2" ] && tfargs="$tfargs $tf2"
+    for frac in 0.5 0.75; do
+        python scripts/collect_student_takeover.py $common \
+            $tfargs --entry-frac $frac \
+            --output "$PD/pb/${env}_k${frac/0./}.jsonl" \
+            --rollouts-per-task 4 --max-attempts-per-rollout 3 \
+            > "$SCRATCH/logs/pb_${env}_k${frac/0./}.log" 2>&1; rc=$?
+        rc_ok $rc || { echo "ABORT ${env} B$frac rc=$rc"; return 1; }
+        echo "[$env] B$frac done $(date '+%T')"
+    done
+    return 0
+}
+
+run_env_arms alfworld 8081 8000 & PA=$!
+run_env_arms webshop  8083 8001 & PB=$!
+wait $PA; RCA=$?
+wait $PB; RCB=$?
+echo "arms done rc_af=$RCA rc_ws=$RCB"
+
+echo "---- [5] 就地汇总 ----"
+python - <<'EOF'
+import json, glob
+for f in sorted(glob.glob('/projects_vol/gp_wangwy/qisheng/duet_h200/catalyst_pilots/p*/*.jsonl')):
+    n=s=0; div=0
+    for ln in open(f):
+        r=json.loads(ln); n+=1; s+=int(bool(r.get('success')))
+        div+=int(r.get('replay_divergence') or 0)
+    extra=f'  divergence_total={div}' if 'pb/' in f else ''
+    print(f'{f.split("catalyst_pilots/")[1]:28s} n={n:5d} success={s:4d} SR={s/max(n,1):.1%}{extra}')
+EOF
+echo "######## CATALYST PILOTS END rc_af=$RCA rc_ws=$RCB $(date '+%F %T') ########"
+[ $RCA -eq 0 ] && [ $RCB -eq 0 ] && exit 0 || exit 1

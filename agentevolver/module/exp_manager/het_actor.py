@@ -1079,6 +1079,10 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                 select_keys.append("teacher_mask")
             if "teacher_loss_scale" in data.batch:
                 select_keys.append("teacher_loss_scale")
+            # ⭐ CATALYST 去提示重放 BC:mask 仅在批内存在重放样本时由
+            # samples_to_dataproto 构造(默认关闭 → key 不存在 → 零改动)。
+            if "catalyst_replay_mask" in data.batch:
+                select_keys.append("catalyst_replay_mask")
         # if multi_turn:
         #     select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -1457,6 +1461,23 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
+                    # ⭐ CATALYST 去提示重放 BC:w=min(1,exp(φ)),φ=logπ+H 需要
+                    # per-token 全词表熵 → 本 micro-batch 含重放 token 时强制算熵
+                    # (规格 F11;catalyst 关闭时本块零行为)。
+                    try:
+                        catalyst_bc_cfg = (
+                            self.config.get("catalyst", {}) or {}
+                        ).get("replay_bc", {}) or {}
+                    except Exception:
+                        catalyst_bc_cfg = {}
+                    catalyst_bc_enable = bool(catalyst_bc_cfg.get("enable", False))
+                    catalyst_replay_mask_full = (
+                        data.get("catalyst_replay_mask", None)
+                        if catalyst_bc_enable
+                        else None
+                    )
+                    if catalyst_replay_mask_full is not None:
+                        calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)  # ⭐ Forward pass to get entropy and log probabilities
 
                     ##################
@@ -1471,6 +1492,24 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     from .dr3_ratio import DR3RatioEstimator, compute_sequence_features
                     off_cliprange_high = self.config.get("off_cliprange_high", 1.0)
                     exp_mask = data["exp_mask"][:, -response_length:]
+
+                    # ⭐ CATALYST:重放 token mask(response 制式)与 PG 剔除 mask。
+                    # 重放行"只 BC 无 PG":pg_response_mask 把重放行整行剔出 PG /
+                    # 熵奖励 / KL 的聚合;catalyst 关闭时 pg_response_mask 与
+                    # response_mask 是同一对象(零行为差异)。
+                    catalyst_replay_mask = None
+                    catalyst_replay_rows = None
+                    pg_response_mask = response_mask
+                    if catalyst_replay_mask_full is not None:
+                        _crm = catalyst_replay_mask_full[:, -response_length:]
+                        catalyst_replay_mask = (_crm * response_mask).float()
+                        catalyst_replay_rows = _crm.sum(dim=-1) > 0
+                        if bool(catalyst_replay_rows.any()):
+                            pg_response_mask = response_mask * (
+                                (~catalyst_replay_rows)
+                                .unsqueeze(-1)
+                                .to(response_mask.dtype)
+                            )
                     
                     # ⭐ Off-policy policy shaping configuration
                     off_policy_shaping_mode = self.config.get("off_policy_shaping_mode", "higher_clip_bound")
@@ -2688,7 +2727,8 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
-                            response_mask=response_mask,
+                            # ⭐ CATALYST:重放行剔除出 PG(默认时与 response_mask 同对象)
+                            response_mask=pg_response_mask,
                             exp_mask=exp_mask,   # (bs, response_length) ANNI add: 1 w/ exp(off-policy); 0 w/o exp(on-policy)
                             cliprange=clip_ratio,
                             cliprange_low=clip_ratio_low,
@@ -2708,6 +2748,84 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                             f"use_dapo={use_dapo}, dr3_enable={dr3_enable}, use_chord={use_chord}, "
                             f"has_teacher_data={has_teacher_data}, dr3_apply_to={dr3_apply_to}"
                         )
+
+                    # ================================================================
+                    # ⭐ CATALYST 去提示重放 BC(M1 工作项③)
+                    # 零模仿不变式:重放 token 全为学生自写、环境盖章;教师 token
+                    # 在 catalyst 配置下根本不进批(下方 RuntimeError 双保险)。
+                    # w = stop-grad[min(w_cap, exp((logπ+H)/τ))],φ 从同一次
+                    # forward 就地取;损失 L += β·agg(w·(−logπ), replay_mask)。
+                    # ================================================================
+                    catalyst_bc_loss = None
+                    catalyst_bc_beta = 0.0
+                    catalyst_bc_metrics: dict[str, float] = {}
+                    if (
+                        catalyst_replay_mask is not None
+                        and bool((catalyst_replay_mask.sum() > 0).item())
+                    ):
+                        if use_dapo or use_chord or dr3_enable or has_teacher_data:
+                            raise RuntimeError(
+                                "CATALYST replay BC requires use_dapo/use_chord/"
+                                "use_dr3 off and no teacher tokens in the batch "
+                                "(zero-imitation invariant); got "
+                                f"use_dapo={use_dapo}, use_chord={use_chord}, "
+                                f"dr3_enable={dr3_enable}, "
+                                f"has_teacher_data={has_teacher_data}"
+                            )
+                        if entropy is None:
+                            raise RuntimeError(
+                                "CATALYST replay BC requires per-token entropy "
+                                "(calculate_entropy must be forced on)"
+                            )
+                        catalyst_bc_beta = float(catalyst_bc_cfg.get("beta", 0.1))
+                        from agentevolver.module.exp_manager.catalyst import (
+                            compute_replay_bc_terms,
+                        )
+                        # ⭐ w 在 no_grad 下计算(stop-grad,规格 T3);
+                        # φ=logπ+H 取自本 micro-batch 同一次 forward。
+                        catalyst_w, catalyst_bc_losses = compute_replay_bc_terms(
+                            log_prob,
+                            entropy,
+                            w_cap=float(catalyst_bc_cfg.get("w_cap", 1.0)),
+                            phi_tau=float(catalyst_bc_cfg.get("phi_tau", 1.0)),
+                        )
+                        catalyst_bc_loss = agg_loss(
+                            loss_mat=catalyst_bc_losses,
+                            loss_mask=catalyst_replay_mask,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        if bool(torch.isnan(catalyst_bc_loss).item()):
+                            catalyst_bc_loss = torch.tensor(
+                                0.0, device=log_prob.device
+                            )
+                        with torch.no_grad():
+                            _replay_bool = catalyst_replay_mask.bool()
+                            _w_vals = catalyst_w[_replay_bool].float()
+                            if _w_vals.numel() > 0:
+                                _q = torch.quantile(
+                                    _w_vals,
+                                    torch.tensor(
+                                        [0.1, 0.5, 0.9], device=_w_vals.device
+                                    ),
+                                )
+                                catalyst_bc_metrics = {
+                                    "catalyst/w_mean": _w_vals.mean().item(),
+                                    "catalyst/w_p10": _q[0].item(),
+                                    "catalyst/w_p50": _q[1].item(),
+                                    "catalyst/w_p90": _q[2].item(),
+                                    "catalyst/replay_token_count": float(
+                                        _replay_bool.sum().item()
+                                    ),
+                                    "catalyst/bc_loss": float(
+                                        catalyst_bc_loss.detach().item()
+                                    ),
+                                    "catalyst/bc_weighted_loss": float(
+                                        (catalyst_bc_beta * catalyst_bc_loss)
+                                        .detach()
+                                        .item()
+                                    ),
+                                }
+
                     pg_loss = ret_dict["pg_loss"]
                     pg_losses = ret_dict["pg_losses"]
                     on_pg_losses = ret_dict["on_pg_losses"]
@@ -2727,19 +2845,37 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                     teacher_diag_stats = ret_dict.get("teacher_diag_stats")  # ratio/adv 分布统计
                     exp_replay_diag_stats = ret_dict.get("exp_replay_diag_stats")  # endo replay: ratio/adv/shaping 统计
                     ##################
+                    # ⭐ CATALYST:熵奖励/KL 的聚合 mask 默认剔除重放 token
+                    # (exclude_replay_from_entropy_kl=true;catalyst 关闭时
+                    # entropy_kl_mask 与 response_mask 同对象,零行为差异)。
+                    entropy_kl_mask = response_mask
+                    if (
+                        catalyst_replay_mask is not None
+                        and pg_response_mask is not response_mask
+                        and bool(
+                            catalyst_bc_cfg.get(
+                                "exclude_replay_from_entropy_kl", True
+                            )
+                        )
+                    ):
+                        entropy_kl_mask = pg_response_mask
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate entropy loss
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=entropy_kl_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate entropy loss
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
 
+                    # ⭐ CATALYST:辅助 BC 项(只作用于重放 token;β 全局系数)
+                    if catalyst_bc_loss is not None:
+                        policy_loss = policy_loss + catalyst_bc_beta * catalyst_bc_loss
+
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)  # ⭐ Compute KL divergence penalty
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate KL divergence loss
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=entropy_kl_mask, loss_agg_mode=loss_agg_mode)  # ⭐ Aggregate KL divergence loss
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_kl_sum, micro_kl_weight = _loss_metric_sum_and_weight(
@@ -2868,6 +3004,9 @@ class HETDataParallelPPOActor(DataParallelPPOActor):
                                     data[f"exp_replay_diag/{k}"] = float(v)
                             except Exception:
                                 pass
+                    # ⭐ CATALYST 重放 BC 遥测(w 分位数/损失/token 数)
+                    if catalyst_bc_metrics:
+                        data.update(catalyst_bc_metrics)
                     ##################
                     append_to_dict(metrics, data)
 

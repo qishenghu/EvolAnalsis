@@ -224,6 +224,26 @@ patch(
     "P5 wrap-policy tolerate missing classes",
 )
 
+# ---------------------------------------------------------------------------
+# P6: chat_scheduler.py — never send tools=[]/None to the rollout server.
+# vLLM >= 0.21 rejects an empty tools array with HTTP 400 ("`tools` must not
+# be an empty array"), which older servers (<= 0.19) silently accepted. The
+# scheduler always forwards completion_callback.tool_schemas, which is [] for
+# tool-free agents (multi_turn.tool_config_path == '').
+# ---------------------------------------------------------------------------
+patch(
+    "workers/rollout/chat_scheduler.py",
+    """            extra_body = chat_complete_request.pop("extra_body", {})
+            chat_complete_request.update(extra_body or {})
+            extra_headers = chat_complete_request.pop("extra_headers")""",
+    """            extra_body = chat_complete_request.pop("extra_body", {})
+            chat_complete_request.update(extra_body or {})
+            if not chat_complete_request.get("tools"):  # [t5x-patch] P6: vllm>=0.21 400s on tools=[]
+                chat_complete_request.pop("tools", None)
+            extra_headers = chat_complete_request.pop("extra_headers")""",
+    "P6 drop empty tools field for vllm 0.21+",
+)
+
 
 def main():
     if len(sys.argv) < 2:

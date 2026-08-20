@@ -1,0 +1,120 @@
+# Teacher-collection student contract, GaaS H200 cluster (2026-08-04).
+# Full copy of the lane-B s200 WebShop baseline with exactly two edits:
+# experiment_name and the student model/tokenizer path moved to this cluster's
+# shared-models volume. Context/curriculum contract fields are byte-identical.
+# Used only by collect_openrouter_teacher_trajectories.py.
+# ICLR 2027 production baseline: Qwen3.5-4B pure on-policy GRPO on
+# WebShop, lane B (GPUs 4-7).
+#
+# The WebShop snapshot gate already owns the benchmark-specific v5 context
+# policy (four recent turns and 512-token compacted old observations).  This
+# file changes only canary-scale knobs into the paper-scale training contract.
+# One epoch contains 1,600 unique prompts: batch 8 => exactly 200 updates.
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - /duet_paper_experiments_configs/iclr2027/webshop/webshop_qwen35_4b_grpo_snapshot_gate@_global_
+  - _self_
+
+trainer:
+  experiment_name: webshop_qwen35_4b_collect_h200
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  total_training_steps: 200
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  save_freq: 50
+  # WebShop's strict success often changes late in training.  Dense held-out
+  # checkpoints distinguish a delayed take-off from a genuinely failed run.
+  test_freq: 25
+  val_before_train: true
+  resume_mode: disable
+  save_checkpoint_on_identity_failure: true
+  export_actor_weights_on_identity_failure: true
+  validation_data_dir: experiments/webshop/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/webshop/${trainer.experiment_name}/rollout_log
+  logger: [console, wandb]
+
+actor_rollout_ref:
+  model:
+    path: /projects_vol/gp_wangwy/models/Qwen3.5-4B
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+  actor:
+    behavior_logprob_fp32_temperature: true
+    skip_zero_advantage_grpo_update: true
+    ppo_mini_batch_size: 8
+    ppo_max_token_len_per_gpu: 32768
+  rollout:
+    use_qwen3: true
+    thinking_mode: native_qwen35
+    prompt_length: 22528
+    response_length: 10240
+    max_model_len: 32768
+    length_truncation_reward: -0.1
+    length_truncation_max_decision_fraction: 0.10
+    temperature: 0.6
+    log_prob_max_token_len_per_gpu: 32768
+    external_server_addresses:
+      - 127.0.0.1:8211
+      - 127.0.0.1:8212
+      - 127.0.0.1:8213
+      - 127.0.0.1:8214
+    external_request_timeout: 1200
+    external_sleep_between_steps: true
+    enforce_eager: false
+    use_rollout_log_probs_as_old: true
+    rollout_logprob_drift_mean_threshold: 0.02
+    rollout_logprob_drift_p99_threshold: 0.25
+    rollout_importance_ratio_outside_clip_threshold: 0.01
+    # Must match MAX_NUM_SEQS=1 on the already supervised external lane.
+    max_num_seqs: 1
+    n: 8
+    max_env_worker: 32
+    max_trajectory_resubmits: 1
+    # The calibrated distribution/tail gates remain fail-closed.  A lone raw
+    # maximum is retained as diagnostics because recurrent decode and the
+    # FSDP teacher-force path are not tokenwise bit-identical on Qwen3.5 GDN.
+    rollout_logprob_drift_max_threshold: -1
+    context_management:
+      enabled: true
+      max_prompt_tokens: 22528
+      recent_turns: 4
+      min_recent_turns: 1
+      history_observation_max_tokens: 512
+      recent_observation_max_tokens: -1
+      allow_current_observation_truncation: false
+      reasoning_history_tokens: 0
+      snapshot_training: true
+      snapshot_selection: token_weighted
+      snapshot_selection_seed: 2025
+    multi_turn:
+      max_steps: 30
+  ref:
+    behavior_logprob_fp32_temperature: true
+    log_prob_max_token_len_per_gpu: 32768
+
+critic:
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+
+data:
+  train_batch_size: 8
+  max_prompt_length: 22528
+  max_response_length: 10240
+  max_train_tasks: 1600
+  max_val_tasks: 200
+  validation_shuffle: false
+  val_batch_size: 8
+  dataloader_num_workers: 0
+
+task_manager:
+  strategy_args:
+    max_explore_step: 30
+
+thread_pool:
+  max_workers: 8

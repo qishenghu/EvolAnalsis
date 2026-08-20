@@ -1,0 +1,99 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>CATALYST v4 胜因解剖</title>
+<style>
+  :root{--bg:#101418;--fg:#e8edf2;--acc:#4fc3f7;--good:#66bb6a;--bad:#ef5350;--dim:#8a97a5;--card:#1a2027}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font-family:"Noto Sans SC","PingFang SC",sans-serif;overflow:hidden}
+  .slide{display:none;width:100vw;height:100vh;padding:5vh 7vw;flex-direction:column;justify-content:center}
+  .slide.on{display:flex}
+  h1{font-size:2.6em;margin-bottom:.4em;color:var(--acc)}
+  h2{font-size:1.9em;margin-bottom:.7em;color:var(--acc)}
+  p,li{font-size:1.15em;line-height:1.75;color:var(--fg)}
+  ul{margin-left:1.2em}
+  .big{font-size:3.4em;font-weight:700;color:var(--good)}
+  .k{color:var(--acc);font-weight:600}.g{color:var(--good);font-weight:600}.r{color:var(--bad);font-weight:600}.d{color:var(--dim)}
+  table{border-collapse:collapse;margin:1em 0;font-size:1.02em}
+  th,td{border:1px solid #2c3540;padding:.45em .9em;text-align:center}
+  th{background:var(--card);color:var(--acc)}
+  .card{background:var(--card);border-radius:12px;padding:1em 1.4em;margin:.6em 0}
+  .foot{position:fixed;bottom:2vh;right:3vw;color:var(--dim);font-size:.9em}
+  .tag{position:fixed;top:2vh;left:3vw;color:var(--dim);font-size:.9em}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:1.2em}
+</style></head><body>
+
+<div class="slide on"><h1>CATALYST v4:统一分配法则的胜利</h1>
+<p style="font-size:1.5em">为什么这次超越了 GRPO 与此前所有版本</p>
+<p class="d" style="margin-top:2em">DUET → CATALYST 项目 · ICLR 2027 · 2026-08-19<br>数据:v4_s0 全量扫评 × GRPO10 双种子 × v1–v3 同协议对照</p></div>
+
+<div class="slide"><h2>结果一页</h2>
+<table><tr><th></th><th>v4_s0</th><th>GRPO10 强种子</th><th>GRPO10 两种子均值</th></tr>
+<tr><td>到达 GRPO 毕生峰值所需步数</td><td class="g">40 步</td><td>90–100 步</td><td>—</td></tr>
+<tr><td>pass@1 @100</td><td class="g">74.2(项目纪录)</td><td>69.1</td><td>60.3</td></tr>
+<tr><td>pass@3 @100</td><td>84.6</td><td>88.9</td><td>75.7</td></tr>
+<tr><td>覆盖率 @50(128 题至少成一次)</td><td class="g">112</td><td>89</td><td>—</td></tr></table>
+<p><span class="big">2.5×</span> 步数效率;前 70 步峰值领先 <span class="g">+25.0 / +27.7</span>;终点对两种子均值 <span class="g">+13.9 / +8.9</span></p></div>
+
+<div class="slide"><h2>v4 是什么:一条法则,四个参数</h2>
+<div class="card"><p>一个任务的一族练法 <span class="k">context</span> ∈ { 裸做 · 带提示做 · 从进度 f 接管做 }<br>教师知识只扩充这个集合(prompt / 起点),<span class="k">永不进损失</span></p></div>
+<div class="grid">
+<div class="card"><p><span class="k">估计</span>:V̂(任务,c) = 全局分段 EMA ⊕ 逐任务 EMA(精度加权收缩)</p></div>
+<div class="card"><p><span class="k">排产</span>:裸 m(1−m);辅助 m(1−m)·<b>(1−V̂<sub>裸</sub>)</b>(目标锚定)</p></div>
+<div class="card"><p><span class="k">计账</span>:A = r − (n₀m + Σ<sub>j≠i</sub>r<sub>j</sub>)/(n₀+k−1)(所有臂统一)</p></div>
+<div class="card"><p><span class="k">还原性</span>:context 退化为{裸} → 逐字还原 GRPO/RLOO</p></div></div>
+<p class="d">参数 15 → 4;课程的出现、聚焦、退场全部是推论,不再有手调阈值</p></div>
+
+<div class="slide"><h2>胜因 A:统一优势基线 —— 三处零梯度病一次治愈</h2>
+<ul><li>GRPO 组均值基线的死穴:组内全同 → 零梯度。三代人踩了三次:角点裸组(v1)、同起点 entry 组(v2)、高成功率 hint 小组(v1–v3)</li>
+<li>历史回放:携梯度行 <span class="r">43.0%</span> → <span class="g">77.2%</span>;在线实测 0.56–1.0</li>
+<li><b>隐藏红利</b>:辅助退场后,v4 的"纯 GRPO 阶段"仍是<span class="k">更好的 GRPO</span>——全同裸组照样出梯度,领先没有被回吐</li></ul></div>
+
+<div class="slide"><h2>胜因 B:课程爆发 + 目标锚定退火</h2>
+<table><tr><th>step</th><th>1</th><th>10</th><th>15</th><th>30</th></tr>
+<tr><td>辅助臂份额</td><td>55.5%</td><td>36.7%</td><td class="g">0%(自动全额退场)</td><td>0%</td></tr>
+<tr><td>val(v4)</td><td>—</td><td>30.5</td><td>—</td><td class="g">57.0</td></tr>
+<tr><td>val(GRPO10)</td><td>—</td><td>33.6</td><td>—</td><td>40.6</td></tr></table>
+<ul><li>爆发窗前置 ~17pp 能力;退场无时间表,纯粹是 (1−V̂<sub>裸</sub>) 的数学推论</li>
+<li>对照 v3 之死:臂税 14–25% 永不退 + 熵被正优势烧穿(0.155@55)<br>v4:优势均值 step 20 起归零,pass@3 峰值 88.3 —— <span class="g">多样性无损</span></li></ul></div>
+
+<div class="slide"><h2>胜因 C+D:会预测的值表 & 干净的基建</h2>
+<div class="grid"><div class="card"><p><b>值表校准</b><br>在线 Brier 0.205 → 0.137,全程 &lt;&lt; 0.250(常数)<br>难度自举消灭冷启动聋子期 —— step 1 即精准排课</p></div>
+<div class="card"><p><b>基建</b><br>预防性换血(step 50)→ 全程无垂死环境窗口<br>对照:v1/v3/GRPO10 均死于 step≈76 且死前喂毒</p></div></div>
+<h2 style="margin-top:.6em">行为内化(course 的遗产,裸上下文仍在)</h2>
+<table><tr><th>@100</th><th>think 词数/决策</th><th>决策数/题</th><th>病理口癖</th></tr>
+<tr><td class="k">v4</td><td class="g">67</td><td class="g">16.3(更高效)</td><td>0%</td></tr>
+<tr><td>GRPO10</td><td>29</td><td>18.5</td><td>0%</td></tr></table>
+<p class="d">想得多、走得准 —— "think 也值得学"的初心在数据里的样子</p></div>
+
+<div class="slide"><h2>对四代的逐一裁决</h2>
+<table><tr><th>版本</th><th>败因(已诊断)</th><th>v4 的修复</th></tr>
+<tr><td>v1</td><td>剥条件克隆 → 上下文级 off-policyness(21% 引用泄漏、Wait 61.9%)</td><td>教师只进 prompt/起点,损失纯 PG</td></tr>
+<tr><td>v2</td><td>同起点方差坍缩(组活性 17.7%)+ 阶梯算术不可行</td><td>逐槽 frac + 分数竞价,无阶梯</td></tr>
+<tr><td>v3</td><td>熵透支 + 臂税不退 + hint 零梯度</td><td>均值归零优势 + 锚定退火 + 统一基线</td></tr>
+<tr><td>GRPO</td><td>隐式课程慢热 + 组基线浪费 + 种子方差巨大(两种子终点差 17.7/26.4pp)</td><td>显式分配 + LOO/先验;2.5× 效率</td></tr></table></div>
+
+<div class="slide"><h2>诚实清单:新诊断的问题</h2>
+<div class="card"><p><b>① epoch-2 的 V̂ 过期(新发现)</b>:800 任务 ÷ 16/步 = 50 步一轮;二次到访时旧估计系统性偏低。四个同根信号:辅助份额回潮(0→0.29–0.39)· Brier 恶化(0.155→0.31)· 优势转正(+0.17)· 熵下滑(0.35→0.21)→ 80–90 波动谷的头号嫌疑</p></div>
+<div class="card"><p><b>② pass@3 终点 −4.3</b> vs 强种子(≈1σ,待种子裁决)</p></div>
+<div class="card"><p><b>③ 单种子</b>:v4_s1/s2 在跑(GRPO 的种子教训在前,此项不可省)</p></div></div>
+
+<div class="slide"><h2>继续改进的路线(全部由诊断驱动)</h2>
+<table><tr><th>优先</th><th>改进</th><th>治什么</th><th>成本</th></tr>
+<tr><td class="g">v4.1a</td><td>时效衰减收缩 n_eff·γ^Δt(陈旧任务层让位新鲜全局层)</td><td>①全链</td><td>~10 行</td></tr>
+<tr><td class="g">v4.1b</td><td><b>法则上移:任务级分配</b>(dataloader 按可学习性采样任务)</td><td>跨任务预算浪费(剩余最大杠杆)</td><td>中</td></tr>
+<tr><td>v5</td><td>V̂ 门控 on-policy 自蒸馏桥(LOPD 启发)</td><td>hint 存量转移</td><td>大</td></tr>
+<tr><td>放大</td><td>WS/SciWorld 域 · 3 seed · 消融四连</td><td>泛化与统计效力</td><td>排程</td></tr></table>
+<p class="d">纪律:每项改进先有诊断,后有代码 —— v1→v4 的路就是这么走出来的</p></div>
+
+<div class="slide"><h1>一句话总结</h1>
+<div class="card" style="margin-top:1em"><p style="font-size:1.5em;line-height:2">三次受控失败把问题从"怎么用教师数据"收敛为<br><span class="k">"怎么给一族练法定价"</span>;<br>v4 用一个四参数的分配法则回答了它:<br><span class="g">2.5 倍加速,终点不伤反升</span>,课程功成身退,GRPO 是它的特例。</p></div>
+<p class="d" style="margin-top:2em">下一步:v4 s1/s2(在跑)→ 3×3 终裁 → WS 域 → ICLR 2027(abstract 9/18)</p></div>
+
+<div class="tag">CATALYST v4 · 2026-08-19</div>
+<div class="foot">← → 翻页 · <span id="pg"></span></div>
+<script>
+const S=[...document.querySelectorAll('.slide')];let i=0;
+function show(n){S[i].classList.remove('on');i=(n+S.length)%S.length;S[i].classList.add('on');document.getElementById('pg').textContent=(i+1)+' / '+S.length;}
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key===' ')show(i+1);if(e.key==='ArrowLeft')show(i-1);});
+document.addEventListener('click',e=>show(e.clientX>innerWidth/2?i+1:i-1));
+show(0);
+</script></body></html>

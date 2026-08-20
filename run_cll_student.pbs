@@ -1,0 +1,41 @@
+#!/bin/bash
+# 学生 rollout 的 CLL 打分(2026-08-07):为判别器离线 AUC 提供"学生类"特征。
+# 学生 rollout 文件与教师 schema 兼容,直接复用 cll_teacher_profile.py。
+#PBS -N cll_student
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=24:ngpus=2:mem=200gb
+#PBS -l walltime=6:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/cll_student.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+OUT=$REPO/analysis_outputs/cll_teacher_profile
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200
+exec > >(tee -a "$SCRATCH/logs/cll_student.live.log") 2>&1
+echo "######## CLL STUDENT start $(date '+%F %T') ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+PY=/projects_vol/gp_wangwy/qisheng/duet_h200/conda/envs/vllm2/bin/python
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+
+CUDA_VISIBLE_DEVICES=0 $PY analysis/cll_teacher_profile.py \
+    --input "$SCRATCH/student_rollouts/alfworld_qwen35_4b_student_rollouts.jsonl" \
+    --config "$CFG/alfworld_qwen35_4b_collect_h200.yaml" \
+    --max-records 400 --device cuda:0 \
+    --output "$OUT/cll_student_af_400.jsonl" \
+    > "$SCRATCH/logs/cll_student_af.log" 2>&1 &
+P1=$!
+CUDA_VISIBLE_DEVICES=1 $PY analysis/cll_teacher_profile.py \
+    --input "$SCRATCH/student_rollouts/webshop_qwen35_4b_student_rollouts.jsonl" \
+    --config "$CFG/webshop_qwen35_4b_collect_h200.yaml" \
+    --max-records 400 --device cuda:0 \
+    --output "$OUT/cll_student_ws_400.jsonl" \
+    > "$SCRATCH/logs/cll_student_ws.log" 2>&1 &
+P2=$!
+wait $P1; echo "student_af rc=$?"
+wait $P2; echo "student_ws rc=$?"
+ls -la "$OUT"/cll_student_*.summary.json 2>/dev/null
+echo "######## CLL STUDENT END $(date '+%F %T') ########"

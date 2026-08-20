@@ -1,0 +1,165 @@
+#!/bin/bash
+# =============================================================================
+# Qwen3.5-4B PURE-GRPO ALFWorld training smoke — first RL training on GaaS H200
+# (2026-08-08). 20 steps, 16 tasks x 8 rollouts, eval every 5 steps.
+#
+# Stack: duet-train env (duet clone + transformers 5.14.1/tokenizers 0.22.2 +
+#        verl t5x patches) for FSDP training; external vLLM rollout lane
+#        (vllm2 env, ports 8201-8204, MAX_NUM_SEQS=1, gpu_util 0.25) colocated
+#        on the same 4 GPUs; per-step weight hot-swap via collective_rpc.
+# Config: config/duet_paper_experiments_configs/iclr2027/train_h200/
+#         alfworld_qwen35_4b_grpo_smoke.yaml  (contract == collect_h200 AF yaml)
+#
+# Submit : qsub -h run_train_smoke.pbs   (user-hold; main session releases)
+# Watch  : tail -f /projects_vol/gp_wangwy/qisheng/duet_h200/logs/smoke_q35af.live.log
+# Abort  : qdel <jobid>  (cleanup trap stops rollout servers + AF stack by PID)
+# =============================================================================
+#PBS -N smoke_q35af
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=120:ngpus=4:mpiprocs=8:mem=2000gb
+#PBS -l walltime=12:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/smoke_q35af.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+LIVELOG=$SCRATCH/logs/smoke_q35af.live.log
+TRAINLOG=$SCRATCH/logs/smoke_q35af.train.log
+EXPERIMENT_NAME=smoke_qwen35_4b_grpo_af
+SMOKE_CONF=config/duet_paper_experiments_configs/iclr2027/train_h200/alfworld_qwen35_4b_grpo_smoke.yaml
+MODEL_DIR=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+BASE_PORT=8201
+mkdir -p "$(dirname "$LIVELOG")"
+
+exec > >(tee -a "$LIVELOG") 2>&1
+echo "######## SMOKE_Q35AF  $(date '+%F %T')  job=${PBS_JOBID:-?}  host=$(hostname) ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+
+# ---- training env = duet-train; AF env stack stays on the original duet ----
+export CONDA_ENV_DUET=duet-train
+source "$REPO/env_config.sh"
+# Unified job preamble — L1 GPU indices, L2 node-local scratch, L6 pidfile
+# healing, credential hygiene (online-only W&B, netrc auth, never env-var keys),
+# L3/L4/L8 config gate. See docs/infra/LANDMINES.md.
+source "$REPO/scripts/duet_job_preamble.sh"
+duet_preamble_gpu 4                || exit 1
+duet_preamble_wandb require-online || exit 1
+
+duet_activate || { echo "ABORT: duet-train activation failed"; exit 1; }
+echo "trainer python: $(which python) ($(python -V 2>&1))"
+
+# ---- duet-train stack acceptance (fail fast before touching GPUs) ----------
+python - <<'EOF' || { echo "ABORT: duet-train stack acceptance failed"; exit 1; }
+import transformers, tokenizers, verl, pathlib
+assert transformers.__version__ == "5.14.1", transformers.__version__
+assert tokenizers.__version__ == "0.22.2", tokenizers.__version__
+verl_init = pathlib.Path(verl.__file__).read_text()
+assert "t5x-patch" in verl_init, "verl t5x patches missing in this env"
+from transformers import AutoConfig
+cfg = AutoConfig.from_pretrained("/projects_vol/gp_wangwy/models/Qwen3.5-4B")
+print("acceptance OK:", transformers.__version__, tokenizers.__version__, cfg.model_type)
+EOF
+
+python -c "from agentevolver.utils.tracking import preflight_wandb_online; preflight_wandb_online(project_name='agentevolver', experiment_name='$EXPERIMENT_NAME')" \
+    || { echo "ABORT: W&B online preflight failed (netrc auth?)"; exit 1; }
+
+python config/validate_length_config.py "$SMOKE_CONF" || { echo "ABORT: length-contract validation failed"; exit 1; }
+
+# Idempotent resubmission: archive stale smoke outputs instead of refusing.
+STAMP=$(date +%Y%m%d_%H%M%S)
+for d in "checkpoints/agentevolver/$EXPERIMENT_NAME" "experiments/alfworld/$EXPERIMENT_NAME"; do
+    if [ -e "$d" ]; then
+        echo "archiving stale $d -> ${d}.pre_${STAMP}"
+        mv "$d" "${d}.pre_${STAMP}"
+    fi
+done
+
+# Config health gate (L3/L4/L8 + lane + val completeness). Deliberately AFTER the
+# archive loop above: the collision rule then also proves the archive worked.
+# --allow-disable: this is a throwaway smoke run and the loop above archives the
+# previous outputs, so resume_mode=disable is the intended semantics here.
+duet_validate_train_config "$SMOKE_CONF" \
+    --allow-disable \
+    --lane-mns 1 --lane-gmu 0.25 \
+    --experiment-name "$EXPERIMENT_NAME" \
+    || { echo "ABORT: train config validation failed"; exit 1; }
+
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    BASE_PORT=$BASE_PORT bash start_rollout_servers.sh stop 2>/dev/null || true
+    env -u CONDA_ENV_DUET bash start_env_alfworld.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------ [1] AlfWorld stack --
+# L2: node-local scratch for the libdownward temp-dir churn (also sets
+# TRITON_CACHE_DIR / VLLM_CACHE_ROOT). This smoke run is 20 steps, far under the
+# ~3000-reset mmap ceiling, so it starts no sweeper — see docs/infra/LANDMINES.md L2.
+duet_preamble_tmp || exit 1
+echo "---- starting ALFWorld stack (original duet env) ----"
+env -u CONDA_ENV_DUET bash start_env_alfworld.sh || { echo "ABORT: alfworld stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8081/docs > /dev/null || { echo "ABORT: env_service 8081"; exit 1; }
+echo "ALFWorld stack up (AgentGym 36001 / env_service 8081)"
+
+# --------------------------------------------- [2] external rollout servers --
+# L6: heal a stale pidfile left by a qdel'd predecessor (shared storage,
+# node-local PIDs); refuse to proceed if a genuinely live lane is listed.
+PIDFILE="$REPO/logs/rollout_servers_${BASE_PORT}.pids"
+duet_preamble_pidfile_heal "$PIDFILE" || exit 1
+echo "---- starting 4x TP1 rollout servers (vllm2 env) ----"
+MODEL_DIR="$MODEL_DIR" \
+GPUS="$CUDA_VISIBLE_DEVICES" \
+BASE_PORT=$BASE_PORT \
+GPU_MEM_UTIL=0.25 \
+MAX_MODEL_LEN=32768 \
+MAX_NUM_SEQS=1 \
+WAIT_ATTEMPTS=900 \
+EXPERIMENT_TAG="$EXPERIMENT_NAME" \
+EXPERIMENT_CONFIG="$SMOKE_CONF" \
+bash start_rollout_servers.sh start || { echo "ABORT: rollout servers failed to come up"; exit 1; }
+
+# Contract check on the freshest manifest for this lane (A100 queue discipline).
+MANIFEST=$(ls -t logs/rollout_servers_${BASE_PORT}_*.manifest 2>/dev/null | head -1)
+[ -n "$MANIFEST" ] || { echo "ABORT: no rollout manifest"; exit 1; }
+echo "rollout manifest: $MANIFEST"
+for field in \
+    "model_dir=$MODEL_DIR" \
+    "base_port=$BASE_PORT" \
+    "max_model_len=32768" \
+    "max_num_seqs=1" \
+    "gpu_memory_utilization=0.25" \
+    "logprobs_mode=processed_logprobs" \
+    "enforce_eager=0" \
+    "vllm_enable_fla_packed_recurrent_decode=0" \
+    "health_verified_ports=8201 8202 8203 8204"; do
+    grep -aFxq "$field" "$MANIFEST" || { echo "ABORT: manifest lacks contract field: $field"; exit 1; }
+done
+echo "rollout contract manifest verified"
+
+echo "---- rollout sanity completion (native qwen3.5 template) ----"
+SANITY=$(curl -sf --max-time 600 "http://127.0.0.1:${BASE_PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"models/Qwen3.5-4B","messages":[{"role":"user","content":"Reply with <action>\nlook\n</action> after thinking briefly."}],"max_tokens":512,"temperature":0.9}')
+echo "$SANITY" | head -c 500; echo
+echo "$SANITY" | grep -q "action" || { echo "ABORT: sanity completion malformed"; exit 1; }
+
+# ------------------------------------------------------------ [3] training --
+# Short node-local Ray lane (AF_UNIX 107-byte socket budget).
+LANE_RAY_TMPDIR="${RAY_TMPDIR}/afsmk"
+mkdir -p "$LANE_RAY_TMPDIR"
+echo "---- launching training: $EXPERIMENT_NAME  (RAY_TMPDIR=$LANE_RAY_TMPDIR) ----"
+set +e
+RAY_TMPDIR="$LANE_RAY_TMPDIR" \
+python launcher.py --conf "$SMOKE_CONF" > "$TRAINLOG" 2>&1
+rc=$?
+echo "---- training exited rc=$rc  $(date '+%F %T') ----"
+
+# ------------------------------------------------------ [4] readout summary --
+echo "---- key metric lines (success/kl/entropy/step timing) ----"
+grep -aE "success_onpolicy|actor/kl|entropy|time.*step|step:[0-9]+|global_step" "$TRAINLOG" | tail -60 || true
+echo "---- last 30 trainer log lines ----"
+tail -30 "$TRAINLOG"
+echo "######## SMOKE_Q35AF END rc=$rc  $(date '+%F %T') ########"
+exit "$rc"

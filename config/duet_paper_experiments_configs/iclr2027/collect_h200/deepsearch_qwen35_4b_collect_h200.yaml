@@ -1,0 +1,270 @@
+# DeepSearch(MuSiQue 3-4 hop × wiki-18 BM25)教师采集学生契约,
+# GaaS H200 集群(2026-08-07 新建)。
+# 以 alfworld_qwen35_4b_collect_h200.yaml 为模板,仅改:experiment_name、
+# 日志目录、env_service(deepsearch/:8086/env_params)、multi_turn.max_steps=20、
+# 上下文管理(无压缩,见下)、task_manager、data.max_train_tasks。
+# 32K 契约(22528 prompt + 10240 response)不变。
+#
+# 上下文决策(docs/design/DEEPSEARCH_ENV.md §4):20 步 × top-3 检索观测
+# ≈ 15K < 22528,整个 episode 合同内全量无损——recent_turns=20 覆盖全部轮次,
+# 历史观测上限 1024 tok 仅作病态兜底(正常永不触发),不做 AF/WS 式压缩。
+# 温度先沿 AF 的 0.9(教师试点可用采集器 --temperature 覆盖,覆盖值进契约)。
+# 仅供 collect_openrouter_teacher_trajectories*.py / collect_student_rollouts.py 使用。
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+trainer:
+  experiment_name: deepsearch_qwen35_4b_collect_h200
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 1
+  total_training_steps: 100
+  # Persist every half of the run. This key is explicit so launcher.py
+  # resolves it into the workspace instead of a disposable Ray working_dir.
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  save_freq: 50
+  test_freq: 50
+  val_before_train: false
+  resume_mode: disable
+  # Preserve the exact pre-update state if a strict identity gate stops the run.
+  save_checkpoint_on_identity_failure: true
+  export_actor_weights_on_identity_failure: true
+  validation_data_dir: experiments/deepsearch/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/deepsearch/${trainer.experiment_name}/rollout_log
+  # Future launches are required to stream online while retaining local logs.
+  logger: [console, wandb]
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  grpo:
+    teacher_baseline_separation:
+      enable: false
+      teacher_baseline: all_mean
+      non_teacher_baseline: non_teacher_mean
+      std_source: non_teacher
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: strict
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: additive
+
+actor_rollout_ref:
+  model:
+    path: /projects_vol/gp_wangwy/models/Qwen3.5-4B
+    # Qwen3.5 Gated DeltaNet cannot use verl's remove-padding/Ulysses patch.
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+  actor:
+    behavior_logprob_fp32_temperature: true
+    # A pure-GRPO all-equal group has no policy-gradient signal. Do not allow
+    # KL roundoff or AdamW decay to turn it into a weight-changing update.
+    skip_zero_advantage_grpo_update: true
+    optim:
+      lr: 1.0e-06
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    ppo_max_token_len_per_gpu: 32768
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    use_dr3: false
+    use_chord: false
+    use_uniform_mix: false
+    teacher_use_log_prob: false
+    teacher_policy_shaping_enable: false
+    teacher_use_clip: false
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: true
+    thinking_mode: native_qwen35
+    enable_request_id: false
+    # One decision receives up to 10K sampled reasoning+action tokens; the
+    # managed prompt receives the remainder of the exact 32K model budget.
+    prompt_length: 22528
+    response_length: 10240
+    max_model_len: 32768
+    length_truncation_reward: 0.0
+    length_truncation_max_decision_fraction: 0.10
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: external_vllm
+    external_server_addresses:
+      - 127.0.0.1:8211
+      - 127.0.0.1:8212
+      - 127.0.0.1:8213
+      - 127.0.0.1:8214
+    external_request_timeout: 1200
+    external_sleep_between_steps: true
+    # Must match MAX_NUM_SEQS=1 in the external-server manifest.
+    max_num_seqs: 1
+    enforce_eager: false
+    # PPO's old-policy denominator is the logprob produced by the sampler.
+    use_rollout_log_probs_as_old: true
+    rollout_logprob_drift_mean_threshold: 0.02
+    rollout_logprob_drift_p99_threshold: 0.25
+    rollout_importance_ratio_outside_clip_threshold: 0.01
+    # A lone raw maximum is diagnostic-only; aggregate and non-finite hard
+    # gates remain active. Negative disables this one gate in the trainer.
+    rollout_logprob_drift_max_threshold: -1
+    # One same-UID/same-rollout retry tolerates a transient env HTTP failure;
+    # the group-integrity gate still refuses any incomplete n=8 group.
+    max_trajectory_resubmits: 1
+    mode: async
+    gpu_memory_utilization: 0.25
+    n: 8
+    log_prob_max_token_len_per_gpu: 32768
+    val_kwargs:
+      n: 1
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      do_sample: false
+      seed: 2025
+    # Preserve the original baseline's 32 outstanding environment workers;
+    # each TP1 server admits one sequence at a time via MAX_NUM_SEQS=1.
+    max_env_worker: 32
+    context_template: linear
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    context_management:
+      enabled: true
+      max_prompt_tokens: 22528
+      # 无压缩:recent_turns=20 覆盖 max_steps=20 的全部轮次,历史观测永不
+      # 进入压缩路径;1024 tok 上限仅是病态兜底(单观测异常膨胀时兜住契约)。
+      recent_turns: 20
+      min_recent_turns: 1
+      history_observation_max_tokens: 1024
+      recent_observation_max_tokens: -1
+      allow_current_observation_truncation: false
+      # Historical hidden reasoning is not replayed by the native Qwen3.5
+      # template. Current-turn reasoning still has the full 10K response cap.
+      reasoning_history_tokens: 0
+      snapshot_training: true
+      snapshot_selection: token_weighted
+      snapshot_selection_seed: 2025
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      # 20 步(2026-08-05 用户上调自 10;不上 30 的论证见 DEEPSEARCH_ENV.md §3;
+      # 采集器 EXPECTED_MAX_STEPS["deepsearch"] 同值)。
+      max_steps: 20
+      tool_config_path: ''
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 32768
+
+critic:
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+
+data:
+  train_batch_size: 8
+  max_prompt_length: 22528
+  max_response_length: 10240
+  filter_overlong_prompts: true
+  truncation: error
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  # DeepSearch val 集为 200 题(task_ids_val200_seed2026.txt)。
+  max_val_tasks: 200
+  validation_shuffle: false
+  dataloader_num_workers: 0
+  val_type: val
+  # 与 1600 任务 seed-2026 课程对齐(data/deepsearch/task_ids_1600_seed2026.txt)。
+  max_train_tasks: 1600
+  shuffle: true
+  seed: 2025
+  task_seed: 2026
+
+env_service:
+  env_type: deepsearch
+  env_url: http://127.0.0.1:8086
+  env_params:
+    # DeepsearchEnv 构造参数经 EnvWorker._get_env_create_params → /create params
+    # 原样传入(与 AF/WS 配置同一写法)。显式钉住检索契约,进采集 manifest。
+    action_format: react_tags
+    retrieval_url: http://127.0.0.1:25011
+    top_k: 3
+
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  # deepsearch 尚无 cookbook/env_profiles/ 画像文件;采集器不读 task_manager,
+  # 此处置空。若日后用于训练需先补画像。
+  env_profile: null
+
+exp_manager:
+  train_rollout_mode: woexp
+  val_rollout_mode: woexp
+  rollout_ratio: 0
+  train_sample_mode: alldiscard
+  train_sample_keepratio: 0.0
+  experience_template: 'Some Related Experience: <EXP>{}</EXP>'
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: http://127.0.0.1:8124
+    workspace_id: deepsearch_qwen35_4b_collect_h200
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  experience_replay:
+    enable: false
+  teacher_experience:
+    enable: false
+  state_channel:
+    enable: false
+
+attribution_driven_credit_assignment:
+  enable: false
+
+thread_pool:
+  max_workers: 8

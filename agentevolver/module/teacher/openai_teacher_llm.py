@@ -170,6 +170,14 @@ class OpenAITeacherLLM(BaseTeacherLLM):
                              or getattr(choice.message, "reasoning_content", None))
                 if reasoning and "<think>" not in response_text:
                     response_text = f"<think>\n{reasoning.strip()}\n</think>\n{response_text.lstrip()}"
+                elif not reasoning and "</think>" in response_text:
+                    # Thinking-forced chat templates (Qwen3/3.5) put the opening
+                    # <think> in the generation prompt, so a server without a
+                    # reasoning parser returns "...body...</think>...". Restore
+                    # the canonical tagged form for storage/replay.
+                    head = response_text.split("</think>", 1)[0]
+                    if "<think>" not in head:
+                        response_text = "<think>\n" + response_text.lstrip("\n")
                 
                 # 提取 log_prob（如果有）
                 finish_reason = getattr(choice, "finish_reason", None)

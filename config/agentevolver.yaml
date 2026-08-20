@@ -145,6 +145,20 @@ actor_rollout_ref:
     # This helps prevent entropy collapse by encouraging exploration of low-probability tokens.
     # ============================================================================
     use_dapo: false  # Enable DAPO's Clip-Higher mechanism (set to true to use DAPO)
+
+    # ============================================================================
+    # CATALYST (ICLR 2027, M1) — actor-side knobs. Defaults ALL OFF; the actor
+    # only reads these when the batch actually carries catalyst_replay_mask.
+    # Trainer asserts replay_bc.enable == exp_manager.catalyst.replay.enable.
+    # See docs/design/CATALYST_IMPL_SPEC.md.
+    # ============================================================================
+    catalyst:
+      replay_bc:
+        enable: false          # de-hinted replay auxiliary BC (only-BC, no PG)
+        beta: 0.1              # global BC coefficient β
+        w_cap: 1.0             # w = min(w_cap, exp(φ/τ)), φ = logπ + H (stop-grad)
+        phi_tau: 1.0
+        exclude_replay_from_entropy_kl: true
   ref:
     log_prob_micro_batch_size_per_gpu: 1
     fsdp_config:
@@ -262,6 +276,48 @@ exp_manager:
     enable_context_generator: false
     retrieve_top_k: 3
     updated_freq: 0
+
+  # ============================================================================
+  # CATALYST (ICLR 2027, M1): hinted-arm rollouts / per-(task,arm) baselines /
+  # de-hinted replay BC / online governance. Defaults ALL OFF — with
+  # enable=false the training path is byte-identical to the status quo
+  # (tests/test_catalyst_default_off.py). See docs/design/CATALYST_IMPL_SPEC.md.
+  # M1 mutual exclusions (asserted in trainer._catalyst_setup): requires
+  # teacher_experience/experience_replay/repo/state_channel/use_chord/use_dr3/
+  # use_dapo/teacher_baseline_separation all disabled.
+  # ============================================================================
+  catalyst:
+    enable: false
+    hints:
+      # data/catalyst_hints/{env}_{teacher}.json, built by
+      # scripts/build_catalyst_hints.py. REQUIRED when enable=true (fail-fast).
+      file: null
+      require_manifest: true
+    governance:
+      s_hi: 0.8                # s*: SR_bare target in ρ = clip(1−SR_bare/s*,0,ρ_max)
+      rho_max: 0.5
+      delta_u: 0.0             # δ: hint arm opens only when U > δ
+      ema_alpha: 0.2
+      u_bootstrap_min_obs: 8   # U gate auto-passes until this many hint rollouts observed
+      min_hint_rollouts: 2     # quantized k_hint ∈ {0} ∪ [min, n−2]
+      max_hint_rollouts: -1    # -1 = n−2
+      retire_windows: 3        # U ≤ δ for N consecutive windows → task retired (M1: permanent)
+      state_dir: null          # default {trainer.default_local_dir}/catalyst_state
+    arm_baseline:
+      enable: true             # per-(task,arm) GRPO baselines via uid suffix (D1)
+      std_fallback_to_group: true
+    replay:
+      enable: false            # de-hinted replay channel (must match actor replay_bc.enable)
+      per_task: 1
+      pool_max_per_task: 4
+      ttl_steps: 20
+      audit_on_insert: true    # military-rule probe: rebuilt prompt == decision snapshot
+    thermostat:
+      enable: false            # A′ = A + λ(−logπ − b); λ ← [λ+η(H_ref−Ĥ)]₊
+      h_ref: 0.35
+      eta: 0.01
+      lambda_init: 0.0
+      lambda_max: 1.0
 
      
 

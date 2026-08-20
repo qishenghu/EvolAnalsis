@@ -52,7 +52,9 @@ class SciworldEnv(BaseEnv):
         # 外部 ScienceWorld HTTP 服务器地址
         self.server_url: str = (
             self.params.get("server_url")
-            or os.environ.get("SCIWORLD_SERVER_URL", "http://127.0.0.1:36004")
+            # 26004: start_env_sciworld.sh 已把 AgentGym 端口迁出 ephemeral 区
+            # (32768+),旧默认 36004 会连不上——保持与启动脚本一致。
+            or os.environ.get("SCIWORLD_SERVER_URL", "http://127.0.0.1:26004")
         ).rstrip("/")
 
         # ScienceWorld simplification preset (e.g. "easy", "teleportAction,openDoors", or "")
@@ -83,6 +85,22 @@ class SciworldEnv(BaseEnv):
         self.last_action_correction: Optional[Dict[str, Any]] = None
 
         self.action_correction_enable = os.environ.get("SCIWORLD_ACTION_CORRECTION", "1").lower() not in {"0", "false", "no"}
+
+        # Score-threshold success mode (2026-08-05, user decision for teacher
+        # collection & ICLR runs): SciWorld tasks are long-horizon and the raw
+        # score is a 0-100 progress measure. When `score_success_threshold` is
+        # set (param or SCIWORLD_SCORE_SUCCESS_THRESHOLD), an episode SUCCEEDS
+        # as soon as the running MAX score exceeds it (early stop), mirroring
+        # the WebShop env-success (score>=0.9) convention. None = legacy
+        # behavior (done AND score > sciworld_success_threshold), untouched.
+        _thr = self.params.get(
+            "score_success_threshold",
+            os.environ.get("SCIWORLD_SCORE_SUCCESS_THRESHOLD"),
+        )
+        self.score_success_threshold: Optional[float] = (
+            float(_thr) if _thr is not None else None
+        )
+        self.max_score: float = 0.0
 
     # ---------------------------
     # Internal HTTP helpers
@@ -237,6 +255,10 @@ class SciworldEnv(BaseEnv):
         self.is_done = reset_result.get("done", False)
         self.current_reward = reset_result.get("reward", 0.0)
         self.current_score = reset_result.get("score", 0.0)
+        try:
+            self.max_score = max(0.0, float(self.current_score or 0.0))
+        except (TypeError, ValueError):
+            self.max_score = 0.0
         
         # Keep the task-level FOCUS restriction only in the initial prompt,
         # matching agl-envs more closely and avoiding repeated hint bloat.
@@ -426,7 +448,39 @@ In each turn, you must output your thought/reasoning and then output your action
         self.is_done = step_result.get("done", False)
         self.current_reward = step_result.get("reward", 0.0)
         self.current_score = step_result.get("score", 0.0)
-        
+        try:
+            self.max_score = max(self.max_score, float(self.current_score or 0.0))
+        except (TypeError, ValueError):
+            pass
+
+        # Early stop on score threshold (see __init__): the moment the running
+        # max score crosses the threshold, the episode is a success and ends.
+        if (
+            self.score_success_threshold is not None
+            and self.max_score > self.score_success_threshold
+        ):
+            self.is_done = True
+            return {
+                "state": [{
+                    "role": "user",
+                    "content": (
+                        f"Task completed: score {self.current_score:.0f} "
+                        f"(max {self.max_score:.0f}) exceeded the success "
+                        f"threshold {self.score_success_threshold:.0f}."
+                    ),
+                }],
+                "reward": 1.0,
+                "is_terminated": True,
+                "info": {
+                    "score": self.current_score,
+                    "max_score": self.max_score,
+                    "early_stop_on_score": True,
+                    "parsed_action": parsed_action,
+                    "executed_action": corrected_action,
+                },
+                "instance_id": self.instance_id,
+            }
+
         # Get updated action hints
         action_hints = self._get_action_hints()
         
@@ -467,6 +521,11 @@ In each turn, you must output your thought/reasoning and then output your action
         """
         if self.current_score is None:
             return 0.0
+        # Score-threshold success mode (2026-08-05): success = running MAX
+        # score exceeded the threshold at any point (episodes may also have
+        # been early-stopped at that moment; see step()).
+        if self.score_success_threshold is not None:
+            return 1.0 if float(self.max_score) > self.score_success_threshold else 0.0
         params = params or {}
         threshold = float(params.get("sciworld_success_threshold", 0))
         return 1.0 if (self.is_done and float(self.current_score) > threshold) else 0.0
@@ -486,6 +545,8 @@ In each turn, you must output your thought/reasoning and then output your action
             "done": self.is_done,
             "reward": self.current_reward,
             "score": self.current_score,
+            "max_score": self.max_score,
+            "score_success_threshold": self.score_success_threshold,
         }
     
     def close(self):

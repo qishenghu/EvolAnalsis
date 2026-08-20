@@ -30,16 +30,27 @@ done
 
 kill_port() {
     local port=$1
-    local pids=$(lsof -ti:$port 2>/dev/null)
-    local pid args
+    # -sTCP:LISTEN 只杀监听者(lsof 会把连着该端口的客户端一并列出,
+    # 2026-08-08 曾误杀采集驱动 rc=143)。
+    local pids=$(lsof -ti:$port -sTCP:LISTEN 2>/dev/null)
+    local pid args owner me
+    me=$(id -un)
     for pid in $pids; do
+        # NTU GaaS: compute nodes are shared, so ports are node-global and
+        # another user's job may legitimately hold this one. Only ever touch
+        # our own processes.
+        owner=$(ps -p "$pid" -o user= 2>/dev/null | tr -d ' ')
+        if [ -n "$owner" ] && [ "$owner" != "$me" ]; then
+            echo "  REFUSING to kill PID $pid on port $port (owned by '$owner', not '$me')"
+            continue
+        fi
         args=$(ps -p "$pid" -o args= 2>/dev/null)
         # The ephemeral port range on this host is 32768-60999, which OVERLAPS the
         # service ports below. vLLM/Ray actors bind RANDOM ports in that range, so a
         # blind kill-by-port can take down a running training job. Never kill a
         # process that looks like training infrastructure.
         case "$args" in
-            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*)
+            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*|*collect_openrouter*|*collect_student*)
                 echo "  REFUSING to kill PID $pid on port $port (training process): ${args:0:80}"
                 continue
                 ;;
@@ -64,6 +75,9 @@ kill_port $AGENTGYM_PORT
 kill_port $ENVSERVICE_PORT
 
 echo "[1/2] Starting AgentGym WebShop server on port $AGENTGYM_PORT..."
+# The vendored `webshop` tree is not pip-installed; `web_agent_site` resolves
+# via PYTHONPATH. Data/index paths inside it are file-relative, so cwd is free.
+export PYTHONPATH="$SCRIPT_DIR/AgentGym/agentenv-webshop/webshop${PYTHONPATH:+:$PYTHONPATH}"
 nohup $WEBSHOP_BIN --host 127.0.0.1 --port $AGENTGYM_PORT \
     > "$LOGDIR/webshop_agentgym.log" 2>&1 &
 disown

@@ -40,7 +40,9 @@ done
 
 kill_port() {
     local port=$1
-    local pids=$(lsof -ti:$port 2>/dev/null)
+    # -sTCP:LISTEN 只杀监听者:lsof 会把连着该端口的客户端一并列出,
+    # 2026-08-08 曾因此误杀正在采集的驱动进程(rc=143)。
+    local pids=$(lsof -ti:$port -sTCP:LISTEN 2>/dev/null)
     local pid args
     for pid in $pids; do
         args=$(ps -p "$pid" -o args= 2>/dev/null)
@@ -49,7 +51,7 @@ kill_port() {
         # blind kill-by-port can take down a running training job. Never kill a
         # process that looks like training infrastructure.
         case "$args" in
-            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*)
+            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*|*collect_openrouter*|*collect_student*)
                 echo "  REFUSING to kill PID $pid on port $port (training process): ${args:0:80}"
                 continue
                 ;;

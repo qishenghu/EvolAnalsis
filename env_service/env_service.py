@@ -39,6 +39,75 @@ _RAY_NUM_CPUS_ENV = "ENV_SERVICE_RAY_NUM_CPUS"
 _RAY_OBJECT_STORE_MEMORY_ENV = "ENV_SERVICE_RAY_OBJECT_STORE_MEMORY"
 _RAY_INCLUDE_DASHBOARD_ENV = "ENV_SERVICE_RAY_INCLUDE_DASHBOARD"
 
+# --------------------------------------------------------------------------- #
+# Optional shared-actor recycling.  BOTH KNOBS DEFAULT TO OFF, and with them off
+# every code path below is byte-for-byte the historical behaviour.
+#
+# Why it exists (docs/infra/LANDMINES.md L2): a long-lived environment process
+# that dlopens a fresh copy of a shared object on every episode accumulates
+# mmap regions that are never reclaimed, and eventually dies with "failed to map
+# segment from shared object".  A process cannot un-leak that; only a new
+# process can.  So: retire the actor after it has served N instances and let the
+# next create build a fresh one.
+#
+#   DUET_ENV_ACTOR_MAX_INSTANCES  0 (default) = never recycle; N > 0 = recycle
+#                                 the shared actor after N created instances
+#   DUET_ENV_ACTOR_SELF_HEAL      off (default); on = when a request fails with
+#                                 a map-segment-class error, rebuild the actor
+#                                 and retry that request exactly once
+#
+# IMPORTANT SCOPE NOTE: the AlfWorld and WebShop adapters in this repo are thin
+# HTTP clients for the AgentGym servers (:36001 / :36003), so the leaking
+# process is the AgentGym server, NOT this actor.  Recycling the actor here does
+# not reclaim those mmaps; restarting the AgentGym stack does (see
+# scripts/ckpt_sweep_driver.sh).  These knobs are the right cure only for
+# environments whose episode work runs inside the actor process.
+# --------------------------------------------------------------------------- #
+_ACTOR_MAX_INSTANCES_ENV = "DUET_ENV_ACTOR_MAX_INSTANCES"
+_ACTOR_SELF_HEAL_ENV = "DUET_ENV_ACTOR_SELF_HEAL"
+
+# Substrings that identify "this process can no longer map shared objects".
+# Deliberately narrow: a self-heal that fires on ordinary env errors would mask
+# real bugs and throw away healthy episodes.
+_MMAP_EXHAUSTION_MARKERS = (
+    "failed to map segment from shared object",
+    "cannot allocate memory in static tls block",
+    "cannot map zero-fill pages",
+    "cannot enable executable stack",
+)
+
+
+def _actor_max_instances() -> int:
+    """Instances a shared actor may serve before it is retired. 0 = never."""
+    raw = os.environ.get(_ACTOR_MAX_INSTANCES_ENV)
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError as error:
+        raise ValueError(
+            f"{_ACTOR_MAX_INSTANCES_ENV} must be a non-negative integer",
+        ) from error
+    if value < 0:
+        raise ValueError(
+            f"{_ACTOR_MAX_INSTANCES_ENV} must be a non-negative integer",
+        )
+    return value
+
+
+def _actor_self_heal_enabled() -> bool:
+    """Rebuild-and-retry on map-segment errors. Off unless explicitly enabled."""
+    return bool(_optional_boolean_from_env(_ACTOR_SELF_HEAL_ENV))
+
+
+def looks_like_mmap_exhaustion(error: BaseException) -> bool:
+    """True when `error` reads like the dlopen/mmap ceiling, not a task failure."""
+    text = f"{type(error).__name__}: {error}".lower()
+    cause = getattr(error, "__cause__", None)
+    if cause is not None:
+        text += f" {cause}".lower()
+    return any(marker in text for marker in _MMAP_EXHAUSTION_MARKERS)
+
 
 def _optional_positive_number_from_env(name: str) -> Optional[float]:
     """Parse an optional, finite, positive Ray numeric setting."""
@@ -232,6 +301,20 @@ class EnvService:
         self.shared_actors = {}  # {env_type: actor}
         self.instance_env_types = {}  # {instance_id: env_type} - track env_type for each instance
 
+        # --- optional shared-actor recycling bookkeeping (inert when off) ----
+        # A shared actor is identified by (env_type, generation); retiring one
+        # just bumps the generation so the NEXT create builds a fresh actor,
+        # while the old one keeps serving the episodes already running on it and
+        # is killed once the last of them is released.  Nothing here changes
+        # behaviour unless DUET_ENV_ACTOR_MAX_INSTANCES / _SELF_HEAL are set.
+        self.shared_actor_generation = {}   # {env_type: int}
+        self.actor_handles = {}             # {(env_type, gen): actor}
+        self.actor_created_instances = {}   # {(env_type, gen): int}
+        self.actor_live_instances = {}      # {(env_type, gen): set(instance_id)}
+        self.actor_retiring = set()         # {(env_type, gen)}
+        self.instance_actor_key = {}        # {instance_id: (env_type, gen)}
+        self.actor_recycle_events = []      # [{when, env_type, gen, reason, served}]
+
     async def cleanup_inactive_instances(self):
         """
         Periodically clean up inactive environment instances.
@@ -350,6 +433,132 @@ class EnvService:
         self.remote_env[env_type] = RemoteEnv
         return RemoteEnv
 
+    # ----------------------------------------------------------------- #
+    # Optional shared-actor recycling.  Every method here is a no-op when
+    # DUET_ENV_ACTOR_MAX_INSTANCES is unset/0 and DUET_ENV_ACTOR_SELF_HEAL is
+    # off, which is the default.
+    # ----------------------------------------------------------------- #
+    def _actor_key(self, env_type: str):
+        """Current (env_type, generation) key for this env type's shared actor."""
+        return (env_type, self.shared_actor_generation.get(env_type, 0))
+
+    def _acquire_shared_actor(self, env_type: str, env_remote_cls):
+        """Return (key, actor) for env_type, creating a fresh actor if needed."""
+        key = self._actor_key(env_type)
+        actor = self.actor_handles.get(key)
+        if actor is None:
+            actor = env_remote_cls.remote()
+            self.actor_handles[key] = actor
+            self.actor_created_instances[key] = 0
+            self.actor_live_instances[key] = set()
+            if key[1] > 0:
+                print(
+                    f"[env_service] shared actor for {env_type} rebuilt "
+                    f"(generation {key[1]}) — fresh process, fresh mmap space",
+                )
+        # Keep the historical mapping in sync for anything that reads it.
+        self.shared_actors[env_type] = actor
+        return key, actor
+
+    def _note_instance_created(self, key, instance_id: str) -> None:
+        self.actor_created_instances[key] = self.actor_created_instances.get(key, 0) + 1
+        self.actor_live_instances.setdefault(key, set()).add(instance_id)
+        self.instance_actor_key[instance_id] = key
+
+    def _note_instance_released(self, instance_id: str) -> None:
+        key = self.instance_actor_key.pop(instance_id, None)
+        if key is None:
+            return
+        self.actor_live_instances.get(key, set()).discard(instance_id)
+        self._kill_actor_if_drained(key)
+
+    def _kill_actor_if_drained(self, key) -> None:
+        """Kill a retired actor once its last in-flight episode has finished."""
+        if key not in self.actor_retiring:
+            return
+        if self.actor_live_instances.get(key):
+            return
+        actor = self.actor_handles.pop(key, None)
+        if actor is not None:
+            try:
+                ray.kill(actor)
+            except Exception as error:  # noqa: BLE001 - teardown must not fail a request
+                print(f"[env_service] ray.kill on retired actor {key} failed: {error}")
+        self.actor_retiring.discard(key)
+        self.actor_created_instances.pop(key, None)
+        self.actor_live_instances.pop(key, None)
+        print(f"[env_service] retired shared actor {key} reaped")
+
+    def _retire_shared_actor(self, env_type: str, reason: str, force: bool = False) -> bool:
+        """Bump the generation so the next create builds a fresh actor process.
+
+        ``force`` (self-heal path) kills the old actor immediately: it has
+        already proved it cannot map shared objects, so draining it would only
+        hand more episodes to a dead process.
+        """
+        key = self._actor_key(env_type)
+        if key not in self.actor_handles:
+            return False
+        served = self.actor_created_instances.get(key, 0)
+        self.actor_retiring.add(key)
+        self.shared_actor_generation[env_type] = key[1] + 1
+        self.shared_actors.pop(env_type, None)
+        self.actor_recycle_events.append(
+            {
+                "when": datetime.now().isoformat(timespec="seconds"),
+                "env_type": env_type,
+                "generation": key[1],
+                "reason": reason,
+                "instances_served": served,
+                "forced": bool(force),
+            },
+        )
+        print(
+            f"[env_service] retiring shared actor {key} after {served} instance(s): {reason}"
+            f"{' (forced)' if force else ''}",
+        )
+        if force:
+            for instance_id in list(self.actor_live_instances.get(key, set())):
+                self.env_actors.pop(instance_id, None)
+                self.instance_env_types.pop(instance_id, None)
+                self.last_access_time.pop(instance_id, None)
+                self.instance_actor_key.pop(instance_id, None)
+            self.actor_live_instances[key] = set()
+        self._kill_actor_if_drained(key)
+        return True
+
+    def _maybe_retire_on_quota(self, env_type: str) -> None:
+        """Retire the shared actor once it has served its instance quota."""
+        quota = _actor_max_instances()
+        if quota <= 0:
+            return
+        key = self._actor_key(env_type)
+        served = self.actor_created_instances.get(key, 0)
+        if served < quota:
+            return
+        self._retire_shared_actor(
+            env_type,
+            f"instance quota reached ({served}/{quota}, {_ACTOR_MAX_INSTANCES_ENV})",
+        )
+
+    def actor_stats(self) -> Dict[str, Any]:
+        """Introspection for tests and for measuring the leak in production."""
+        return {
+            "max_instances": _actor_max_instances(),
+            "self_heal": _actor_self_heal_enabled(),
+            "actors": [
+                {
+                    "env_type": env_type,
+                    "generation": gen,
+                    "instances_served": self.actor_created_instances.get((env_type, gen), 0),
+                    "live_instances": len(self.actor_live_instances.get((env_type, gen), set())),
+                    "retiring": (env_type, gen) in self.actor_retiring,
+                }
+                for (env_type, gen) in sorted(self.actor_handles.keys())
+            ],
+            "recycle_events": list(self.actor_recycle_events),
+        }
+
     async def get_env_profile(
         self,
         env_type: str,
@@ -437,9 +646,41 @@ class EnvService:
         Returns:
             str: The ID of the created environment instance.
         """
+        if instance_id is None:
+            instance_id = f"exp_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+        # Self-heal is opt-in; with it off this is exactly one attempt, i.e. the
+        # historical single-shot behaviour.
+        attempts = 2 if _actor_self_heal_enabled() else 1
+        last_error: Optional[BaseException] = None
+        for attempt in range(attempts):
+            try:
+                return await self._create_instance_once(
+                    env_type, task_id, instance_id, params,
+                )
+            except Exception as error:  # noqa: BLE001 - decide, then re-raise
+                last_error = error
+                is_last = attempt == attempts - 1
+                if is_last or not looks_like_mmap_exhaustion(error):
+                    raise
+                print(
+                    f"[env_service] map-segment failure on create ({error}); "
+                    f"rebuilding the {env_type} actor and retrying once",
+                )
+                self._retire_shared_actor(
+                    env_type, f"self-heal: {type(error).__name__}", force=True,
+                )
+        raise last_error  # pragma: no cover - loop always returns or raises
+
+    async def _create_instance_once(
+        self,
+        env_type: str,
+        task_id: str,
+        instance_id: str,
+        params: Dict = None,
+    ) -> str:
+        """One create attempt. Body unchanged from the pre-recycling version."""
         try:
-            if instance_id is None:
-                instance_id = f"exp_{int(time.time())}_{uuid.uuid4().hex[:8]}"
             print(f"Creating env with instance_id: {instance_id}")
             env_remote_cls = self.get_remote_env_cls(env_type)
 
@@ -457,13 +698,15 @@ class EnvService:
             # sharing the actor is safe. The actor is created with max_concurrency
             # so concurrent step/release HTTP calls do not block each other.
             if env_type in ["alfworld", "webshop"]:
-                # Reuse shared actor for this env_type
-                if env_type not in self.shared_actors:
-                    self.shared_actors[env_type] = env_remote_cls.remote()
-                env_actor = self.shared_actors[env_type]
+                # Reuse shared actor for this env_type.  _acquire_shared_actor
+                # is the old `if env_type not in self.shared_actors: create`
+                # plus generation bookkeeping; with recycling off the generation
+                # never moves, so it hands back the same actor forever.
+                actor_key, env_actor = self._acquire_shared_actor(env_type, env_remote_cls)
                 # Create env instance within the shared actor
                 await env_actor.create_env_instance.remote(task_id, instance_id, params)
                 init_state = await env_actor.get_init_state.remote(instance_id, params)
+                self._note_instance_created(actor_key, instance_id)
             else:
                 # Default behavior: one actor per instance.
                 # NOTE: `RemoteEnv.__init__` takes no args, so do NOT pass task_id/instance_id here.
@@ -481,6 +724,13 @@ class EnvService:
             self.instance_env_types[instance_id] = env_type
 
             self.update_access_time(instance_id)
+
+            # No-op unless DUET_ENV_ACTOR_MAX_INSTANCES > 0. Runs after the
+            # instance is fully registered, so retiring never strands a caller:
+            # this instance keeps using the outgoing actor, the NEXT one gets a
+            # fresh process.
+            if env_type in ["alfworld", "webshop"]:
+                self._maybe_retire_on_quota(env_type)
 
             return init_state
 
@@ -529,6 +779,20 @@ class EnvService:
 
         except Exception as e:
             print(f"Error in step: {str(e)}")
+            # Opt-in only. A step cannot be retried on a fresh actor (the episode
+            # state died with the old process), so all we can do is rebuild the
+            # actor NOW so the next create lands on a healthy process instead of
+            # every subsequent episode failing the same way.
+            if _actor_self_heal_enabled() and looks_like_mmap_exhaustion(e):
+                env_type = self.instance_env_types.get(instance_id)
+                if env_type in ("alfworld", "webshop"):
+                    print(
+                        "[env_service] map-segment failure on step; rebuilding the "
+                        f"{env_type} actor so later episodes get a fresh process",
+                    )
+                    self._retire_shared_actor(
+                        env_type, f"self-heal on step: {type(e).__name__}", force=True,
+                    )
             raise
 
     async def evaluate(
@@ -593,10 +857,13 @@ class EnvService:
             # Per-instance actor: close the env instance then kill the actor.
             await env_actor.close.remote(instance_id)
             ray.kill(self.env_actors[instance_id])
-        
+
         del self.env_actors[instance_id]
         self.instance_env_types.pop(instance_id, None)
         self.last_access_time.pop(instance_id, None)
+        # Drops this instance from its actor's live set and reaps the actor if it
+        # was retired and this was its last episode. No-op when recycling is off.
+        self._note_instance_released(instance_id)
         return True
 
 
@@ -650,6 +917,20 @@ async def healthz():
         Response: A successful response with status code 200.
     """
     return Response(content="OK", status_code=200)
+
+
+@app.get(
+    "/admin/env_actor_stats",
+    summary="Shared-actor recycling counters (read-only)",
+)
+async def env_actor_stats():
+    """Report the shared-actor instance counters and any recycle events.
+
+    Read-only and always available: with recycling off it still reports how many
+    instances each shared actor has served, which is how you measure how close
+    the AlfWorld stack is to its dlopen ceiling without changing any behaviour.
+    """
+    return {"success": True, "data": env_service.actor_stats()}
 
 
 @app.post("/get_env_profile")

@@ -1,0 +1,214 @@
+#!/bin/bash
+# =============================================================================
+# Qwen3.5-122B-A10B teacher-trajectory collection — ALFWorld + WebShop,
+# 1600-task seed-2026 curriculum each, on one 4×H200 PBS allocation.
+#
+# In-job pipeline (idempotent under resubmission; every collector uses --resume):
+#   [1] vLLM 0.20.x serves the 122B teacher (TP=4, thinking-on native template)
+#   [2] ALFWorld (:36001/:8081) + WebShop (:36003/:8083) env stacks
+#   [3] WebShop determinism gate: same task twice within one boot AND across a
+#       stack restart must yield byte-identical initial state (goal params)
+#   [4] Pilot: 50 tasks/env, per-turn <think>+<action> integrity + SR gates
+#   [5] Full campaign: 1600 tasks/env, 1 success slot/task, ≤4 attempts/slot
+#
+# Submit : qsub run_teacher122b_collect.pbs
+# Watch  : tail -f /projects_vol/gp_wangwy/qisheng/duet_h200/logs/teach122b_topup.live.log
+# Abort  : touch /projects_vol/gp_wangwy/qisheng/duet_h200/logs/TEACH122B_TOPUP_STOP
+#          (honoured between phases; never kill by broad pattern)
+# =============================================================================
+#PBS -N t122b_top8
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=120:ngpus=4:mpiprocs=8:mem=2000gb
+#PBS -l walltime=96:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/teach122b_topup.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+LIVELOG=$SCRATCH/logs/teach122b_topup.live.log
+STOPFILE=$SCRATCH/logs/TEACH122B_TOPUP_STOP
+OUTDIR=$SCRATCH/teacher_data/qwen35_122b
+TEACHER_MODEL_DIR=/projects_vol/gp_wangwy/models/Qwen3.5-122B-A10B
+SERVED_NAME=qwen35-122b-a10b
+VLLM_PORT=8300
+mkdir -p "$(dirname "$LIVELOG")" "$OUTDIR/pilot"
+
+exec > >(tee -a "$LIVELOG") 2>&1
+echo "######## TEACH122B  $(date '+%F %T')  job=${PBS_JOBID:-?}  host=$(hostname) ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+
+source "$REPO/env_config.sh"
+PF_EXPECT_NGPUS=4
+source "$REPO/scripts/h200_node_preflight.sh"
+if ! pf_run_all; then
+    echo "ABORT: preflight failed"; exit 1
+fi
+duet_activate || { echo "ABORT: duet env activation failed"; exit 1; }
+echo "collector python: $(which python) ($(python -V 2>&1))"
+
+VLLM_PY="$CONDA_PATH/envs/${CONDA_ENV_VLLM2}/bin/python"
+[ -x "$VLLM_PY" ] || { echo "ABORT: vllm2 env missing at $VLLM_PY"; exit 1; }
+echo "vllm: $($VLLM_PY -c 'import vllm; print(vllm.__version__)' 2>/dev/null)"
+
+export OPENROUTER_API_KEY=local-vllm
+export VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0
+TEACH_MAX_NUM_SEQS="${TEACH_MAX_NUM_SEQS:-8}"
+
+VLLM_PID=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$VLLM_PID" ] && kill "$VLLM_PID" 2>/dev/null
+    bash start_env_alfworld.sh stop 2>/dev/null || true
+    bash start_env_webshop.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+check_stop() {
+    if [ -f "$STOPFILE" ]; then
+        echo "STOPFILE present — aborting between phases."
+        exit 2
+    fi
+}
+
+# ---------------------------------------------------------------- [1] vLLM ---
+# torch.compile / triton caches MUST be node-local: ~/.cache lives on NFS here
+# and multi-rank file locking on NFS wedged the 2026-08-04 first attempt (TP1-3
+# stuck in compile, shm_broadcast starved, engine never came up).
+export VLLM_CACHE_ROOT="/tmp/vllm_cache_$(id -un)"
+export TRITON_CACHE_DIR="/tmp/triton_cache_$(id -un)"
+mkdir -p "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR"
+
+start_vllm() {
+    local extra="$1"
+    echo "starting vLLM server (extra: ${extra:-none}) ..."
+    VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 \
+    "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+        --model "$TEACHER_MODEL_DIR" \
+        --served-model-name "$SERVED_NAME" \
+        --tensor-parallel-size 4 \
+        --max-model-len 32768 \
+        --max-num-seqs "$TEACH_MAX_NUM_SEQS" \
+        --gpu-memory-utilization 0.90 \
+        --port "$VLLM_PORT" \
+        $extra \
+        >> "$SCRATCH/logs/vllm_122b.log" 2>&1 &
+    VLLM_PID=$!
+}
+
+wait_vllm() {
+    # 45 min cap; every probe carries its own timeout so a bound-but-wedged
+    # port can never hang the watchdog (the exact 2026-08-04 failure mode).
+    for i in $(seq 1 270); do
+        if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+            return 1   # process died
+        fi
+        if curl -sf --max-time 8 "http://127.0.0.1:$VLLM_PORT/v1/models" > /dev/null; then
+            return 0
+        fi
+        sleep 10
+    done
+    echo "wait_vllm: 45-min cap reached; engine log tail:"
+    tail -5 "$SCRATCH/logs/vllm_122b.log"
+    return 1
+}
+
+stop_vllm() {
+    [ -n "$VLLM_PID" ] && kill "$VLLM_PID" 2>/dev/null
+    sleep 10
+}
+
+VLLM_OK=0
+for ATTEMPT in "--reasoning-parser qwen3" "" "--enforce-eager"; do
+    start_vllm "$ATTEMPT"
+    if wait_vllm; then VLLM_OK=1; break; fi
+    echo "vLLM attempt failed (extra: ${ATTEMPT:-none}); escalating fallback"
+    stop_vllm
+done
+if [ "$VLLM_OK" != "1" ]; then
+    echo "ABORT: vLLM server failed all attempts — see $SCRATCH/logs/vllm_122b.log"
+    tail -40 "$SCRATCH/logs/vllm_122b.log"
+    exit 1
+fi
+echo "vLLM server up (pid=$VLLM_PID)"
+
+echo "---- teacher sanity completion ----"
+SANITY=$(curl -sf --max-time 600 "http://127.0.0.1:$VLLM_PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$SERVED_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with <action>\\nlook\\n</action> after thinking briefly.\"}],\"max_tokens\":512,\"temperature\":0.6}")
+echo "$SANITY" | head -c 600; echo
+echo "$SANITY" | grep -q "action" || { echo "ABORT: sanity completion malformed"; exit 1; }
+check_stop
+
+# ---------------------------------------------------------- [2] env stacks ---
+echo "---- starting ALFWorld stack ----"
+bash start_env_alfworld.sh || { echo "ABORT: alfworld stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8081/docs > /dev/null || { echo "ABORT: env_service 8081"; exit 1; }
+echo "---- starting WebShop stack ----"
+bash start_env_webshop.sh || { echo "ABORT: webshop stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8083/docs > /dev/null || { echo "ABORT: env_service 8083"; exit 1; }
+check_stop
+
+# ------------------------------------------- [3] WebShop determinism gate ---
+DET_TASKS=$(head -5 data/webshop/task_ids_1600_seed2026.txt | paste -sd,)
+echo "---- webshop determinism phase a (tasks: $DET_TASKS) ----"
+python scripts/accept_teacher_pilot.py webshop-determinism \
+    --env-url http://127.0.0.1:8083 --tasks "$DET_TASKS" \
+    --phase a --fingerprint-store "$OUTDIR/webshop_det_fingerprints.json" \
+    || { echo "ABORT: within-boot determinism failed"; exit 1; }
+echo "---- restarting webshop stack for cross-restart check ----"
+bash start_env_webshop.sh stop; sleep 5
+bash start_env_webshop.sh || { echo "ABORT: webshop restart"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8083/docs > /dev/null || { echo "ABORT: env_service 8083 after restart"; exit 1; }
+python scripts/accept_teacher_pilot.py webshop-determinism \
+    --env-url http://127.0.0.1:8083 --tasks "$DET_TASKS" \
+    --phase b --fingerprint-store "$OUTDIR/webshop_det_fingerprints.json" \
+    || { echo "ABORT: cross-restart determinism failed — fix seeding before collecting"; exit 1; }
+check_stop
+
+# ------------------------------------------------- [4] top-up to 8 attempts ---
+# Phase-2 of the user-approved 8-attempt cap (2026-08-05): re-attempt ONLY the
+# tasks the 4-attempt phase-1 campaign left uncovered, with 4 more attempts.
+run_topup() {
+    local env=$1 envurl=$2 out=$3 phase1=$4
+    python scripts/collect_openrouter_teacher_trajectories_topup.py \
+        --config "config/duet_paper_experiments_configs/iclr2027/collect_h200/${env}_qwen35_4b_collect_h200.yaml" \
+        --env-url "$envurl" \
+        --task-file "data/${env}/task_ids_1600_seed2026.txt" \
+        --output "$out" \
+        --model "$SERVED_NAME" \
+        --api-base "http://127.0.0.1:$VLLM_PORT/v1" \
+        --api-key-env OPENROUTER_API_KEY \
+        --rollouts-per-task 1 \
+        --max-attempts-per-rollout 4 \
+        --max-workers 16 \
+        --skip-tasks-covered-by "$phase1" \
+        --resume \
+        --wandb-run-name "teach122b_${env}_topup8"
+}
+
+echo "---- top-up campaign: uncovered tasks only, +4 attempts (total cap 8) ----"
+run_topup alfworld http://127.0.0.1:8081 \
+    "$OUTDIR/alfworld_qwen35_122b_t1600_topup8.jsonl" \
+    "$OUTDIR/alfworld_qwen35_122b_t1600_r1.jsonl" \
+    > "$SCRATCH/logs/teach122b_topup_alfworld.log" 2>&1 &
+TOP_AF=$!
+run_topup webshop http://127.0.0.1:8083 \
+    "$OUTDIR/webshop_qwen35_122b_t1600_topup8.jsonl" \
+    "$OUTDIR/webshop_qwen35_122b_t1600_r1.jsonl" \
+    > "$SCRATCH/logs/teach122b_topup_webshop.log" 2>&1 &
+TOP_WS=$!
+wait $TOP_AF; RC_AF=$?
+wait $TOP_WS; RC_WS=$?
+echo "topup collectors done rc_af=$RC_AF rc_ws=$RC_WS"
+
+echo "---- final counts (phase1 + topup) ----"
+for f in "$OUTDIR"/alfworld_qwen35_122b_t1600_r1.jsonl "$OUTDIR"/alfworld_qwen35_122b_t1600_topup8.jsonl \
+         "$OUTDIR"/webshop_qwen35_122b_t1600_r1.jsonl "$OUTDIR"/webshop_qwen35_122b_t1600_topup8.jsonl; do
+    [ -f "$f" ] && echo "$(wc -l < "$f") trajectories  $f"
+done
+echo "######## TEACH122B_TOPUP END rc_af=$RC_AF rc_ws=$RC_WS  $(date '+%F %T') ########"
+# rc=2 = 完成但仍有硬任务未覆盖(8 次后的空缺格 = guided-p≈0 角点素材),正常结局。
+rc_ok() { [ "$1" = "0" ] || [ "$1" = "2" ]; }
+rc_ok "$RC_AF" && rc_ok "$RC_WS" && exit 0 || exit 1

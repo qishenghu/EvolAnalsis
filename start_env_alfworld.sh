@@ -6,6 +6,12 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env_config.sh"
 
+# $ALFWORLD_BIN is a console script whose shebang is `#!/usr/bin/env python3.11`,
+# so it needs the duet env on PATH. This script used to rely on the caller having
+# activated it (the queue script does), which made it unusable standalone. Activate
+# here instead — idempotent, and it keeps the env service reproducible on its own.
+duet_activate || { echo "ERROR: cannot activate duet env"; exit 1; }
+
 AGENTGYM_PORT=36001
 ENVSERVICE_PORT=8081
 PYTHON="${CONDA_PATH}/envs/${CONDA_ENV_DUET}/bin/python"
@@ -29,16 +35,27 @@ done
 
 kill_port() {
     local port=$1
-    local pids=$(lsof -ti:$port 2>/dev/null)
-    local pid args
+    # -sTCP:LISTEN 只杀监听者(lsof 会把连着该端口的客户端一并列出,
+    # 2026-08-08 曾误杀采集驱动 rc=143)。
+    local pids=$(lsof -ti:$port -sTCP:LISTEN 2>/dev/null)
+    local pid args owner me
+    me=$(id -un)
     for pid in $pids; do
+        # NTU GaaS: compute nodes are `sharing = default_shared`, so ports are
+        # node-global and another user's job may legitimately hold this one.
+        # Only ever touch our own processes.
+        owner=$(ps -p "$pid" -o user= 2>/dev/null | tr -d ' ')
+        if [ -n "$owner" ] && [ "$owner" != "$me" ]; then
+            echo "  REFUSING to kill PID $pid on port $port (owned by '$owner', not '$me')"
+            continue
+        fi
         args=$(ps -p "$pid" -o args= 2>/dev/null)
         # The ephemeral port range on this host is 32768-60999, which OVERLAPS the
         # service ports below. vLLM/Ray actors bind RANDOM ports in that range, so a
         # blind kill-by-port can take down a running training job. Never kill a
         # process that looks like training infrastructure.
         case "$args" in
-            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*)
+            *ray::*|*vllm*|*EngineCore*|*main_ppo*|*launcher.py*|*collect_openrouter*|*collect_student*)
                 echo "  REFUSING to kill PID $pid on port $port (training process): ${args:0:80}"
                 continue
                 ;;

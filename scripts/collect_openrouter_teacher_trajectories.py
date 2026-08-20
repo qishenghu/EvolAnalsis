@@ -51,13 +51,20 @@ SCHEMA_VERSION = "openrouter_teacher_trajectory_v2"
 ATTEMPT_SCHEMA_VERSION = "openrouter_teacher_attempt_v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash"
 DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
-DEFAULT_STUDENT_TOKENIZER = "/data/shared_models/Qwen3.5-4B-think"
+# GaaS-cluster (H200) artifact pins, 2026-08-04. The stock /projects_vol
+# Qwen3.5-4B chat template is thinking-on by default and strips historical
+# <think> blocks — semantically identical to the A100 "-think" patched dir
+# this contract originally pinned (tokenizer.json is byte-identical to the
+# A100 pin; chat_template.jinja/tokenizer_config.json bytes differ because
+# the A100 dir patched an older HF snapshot). Cross-machine reconciliation
+# must re-pin these hashes explicitly.
+DEFAULT_STUDENT_TOKENIZER = "/projects_vol/gp_wangwy/models/Qwen3.5-4B"
 EXPECTED_TOKENIZER_HASHES = {
     "chat_template.jinja": (
-        "1bdb2478ddd74a9d051a91e202e370625156ebac9fb68783644340656c54fc00"
+        "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
     ),
     "tokenizer_config.json": (
-        "10091de61534503d0cfa31af65a8e7436ad3e49d6fdb5926f3da0390b302b15c"
+        "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
     ),
     "tokenizer.json": (
         "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
@@ -66,12 +73,34 @@ EXPECTED_TOKENIZER_HASHES = {
 EXPECTED_CONTEXT = {
     "alfworld": {"recent_turns": 2, "history_observation_max_tokens": 160},
     "webshop": {"recent_turns": 4, "history_observation_max_tokens": 512},
+    # sciworld:上下文压缩沿 ALFWorld 风格(recent 2 / 历史观测 160 tok),
+    # 32K 契约不变;该组参数待 GPU 冒烟确认(军规),确认前仅限试点采集。
+    "sciworld": {"recent_turns": 2, "history_observation_max_tokens": 160},
+    # deepsearch:20 步 × top-3 检索观测 ≈ 15K < 22528,合同内全量无损;
+    # recent_turns=20 覆盖全部轮次,1024 tok 历史上限仅作病态兜底(正常
+    # 永不触发)。见 docs/design/DEEPSEARCH_ENV.md §4。
+    "deepsearch": {"recent_turns": 20, "history_observation_max_tokens": 1024},
+}
+# 各环境 multi_turn.max_steps 契约值。AF/WS 维持 30(历史契约,不可动);
+# sciworld 长程实验取 100;deepsearch 取 20(论证见 DEEPSEARCH_ENV.md §3)。
+EXPECTED_MAX_STEPS = {
+    "alfworld": 30,
+    "webshop": 30,
+    "sciworld": 100,
+    "deepsearch": 20,
 }
 CANONICAL_TASK_SOURCES = {
     "alfworld": PROJECT_ROOT
     / "AgentGym/agentenv-alfworld/configs/mappings_train.json",
     "webshop": PROJECT_ROOT
     / "env_service/environments/webshop/webshop_train.json",
+    # sciworld:规范池由 scripts/build_sciworld_task_pool.py 从
+    # SciworldEnv.get_query_list("train")(= eval 200 题的补集)一次性固化。
+    "sciworld": PROJECT_ROOT / "data/sciworld/canonical_task_pool.json",
+    # deepsearch:MuSiQue 3-4 hop 训练池(5562 条,jsonl 每行含 task_id,
+    # 落盘时已按 task_id 字典序排序;见 scripts/build_deepsearch_splits.py
+    # 与 data/deepsearch/SPLIT_MANIFEST.json)。
+    "deepsearch": PROJECT_ROOT / "data/deepsearch/tasks_train_pool.jsonl",
 }
 
 
@@ -184,15 +213,64 @@ def _numeric_webshop_id(value: Any) -> str:
     return str(int(match.group(1)))
 
 
+def _canonical_task_id(env_name: str, value: Any) -> str:
+    """按环境把任务 id 规范成课程文件中的字符串形态。
+
+    - alfworld/sciworld:十进制整数字符串(int 往返剔除前导零等非规范形态);
+    - webshop:"webshop_123"/"123" 统一为 "123";
+    - deepsearch:id 本身是字符串(如 "musique_train_13900"),原样保留,
+      仅做字符集校验——绝不能过 int()。
+    """
+    if env_name == "webshop":
+        return _numeric_webshop_id(value)
+    if env_name == "deepsearch":
+        text = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", text):
+            raise ValueError(f"invalid deepsearch task id: {value!r}")
+        return text
+    return str(int(value))
+
+
+def _membership_sort_key(env_name: str):
+    """sorted_membership 的排序键(per-env)。
+
+    alfworld/webshop/sciworld 维持 int 键——AF/WS 既有 manifest 里的
+    sorted_membership_sha256 必须逐字节不变;deepsearch 的字符串 id 用
+    字典序,与 scripts/build_deepsearch_splits.py 的 sorted() 约定一致。
+    """
+    if env_name == "deepsearch":
+        return lambda item: item
+    return lambda item: int(item)
+
+
 def canonical_task_pool(env_name: str) -> tuple[List[str], Path]:
     source = CANONICAL_TASK_SOURCES[env_name]
-    payload = json.loads(source.read_text(encoding="utf-8"))
-    if env_name == "alfworld":
-        task_ids = [str(item["item_id"]) for item in payload]
-    elif env_name == "webshop":
-        task_ids = [_numeric_webshop_id(item["item_id"]) for item in payload]
-    else:  # pragma: no cover - argparse/config validation prevents this
-        raise ValueError(f"unsupported environment: {env_name}")
+    if env_name == "deepsearch":
+        # jsonl 每行一个任务对象;build_deepsearch_splits.py 落盘时已按
+        # task_id 字典序排序,这里复核以保证 shuffle 前的池顺序确定。
+        task_ids = [
+            _canonical_task_id(env_name, json.loads(line)["task_id"])
+            for line in source.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        if task_ids != sorted(task_ids):
+            raise RuntimeError(
+                "canonical deepsearch task pool must be sorted by task_id"
+            )
+    else:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if env_name == "alfworld":
+            task_ids = [str(item["item_id"]) for item in payload]
+        elif env_name == "webshop":
+            task_ids = [_numeric_webshop_id(item["item_id"]) for item in payload]
+        elif env_name == "sciworld":
+            # 固化文件由 build_sciworld_task_pool.py 生成,task_ids 字段保序
+            # 保存 get_query_list("train") 的输出(0..max_eval 去掉 eval 集)。
+            task_ids = [
+                _canonical_task_id(env_name, item) for item in payload["task_ids"]
+            ]
+        else:  # pragma: no cover - argparse/config validation prevents this
+            raise ValueError(f"unsupported environment: {env_name}")
     if len(task_ids) != len(set(task_ids)):
         raise RuntimeError(f"canonical {env_name} task pool contains duplicates")
     return task_ids, source
@@ -206,8 +284,10 @@ def expected_curriculum(env_name: str, task_seed: int, count: int) -> Dict[str, 
     random.Random(task_seed).shuffle(ordered)
     ordered = ordered[:count]
     newline_payload = ("\n".join(ordered) + "\n").encode("utf-8")
+    # 排序键 per-env:AF/WS/SciWorld 维持 int 键(AF/WS 历史 sha 逐字节
+    # 不变),deepsearch 字符串 id 用字典序。
     sorted_payload = (
-        "\n".join(sorted(ordered, key=lambda item: int(item))) + "\n"
+        "\n".join(sorted(ordered, key=_membership_sort_key(env_name))) + "\n"
     ).encode("utf-8")
     return {
         "environment": env_name,
@@ -239,10 +319,8 @@ def load_and_validate_task_file(
     lines = raw.splitlines()
     if any(not line.strip() or line.strip() != line for line in lines):
         raise RuntimeError(f"task file contains blank or non-canonical lines: {path}")
-    task_ids = [
-        _numeric_webshop_id(line) if env_name == "webshop" else str(int(line))
-        for line in lines
-    ]
+    # per-env 规范化:deepsearch 的字符串 id 绝不能过 int()。
+    task_ids = [_canonical_task_id(env_name, line) for line in lines]
     if len(task_ids) != expected_count or len(set(task_ids)) != expected_count:
         raise RuntimeError(
             f"task file must contain exactly {expected_count} unique IDs; "
@@ -290,7 +368,11 @@ def validate_student_contract(config: DictConfig) -> Dict[str, Any]:
         "max_model_len": (int(rollout.max_model_len), 32768),
         "data.max_prompt_length": (int(data.max_prompt_length), 22528),
         "data.max_response_length": (int(data.max_response_length), 10240),
-        "multi_turn.max_steps": (int(rollout.multi_turn.max_steps), 30),
+        # per-env 契约步数(AF/WS 恒 30;sciworld 100;deepsearch 20)。
+        "multi_turn.max_steps": (
+            int(rollout.multi_turn.max_steps),
+            EXPECTED_MAX_STEPS[env_name],
+        ),
         "context_template": (str(rollout.context_template), "linear"),
         "context_management.enabled": (
             bool(rollout.context_management.enabled),
@@ -436,15 +518,14 @@ def verify_live_task_profile(
     body = response.json()
     if not body.get("success"):
         raise RuntimeError(f"live task profile request failed: {json_safe(body)}")
-    live = [
-        _numeric_webshop_id(item) if env_name == "webshop" else str(int(item))
-        for item in body["data"]
-    ]
+    # per-env 规范化:deepsearch 的字符串 id 绝不能过 int()。
+    live = [_canonical_task_id(env_name, item) for item in body["data"]]
     random.Random(task_seed).shuffle(live)
     if live[: len(expected)] != list(expected):
+        live_prefix_payload = ("\n".join(live[: len(expected)]) + "\n").encode()
         raise RuntimeError(
             "live environment profile does not match the frozen curriculum: "
-            f"live_prefix_sha256={sha256_bytes(('\n'.join(live[:len(expected)]) + '\n').encode())}"
+            f"live_prefix_sha256={sha256_bytes(live_prefix_payload)}"
         )
 
 
@@ -1029,7 +1110,7 @@ class TeacherCollector:
         )
 
 
-def implementation_hashes() -> Dict[str, str]:
+def implementation_hashes(env_name: Optional[str] = None) -> Dict[str, str]:
     relative_paths = [
         "scripts/collect_openrouter_teacher_trajectories.py",
         "agentevolver/module/agent_flow/agent_flow.py",
@@ -1040,6 +1121,17 @@ def implementation_hashes() -> Dict[str, str]:
         "env_service/environments/alfworld/alfworld_env.py",
         "env_service/environments/webshop/webshop_env.py",
     ]
+    # 新环境战役额外钉住各自的环境实现;AF/WS 的键集保持原样(契约结构不动,
+    # 老战役 manifest 里的 implementation_sha256 键集可逐一对上)。
+    extra_paths = {
+        "sciworld": ["env_service/environments/sciworld/sciworld_env.py"],
+        "deepsearch": [
+            "env_service/environments/deepsearch/deepsearch_env.py",
+            # 检索服务实现与索引共同决定观测,一并入契约。
+            "env_service/launch_script/retrieval_server.py",
+        ],
+    }
+    relative_paths = relative_paths + extra_paths.get(env_name or "", [])
     return {
         relative: sha256_file(PROJECT_ROOT / relative) for relative in relative_paths
     }
@@ -1132,7 +1224,10 @@ def build_contract(
         },
         "student_tokenizer": dict(tokenizer_manifest),
         "store_prompt_messages": bool(args.store_prompt_messages),
-        "implementation_sha256": implementation_hashes(),
+        # 传入 env 以便为新环境附加各自的实现哈希(AF/WS 键集不变)。
+        "implementation_sha256": implementation_hashes(
+            str(student_contract["environment"])
+        ),
     }
 
 

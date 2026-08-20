@@ -37,6 +37,8 @@ echo "Patching verl at: ${VERL_ROOT}"
 if [ "${RUN_PROOFS}" = "1" ]; then
     echo ""
     echo "=== Import proofs (${ENV_NAME}) ==="
+    # Model dir for the config-load proof: cluster-portable via env_config.sh.
+    export DUET_QWEN35_4B_DIR="${DUET_MODELS_DIR:-/data/shared_models}/Qwen3.5-4B"
     "${PYTHON}" - <<'EOF'
 import transformers
 
@@ -58,7 +60,9 @@ from verl.workers.rollout.chat_scheduler import ChatCompletionScheduler  # noqa:
 
 print("ChatCompletionScheduler import OK (no vllm required)")
 
-cfg = transformers.AutoConfig.from_pretrained("/data/shared_models/Qwen3.5-4B")
+import os
+
+cfg = transformers.AutoConfig.from_pretrained(os.environ["DUET_QWEN35_4B_DIR"])
 print(f"Qwen3.5-4B config OK: model_type={cfg.model_type}, architectures={cfg.architectures}")
 EOF
     echo "=== All import proofs passed ==="

@@ -1,0 +1,81 @@
+# stable_truncation_integration.patch
+# =====================================================================
+# 目的:把 StructuredContextPolicy._clip_text 的两处"token 切片 decode 存
+# 文字"改为走 stable_token_truncate / stable_token_truncate_suffix(新文件
+# agentevolver/module/context_manager/stable_truncation.py,已入库,不在
+# 本补丁内),保证截断产物 decode→retokenize 幂等。
+#
+# 【契约锁定文件】本补丁修改 agentevolver/module/context_manager/
+# context_policy.py——该文件被以下在册战役 manifest 的
+# contract.implementation_sha256 逐字节锁定:
+#   * teacher_data/deepseek_v4_flash/{alfworld,webshop,sciworld,deepsearch}
+#     _dsv4flash_t1600_r1 及 {alfworld,webshop}_topup8
+#   * teacher_data/qwen35_122b/{alfworld,webshop,sciworld,deepsearch}
+#     _qwen35_122b_t1600_r1 及 {alfworld,webshop}_topup8
+#   * student_rollouts/{alfworld,webshop,sciworld,deepsearch}
+#     _qwen35_4b_student_rollouts(含 *_p400)
+#   * catalyst_pilots/pa|pb|smoke 各 manifest
+# 锁定期间应用本补丁 = 正在跑/可 resume 的战役契约校验直接拒绝。
+#
+# 【应用时机】必须等 flash(deepseek_v4_flash)与 122B(qwen35_122b)两条
+# 线的双新域(sciworld/deepsearch)采集全部 finalize(manifest audit
+# complete 且不再 resume/topup)之后,才允许应用。应用前再跑一次
+# `grep -rl context_policy.py *.manifest.json` 类核对,确认没有新增在跑
+# 战役引用该文件。
+#
+# 【应用后果(预期行为)】context_policy.py 内容变更 →
+#   * 之后所有新采集战役 manifest 的 implementation_sha256、contract_sha256
+#     全部改变(与旧战役数据不再同契约,属预期,不回填旧 manifest);
+#   * 训练侧若校验 implementation sha,同样以新 sha 为准;
+#   * _clip_text 触发时(alfworld/webshop/sciworld 的历史观察裁剪)产出的
+#     clipped 文字与旧版可能差若干 token(回退到稳定切点),即同输入的
+#     受管 prompt 可能与旧战役不逐 id 相同——这正是本补丁的目的。
+#
+# 【重要澄清】deepsearch p400 的 50/5296 prompt sha 失配的根因**不是**
+# 截断非幂等,而是采集器进程(duet 环境, tokenizers 0.21.2)与 vLLM 服务/
+# 校验(vllm2 环境, tokenizers 0.22.2)对稀有文字(泰卢固语 'తి' 等组合
+# 序列)的分词版本差异。本补丁不修复也不掩盖该问题;已失配数据由
+# analysis/quarantine_rerender_mismatch.py 出隔离清单供训练侧 mask,
+# 版本漂移本身需另行统一 recorder 与 serving 的 tokenizers 版本。
+#
+# 【验证】生成自 diff -u(原文件 vs 补丁版);已用
+#   patch -p1 --dry-run < scripts/patches/stable_truncation_integration.patch
+# 在仓库根验证可干净应用(dry-run 不落盘)。配套测试:
+#   tests/test_stable_truncation.py(duet 环境 10/10 通过)。
+# =====================================================================
+--- a/agentevolver/module/context_manager/context_policy.py
++++ b/agentevolver/module/context_manager/context_policy.py
+@@ -16,6 +16,10 @@
+ from typing import Any, Dict, List, Sequence
+ 
+ from agentevolver.module.context_manager.cmt_base import chat_template_ids
++from agentevolver.module.context_manager.stable_truncation import (
++    stable_token_truncate,
++    stable_token_truncate_suffix,
++)
+ 
+ 
+ class ContextBudgetError(RuntimeError):
+@@ -168,15 +172,16 @@
+         marker = "\n...[context clipped]...\n"
+         marker_ids = self._encode_text(marker)
+         if limit <= len(marker_ids) + 8:
+-            return self.tokenizer.decode(ids[:limit]), True
++            # 稳定截断:回退到 decode→retokenize 幂等的切点,存入历史的文字
++            # 未来重分词时逐 id 复原,不再依赖 BPE 对任意切点的偶然幂等。
++            head = stable_token_truncate(self.tokenizer, ids, limit)
++            return head.text, True
+         available = limit - len(marker_ids)
+         head_n = max(1, int(available * 0.65))
+         tail_n = max(1, available - head_n)
+-        clipped = (
+-            self.tokenizer.decode(ids[:head_n])
+-            + marker
+-            + self.tokenizer.decode(ids[-tail_n:])
+-        )
++        head = stable_token_truncate(self.tokenizer, ids, head_n)
++        tail = stable_token_truncate_suffix(self.tokenizer, ids, tail_n)
++        clipped = head.text + marker + tail.text
+         return clipped, True
+ 
+     @classmethod

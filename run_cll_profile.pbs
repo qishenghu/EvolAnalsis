@@ -1,0 +1,61 @@
+#!/bin/bash
+# CLL 教师轨迹分段打分(2026-08-06 晚,采集收官后的首个分析作业)
+# 流程:单文件 5 条冒烟 → 通过后四文件并行(每卡一个文件,--max-records 400)
+# 产出:analysis_outputs/cll_teacher_profile/ 下的 per-token jsonl + summary
+#PBS -N cll_profile
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=48:ngpus=4:mem=400gb
+#PBS -l walltime=12:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/cll_profile.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+TD=$SCRATCH/teacher_data
+OUT=$REPO/analysis_outputs/cll_teacher_profile
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200
+mkdir -p "$OUT"
+exec > >(tee -a "$SCRATCH/logs/cll_profile.live.log") 2>&1
+echo "######## CLL PROFILE start $(date '+%F %T') job=${PBS_JOBID:-?} ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+# 注意:duet 环境的 transformers 4.53 不认识 qwen3_5,GPU 打分必须用 vllm2 的
+# python(transformers 5.14.1,已补齐 hydra/omegaconf/loguru/best_logger/jieba
+# 依赖,2026-08-06)。脚本内置的 prompt sha 校验兜底跨版本渲染一致性。
+PY=/projects_vol/gp_wangwy/qisheng/duet_h200/conda/envs/vllm2/bin/python
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+
+# ---- [1] 冒烟:5 条记录,单卡 ----
+echo "---- smoke: 5 records on 122B/AF ----"
+CUDA_VISIBLE_DEVICES=0 $PY analysis/cll_teacher_profile.py \
+    --input "$TD/qwen35_122b/alfworld_qwen35_122b_t1600_r1.jsonl" \
+    --config "$CFG/alfworld_qwen35_4b_collect_h200.yaml" \
+    --max-records 5 --device cuda:0 \
+    --output "$OUT/smoke_122b_af.jsonl" || { echo "ABORT: smoke failed"; exit 1; }
+echo "SMOKE PASSED $(date '+%F %T')"
+
+# ---- [2] 四文件并行,每卡一个 ----
+MAX_RECORDS="${MAX_RECORDS:-400}"
+run_one() {
+    local gpu=$1 infile=$2 cfg=$3 tag=$4
+    CUDA_VISIBLE_DEVICES=$gpu $PY analysis/cll_teacher_profile.py \
+        --input "$infile" --config "$cfg" \
+        --max-records "$MAX_RECORDS" --device cuda:0 \
+        --output "$OUT/cll_${tag}_${MAX_RECORDS}.jsonl" \
+        > "$SCRATCH/logs/cll_${tag}.log" 2>&1
+    echo "cll_${tag} rc=$?"
+}
+run_one 0 "$TD/qwen35_122b/alfworld_qwen35_122b_t1600_r1.jsonl"   "$CFG/alfworld_qwen35_4b_collect_h200.yaml" 122b_af &
+P1=$!
+run_one 1 "$TD/deepseek_v4_flash/alfworld_dsv4flash_t1600_r1.jsonl" "$CFG/alfworld_qwen35_4b_collect_h200.yaml" flash_af &
+P2=$!
+run_one 2 "$TD/qwen35_122b/webshop_qwen35_122b_t1600_r1.jsonl"    "$CFG/webshop_qwen35_4b_collect_h200.yaml" 122b_ws &
+P3=$!
+run_one 3 "$TD/deepseek_v4_flash/webshop_dsv4flash_t1600_r1.jsonl" "$CFG/webshop_qwen35_4b_collect_h200.yaml" flash_ws &
+P4=$!
+wait $P1 $P2 $P3 $P4
+echo "---- summaries ----"
+ls -la "$OUT"/*.summary.json 2>/dev/null
+echo "######## CLL PROFILE END $(date '+%F %T') ########"

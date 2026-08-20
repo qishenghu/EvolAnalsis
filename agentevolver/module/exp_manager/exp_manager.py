@@ -20,6 +20,10 @@ from agentevolver.client.em_client import EMClient
 class TaskExpConfig:
     add_exp: List[bool]
     train_mode: str = "discard"     # "keep" | "discard"
+    # ⭐ CATALYST 提示臂:每 rollout 槽位的 hint 文本(None=裸臂)。默认 None,
+    # 仅 exp_manager.catalyst.enable=true 且该任务被路由到 R1 时由
+    # CatalystRuntime.plan_arms 填充;默认路径零改动。
+    catalyst_hint_slots: Optional[List[Optional[str]]] = None
 
 @dataclass
 class TrajExpConfig:
@@ -31,6 +35,18 @@ class TrajExpConfig:
     query: str = ""
     mode: str = "sample"            # "sample" | "validate"
     experience_list: List[str] = field(default_factory=list)
+    # ⭐ CATALYST 提示臂:本 rollout 注入的 hint(None=裸臂,零注入路径)。
+    catalyst_hint_text: Optional[str] = None
+    catalyst_arm: str = "bare"      # "bare" | "hint" | "entry"
+    # ⭐ CATALYST v2 entry 臂:接管计划 payload(EntryPlan.to_payload();
+    # None=非 entry 臂)。与 catalyst_hint_text 互斥(plan_arms 保证)。
+    catalyst_entry_plan: Optional[dict] = None
+    # 重放失败降级标记(worker 设置,agent_flow 落 metadata 供治理计数)。
+    catalyst_entry_degraded: bool = False
+    # v3.1 hint 臂 critic 基线(plan 时冻结的 sr_hint_ema;None=不启用)。
+    catalyst_hint_vhat: Optional[float] = None
+    # v4:本 rollout 的 plan 时冻结 V̂(统一优势基线先验;None=非 v4)。
+    catalyst_v4_m: Optional[float] = None
 
 
 
@@ -126,6 +142,23 @@ class ExperienceManager(object):
                 f"replay_start_epoch={self.repo_replay_start_epoch}, "
                 f"strategy={self.repo_replay_strategy}, "
                 f"g_on={self.repo_g_on}, g_off={self.repo_g_off}"
+            )
+
+        # ⭐ CATALYST (ICLR 2027): 提示臂/分臂基线/去提示重放/治理层。
+        # 默认关闭;开启时 fail-fast 加载 hint 素材(对齐 teacher_experience
+        # 的加载纪律)。互斥断言在 trainer._catalyst_setup 做(需要 actor 配置)。
+        catalyst_cfg = self.exp_manager_config.get("catalyst", {}) or {}
+        self.catalyst_enabled = bool(catalyst_cfg.get("enable", False))
+        self.catalyst = None
+        if self.catalyst_enabled:
+            from agentevolver.module.exp_manager.catalyst import CatalystRuntime
+            self.catalyst = CatalystRuntime(config=config)
+            logger.info(
+                "[ExperienceManager] CATALYST enabled: "
+                f"hints={len(self.catalyst.hint_book)} tasks, "
+                f"replay={'on' if self.catalyst.replay_enabled else 'off'}, "
+                f"arm_baseline={'on' if self.catalyst.arm_baseline_enabled else 'off'}, "
+                f"thermostat={'on' if self.catalyst.thermostat_enabled else 'off'}"
             )
     
     def summarize_in_batch(self, trajectories: List[Trajectory]) -> None:

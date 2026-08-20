@@ -1,0 +1,174 @@
+#!/bin/bash
+# =============================================================================
+# P0 production run — Qwen3.5-4B PURE GRPO on ALFWorld, GaaS H200.
+# Default: 200-step anchor (p0_grpo_af_s0). Grid cells reuse this script:
+#   qsub -v P0_NAME=<cell>,P0_CONF=<grid100-copy>.yaml run_train_p0.pbs
+#
+# Throughput lane params default to the trial-adjudicated winner and MUST
+# match the rollout.max_num_seqs / gpu_memory_utilization in the config.
+# resume: config resume_mode=auto — an existing checkpoint dir means resume;
+# outputs are NOT auto-archived (unlike the smoke/trial scripts).
+# Watch : tail -f /projects_vol/gp_wangwy/qisheng/duet_h200/logs/p0_q35af.live.log
+# =============================================================================
+#PBS -N p0_q35af
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=120:ngpus=4:mpiprocs=8:mem=2000gb
+#PBS -l walltime=48:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/p0_q35af.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+LIVELOG=$SCRATCH/logs/p0_q35af.live.log
+TRAINLOG=$SCRATCH/logs/p0_q35af.train.log
+EXPERIMENT_NAME="${P0_NAME:-p0_grpo_af_s0}"
+P0_CONF="${P0_CONF:-config/duet_paper_experiments_configs/iclr2027/train_h200/alfworld_qwen35_4b_grpo_anchor200.yaml}"
+LANE_MNS="${P0_MNS:-16}"
+LANE_GMU="${P0_GMU:-0.35}"
+# Packed recurrent decode. Trial-adjudicated (thrpk 45700): drift band
+# unchanged vs PKD=0, step time ~404s vs ~475s, decode p50 201 tok/s.
+# The historical =0 was a conservative carry-over from the 2026-08-04 teacher
+# collection; A100 production ran packed ENABLED (qwen35_context_management.md).
+LANE_PKD="${P0_PKD:-1}"
+MODEL_DIR=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+BASE_PORT=8201
+mkdir -p "$(dirname "$LIVELOG")"
+
+exec > >(tee -a "$LIVELOG") 2>&1
+echo "######## P0_Q35AF  $(date '+%F %T')  job=${PBS_JOBID:-?}  host=$(hostname)  name=$EXPERIMENT_NAME mns=$LANE_MNS gmu=$LANE_GMU pkd=$LANE_PKD conf=$P0_CONF ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+
+export CONDA_ENV_DUET=duet-train
+source "$REPO/env_config.sh"
+# Unified job preamble — L1 GPU indices, L2 node-local scratch, L6 pidfile
+# healing, credential hygiene, L3/L4/L8 config gate. See docs/infra/LANDMINES.md.
+source "$REPO/scripts/duet_job_preamble.sh"
+duet_preamble_gpu 4                || exit 1
+duet_preamble_wandb require-online || exit 1
+
+duet_activate || { echo "ABORT: duet-train activation failed"; exit 1; }
+echo "trainer python: $(which python) ($(python -V 2>&1))"
+
+python - <<'EOF' || { echo "ABORT: duet-train stack acceptance failed"; exit 1; }
+import transformers, tokenizers, verl, pathlib, inspect
+assert transformers.__version__ == "5.14.1", transformers.__version__
+assert tokenizers.__version__ == "0.22.2", tokenizers.__version__
+assert "t5x-patch" in pathlib.Path(verl.__file__).read_text()
+from verl.workers.rollout import chat_scheduler as cs
+assert "P6" in inspect.getsource(cs.ChatCompletionScheduler._chat_completions_aiohttp)
+from transformers.utils.import_utils import is_causal_conv1d_available, is_flash_linear_attention_available
+print("GDN fast path:", "fla", is_flash_linear_attention_available(), "conv1d", is_causal_conv1d_available())
+from transformers import AutoConfig
+cfg = AutoConfig.from_pretrained("/projects_vol/gp_wangwy/models/Qwen3.5-4B")
+print("acceptance OK:", transformers.__version__, tokenizers.__version__, cfg.model_type)
+EOF
+
+python -c "from agentevolver.utils.tracking import preflight_wandb_online; preflight_wandb_online(project_name='agentevolver', experiment_name='$EXPERIMENT_NAME')" \
+    || { echo "ABORT: W&B online preflight failed"; exit 1; }
+
+python config/validate_length_config.py "$P0_CONF" || { echo "ABORT: length-contract validation failed"; exit 1; }
+
+# Config health gate. Replaces the two inline python blocks this script used to
+# carry (L4 data-path preflight, config/lane consistency) plus the "existing
+# checkpoints" notice, and adds L3 resume_mode / L8 save_freq / val-completeness
+# / experiment-name-vs-config-identity. Same failure semantics: abort, no GPUs burnt.
+duet_validate_train_config "$P0_CONF" \
+    --lane-mns "$LANE_MNS" --lane-gmu "$LANE_GMU" \
+    --experiment-name "$EXPERIMENT_NAME" \
+    || { echo "ABORT: train config validation failed"; exit 1; }
+
+GPU_SAMPLER_PID=""
+ALF_CLEANER_PID=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$GPU_SAMPLER_PID" ] && kill "$GPU_SAMPLER_PID" 2>/dev/null
+    [ -n "$ALF_CLEANER_PID" ] && kill "$ALF_CLEANER_PID" 2>/dev/null
+    BASE_PORT=$BASE_PORT bash start_rollout_servers.sh stop 2>/dev/null || true
+    env -u CONDA_ENV_DUET bash start_env_alfworld.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ------------------------------------------------------ [1] AlfWorld stack --
+# L2: every AlfWorld reset unpacks libdownward.so into a fresh temp dir. The
+# disk half of the mitigation is a node-local ALFWORLD_TMPDIR plus a sweeper
+# that only deletes dirs untouched for 30+ min. (The *process* half — mmap
+# exhaustion — is not a disk problem; see docs/infra/LANDMINES.md L2.)
+duet_preamble_tmp || exit 1
+ALF_CLEANER_PID=$(duet_preamble_alfworld_cleaner) || exit 1
+echo "---- starting ALFWorld stack (original duet env) ----"
+env -u CONDA_ENV_DUET TMPDIR="$ALFWORLD_TMPDIR" TEMP="$ALFWORLD_TMPDIR" \
+    TMP="$ALFWORLD_TMPDIR" bash start_env_alfworld.sh \
+    || { echo "ABORT: alfworld stack"; exit 1; }
+curl -sf --max-time 30 http://127.0.0.1:8081/docs > /dev/null || { echo "ABORT: env_service 8081"; exit 1; }
+
+# --------------------------------------------- [2] external rollout servers --
+# TRITON_CACHE_DIR is set by duet_preamble_tmp above.
+# L6: heal a stale pidfile left by a qdel'd predecessor (shared storage, node-
+# local PIDs); refuse to proceed if a genuinely live lane is listed.
+PIDFILE="$REPO/logs/rollout_servers_${BASE_PORT}.pids"
+duet_preamble_pidfile_heal "$PIDFILE" || exit 1
+
+echo "---- starting 4x TP1 rollout servers (vllm2 env, MNS=$LANE_MNS GMU=$LANE_GMU PKD=$LANE_PKD) ----"
+MODEL_DIR="$MODEL_DIR" \
+GPUS="$CUDA_VISIBLE_DEVICES" \
+BASE_PORT=$BASE_PORT \
+GPU_MEM_UTIL="$LANE_GMU" \
+MAX_MODEL_LEN=32768 \
+MAX_NUM_SEQS="$LANE_MNS" \
+VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE="$LANE_PKD" \
+WAIT_ATTEMPTS=900 \
+EXPERIMENT_TAG="$EXPERIMENT_NAME" \
+EXPERIMENT_CONFIG="$P0_CONF" \
+bash start_rollout_servers.sh start || { echo "ABORT: rollout servers failed to come up"; exit 1; }
+
+MANIFEST=$(ls -t logs/rollout_servers_${BASE_PORT}_*.manifest 2>/dev/null | head -1)
+[ -n "$MANIFEST" ] || { echo "ABORT: no rollout manifest"; exit 1; }
+echo "rollout manifest: $MANIFEST"
+for field in \
+    "model_dir=$MODEL_DIR" \
+    "base_port=$BASE_PORT" \
+    "max_model_len=32768" \
+    "max_num_seqs=$LANE_MNS" \
+    "gpu_memory_utilization=$LANE_GMU" \
+    "logprobs_mode=processed_logprobs" \
+    "enforce_eager=0" \
+    "vllm_enable_fla_packed_recurrent_decode=$LANE_PKD" \
+    "health_verified_ports=8201 8202 8203 8204"; do
+    grep -aFxq "$field" "$MANIFEST" || { echo "ABORT: manifest lacks contract field: $field"; exit 1; }
+done
+echo "rollout contract manifest verified"
+
+SANITY=$(curl -sf --max-time 600 "http://127.0.0.1:${BASE_PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"models/Qwen3.5-4B","messages":[{"role":"user","content":"Reply with <action>\nlook\n</action> after thinking briefly."}],"max_tokens":512,"temperature":0.9}')
+echo "$SANITY" | grep -q "action" || { echo "ABORT: sanity completion malformed"; exit 1; }
+echo "sanity completion OK"
+
+# --------------------------------------------------- [3] GPU usage sampler --
+(
+    while true; do
+        echo "==== GPU_SAMPLE $(date '+%F %T') ===="
+        nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader
+        nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader
+        sleep 300
+    done
+) >> "$SCRATCH/logs/p0_q35af.gpu.log" 2>&1 &
+GPU_SAMPLER_PID=$!
+echo "GPU sampler pid=$GPU_SAMPLER_PID -> $SCRATCH/logs/p0_q35af.gpu.log (5-min cadence)"
+
+# ------------------------------------------------------------ [4] training --
+LANE_RAY_TMPDIR="${RAY_TMPDIR}/afp0"
+mkdir -p "$LANE_RAY_TMPDIR"
+echo "---- launching training: $EXPERIMENT_NAME  (RAY_TMPDIR=$LANE_RAY_TMPDIR) ----"
+set +e
+RAY_TMPDIR="$LANE_RAY_TMPDIR" \
+python launcher.py --conf "$P0_CONF" > "$TRAINLOG" 2>&1
+rc=$?
+echo "---- training exited rc=$rc  $(date '+%F %T') ----"
+
+echo "---- last step lines ----"
+grep -aoE "step:[0-9]+ - .*" "$TRAINLOG" | tail -3 | cut -c1-400
+echo "######## P0_Q35AF END rc=$rc  $(date '+%F %T') ########"
+exit "$rc"

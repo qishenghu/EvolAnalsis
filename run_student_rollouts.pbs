@@ -1,0 +1,93 @@
+#!/bin/bash
+# 学生 rollout 采集 + DeepSearch closed-book(2026-08-07 凌晨,挂在全量 CLL 之后)
+# [1] vLLM 服务 Qwen3.5-4B(GPU0,端口 8000,--reasoning-parser qwen3,与 122B 教师服务同款路径)
+# [2] 计算节点自起 AF/WS 环境栈
+# [3] 学生 rollout 采集(成败全落盘,AF/WS 各 400 任务,判别器 AUC 的"学生类")
+# [4] DeepSearch closed-book 评测(GPU1,vllm2 离线推理,与 [3] 并行)
+#PBS -N student_ro
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=48:ngpus=4:mem=400gb
+#PBS -l walltime=10:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/student_rollouts.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+OUT=$SCRATCH/student_rollouts
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200
+STUDENT=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+VLLM_PORT=8000
+mkdir -p "$OUT" "$SCRATCH/logs"
+exec > >(tee -a "$SCRATCH/logs/student_rollouts.live.log") 2>&1
+echo "######## STUDENT ROLLOUTS start $(date '+%F %T') job=${PBS_JOBID:-?} ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+duet_activate || { echo "ABORT: duet env"; exit 1; }
+VLLM_PY="$CONDA_PATH/envs/${CONDA_ENV_VLLM2:-vllm2}/bin/python"
+export VLLM_CACHE_ROOT="/tmp/vllm_cache_$(id -un)"
+export TRITON_CACHE_DIR="/tmp/triton_cache_$(id -un)"
+export TMPDIR=/tmp/duet_tmp_$(id -un); mkdir -p "$TMPDIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR"
+
+VPID=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$VPID" ] && kill "$VPID" 2>/dev/null
+    bash start_env_alfworld.sh stop 2>/dev/null || true
+    bash start_env_webshop.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# ---- [1] 学生 vLLM 服务(GPU0)----
+echo "---- starting student vLLM (Qwen3.5-4B, GPU0) ----"
+CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 \
+"$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+    --model "$STUDENT" --served-model-name qwen35-4b-student \
+    --tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 16 \
+    --gpu-memory-utilization 0.85 --port $VLLM_PORT \
+    --reasoning-parser qwen3 \
+    >> "$SCRATCH/logs/vllm_student4b.log" 2>&1 &
+VPID=$!
+for i in $(seq 1 90); do
+    kill -0 "$VPID" 2>/dev/null || { echo "ABORT: student vLLM died"; tail -20 "$SCRATCH/logs/vllm_student4b.log"; exit 1; }
+    curl -sf --max-time 8 "http://127.0.0.1:$VLLM_PORT/v1/models" >/dev/null && break
+    [ $i -eq 90 ] && { echo "ABORT: student vLLM timeout"; exit 1; }
+    sleep 10
+done
+echo "student vLLM up (pid=$VPID)"
+
+# ---- [2] 环境栈 ----
+bash start_env_alfworld.sh || { echo "ABORT: alfworld stack"; exit 1; }
+bash start_env_webshop.sh  || { echo "ABORT: webshop stack"; exit 1; }
+
+# ---- [3] 学生 rollout 采集(AF/WS 并行,各 400 任务,成败全落盘)----
+export OPENROUTER_API_KEY=EMPTY
+roll() {
+    local env=$1 port=$2
+    python scripts/collect_student_rollouts.py \
+        --config "$CFG/${env}_qwen35_4b_collect_h200.yaml" \
+        --env-url "http://127.0.0.1:$port" \
+        --task-file "data/${env}/task_ids_1600_seed2026.txt" \
+        --output "$OUT/${env}_qwen35_4b_student_rollouts.jsonl" \
+        --model qwen35-4b-student --api-base "http://127.0.0.1:$VLLM_PORT/v1" \
+        --api-key-env OPENROUTER_API_KEY \
+        --rollouts-per-task 1 --max-attempts-per-rollout 1 \
+        --max-tasks 400 --max-workers 8 --resume \
+        > "$SCRATCH/logs/student_ro_${env}.log" 2>&1
+    echo "student_ro_${env} rc=$?"
+}
+roll alfworld 8081 & RA=$!
+roll webshop 8083  & RB=$!
+
+# ---- [4] DeepSearch closed-book(GPU1,与 [3] 并行)----
+CUDA_VISIBLE_DEVICES=1 "$VLLM_PY" analysis/deepsearch_closedbook_eval.py \
+    --model "$STUDENT" --tp 1 \
+    > "$SCRATCH/logs/deepsearch_closedbook.log" 2>&1
+echo "closedbook rc=$?"
+
+wait $RA $RB
+echo "---- outputs ----"
+wc -l "$OUT"/*.jsonl 2>/dev/null
+ls -la "$REPO/analysis_outputs/deepsearch_closedbook/" 2>/dev/null
+echo "######## STUDENT ROLLOUTS END $(date '+%F %T') ########"

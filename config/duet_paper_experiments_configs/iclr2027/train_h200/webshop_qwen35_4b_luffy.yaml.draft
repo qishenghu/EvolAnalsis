@@ -1,0 +1,297 @@
+# draft: 待 GRPO 冒烟定稿后对齐 duet-train 环境细节
+#   (external_server_addresses / gpu_memory_utilization / offload / micro-batch /
+#    wandb project + lane assignment 以 train_h200 GRPO 冒烟配置定稿为准;
+#    本文件先锁定算法与数据契约, 勿直接启动)。
+#
+# ICLR 2027 LUFFY baseline — WebShop, Qwen3.5-4B, GaaS H200.
+#
+# Provenance (audited 2026-08-08):
+# * Context/rollout contract: flattened from
+#   iclr2027/webshop/webshop_qwen35_4b_grpo_snapshot_gate.yaml +
+#   iclr2027/collect_h200/webshop_qwen35_4b_collect_h200.yaml overrides — the
+#   exact student contract under which the deepseek-v4-flash teacher data was
+#   collected: 22528/10240, recent_turns 4 / history_observation_max_tokens 512,
+#   react_tags + action sanitizer, max_steps 30, temperature 0.6,
+#   native_qwen35 thinking, snapshot_training.
+# * LUFFY algorithm block: verbatim from the NeurIPS-era canonical baseline
+#   webshop/webshop_qwen3b_luffy.yaml (launched via
+#   run_scripts/20_main_paper/run_qwen3b_webshop.sh; the main-table 38.0% cell
+#   came from its algorithm-identical rerun ws_luffy_rerun_2026_05_03.yaml).
+#   There is no use_luffy key: LUFFY == use_chord:false + use_dr3:false +
+#   teacher policy shaping f(x)=x/(x+beta), beta=0.1, use_kl_loss=true.
+# * Teacher log-prob decision: the deepseek-v4-flash API data carries NO
+#   token log-probs, and exp_manager's v2 loader force-sets has_log_prob=false.
+#   het_core_algos.het_compute_teacher_aware_loss with teacher_use_log_prob=false
+#   uses ratio = pi_current (denominator 1) + p/(p+beta) shaping — exactly the
+#   LUFFY-paper off-policy approximation; no teacher log-prob is ever needed.
+# * Batch scale: ICLR battle spec — 16 tasks x 8 rollouts, 200 steps,
+#   eval every 10 steps.
+# * Teacher data: data/teacher_trajectories/iclr2027_flash/ (openrouter
+#   teacher v2 jsonl, deepseek-v4-flash, 599 tasks; produced by
+#   scripts/convert_teacher_v2_to_training.py).
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+trainer:
+  experiment_name: webshop_qwen35_4b_luffy_iclr_b16_s200
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  # 1600 unique tasks / batch 16 = 100 steps per epoch => 2 epochs = 200 steps.
+  total_epochs: 2
+  total_training_steps: 200
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  save_freq: 50
+  # Battle spec: held-out validation every 10 optimizer steps.
+  test_freq: 10
+  val_before_train: true
+  resume_mode: disable
+  save_checkpoint_on_identity_failure: true
+  export_actor_weights_on_identity_failure: true
+  validation_data_dir: experiments/webshop/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/webshop/${trainer.experiment_name}/rollout_log
+  logger: [console, wandb]
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  grpo:
+    # NeurIPS-era CHORD/LUFFY baselines all ran WITH baseline separation
+    # (webshop_qwen3b_luffy.yaml lines 29-33) — keep it for comparability.
+    teacher_baseline_separation:
+      enable: true
+      teacher_baseline: all_mean
+      non_teacher_baseline: non_teacher_mean
+      std_source: non_teacher
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: strict
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: additive
+
+actor_rollout_ref:
+  model:
+    path: /projects_vol/gp_wangwy/models/Qwen3.5-4B
+    # Qwen3.5 Gated DeltaNet cannot use verl's remove-padding/Ulysses patch.
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+  actor:
+    behavior_logprob_fp32_temperature: true
+    # LUFFY's shaped teacher term must still train when on-policy advantages
+    # are all-equal; the pure-GRPO zero-advantage skip is not part of the
+    # NeurIPS baseline.
+    skip_zero_advantage_grpo_update: false
+    optim:
+      lr: 1.0e-06
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 16
+    ppo_max_token_len_per_gpu: 32768
+    # NeurIPS LUFFY definition keeps the KL loss on (CHORD switches it off).
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    # ---- LUFFY baseline (policy shaping, no teacher log-prob) ----
+    use_dr3: false
+    use_chord: false
+    use_uniform_mix: false
+    teacher_use_log_prob: false
+    teacher_policy_shaping_enable: true
+    teacher_policy_shaping_mode: p_div_p_beta
+    teacher_policy_shaping_beta: 0.1
+    teacher_use_clip: false
+    use_dapo: false
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: true
+    thinking_mode: native_qwen35
+    enable_request_id: false
+    prompt_length: 22528
+    response_length: 10240
+    max_model_len: 32768
+    # Hitting 10K means no valid action was produced: episode ends, scored as
+    # failure with a small penalty (WebShop snapshot-gate contract).
+    length_truncation_reward: -0.1
+    length_truncation_max_decision_fraction: 0.10
+    temperature: 0.6
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: external_vllm
+    # draft: server lane to be re-pointed at the duet-train smoke lane.
+    external_server_addresses:
+      - 127.0.0.1:8211
+      - 127.0.0.1:8212
+      - 127.0.0.1:8213
+      - 127.0.0.1:8214
+    external_request_timeout: 1200
+    external_sleep_between_steps: true
+    max_num_seqs: 1
+    enforce_eager: false
+    use_rollout_log_probs_as_old: true
+    rollout_logprob_drift_mean_threshold: 0.02
+    rollout_logprob_drift_p99_threshold: 0.25
+    rollout_importance_ratio_outside_clip_threshold: 0.01
+    rollout_logprob_drift_max_threshold: -1
+    max_trajectory_resubmits: 1
+    mode: async
+    gpu_memory_utilization: 0.25
+    n: 8
+    log_prob_max_token_len_per_gpu: 32768
+    val_kwargs:
+      n: 1
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      do_sample: false
+      seed: 2025
+    max_env_worker: 32
+    context_template: linear
+    context_template_train_sp_action: false
+    # 4K per-observation safety cap covers the observed WebShop maximum.
+    max_env_len: 4096
+    sparse: true
+    context_management:
+      enabled: true
+      max_prompt_tokens: 22528
+      # Four full turns cover search -> results -> product -> options/buy.
+      recent_turns: 4
+      min_recent_turns: 1
+      history_observation_max_tokens: 512
+      recent_observation_max_tokens: -1
+      allow_current_observation_truncation: false
+      reasoning_history_tokens: 0
+      snapshot_training: true
+      snapshot_selection: token_weighted
+      snapshot_selection_seed: 2025
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ''
+  ref:
+    behavior_logprob_fp32_temperature: true
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 32768
+
+critic:
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+
+data:
+  train_batch_size: 16
+  max_prompt_length: 22528
+  max_response_length: 10240
+  filter_overlong_prompts: true
+  truncation: error
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 8
+  max_val_tasks: 200
+  validation_shuffle: false
+  dataloader_num_workers: 0
+  val_type: val
+  # Match the 1600-task teacher-collection manifest so the training task pool
+  # is the pool the teacher data was drawn from (599/1600 covered — WebShop's
+  # flash teacher only solved 599 tasks; unsolved tasks train pure-GRPO).
+  max_train_tasks: 1600
+  shuffle: true
+  seed: 2025
+  task_seed: 2026
+
+env_service:
+  env_type: webshop
+  env_url: http://127.0.0.1:8083
+  env_params:
+    action_format: react_tags
+    enable_action_sanitizer: true
+    invalid_action_penalty: -0.05
+    invalid_action_penalty_cap: -0.1
+    max_consecutive_invalid_actions: 2
+    terminate_on_invalid_action: false
+    invalid_action_final_reward: -0.1
+
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/webshop.json
+
+exp_manager:
+  train_rollout_mode: woexp
+  val_rollout_mode: woexp
+  rollout_ratio: 0
+  train_sample_mode: alldiscard
+  train_sample_keepratio: 0.0
+  experience_template: 'Some Related Experience: <EXP>{}</EXP>'
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: http://127.0.0.1:8124
+    workspace_id: webshop_qwen35_4b_luffy_iclr_b16_s200
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  experience_replay:
+    enable: false
+  teacher_experience:
+    enable: true
+    mix_mode: rollout_level
+    data_path: data/teacher_trajectories/iclr2027_flash/webshop_dsv4flash_success_dedup.jsonl
+    n_teacher_rollouts_per_task: 1
+    # NeurIPS value kept for parity; the v2 file has exactly 1 success/task.
+    max_trajectories_per_task: 6
+    select_mode: random
+    use_log_prob: false
+    # LUFFY: shaping must be flipped on BOTH here and in actor.teacher_policy_shaping_*.
+    policy_shaping:
+      enable: true
+      mode: p_div_p_beta
+      beta: 0.1
+  state_channel:
+    enable: false
+
+attribution_driven_credit_assignment:
+  enable: false
+
+thread_pool:
+  max_workers: 8

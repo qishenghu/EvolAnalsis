@@ -62,6 +62,9 @@ VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE="${VLLM_ENABLE_FLA_PACKED_RECURRENT_DECO
 VLLM_CACHE_BASE="${VLLM_CACHE_BASE:-${RAY_TMPDIR}/duet_vllm_cache}"
 EXPERIMENT_TAG="${EXPERIMENT_TAG:-unbound}"
 EXPERIMENT_CONFIG="${EXPERIMENT_CONFIG:-}"
+# Health-wait attempts (x2s). Default keeps the historical 4-min cap; cold
+# torch.compile on a fresh node (empty node-local cache) can need far more.
+WAIT_ATTEMPTS="${WAIT_ATTEMPTS:-120}"
 
 LOG_DIR="${SCRIPT_DIR}/logs"
 PIDFILE="${LOG_DIR}/rollout_servers_${BASE_PORT}.pids"
@@ -234,7 +237,7 @@ start)
     echo "Launched ${i} servers on ports ${BASE_PORT}..$((BASE_PORT + i - 1)); pids in ${PIDFILE}"
     echo "Waiting for all servers to become ready..."
     all_ready=0
-    for attempt in $(seq 1 120); do
+    for attempt in $(seq 1 "${WAIT_ATTEMPTS}"); do
         all_ready=1
         for port in "${launched_ports[@]}"; do
             if ! curl -sf --connect-timeout 1 --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null; then

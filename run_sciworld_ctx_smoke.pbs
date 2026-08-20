@@ -1,0 +1,76 @@
+#!/bin/bash
+# SciWorld 上下文冒烟(2026-08-07):军规要求——教师全量采集前,验证学生在
+# 100 轮契约(recent 2/160 压缩)下的 rollout 与训练侧重渲染 token 逐字一致。
+# 流程:[1] GPU0 起学生 vLLM → [2] 本节点起 SciWorld 栈 → [3] 采 60 条学生
+# rollout(成败全落盘)→ [4] cll_teacher_profile --verify-only 校验 sha 一致性。
+# 副产品:SciWorld 学生冷启动 SR(90 分判据)。
+#PBS -N sci_ctx_smoke
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=48:ngpus=2:mem=300gb
+#PBS -l walltime=8:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/sci_ctx_smoke.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+OUT=$SCRATCH/student_rollouts
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200/sciworld_qwen35_4b_collect_h200.yaml
+STUDENT=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+VLLM_PORT=8000
+mkdir -p "$OUT"
+exec > >(tee -a "$SCRATCH/logs/sci_ctx_smoke.live.log") 2>&1
+echo "######## SCI CTX SMOKE start $(date '+%F %T') ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+duet_activate || { echo "ABORT: duet env"; exit 1; }
+VLLM_PY="$CONDA_PATH/envs/${CONDA_ENV_VLLM2:-vllm2}/bin/python"
+export VLLM_CACHE_ROOT="/tmp/vllm_cache_$(id -un)"
+export TRITON_CACHE_DIR="/tmp/triton_cache_$(id -un)"
+export TMPDIR=/tmp/duet_tmp_$(id -un); mkdir -p "$TMPDIR" "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR"
+
+VPID=""
+cleanup() {
+    [ -n "$VPID" ] && kill "$VPID" 2>/dev/null
+    bash start_env_sciworld.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+CUDA_VISIBLE_DEVICES=0 VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 \
+"$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+    --model "$STUDENT" --served-model-name qwen35-4b-student \
+    --tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 16 \
+    --gpu-memory-utilization 0.85 --port $VLLM_PORT \
+    --reasoning-parser qwen3 \
+    >> "$SCRATCH/logs/vllm_student4b.log" 2>&1 &
+VPID=$!
+for i in $(seq 1 90); do
+    kill -0 "$VPID" 2>/dev/null || { echo "ABORT: vLLM died"; exit 1; }
+    curl -sf --max-time 8 "http://127.0.0.1:$VLLM_PORT/v1/models" >/dev/null && break
+    [ $i -eq 90 ] && { echo "ABORT: vLLM timeout"; exit 1; }
+    sleep 10
+done
+echo "student vLLM up"
+bash start_env_sciworld.sh || { echo "ABORT: sciworld stack"; exit 1; }
+
+export OPENROUTER_API_KEY=EMPTY
+python scripts/collect_student_rollouts.py \
+    --config "$CFG" \
+    --env-url "http://127.0.0.1:8084" \
+    --task-file "data/sciworld/task_ids_1600_seed2026.txt" \
+    --output "$OUT/sciworld_qwen35_4b_student_rollouts.jsonl" \
+    --model qwen35-4b-student --api-base "http://127.0.0.1:$VLLM_PORT/v1" \
+    --api-key-env OPENROUTER_API_KEY \
+    --rollouts-per-task 1 --max-attempts-per-rollout 1 \
+    --max-tasks 60 --max-workers 8 --resume
+echo "rollout rc=$?"
+
+echo "---- token-identity verify (军规核心) ----"
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+"$VLLM_PY" analysis/cll_teacher_profile.py \
+    --input "$OUT/sciworld_qwen35_4b_student_rollouts.jsonl" \
+    --config "$CFG" --verify-only \
+    --output "$REPO/analysis_outputs/cll_teacher_profile/verify_sciworld_student.jsonl"
+echo "verify rc=$?"
+echo "######## SCI CTX SMOKE END $(date '+%F %T') ########"

@@ -1,0 +1,236 @@
+#!/bin/bash
+# =============================================================================
+# CHECKPOINT SWEEP — greedy vs sampled decoding on the frozen 128-task ALFWorld
+# held-out val set, for every saved p0_catalyst_af_s0 actor checkpoint.
+#
+# Question this job adjudicates: the in-training val curve (greedy, n=1,
+# temperature 0) rises then collapses while train-side SR stays flat.  Is that
+# collapse a *decoding artifact* (greedy reads the mode of a distribution that
+# training never optimises) or *real generalisation loss*?  Same checkpoints,
+# same 128 tasks, same harness, two decoders:
+#     greedy  : temperature 0,   top_p 1.0, 1 rollout/task   (= trainer val_kwargs)
+#     sampled : temperature 0.9, top_p 1.0, 4 rollouts/task  (= train rollout dist)
+#
+# Ruling (frozen before the run):
+#   sampled flat + greedy collapsing        -> decoding artifact, fix the eval protocol
+#   both collapsing                         -> real degradation, fix the algorithm
+#   anything else                           -> report both magnitudes honestly
+#
+# Inputs : $SCRATCH/ckpt_hf/p0_catalyst_af_s0/step_N  (bf16 HF dirs produced by
+#          scripts/merge_fsdp_ckpt_to_hf.py — run BEFORE submitting, they are
+#          pure-CPU work and must not burn queue time)
+# Outputs: $SCRATCH/ckpt_sweep/{step}_{greedy,sampled}.jsonl  (+ per-shard files)
+#          analysis_outputs/ckpt_sweep/ckpt_sweep_report.md
+# Watch  : tail -f /projects_vol/gp_wangwy/qisheng/duet_h200/logs/ckpt_sweep.live.log
+#
+# Single-slot discipline: this job asks for the same 4-GPU shape as the p0
+# training lane so PBS serialises them.  It never touches p0_q35af.
+# =============================================================================
+#PBS -N ckpt_sweep
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=120:ngpus=4:mpiprocs=8:mem=2000gb
+#PBS -l walltime=16:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/ckpt_sweep.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+# Every knob below defaults to the CATALYST sweep this file was written for, so
+# a bare `qsub run_ckpt_sweep.pbs` reproduces the historical run byte-for-byte.
+# A second method (e.g. the GRPO baseline) reuses the *identical* protocol by
+# overriding only the four "which run" variables through `qsub -v`:
+#   qsub -N ckpt_sweep_grpo -o $SCRATCH/logs/ckpt_sweep_grpo.pbs.log \
+#        -v SWEEP_TAG=grpo,SWEEP_STEPS="50 100",\
+#           SWEEP_HF_ROOT=$SCRATCH/ckpt_hf/p0_grpo_af_s0,\
+#           SWEEP_OUT_DIR=$SCRATCH/ckpt_sweep_grpo,\
+#           SWEEP_PRIMARY_STEPS="50 100",SWEEP_SUPP_STEPS=none,SWEEP_KEEP_STEPS="50 100",\
+#           SWEEP_EXPERIMENT=p0_grpo_af_s0 \
+#        run_ckpt_sweep.pbs
+# Decoding protocol (temperatures, rollout counts, task file, MNS/GMU/PKD, the
+# per-checkpoint stack restart) is deliberately NOT overridable — it is the
+# thing being held constant across methods.
+export SWEEP_TAG="${SWEEP_TAG:-}"
+LIVELOG=$SCRATCH/logs/ckpt_sweep${SWEEP_TAG:+_$SWEEP_TAG}.live.log
+export STEPS="${SWEEP_STEPS:-30 40 50 60 70 20 10}"
+export SWEEP_OUT="${SWEEP_OUT_DIR:-$SCRATCH/ckpt_sweep}"
+export HF_ROOT="${SWEEP_HF_ROOT:-$SCRATCH/ckpt_hf/p0_catalyst_af_s0}"
+export SWEEP_LOGD="$SCRATCH/logs/ckpt_sweep${SWEEP_TAG:+_$SWEEP_TAG}"
+REPORT_OUT="${SWEEP_REPORT_OUT:-analysis_outputs/ckpt_sweep${SWEEP_TAG:+_$SWEEP_TAG}}"
+PRIMARY_STEPS="${SWEEP_PRIMARY_STEPS:-30,40,50,60,70}"
+SUPP_STEPS="${SWEEP_SUPP_STEPS:-10,20}"
+KEEP_STEPS="${SWEEP_KEEP_STEPS:-30 70}"
+# the report cross-checks the sweep against the trainer's own in-run greedy val
+# log under experiments/alfworld/<experiment>/validation_log — that path is
+# per-run, so it must follow HF_ROOT or the cross-check silently compares the
+# wrong training run.
+EXPERIMENT="${SWEEP_EXPERIMENT:-p0_catalyst_af_s0}"
+# `qsub -v` splits its argument on commas, so a caller cannot pass "50,100"
+# there.  Accept space-separated lists and the sentinel `none` (= empty), then
+# normalise to the comma form analysis/ckpt_sweep_report.py parses.
+[ "$PRIMARY_STEPS" = "none" ] && PRIMARY_STEPS=""
+[ "$SUPP_STEPS" = "none" ] && SUPP_STEPS=""
+PRIMARY_STEPS="${PRIMARY_STEPS// /,}"
+SUPP_STEPS="${SUPP_STEPS// /,}"
+export BASE_PORT="${SWEEP_BASE_PORT:-8301}"
+export SHARDS=4
+export WORKERS_PER_SHARD=16
+export MAX_NUM_SEQS=16
+export GPU_MEM_UTIL=0.35
+export PKD=1
+mkdir -p "$(dirname "$LIVELOG")" "$SWEEP_OUT"
+
+exec > >(tee -a "$LIVELOG") 2>&1
+echo "######## CKPT_SWEEP $(date '+%F %T') job=${PBS_JOBID:-?} host=$(hostname) steps='$STEPS' ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+
+source "$REPO/env_config.sh"
+
+# --- 统一前置 ---------------------------------------------------------------
+# GPU 索引重映射(2026-08-12:首跑七个 checkpoint 全挂在这里)。PBS 把
+# CUDA_VISIBLE_DEVICES 设成 GPU UUID(GPU-1f4f0195-...),而 vLLM 对它做 int()
+# 解析 → "invalid literal for int()" → 模型架构探测失败 → 服务起不来。训练 PBS
+# 一直靠 pf_run_all 把它换成 0,1,2,3;扫评脚本自建了前置检查却漏了这一步。
+# 现在统一走 scripts/duet_job_preamble.sh(等价于原来的 PF_EXPECT_NGPUS=4 +
+# source h200_node_preflight.sh + pf_run_all + 打印 CVD)。
+source "$REPO/scripts/duet_job_preamble.sh"
+duet_preamble_gpu 4 || { echo "ABORT: node preflight failed"; exit 1; }
+
+# --- red line: never disturb a co-located training job -----------------------
+# start_env_alfworld.sh frees ports 8081/36001 by killing their listeners, and a
+# training run's env_service is not on its protected-pattern list.  If a trainer
+# is live on THIS node, refuse to run rather than knife it.
+if pgrep -u "$(id -un)" -f "main_ppo" >/dev/null 2>&1 \
+   || pgrep -u "$(id -un)" -f "launcher.py --conf" >/dev/null 2>&1; then
+    echo "ABORT: a training process is live on this node — refusing to touch ports 8081/36001"
+    exit 1
+fi
+
+# --- red line: 4-GPU account quota (LANDMINES N7) ----------------------------
+# PBS 只在集群繁忙时才会替我们串行;空闲时两个 4 卡作业会并行 = 8 卡超额。
+# depend=afterany:<jobid> 也堵不住:队列 runner 的自动续跑会生成新作业号绕过
+# 依赖(2026-08-16 实炸 3.6 小时)。因此本作业开跑前自查:同用户还有其他
+# R 态作业 → 秒退(exit 3),把竞态代价从小时压到秒;由提交方稍后重投。
+OTHER_RUNNING=$(qstat -u "$(id -un)" 2>/dev/null | awk -v me="${PBS_JOBID%%.*}" \
+    '$1 ~ /^[0-9]/ { split($1,a,"."); if (a[1] != me && $10 == "R") n++ } END { print n+0 }')
+if [ "${OTHER_RUNNING:-0}" -gt 0 ]; then
+    echo "ABORT: $OTHER_RUNNING other running job(s) under this account — 4-GPU quota (N7); exiting immediately, resubmit after they finish"
+    exit 3
+fi
+
+# rollout inference never authenticates to W&B; the collector runs wandb-off.
+# (duet_preamble_wandb also unsets WANDB_DISABLED — no behaviour change, since
+#  WANDB_MODE=disabled dominates it either way.)
+duet_preamble_wandb disabled
+# 2026-08-12:曾在此 export VLLM_API_KEY=EMPTY —— vLLM 见到该变量就对 /v1/*
+# 启用鉴权,而 start_rollout_servers.sh 的健康校验用不带 Authorization 头的
+# curl 查 /v1/models,必然 401,于是把已经就绪的服务误判成"起不来"(两次
+# 扫评 7/7 checkpoint 全挂在这里)。服务端不设它;采集器侧只需一个占位 key。
+unset VLLM_API_KEY
+export DUET_EVAL_API_KEY=EMPTY
+
+duet_activate || { echo "ABORT: duet env activation failed"; exit 1; }
+echo "collector python: $(which python) ($(python -V 2>&1))"
+
+# --- preflight: merged checkpoints -------------------------------------------
+missing=0
+for s in $STEPS; do
+    if [ ! -f "$HF_ROOT/step_${s}/MERGE_DONE.json" ]; then
+        echo "PREFLIGHT: missing merged checkpoint $HF_ROOT/step_${s}"
+        missing=1
+    fi
+done
+[ "$missing" = "1" ] && { echo "ABORT: merge the checkpoints first (scripts/merge_fsdp_ckpt_to_hf.py)"; exit 1; }
+echo "preflight: all $(echo $STEPS | wc -w) merged checkpoints present"
+
+# --- preflight: the frozen val curriculum ------------------------------------
+python - <<'EOF' || { echo "ABORT: val curriculum drift"; exit 1; }
+import hashlib, pathlib
+raw = pathlib.Path("data/alfworld/val_task_ids_128_seed2025.txt").read_bytes()
+sha = hashlib.sha256(raw).hexdigest()
+expect = "d90efe607c6d63c518968d8ab6a10cb2575d3dff2b4ea6d4e6609ee041680187"
+assert sha == expect, f"val task file sha {sha} != {expect}"
+print(f"val curriculum verified: 128 tasks sha256={sha}")
+EOF
+
+# --- preflight: no stale rollout lane on this node (L6) ----------------------
+PIDFILE="$REPO/logs/rollout_servers_${BASE_PORT}.pids"
+duet_preamble_pidfile_heal "$PIDFILE" || exit 1
+
+# --- AlfWorld leak mitigation (L2) -------------------------------------------
+# Every env reset unpacks a fresh libdownward.so into TMPDIR; a job-lifetime
+# /var/tmp/pbs.<jobid> accumulates tens of thousands of dirs.  Node-local
+# TMPDIR + a sweeper handles the DISK half; the driver additionally restarts the
+# whole stack between checkpoints, which is what actually handles the mmap half
+# (the sweeper cannot — see docs/infra/LANDMINES.md L2).
+duet_preamble_tmp || exit 1
+ALF_CLEANER_PID=$(duet_preamble_alfworld_cleaner) || exit 1
+
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "${ALF_CLEANER_PID:-}" ] && kill "$ALF_CLEANER_PID" 2>/dev/null
+    BASE_PORT=$BASE_PORT bash start_rollout_servers.sh stop 2>/dev/null || true
+    env -u CONDA_ENV_DUET bash start_env_alfworld.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# --- the sweep ----------------------------------------------------------------
+bash scripts/ckpt_sweep_driver.sh
+sweep_rc=$?
+echo "---- driver exited rc=$sweep_rc $(date '+%F %T') ----"
+
+# --- consolidate shards + report ---------------------------------------------
+for s in $STEPS; do
+    for mode in greedy sampled; do
+        # [0-9] not *: excludes the `.jsonl.attempts.jsonl` telemetry sidecars,
+        # which otherwise land in the consolidated file (384 lines for a 128-
+        # rollout greedy pass) and inflate the completeness gate below.
+        shards=("$SWEEP_OUT"/${s}_${mode}_shard[0-9].jsonl)
+        if [ -f "${shards[0]}" ]; then
+            cat "${shards[@]}" > "$SWEEP_OUT/${s}_${mode}.jsonl"
+            echo "consolidated $SWEEP_OUT/${s}_${mode}.jsonl ($(wc -l < "$SWEEP_OUT/${s}_${mode}.jsonl") records)"
+        fi
+    done
+done
+
+python analysis/ckpt_sweep_report.py --sweep-dir "$SWEEP_OUT" \
+    --primary-steps "$PRIMARY_STEPS" --supplementary-steps "$SUPP_STEPS" \
+    --experiment "$EXPERIMENT" \
+    --out-dir "$REPORT_OUT" || echo "WARNING: report generation failed"
+
+# same three numbers through the pass@3 unbiased estimator (cross-method table)
+python analysis/sweep_table.py --sweep-dir "$SWEEP_OUT" --steps "$STEPS" \
+    --label "${SWEEP_TAG:-catalyst}" || echo "WARNING: sweep_table failed"
+
+# --- disk: keep only the peak/trough merged checkpoints ----------------------
+# Gated hard: prune only when the sweep succeeded outright AND every step landed
+# its full 128 greedy + 512 sampled records AND the report exists.  A partial
+# sweep keeps every merged dir so it can simply be resumed.
+if [ "$sweep_rc" = "0" ] && [ -f "$REPORT_OUT/ckpt_sweep_report.md" ]; then
+    complete=1
+    for s in $STEPS; do
+        g=$(grep -c '"rollout_id"' "$SWEEP_OUT/${s}_greedy.jsonl" 2>/dev/null)
+        p=$(grep -c '"rollout_id"' "$SWEEP_OUT/${s}_sampled.jsonl" 2>/dev/null)
+        if [ "${g:-0}" -lt 128 ] || [ "${p:-0}" -lt 512 ]; then
+            echo "keep-all: step $s incomplete (greedy=${g:-0}/128 sampled=${p:-0}/512)"
+            complete=0
+        fi
+    done
+    if [ "$complete" = "1" ]; then
+        for d in "$HF_ROOT"/step_*; do
+            keep=0
+            for s in $KEEP_STEPS; do
+                [ "$(basename "$d")" = "step_${s}" ] && keep=1
+            done
+            if [ "$keep" = "1" ]; then echo "keeping $d"; else echo "pruning $d"; rm -rf "$d"; fi
+        done
+    else
+        echo "keep-all: sweep incomplete, no merged checkpoint pruned"
+    fi
+else
+    echo "keep-all: sweep rc=$sweep_rc or no report — no merged checkpoint pruned"
+fi
+
+echo "######## CKPT_SWEEP END rc=$sweep_rc $(date '+%F %T') ########"
+exit "$sweep_rc"

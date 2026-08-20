@@ -3487,8 +3487,311 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
 
             # summarize in batch: updating experience pool
             self.exp_manager.summarize_in_batch(trajectories)
-        
+
         return
+
+    # ==================== CATALYST (ICLR 2027, M1) ====================
+
+    def _catalyst_setup(self) -> None:
+        """CATALYST M1:互斥断言 + 渲染器挂载 + 治理状态续训加载。
+
+        默认关闭(exp_manager.catalyst.enable=false)时 self._catalyst=None,
+        fit 主循环中所有 catalyst 钩子零行为(字节等价纪律,规格 §0.2)。
+        """
+        self._catalyst = getattr(self.exp_manager, "catalyst", None)
+        if self._catalyst is None:
+            return
+        exp_cfg = self.config.exp_manager
+        actor_cfg = self.config.actor_rollout_ref.actor
+        algo_cfg = self.config.algorithm
+
+        def _sub_enabled(section: Any) -> bool:
+            try:
+                return bool((section or {}).get("enable", False))
+            except Exception:
+                return False
+
+        conflicts = {
+            "exp_manager.teacher_experience.enable": _sub_enabled(
+                exp_cfg.get("teacher_experience", {})
+            ),
+            "exp_manager.experience_replay.enable": _sub_enabled(
+                exp_cfg.get("experience_replay", {})
+            ),
+            "exp_manager.repo.enable": _sub_enabled(exp_cfg.get("repo", {})),
+            "exp_manager.state_channel.enable": _sub_enabled(
+                exp_cfg.get("state_channel", {})
+            ),
+            "actor.use_chord": bool(actor_cfg.get("use_chord", False)),
+            "actor.use_dr3": bool(actor_cfg.get("use_dr3", False)),
+            "actor.use_dapo": bool(actor_cfg.get("use_dapo", False)),
+            "algorithm.dapo.enable": _sub_enabled(algo_cfg.get("dapo", {})),
+            "algorithm.grpo.teacher_baseline_separation.enable": _sub_enabled(
+                (algo_cfg.get("grpo", {}) or {}).get(
+                    "teacher_baseline_separation", {}
+                )
+            ),
+        }
+        turned_on = sorted(key for key, value in conflicts.items() if value)
+        if turned_on:
+            raise RuntimeError(
+                "[CATALYST] M1 mutual-exclusion violated; disable these before "
+                f"enabling exp_manager.catalyst: {turned_on}"
+            )
+        actor_bc_cfg = (actor_cfg.get("catalyst", {}) or {}).get(
+            "replay_bc", {}
+        ) or {}
+        actor_bc_enable = bool(actor_bc_cfg.get("enable", False))
+        if actor_bc_enable != bool(self._catalyst.replay_enabled):
+            raise RuntimeError(
+                "[CATALYST] actor_rollout_ref.actor.catalyst.replay_bc.enable "
+                f"({actor_bc_enable}) must equal exp_manager.catalyst.replay."
+                f"enable ({self._catalyst.replay_enabled})"
+            )
+        self._catalyst.attach_renderer(
+            self.tokenizer, self.config.actor_rollout_ref.rollout
+        )
+        self._catalyst_state_path = self._catalyst.state_path(
+            self.config.trainer.default_local_dir
+        )
+        try:
+            self._catalyst.load_persistent_state(self._catalyst_state_path)
+        except FileNotFoundError:
+            pass
+        logger.info(
+            "[CATALYST] setup complete: "
+            f"v4={'on' if getattr(self._catalyst, 'v4_enabled', False) else 'off'}, "
+            f"replay={'on' if self._catalyst.replay_enabled else 'off'}, "
+            f"entry={'on' if self._catalyst.entry_enabled else 'off'}, "
+            f"arm_baseline={'on' if self._catalyst.arm_baseline_enabled else 'off'}, "
+            f"thermostat={'on' if self._catalyst.thermostat_enabled else 'off'}, "
+            f"state={self._catalyst_state_path}"
+        )
+
+    def _catalyst_align_batch_for_dp(self, batch: DataProto, metrics: dict) -> DataProto:
+        """进 update_actor 前保证批长可被 DP world_size 等分。
+
+        对齐发生在 to_dataproto 里,但此后批还会经历 union/过滤,长度可能再次
+        变得不整除(2026-08-09 冒烟:35 vs chunk 2 → assert 失败)。这里做最后
+        一道修正:**只丢弃 CATALYST 重放行**(辅助 BC 通道,少几行无损正确性),
+        策略行一行不动;若丢光重放行仍不整除则原样放行,让底层 assert 暴露真因。
+        """
+        if "catalyst_replay_mask" not in batch.batch:
+            return batch
+        # 除数 = lcm(world_size, ppo_mini_batch_size):dispatch 按 world_size 等分,
+        # worker 内部再按 per-GPU mini-batch 等分,两级都必须整除(2026-08-09:
+        # 140 行能被 4 整除却不能被 mini_batch 8 整除,炸在第二级)。
+        ws = int(getattr(self.actor_rollout_wg, "world_size", 1) or 1)
+        try:
+            mini = int(
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            )
+        except Exception:  # noqa: BLE001 - 配置缺失时退化为仅按 world_size 对齐
+            mini = ws
+        dp = math.lcm(max(ws, 1), max(mini, 1))
+        total = len(batch)
+        if dp <= 1 or total % dp == 0:
+            return batch
+        replay_rows = (
+            batch.batch["catalyst_replay_mask"].sum(dim=-1) > 0
+        ).nonzero(as_tuple=True)[0].tolist()
+        if not replay_rows:
+            return batch
+        base = total - len(replay_rows)
+        # 需要保留的重放行数 n:(base + n) ≡ 0 (mod dp),取满足条件的最大 n
+        need = (-base) % dp
+        keep_n = need + ((len(replay_rows) - need) // dp) * dp if len(replay_rows) >= need else -1
+        if keep_n < 0:
+            logger.warning(
+                f"[CATALYST] cannot align batch for DP: total={total} base={base} "
+                f"replay={len(replay_rows)} dp={dp}; leaving batch untouched"
+            )
+            return batch
+        drop = set(replay_rows[keep_n:])
+        kept_idx = [i for i in range(total) if i not in drop]
+        metrics["catalyst/replay_dp_dropped"] = float(len(drop))
+        logger.info(
+            f"[CATALYST] DP align: dropped {len(drop)} replay row(s); "
+            f"{total} -> {len(kept_idx)} (dp={dp})"
+        )
+        return batch.select_idxs(kept_idx)
+
+    def _catalyst_post_advantage(
+        self, batch: DataProto, entropys: Optional[torch.Tensor]
+    ) -> dict:
+        """compute_advantage 之后的 CATALYST 后处理(顺序敏感)。
+
+        ① 重放行 advantage 清零(规格 F5:单样本 uid 组的 GRPO 优势=原始 score,
+           必须显式归零,重放样本"只 BC 无 PG");
+        ② 熵恒温器:A′ = A + λ(−logπ − b)(mask 剔除重放行,保证 ① 不被平移
+           破坏);λ ← clip(λ + η(H_ref − Ĥ), 0, λ_max)。
+        """
+        metrics: dict = {}
+        cat = self._catalyst
+        advantages = batch.batch["advantages"]
+        resp_len = advantages.shape[-1]
+        # ================================================================
+        # ⭐ CATALYST v4:统一优势覆写(所有行,裸/hint/entry 一视同仁)。
+        # A_i = r_i − (n₀·m + Σ_{j≠i} r_j)/(n₀ + k − 1),组 = 本批同
+        # (uid 基, context);m 为 plan 时冻结 V̂(extras 透传)。大组时
+        # ≈ RLOO 留一均值,孤样本退化为先验,全同组照样出梯度。
+        # ================================================================
+        if getattr(cat, "v4_enabled", False):
+            from agentevolver.module.exp_manager.catalyst_v4 import (
+                ctx_key,
+                v4_loo_prior_advantage,
+            )
+
+            extras_arr = batch.non_tensor_batch.get("extras", None)
+            uid_arr = batch.non_tensor_batch.get("uid", None)
+            if extras_arr is not None and uid_arr is not None:
+                rewards_t = batch.batch["token_level_rewards"].sum(dim=-1)
+                resp_mask = batch.batch["response_mask"].to(advantages.dtype)
+                n0 = float(getattr(cat, "v4_n0", 2.0))
+                n_fbins = int(getattr(cat.v4_alloc, "n_fbins", 5))
+                groups: dict = {}
+                for row_index in range(len(advantages)):
+                    extra = (
+                        extras_arr[row_index]
+                        if row_index < len(extras_arr)
+                        else None
+                    )
+                    if not isinstance(extra, dict):
+                        continue
+                    m = extra.get("catalyst_v4_m")
+                    if m is None:
+                        continue  # 非 v4 行(理论不应出现)保持原优势
+                    arm = extra.get("catalyst_arm") or "bare"
+                    ctx = ctx_key(
+                        arm, extra.get("catalyst_entry_frac"), n_fbins
+                    )
+                    base_uid = str(uid_arr[row_index]).split("|")[0]
+                    groups.setdefault((base_uid, ctx), []).append(
+                        (row_index, float(m))
+                    )
+                n_rows = 0
+                adv_sum = 0.0
+                n_signal = 0
+                for (_, _), members in groups.items():
+                    rs = [
+                        1.0 if float(rewards_t[i].item()) > 0.0 else 0.0
+                        for i, _ in members
+                    ]
+                    ms = [m for _, m in members]
+                    a_vals = v4_loo_prior_advantage(rs, ms, n0)
+                    for (row_index, _), a in zip(members, a_vals):
+                        advantages[row_index] = a * resp_mask[row_index]
+                        n_rows += 1
+                        adv_sum += a
+                        if abs(a) > 0.05:
+                            n_signal += 1
+                if n_rows:
+                    metrics["catalyst/v4_adv_rows"] = float(n_rows)
+                    metrics["catalyst/v4_adv_mean"] = adv_sum / n_rows
+                    metrics["catalyst/v4_signal_density"] = n_signal / n_rows
+            return metrics
+        replay_rows = None
+        crm_full = batch.batch.get("catalyst_replay_mask", None)
+        if crm_full is not None:
+            crm = crm_full[:, -resp_len:]
+            replay_rows = crm.sum(dim=-1) > 0
+            if bool(replay_rows.any()):
+                advantages[replay_rows] = 0.0
+            metrics["catalyst/replay_rows_zeroed"] = float(
+                replay_rows.sum().item()
+            )
+        # ⭐ CATALYST v3 课程 critic:entry/hint 行优势覆写 A = r − V̂
+        # (v3 设计 §1.2 + v3.1 追录:高成功率小组在分臂组基线下大概率全同
+        # → 优势恒 0,最强通道发零梯度;V̂ 在 plan 时冻结并经 metadata→extras
+        # 透传,与采样时的课程状态一致)。hint 覆写由 vhat 键的存在性门控
+        # (仅 hint_critic_baseline=true 时 plan 侧才写入)。
+        entry_critic_on = (
+            getattr(cat, "entry_enabled", False)
+            and getattr(cat, "entry_mode", "ladder") == "interval"
+        )
+        hint_critic_on = bool(getattr(cat, "hint_critic_baseline", False))
+        if entry_critic_on or hint_critic_on:
+            extras_arr = batch.non_tensor_batch.get("extras", None)
+            if extras_arr is not None:
+                rewards = batch.batch["token_level_rewards"].sum(dim=-1)
+                resp_mask = batch.batch["response_mask"].to(advantages.dtype)
+                scale = float(getattr(cat, "entry_adv_scale", 1.0))
+                stats = {"entry": [0, 0.0], "hint": [0, 0.0]}
+                for row_index in range(len(advantages)):
+                    extra = (
+                        extras_arr[row_index]
+                        if row_index < len(extras_arr)
+                        else None
+                    )
+                    if not isinstance(extra, dict):
+                        continue
+                    arm = extra.get("catalyst_arm")
+                    if arm == "entry" and entry_critic_on:
+                        vhat = float(
+                            extra.get("catalyst_entry_vhat", 0.0) or 0.0
+                        )
+                    elif (
+                        arm == "hint"
+                        and hint_critic_on
+                        and extra.get("catalyst_hint_vhat") is not None
+                    ):
+                        vhat = float(extra["catalyst_hint_vhat"])
+                    else:
+                        continue
+                    r = 1.0 if float(rewards[row_index].item()) > 0.0 else 0.0
+                    a = (r - vhat) * scale
+                    advantages[row_index] = a * resp_mask[row_index]
+                    stats[arm][0] += 1
+                    stats[arm][1] += a
+                for arm, (n_over, adv_sum) in stats.items():
+                    if n_over:
+                        metrics[f"catalyst/{arm}_adv_rows"] = float(n_over)
+                        metrics[f"catalyst/{arm}_adv_mean"] = adv_sum / n_over
+        if cat.thermostat_enabled:
+            if self.config.actor_rollout_ref.rollout.multi_turn.enable:
+                thermo_mask = batch.batch["loss_mask"][:, -resp_len:]
+            else:
+                thermo_mask = batch.batch["response_mask"]
+            thermo_mask = thermo_mask.to(advantages.dtype)
+            if replay_rows is not None:
+                thermo_mask = thermo_mask * (
+                    (~replay_rows).unsqueeze(-1).to(thermo_mask.dtype)
+                )
+            denom = thermo_mask.sum().clamp_min(1.0)
+            old_lp = batch.batch["old_log_probs"]
+            if entropys is None or entropys.shape != advantages.shape:
+                raise RuntimeError(
+                    "[CATALYST] thermostat requires response-aligned entropys"
+                )
+            h_hat = float(
+                ((entropys.to(advantages.dtype) * thermo_mask).sum() / denom)
+                .item()
+            )
+            neg_lp = -old_lp.to(advantages.dtype)
+            baseline_b = (neg_lp * thermo_mask).sum() / denom
+            shift = cat.thermo_lambda * (neg_lp - baseline_b) * thermo_mask
+            advantages += shift
+            metrics.update(
+                {
+                    "catalyst/lambda": float(cat.thermo_lambda),
+                    "catalyst/h_hat": h_hat,
+                    "catalyst/h_ref": float(cat.thermo_h_ref),
+                    "catalyst/thermo_b": float(baseline_b.item()),
+                    "catalyst/adv_shift_abs_mean": float(
+                        (shift.abs().sum() / denom).item()
+                    ),
+                }
+            )
+            cat.thermo_lambda = min(
+                max(
+                    cat.thermo_lambda
+                    + cat.thermo_eta * (cat.thermo_h_ref - h_hat),
+                    0.0,
+                ),
+                cat.thermo_lambda_max,
+            )
+            metrics["catalyst/lambda_next"] = float(cat.thermo_lambda)
+        return metrics
 
 
     def fit(self):
@@ -3508,6 +3811,10 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
             )
 
         self.global_steps = 0
+
+        # ⭐ CATALYST:互斥断言 + 渲染器挂载 + 治理状态加载(默认关闭时
+        # self._catalyst=None,后续所有钩子零行为)。
+        self._catalyst_setup()
 
         # load checkpoint before doing anything
         self._load_checkpoint()
@@ -3794,6 +4101,24 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             task_exp_configs = self.exp_manager.get_complete_exp_configs(tasks, mode="sample")
                             assert len(task_exp_configs)==len(tasks), "{len(task_exp_configs)=}, {len(gen_batch)=}"
 
+                            # ⭐ CATALYST 工作项①:R0/R1 路由 + 每任务提示臂槽位
+                            # (ρ_task 量化;validate 模式不经此路径,永不注入)。
+                            if getattr(self, "_catalyst", None) is not None:
+                                catalyst_plan_metrics = self._catalyst.plan_arms(
+                                    tasks=tasks,
+                                    task_exp_configs=task_exp_configs,
+                                    n_rollout=int(
+                                        self.config.actor_rollout_ref.rollout.n
+                                    ),
+                                    global_step=self.global_steps,
+                                )
+                                metrics.update(
+                                    {
+                                        f"catalyst/{k}": v
+                                        for k, v in catalyst_plan_metrics.items()
+                                    }
+                                )
+
                             # TODO enable tracing by jinli 0619
                             print("=" * 10 + "start fit rollout" + "=" * 10)
                             
@@ -3885,9 +4210,78 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                                     )
                             else:
                                 all_trajectories = trajectories
-                            
+
+                            # ⭐ CATALYST 工作项③/④:治理层双臂 EMA 更新 + 提示臂
+                            # 成功轨迹入池(含入池军规审计)+ 去提示重放样本构建
+                            # (仅当前批任务,规格 F7)。默认关闭零行为。
+                            catalyst_replay_samples = None
+                            if getattr(self, "_catalyst", None) is not None:
+                                catalyst_gov_metrics = (
+                                    self._catalyst.update_after_rollout(
+                                        trajectories, self.global_steps
+                                    )
+                                )
+                                metrics.update(
+                                    {
+                                        f"catalyst/{k}": v
+                                        for k, v in catalyst_gov_metrics.items()
+                                    }
+                                )
+                                (
+                                    catalyst_replay_samples,
+                                    catalyst_replay_metrics,
+                                ) = self._catalyst.build_replay_samples(
+                                    tasks,
+                                    global_step=self.global_steps,
+                                    max_prompt_len=int(
+                                        self.config.data.max_prompt_length
+                                    ),
+                                    max_response_len=int(
+                                        self.config.data.max_response_length
+                                    ),
+                                )
+                                metrics.update(
+                                    {
+                                        f"catalyst/{k}": v
+                                        for k, v in catalyst_replay_metrics.items()
+                                    }
+                                )
+                                # 治理状态持久化 + per-task dump(F4 图证据)
+                                try:
+                                    self._catalyst.save_persistent_state(
+                                        self._catalyst_state_path
+                                    )
+                                    rollout_data_dir = self.config.trainer.get(
+                                        "rollout_data_dir", None
+                                    )
+                                    if rollout_data_dir:
+                                        os.makedirs(
+                                            rollout_data_dir, exist_ok=True
+                                        )
+                                        catalyst_dump_path = os.path.join(
+                                            rollout_data_dir,
+                                            f"catalyst_gov_step_{self.global_steps}.json",
+                                        )
+                                        with open(
+                                            catalyst_dump_path,
+                                            "w",
+                                            encoding="utf-8",
+                                        ) as catalyst_dump_file:
+                                            json.dump(
+                                                self._catalyst.per_task_dump(),
+                                                catalyst_dump_file,
+                                                ensure_ascii=False,
+                                                indent=1,
+                                            )
+                                except Exception as catalyst_persist_error:
+                                    logger.warning(
+                                        "[CATALYST] state/dump persistence "
+                                        f"failed: {catalyst_persist_error}"
+                                    )
+
                             gen_batch_output = self.env_manager.to_dataproto(
-                                all_trajectories, optimizer_batch=True
+                                all_trajectories, optimizer_batch=True,
+                                extra_samples=catalyst_replay_samples,
                             )
                             
                             # update metrics about experience manager
@@ -3944,7 +4338,26 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                     if "group_ids" in batch.batch:
                         # group_ids 是 tensor，shape: (batch_size,)
                         group_ids = batch.batch["group_ids"].cpu().numpy()
-                        batch.non_tensor_batch["uid"] = np.array([str(int(gid)) for gid in group_ids], dtype=object)
+                        # ⭐ CATALYST 工作项②分臂基线(D1 uid 后缀方案):提示臂
+                        # 样本 uid 加 "|h" 后缀 → 现有 GRPO 分组函数自动得到
+                        # (task, arm) 分组的均值/方差,零数学新代码。裸臂/重放
+                        # 样本(自带独立 data_id)不加后缀。默认关闭走原路径。
+                        if (
+                            getattr(self, "_catalyst", None) is not None
+                            and self._catalyst.arm_baseline_enabled
+                        ):
+                            from agentevolver.module.exp_manager.catalyst import (
+                                arm_uid_values,
+                            )
+                            batch.non_tensor_batch["uid"] = np.array(
+                                arm_uid_values(
+                                    group_ids,
+                                    batch.non_tensor_batch.get("extras", None),
+                                ),
+                                dtype=object,
+                            )
+                        else:
+                            batch.non_tensor_batch["uid"] = np.array([str(int(gid)) for gid in group_ids], dtype=object)
                     else:
                         # 如果没有 group_ids，使用随机 UUID（向后兼容）
                         batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
@@ -5218,6 +5631,15 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             config=self.config.algorithm,
                         )
 
+                        # ⭐ CATALYST 后处理(顺序敏感):① 重放行优势清零(单
+                        # 样本 uid 组的 GRPO 优势=原始 score,规格 F5)→ ② 熵
+                        # 恒温器 A′=A+λ(−logπ−b)(mask 已剔除重放行)。
+                        if getattr(self, "_catalyst", None) is not None:
+                            catalyst_adv_metrics = self._catalyst_post_advantage(
+                                batch, entropys
+                            )
+                            metrics.update(catalyst_adv_metrics)
+
                         # ============================================================================
                         # SC Post-GRPO Injection: Add SC bonus to on-policy advantages.
                         # This preserves PBRS guarantee: SC shapes learning signal without
@@ -5765,6 +6187,11 @@ class AgentEvolverRayPPOTrainer(RayPPOTrainer):
                             for _tmp_key in ["_sc_progress", "_sc_bonus", "_sc_coverage", "_sc_matched_states", "_sc_reward_pre_shaping", "_sc_tlr_before_shaping"]:
                                 batch.batch.pop(_tmp_key, None)
                             batch.non_tensor_batch.pop("_sl_per_sample_deltas", None)
+                            # ⭐ CATALYST:update_actor 按 DP world_size 等分切批
+                            # ("only support equal chunk"),而重放行注入后批长
+                            # 可能不整除(2026-08-09 冒烟:35 vs chunk 2)。重放
+                            # 是辅助 BC 通道,按需丢几行无损正确性;策略行一行不动。
+                            batch = self._catalyst_align_batch_for_dp(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)  # ⭐ Update the actor with the new batch
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

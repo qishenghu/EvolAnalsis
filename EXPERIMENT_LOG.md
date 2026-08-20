@@ -319,3 +319,51 @@ Llama-3.2-3B-Instruct 即使在 system prompt 明确要求 XML 格式 + "Do NOT 
   - 诊断:**长度-only AUC = 0.558**(教师 n=400 实测),DR3 长度捷径不存在,特征硬化取消;教师 assistant token 中 **85.2% 是 think**(B 对 BC 通道的价值 ×6)。
   - 工程:权重同步移至 `/dev/shm`(88s→34-39s);teacher loss_mask 与 on-policy 对称(`force_training`);三处 think 解析条件修正。
 - **2026-07-31 夜:根因订正 + v2 发车**。前述 ALFWorld/WebShop 多次崩溃的主因是 `/no_think` 注入与 thinking 生成提示词冲突(非熵坍缩);新增 `native_qwen35` 模式修复,文本级验收全绿(0/64 畸形、标签 64/64 完整、输出长度恢复 17×)。实验重命名为 `{env}_qwen35_4b_grpo_v2`。教师采集脚本收尾截断 bug 已修,ALFWorld 重采中。
+
+---
+
+## 2026-08-04: Qwen3.5-122B 教师采集战役(GaaS H200 集群)
+
+**目标**:以 Qwen3.5-122B-A10B(同家族教师)在 ALFWorld/WebShop 各采 1600 任务(seed-2026 课程,与学生训练课程逐字一致)的教师轨迹,每轮 reasoning+action 完整;WebShop 环境可重放性作为硬性前置。
+
+**基建落地(登录节点已验证)**:
+- 新集群适配:`env_config.sh` 移植 GaaS 布局(conda-pack duet env、短 RAY_TMPDIR、ALFWORLD_DATA);`start_env_alfworld.sh` 取回 rebuttal 期集群修复版;`start_env_webshop.sh` 补 PYTHONPATH(vendored web_agent_site 非 pip 安装)+ 共享节点 kill 属主保护。
+- 新环境:`vllm2`(vllm 0.21.0,0.20.x 无二进制 wheel;驱动 580.65/CUDA13 兼容)服务 122B TP=4;`agentenv-webshop`(py3.8+faiss+jdk11+pyserini 索引)从零构建,首次在本集群跑通。
+- 采集器 `collect_openrouter_teacher_trajectories.py` 集群补丁:①py3.11 f-string 兼容;②学生 tokenizer 契约重钉本集群 stock `Qwen3.5-4B`(chat template 语义 = A100 的 -think patch:thinking 默认开+历史 think 剥离;tokenizer.json 与 A100 逐字节一致,template/config 哈希已重钉并注明跨机核对要求);③`OpenAITeacherLLM` 增加无 reasoning 字段时的 `<think>` 开标签重建(本地 vLLM 无 reasoning parser 时的规范化)。
+- 采集 config:`config/duet_paper_experiments_configs/iclr2027/collect_h200/{alfworld,webshop}_qwen35_4b_collect_h200.yaml` = v5/s200 生产基线全量拷贝,仅改 model.path 与 experiment_name,32K/22528/10240、native_qwen35、AF 2/160 与 WS 4/512 上下文合同逐字继承;两环境 `--contract-only` + live-profile 校验通过(contract_sha AF=3c5abb4e…、WS=c9610764…)。
+- 课程:`data/{alfworld,webshop}/task_ids_1600_seed2026.txt` 由采集器自身 `expected_curriculum`(pool shuffle seed 2026 取前 1600)生成;AF 池 2420、WS 池 6710;ordered sha AF=38373eb2…、WS=bd235d35…。
+
+**WebShop 可重放性(用户点名的风险)判定**:随机源定位于原版 princeton 代码 SimServer init 的无 seed goal shuffle(每次重启 goal↔session 映射漂移,即"同一 task 目标商品参数变"的根因);本 repo vendored 副本已带 `random.seed(233)` 修复("HBY: Fix")。实测验收:5 任务 × 同 boot 两次 create + 跨全栈重启,初始状态指纹全部一致 → **可重放性钉死**。同一验收门固化在 PBS 作业内每次开跑前重测(`scripts/accept_teacher_pilot.py webshop-determinism`)。
+
+**作业设计**(`run_teacher122b_collect.pbs`,gpu_as 4×H200,幂等可重提):vLLM 122B(TP=4,thinking-on 原生模板,reasoning parser 失败自动降级)→ 双环境栈 → WebShop 确定性门 → 试点 50 任务/env(逐 decision `<think>`+`<action>` 完整性 + slot SR 门:AF≥0.40/WS≥0.20)→ 全量 1600/env(每任务 1 成功槽,≤4 次尝试,双环境并发,--resume 续采)。产出:`$SCRATCH/teacher_data/qwen35_122b/{alfworld,webshop}_qwen35_122b_t1600_r1.jsonl` + attempts ledger + manifest(含全部实现/契约哈希)。
+
+## 2026-08-04 深夜: 双教师采集战役状态 + DeepSeek reasoning 开关发现
+
+**Qwen3.5-122B(4×H200,作业 42431)**: 试点验收门全过(AF slot SR 80%,WS ~34%;逐 decision think/action 完整性 100%),已转入 1600×2 全量。第一次作业(42420)被误杀:qstat 的 CPU 时间列被误读为运行时长;顺带修出三个真实缺口(看门狗 curl 无超时会在"端口通但接口挂"时永久卡死;torch.compile 缓存在 NFS 有多 rank 死锁风险,已改节点本地;新增 enforce-eager 回退档与监控停滞心跳)。
+
+**DeepSeek-v4-flash(OpenRouter,登录节点)**: 三轮试点迭代后跑通,全量 1600×2 已启动(fork 采集器 `collect_openrouter_teacher_trajectories_dsv4.py`,共享模块零改动以保 122B 契约)。三个问题与修复:
+1. 登录节点 ALFWorld TMPDIR 落 NFS → TextWorld 清理临时目录触发 ENOTEMPTY(silly-rename),50 任务全 500。修复:服务启动用节点本地 /tmp。
+2. **flash 多轮下默认不走 reasoning 通道**(501 decision 仅 18 个带 reasoning),内容只有一句内联理由。修复:强制 `reasoning: {enabled: true}`;随之暴露 OpenRouter/provider 解析缺陷——整个输出(含 `<action>` 与 EOS)进 reasoning 字段、content 为空。修复:fork 内确定性切分(最后一个完整 action 块归 content,其余归 think)+ decision 级 reasoning 缺失重试 + 成功轨迹逐 decision think 硬校验。
+3. **科学观察(值得进论文素材)**: reasoning 关/开把 flash 的 WebShop 严格成功从 **0/106 翻转到 32% slot SR(带 1.0 满分)**,ALFWorld 从 80%(无 think 内容)到 84%(带完整 think)。同协议对照 122B WS ~34%。教师侧 thinking 对 WebShop 属性精确对齐有决定性因果作用——teacher think 价值的直接证据。
+4. **上下文无罪核验**(用户质疑触发): WS 每页观测天然含 Instruction(26/27);全部成功轨迹 dropped_turns=0、prompt 峰值 10218<<22528;AF 侧用 60 个真实存盘 prompt 验证 goal 100% 在场(25 步长轨迹第 24 步仍在)。122B 同管线 28.8-34% 是决定性交叉证据。
+
+产出路径: `$SCRATCH/teacher_data/qwen35_122b/{env}_qwen35_122b_t1600_r1.jsonl`、`$SCRATCH/teacher_data/deepseek_v4_flash/{env}_dsv4flash_t1600_r1.jsonl`(各含 attempts ledger + 契约 manifest;失败试点 ledger 归档于 pilot_attempt*/ 保留证据链)。
+
+## 2026-08-05: 尝试上限提高到 8(用户批准),两段式实施
+
+契约里 max_attempts 不可热改,采用两段式:当期 4 次上限战役跑完(已入库成功零浪费)→ 补采战役对未覆盖任务追加 4 次(合计恰好 8)。新工件:`scripts/collect_openrouter_teacher_trajectories_topup.py`(统一补采 fork:--skip-tasks-covered-by 跳过一期覆盖任务并在契约记录 skip 文件哈希;--force-openrouter-reasoning 门控 OpenRouter reasoning 强制,flash 开/122B 关)、`run_teacher122b_topup.pbs`(42431 结束后提交)。flash 补采在登录节点于一期完成后启动。补采输出 `{env}_*_topup8.jsonl` 独立 manifest,最终教师集 = 一期 ∪ 补采。
+
+## 2026-08-08 → 08-20: CATALYST 训练战役(ALFWorld,Qwen3.5-4B,H200 4 卡)
+
+TEMPO 提案让位于 CATALYST 系列(experiential RL:教师册/成功池/hint 多 context 统一排产)。四代方法与三条定律、v4 统一分配法则(context 族 + V̂ 三层收缩 + m(1−m) 排产 + LOO 先验优势)的完整叙述见 `docs/research/CATALYST_v4_深度分析_2026-08-19.md`;各版设计与失败归因文档同目录按日期排列。
+
+**主结果(greedy val@128,ALFWorld held-out,step 10→100)**:
+- `p0_grpo10_af_s0/s1/s2`(GRPO 基线,n=8):终点 73.4 / 43.8 / 35.9,三种子中两个尾崩,波动剧烈。
+- `p0_catalystv4_af_s0`(v4,带 v1-v3 难度画像预填):30.5→75.0@100,巅峰 74.2@70。
+- `p0_catalystv4_af_s3`(**v4 零自举规范版**,seed 2025,公平性裁定后的正版):39.8→71.9@50(巅峰,同期全场最高)→ 71.1@80 → 39.8@100(末段崩溃)。零自举开局反而更快(摸底考=有效训练),画像非胜因。
+- 末段崩溃已读轨迹定性:策略锐化进"重复动作死循环"(失败样本 Invalid action≥3 次占比 16%@80→59%@100),GRPO 两种子同病,疑 greedy 解码伪象,pass@k 扫评裁决中。
+- `p0_catalystv5_af_s0`(v4+失败前缀 rescue 第四格):**负结果**,val 单调降至 30.5@60 停跑。死因=失败桶 90% 为超时徘徊轨迹(垃圾素材)+ m(1−m) 课程吸池 + epoch 门控洪水;三次诊断两次证伪全过程见 `docs/research/CATALYST_v5_负结果验尸_2026-08-20.md`。rescue 按现设计废弃,只进负结果/消融叙事。
+
+**在跑(2026-08-20 深夜)**:`ckpt_sweep_catalystv4s3`(job 50598,步序 50→80→70→100→90→…关键步优先)与 `ckpt_sweep_grpo10s2`(job 50599,depend 链)——10 checkpoint × {greedy 128, sampled n=4×128} 扫评,产出 pass@1/pass@3 终表(s3 vs s0 vs GRPO×3)与末段崩溃的"解码伪象 vs 真退化"裁决。grpo10 s0/s1 扫评已完成(`analysis_outputs/ckpt_sweep_grpo10*/`)。
+
+**资产位置(不在 git)**:checkpoints 与 catalyst 状态快照在 `$SCRATCH/checkpoints/` 与 `checkpoints/agentevolver/`;合并 HF 权重在 `$SCRATCH/ckpt_hf/`;扫评原始 jsonl 在 `$SCRATCH/ckpt_sweep_*/`;训练 rollout/validation 日志在 `experiments/alfworld/p0_*/`;wandb 项目 `agentevolver`(注意 PBS 每次重启同名新开 run,曲线分段)。

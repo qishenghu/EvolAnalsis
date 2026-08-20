@@ -30,6 +30,7 @@ from agentevolver.utils.step_parser import parse_response_ids_to_steps
 from agentevolver.module.task_manager.rewards import LlmAsJudgeRewardCalculator,LlmAsJudgeRewardCalculatorWithGT,LlmAsJudgeBinaryRewardCalculator,LlmAsJudgeBinaryRewardCalculatorWithGT,EnvGrader, AvgBinaryGTJudge, AvgLlmJudge
 from beast_logger import register_logger
 from agentevolver.module.exp_manager.exp_manager import TaskExpConfig, TrajExpConfig
+from agentevolver.module.exp_manager.catalyst_entry import CatalystEntryReplayError
 
 
 def _sample_uid(sample: Sample) -> str:
@@ -470,6 +471,24 @@ class ParallelEnvManager(object):
                 trajectory.metadata["rollout_mode"] = mode
                 return trajectory
 
+            except CatalystEntryReplayError as e:
+                # ⭐ CATALYST v2:教师前缀重放失败 → 该槽降级为裸臂重试。
+                # 半推进的 env 实例被丢弃(下一轮 EnvWorker 会新建实例),
+                # 绝不把"任务做了一半"的状态当裸 rollout 用。
+                logger.warning(
+                    f"[CATALYST] entry replay failed for task "
+                    f"{traj_exp_config.task_id} rollout {rollout_id}: {e}; "
+                    "degrading this slot to bare and retrying"
+                )
+                traj_exp_config.catalyst_entry_plan = None
+                traj_exp_config.catalyst_arm = "bare"
+                traj_exp_config.catalyst_entry_degraded = True
+                if retry == max_retry - 1:
+                    # 最后一轮才失败:没有重试额度再跑裸臂了,fail-fast
+                    # 走上层 trajectory-resubmit,不能静默返回 None。
+                    raise
+                continue
+
             except Exception as e:
                 if retry < max_retry - 1:
                     logger.bind(exception=True).exception(f"rollout_env_worker error: {e.args}, retrying {retry + 1}/{max_retry}")
@@ -538,11 +557,55 @@ class ParallelEnvManager(object):
             # 2. submit: submit all tasks to the thread pool
             for data_id, (task, task_exp_config) in enumerate(zip(tasks, task_exp_configs)):
                 task_rollout_n = task_rollout_counts[data_id]
+                # ⭐ CATALYST 提示臂:每槽位 hint 文本(None=裸臂/默认路径)。
+                catalyst_hint_slots = getattr(
+                    task_exp_config, "catalyst_hint_slots", None
+                )
+                # ⭐ CATALYST v2 entry 臂:每槽位接管计划 payload(与 hint
+                # 槽位互斥,plan_arms 只会设其一)。
+                catalyst_entry_slots = getattr(
+                    task_exp_config, "catalyst_entry_slots", None
+                )
+                # ⭐ CATALYST v4:每槽位 plan 时冻结的 V̂(统一优势先验)。
+                catalyst_v4_m_slots = getattr(
+                    task_exp_config, "catalyst_v4_m_slots", None
+                )
                 for rollout_id in range(task_rollout_n):
                     add_exp = task_exp_config.add_exp[rollout_id] if rollout_id < len(task_exp_config.add_exp) else False
                     train_mode = task_exp_config.train_mode
+                    catalyst_hint_text = (
+                        catalyst_hint_slots[rollout_id]
+                        if catalyst_hint_slots is not None
+                        and rollout_id < len(catalyst_hint_slots)
+                        else None
+                    )
+                    catalyst_entry_plan = (
+                        catalyst_entry_slots[rollout_id]
+                        if catalyst_entry_slots is not None
+                        and rollout_id < len(catalyst_entry_slots)
+                        else None
+                    )
+                    # v5:hint×entry 复合槽 = rescue(2×2 第四格);互斥断言
+                    # 移除,槽位纪律由 plan_arms 一侧持有。
                     traj_exp_config = TrajExpConfig(
-                        add_exp=add_exp, train_mode=train_mode, task_id=task.task_id, data_id=data_id, rollout_id=rollout_id, mode=mode)
+                        add_exp=add_exp, train_mode=train_mode, task_id=task.task_id, data_id=data_id, rollout_id=rollout_id, mode=mode,
+                        catalyst_hint_text=catalyst_hint_text,
+                        catalyst_entry_plan=catalyst_entry_plan,
+                        catalyst_hint_vhat=(
+                            getattr(task_exp_config, "catalyst_hint_vhat", None)
+                            if catalyst_hint_text else None
+                        ),
+                        catalyst_v4_m=(
+                            catalyst_v4_m_slots[rollout_id]
+                            if catalyst_v4_m_slots is not None
+                            and rollout_id < len(catalyst_v4_m_slots)
+                            else None
+                        ),
+                        catalyst_arm=(
+                            "rescue" if (catalyst_entry_plan and catalyst_hint_text)
+                            else "entry" if catalyst_entry_plan
+                            else ("hint" if catalyst_hint_text else "bare")
+                        ))
 
                     params = (task, traj_exp_config, str(data_id), str(rollout_id), mode, thread_index, tmux,stop)
                     future = executor.submit(self.rollout_env_worker, *params)
@@ -624,20 +687,25 @@ class ParallelEnvManager(object):
 
     # TODO: define an extra class for trajectory-dataproto converting.
     def to_dataproto(
-        self, cmt_array, *, optimizer_batch: Optional[bool] = None
+        self, cmt_array, *, optimizer_batch: Optional[bool] = None,
+        extra_samples: Optional[List[Sample]] = None,
     ) -> DataProto:
         """
         Converts a list of trajectories into a DataProto object.
 
         Args:
             cmt_array (list): A list of trajectories that need to be converted.
+            extra_samples: Pre-built Sample objects (e.g. CATALYST de-hinted
+                replay samples) appended before alignment/padding. Default None
+                keeps the historical byte-identical path.
 
         Returns:
             DataProto: The resulting DataProto object after conversion.
         """
         # Step 1: Convert trajectories to samples: tokenizing
         samples = self.trajectories_to_samples(
-            cmt_array, optimizer_batch=optimizer_batch
+            cmt_array, optimizer_batch=optimizer_batch,
+            extra_samples=extra_samples,
         )  # ⭐ Tokenize the trajectories to create samples
 
         # Step 2: Convert samples to DataProto: padding
@@ -1112,6 +1180,22 @@ class ParallelEnvManager(object):
                 "context_overflow_prompt_tokens"
             ),
         }
+        # ⭐ CATALYST:仅提示臂 rollout 携带 catalyst_arm(默认路径不加键——
+        # 严格字节等价纪律,规格 D3)。裸臂在消费端按缺省 "bare" 处理。
+        if "catalyst_arm" in cmt.metadata:
+            extras["catalyst_arm"] = cmt.metadata["catalyst_arm"]
+        # ⭐ CATALYST v2 entry 臂:rung 决定 uid 分组(同任务同 rung 同基线)。
+        if "catalyst_entry_rung" in cmt.metadata:
+            extras["catalyst_entry_rung"] = cmt.metadata["catalyst_entry_rung"]
+        # ⭐ CATALYST v3/v4:critic 基线、frac 与 v4 统一先验(trainer 侧用)。
+        for _k in (
+            "catalyst_entry_vhat",
+            "catalyst_entry_frac",
+            "catalyst_hint_vhat",
+            "catalyst_v4_m",
+        ):
+            if _k in cmt.metadata:
+                extras[_k] = cmt.metadata[_k]
         return extras
 
 
@@ -1120,12 +1204,15 @@ class ParallelEnvManager(object):
         cmt_array: List,
         *,
         optimizer_batch: Optional[bool] = None,
+        extra_samples: Optional[List[Sample]] = None,
     ) -> List[Sample]:
         """
         Converts a list of trajectories into a list of samples, ensuring the number of samples is divisible by the total number of GPUs across all nodes.
 
         Args:
             cmt_array (List): A list of trajectories to be converted into samples.
+            extra_samples: Pre-built samples appended after conversion, before
+                whole-group alignment (CATALYST replay path). Default None.
 
         Returns:
             List[Sample]: A list of samples with extras added and adjusted to be divisible by the world size.
@@ -1141,6 +1228,12 @@ class ParallelEnvManager(object):
             for sample in sample_arr:
                 sample.extras = extras  # ⭐ Add extra information to each sample
             sample_arr_final += sample_arr
+
+        # ⭐ CATALYST replay samples arrive pre-tokenized with their own extras.
+        # They join before alignment so world-size divisibility still holds;
+        # each one forms its own complete single-sample UID group.
+        if extra_samples:
+            sample_arr_final += list(extra_samples)
 
         # Step 2: Align optimizer-bound batches using complete GRPO UID groups.
         # Random sample-level deletion corrupts GRPO whenever it removes only
@@ -1617,6 +1710,39 @@ class ParallelEnvManager(object):
         if has_rollout_log_probs:
             batch_fields["rollout_log_probs"] = rollout_log_probs
             batch_fields["rollout_log_probs_mask"] = rollout_log_probs_mask
+
+        # ⭐ CATALYST 去提示重放:仅当批内存在重放样本时才构造该 tensor —— 默认
+        # 关闭的批 keys/值逐字节等价(规格 §0.2/D3)。full-sequence 制式,与
+        # teacher_mask 同构:prompt 段全 0,response 段 = response_loss_mask。
+        has_catalyst_replay = any(
+            bool((sample.extras or {}).get("is_catalyst_replay", False))
+            for sample in samples
+        )
+        if has_catalyst_replay:
+            catalyst_replay_mask_list = []
+            for sample in samples:
+                if (sample.extras or {}).get("is_catalyst_replay", False):
+                    catalyst_replay_mask_list.append(
+                        torch.tensor(sample.response_loss_mask, dtype=torch.int)
+                    )
+                else:
+                    catalyst_replay_mask_list.append(
+                        torch.zeros(
+                            len(sample.response_loss_mask), dtype=torch.int
+                        )
+                    )
+            catalyst_replay_mask = pad_sequence(
+                catalyst_replay_mask_list, batch_first=True, padding_value=0
+            )
+            catalyst_replay_mask = pad_sequence_to_length(
+                catalyst_replay_mask, max_response_length_this_batch, 0
+            )
+            prompt_catalyst_replay_mask = torch.zeros_like(
+                prompt_ids, dtype=torch.int
+            )
+            batch_fields["catalyst_replay_mask"] = torch.cat(
+                (prompt_catalyst_replay_mask, catalyst_replay_mask), dim=-1
+            )
 
         context_stats = [sample.extras.get("context_stats") for sample in samples]
         if any(isinstance(stats, dict) for stats in context_stats):

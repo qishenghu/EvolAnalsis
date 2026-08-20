@@ -1,0 +1,126 @@
+#!/bin/bash
+# =============================================================================
+# 新域学生 utility 作业(2026-08-08):2×H200,吃满配额余量
+#   [1] GPU0/GPU1 各起 Qwen3.5-4B vLLM(8020=sciworld 侧,8021=deepsearch 侧(避开本人其他作业端口空间))
+#   [2] 本节点起 SciWorld 栈;DeepSearch 栈(retrieval+env,计算节点首跑,
+#       失败不致命——sciworld 侧照常采)
+#   [3] 学生 rollout:两域各 400 任务(seed-2026 前缀,n=1,attempts=3 防
+#       infra 烧槽),成败全落盘 → 新域失败池 + 未来 AUC/CLL 学生类
+#   [4] cll_teacher_profile --verify-only 军规校验两份输出
+#       (deepsearch 学生侧军规缺口在此闭合)
+# =============================================================================
+#PBS -N nd_student_util
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=48:ngpus=2:mem=400gb
+#PBS -l walltime=12:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/nd_student_util.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+OUT=$SCRATCH/student_rollouts
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200
+STUDENT=/projects_vol/gp_wangwy/models/Qwen3.5-4B
+mkdir -p "$OUT" "$SCRATCH/logs"
+exec > >(tee -a "$SCRATCH/logs/nd_student_util.live.log") 2>&1
+echo "######## ND STUDENT UTIL start $(date '+%F %T') job=${PBS_JOBID:-?} ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+
+# 统一前置(2026-08-12 补):本脚本此前完全没有 GPU 索引防护。下面 start_student
+# 用 CUDA_VISIBLE_DEVICES=$1(0/1)起 vLLM;PBS 批处理却把 CUDA_VISIBLE_DEVICES 设成
+# GPU UUID,vLLM 对其做 int() 解析直接失败。pf_fix_gpus 把它换成 cgroup 内的数字
+# 索引并断言"看见的正好是我们申请的 2 张卡"。详见 docs/infra/LANDMINES.md L1。
+# DUET_PREAMBLE_PORTS="":本作业起的是 sciworld(8084)/deepsearch(8086)栈,
+# 不碰 AlfWorld 的 36001/8081,不该被邻居占用这两个端口而拒绝启动。
+source "$REPO/scripts/duet_job_preamble.sh"
+DUET_PREAMBLE_PORTS=""
+duet_preamble_gpu 2 || { echo "ABORT: node preflight failed"; exit 1; }
+duet_preamble_wandb disabled   # 离线采集作业;顺带清掉明文凭证
+# 与原来逐行 export 等价:VLLM_CACHE_ROOT / TRITON_CACHE_DIR / TMPDIR 全在 /tmp。
+duet_preamble_tmp --with-tmpdir || exit 1
+
+duet_activate || { echo "ABORT: duet env"; exit 1; }
+VLLM_PY="$CONDA_PATH/envs/${CONDA_ENV_VLLM2:-vllm2}/bin/python"
+
+VP0=""; VP1=""
+cleanup() {
+    echo "---- cleanup $(date '+%F %T') ----"
+    [ -n "$VP0" ] && kill "$VP0" 2>/dev/null
+    [ -n "$VP1" ] && kill "$VP1" 2>/dev/null
+    bash start_env_sciworld.sh stop 2>/dev/null || true
+    bash start_env_deepsearch.sh stop 2>/dev/null || true
+}
+trap cleanup EXIT
+
+start_student() {
+    CUDA_VISIBLE_DEVICES=$1 VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE=0 \
+    "$VLLM_PY" -m vllm.entrypoints.openai.api_server \
+        --model "$STUDENT" --served-model-name qwen35-4b-student \
+        --tensor-parallel-size 1 --max-model-len 32768 --max-num-seqs 16 \
+        --gpu-memory-utilization 0.85 --port $2 \
+        --reasoning-parser qwen3 \
+        >> "$SCRATCH/logs/vllm_ndutil_gpu$1.log" 2>&1 &
+    echo $!
+}
+VP0=$(start_student 0 8020)
+VP1=$(start_student 1 8021)
+for port in 8020 8021; do
+    for i in $(seq 1 90); do
+        curl -sf --max-time 8 "http://127.0.0.1:$port/v1/models" >/dev/null && break
+        [ $i -eq 90 ] && { echo "ABORT: vLLM :$port timeout"; exit 1; }
+        sleep 10
+    done
+done
+echo "student vLLMs up"
+
+bash start_env_sciworld.sh || { echo "ABORT: sciworld stack"; exit 1; }
+DS_OK=1
+bash start_env_deepsearch.sh || { echo "WARN: deepsearch stack failed on compute node — sciworld continues"; DS_OK=0; }
+
+export OPENROUTER_API_KEY=EMPTY
+rc_ok() { [ "$1" = "0" ] || [ "$1" = "2" ]; }
+roll() {   # $1 env  $2 env_port  $3 vllm_port
+    python scripts/collect_student_rollouts.py \
+        --config "$CFG/$1_qwen35_4b_collect_h200.yaml" \
+        --env-url "http://127.0.0.1:$2" \
+        --task-file "data/$1/task_ids_1600_seed2026.txt" \
+        --output "$OUT/$1_qwen35_4b_student_rollouts_p400.jsonl" \
+        --model qwen35-4b-student --api-base "http://127.0.0.1:$3/v1" \
+        --api-key-env OPENROUTER_API_KEY \
+        --rollouts-per-task 1 --max-attempts-per-rollout 3 \
+        --max-tasks 400 --max-workers 8 --resume \
+        > "$SCRATCH/logs/student_ro_$1.log" 2>&1
+    echo "student_ro_$1 rc=$?"
+}
+roll sciworld 8084 8020 & RA=$!
+if [ "$DS_OK" = "1" ]; then roll deepsearch 8086 8021 & RB=$!; fi
+wait $RA
+[ "$DS_OK" = "1" ] && wait $RB
+
+echo "---- [4] 军规 verify-only ----"
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+for env in sciworld deepsearch; do
+    f=$OUT/${env}_qwen35_4b_student_rollouts_p400.jsonl
+    [ -s "$f" ] || continue
+    "$VLLM_PY" analysis/cll_teacher_profile.py \
+        --input "$f" --config "$CFG/${env}_qwen35_4b_collect_h200.yaml" \
+        --verify-only \
+        --output "$REPO/analysis_outputs/cll_teacher_profile/verify_${env}_student_p400.jsonl" \
+        && echo "verify_${env} OK" || echo "verify_${env} FAILED"
+done
+
+echo "---- summary ----"
+python - <<'EOF'
+import json, os
+for env in ['sciworld','deepsearch']:
+    p=f"/projects_vol/gp_wangwy/qisheng/duet_h200/student_rollouts/{env}_qwen35_4b_student_rollouts_p400.jsonl"
+    if not os.path.exists(p): print(env,'(no output)'); continue
+    n=s=0
+    for ln in open(p):
+        r=json.loads(ln); n+=1; s+=int(bool(r.get('success')))
+    print(f'{env}: n={n} success={s} SR={s/max(n,1):.1%}')
+EOF
+echo "######## ND STUDENT UTIL END $(date '+%F %T') ########"

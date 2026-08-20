@@ -107,6 +107,81 @@ class AgentFlow(BaseAgentFlow):
             Linear_CMT: The context manager after the execution.
         """
         self.cmt = context_manager
+        # ⭐ CATALYST 提示臂:把教师 think 摘要注入首条 user 消息末尾。位置与
+        # 试点采集器 HintedAgentFlow.execute 同序(manage_rollout_context /
+        # save_init_input 之前)、同目标消息、同模板字节(sha pin 校验)。
+        # hint 为 None(默认)时零行为——连 deepcopy 都不做(字节等价纪律)。
+        catalyst_hint_text = getattr(traj_exp_config, "catalyst_hint_text", None)
+        if catalyst_hint_text:
+            from agentevolver.module.exp_manager.catalyst import (
+                hint_sha256,
+                inject_hint_into_init_messages,
+            )
+            init_messages = inject_hint_into_init_messages(
+                init_messages, catalyst_hint_text
+            )
+            self.cmt.metadata["catalyst_arm"] = "hint"
+            self.cmt.metadata["catalyst_hint_sha256"] = hint_sha256(
+                catalyst_hint_text
+            )
+            # v3.1:hint 臂 critic 基线透传(None=未启用,零行为)
+            _hint_vhat = getattr(traj_exp_config, "catalyst_hint_vhat", None)
+            if _hint_vhat is not None:
+                self.cmt.metadata["catalyst_hint_vhat"] = float(_hint_vhat)
+        # ⭐ CATALYST v2 entry 臂(设计 §2,镜像试点 TakeoverAgentFlow 三步):
+        # ① 逐步重放教师前 k 个 action 推进 env(失败抛
+        #    CatalystEntryReplayError,worker 降级为裸臂重试);
+        # ② save_init_input 之后把 k 对 (action-only assistant, live env 观测)
+        #    seed 进 full_context——教师 think 从不出现,seed 消息不产生
+        #    decision snapshot,故拿不到 loss(零模仿不变式,结构保证);
+        # ③ 学生步数预算收缩为 max_steps − k。
+        catalyst_entry_seed_pairs = None
+        catalyst_entry_payload = getattr(
+            traj_exp_config, "catalyst_entry_plan", None
+        )
+        if catalyst_entry_payload:
+            from agentevolver.module.exp_manager.catalyst_entry import (
+                EntryPlan,
+                replay_teacher_prefix,
+            )
+            entry_plan = EntryPlan.from_payload(catalyst_entry_payload)
+            catalyst_entry_seed_pairs, entry_divergence = (
+                replay_teacher_prefix(
+                    env, instance_id, entry_plan, self.tokenizer
+                )
+            )
+            self.max_steps = int(self.max_steps) - int(entry_plan.k_steps)
+            if self.max_steps < 1:
+                raise RuntimeError(
+                    f"[CATALYST] entry k={entry_plan.k_steps} leaves no "
+                    "student budget; entry book / max_steps misconfigured"
+                )
+            # v5:若本槽同时带 hint(前面已注入)则为 rescue 复合槽
+            self.cmt.metadata["catalyst_arm"] = (
+                "rescue" if catalyst_hint_text else "entry"
+            )
+            self.cmt.metadata["catalyst_entry_rung"] = int(entry_plan.rung)
+            self.cmt.metadata["catalyst_entry_frac"] = float(entry_plan.frac)
+            self.cmt.metadata["catalyst_entry_k"] = int(entry_plan.k_steps)
+            self.cmt.metadata["catalyst_entry_divergence"] = int(
+                entry_divergence
+            )
+            # v3 课程 critic 基线(plan 时冻结,经 extras 透传给优势覆写)
+            self.cmt.metadata["catalyst_entry_vhat"] = float(
+                catalyst_entry_payload.get("vhat", 0.0) or 0.0
+            )
+            self.cmt.metadata["catalyst_entry_source"] = str(
+                catalyst_entry_payload.get("source", "teacher")
+            )
+        if getattr(traj_exp_config, "catalyst_entry_degraded", False):
+            # 重放失败后的降级重试:本 rollout 是干净的裸臂(新 env 实例),
+            # 打标供治理端计数(catalyst/entry_degraded)。
+            self.cmt.metadata["catalyst_entry_degraded"] = True
+        # ⭐ CATALYST v4:所有臂(含裸)透传 plan 时冻结的 V̂(统一优势先验
+        # 与在线校准探针共用;None=非 v4,零行为)。
+        _v4_m = getattr(traj_exp_config, "catalyst_v4_m", None)
+        if _v4_m is not None:
+            self.cmt.metadata["catalyst_v4_m"] = float(_v4_m)
         # Qwen 3 suppressed thinking in history via the /no_think soft switch.
         # Qwen 3.5 dropped those switches, so appending it there is dead text that
         # also contradicts the generation prompt (which opens with '<think>'):
@@ -126,6 +201,32 @@ class AgentFlow(BaseAgentFlow):
         # init_messages, metadata = self.add_experience(init_messages, task_id, data_id, rollout_id, query, add_exp)  # ⭐ Initialize messages and metadata
         # self.cmt.metadata = metadata
         self.cmt.save_init_input(init_messages, add_nothink)
+        # ⭐ CATALYST v2 entry 臂 ②:seed 已发生历史(与试点 _seeded_save_init
+        # 逐字同构:author=llm/env、env 侧带 clip 上限;渲染由
+        # StructuredContextPolicy 走正常军规链路)。seed 不经 save_llm_output,
+        # 不产生 decision snapshot → 结构性拿不到 loss。
+        if catalyst_entry_seed_pairs:
+            for _assistant_content, _user_content in catalyst_entry_seed_pairs:
+                self.cmt.full_context.append(
+                    ExtendedMessage(
+                        author="llm",
+                        role="assistant",
+                        content=str(_assistant_content),
+                        token_generator="auto",
+                        tokenizer=self.tokenizer,
+                    )
+                )
+                self.cmt.full_context.append(
+                    ExtendedMessage(
+                        author="env",
+                        role="user",
+                        content=str(_user_content),
+                        clip=True,
+                        clip_token_limit=self.cmt.max_env_output_length,
+                        token_generator="auto",
+                        tokenizer=self.tokenizer,
+                    )
+                )
 
         request_id: str = ""
         err_in_generating=False

@@ -1,0 +1,73 @@
+#!/bin/bash
+# CATALYST 纯度分析 H-A2(2026-08-08):hindsight 去提示后的学生自写轨迹 CLL。
+# 输入:catalyst_pilots/pa 的 A1(raw)/A2(rewritten)成功轨迹;剥掉注入的
+# 教师提示后按 cll_teacher_profile 同链路重放打 CLL(analysis/
+# catalyst_purity_score.py)。纯 forward 打分:无环境栈、无 vLLM 服务、
+# 无端口占用。GPU0 = alfworld a1→a2,GPU1 = webshop a1→a2(卡间并行,
+# 卡内串行)。风格参照 run_cll_student.pbs。
+#PBS -N catalyst_purity
+#PBS -P gs_ccds_wangwy
+#PBS -q gpu_as
+#PBS -l select=1:ncpus=24:ngpus=2:mem=200gb
+#PBS -l walltime=6:00:00
+#PBS -o /projects_vol/gp_wangwy/qisheng/duet_h200/logs/catalyst_purity.pbs.log
+#PBS -j oe
+
+REPO=/home/qisheng001/DUET_H200/EvolAnalsis
+SCRATCH=/projects_vol/gp_wangwy/qisheng/duet_h200
+PA=$SCRATCH/catalyst_pilots/pa
+OUT=$REPO/analysis_outputs/catalyst_purity
+CFG=$REPO/config/duet_paper_experiments_configs/iclr2027/collect_h200
+mkdir -p "$OUT" "$SCRATCH/logs"
+exec > >(tee -a "$SCRATCH/logs/catalyst_purity.live.log") 2>&1
+echo "######## CATALYST PURITY start $(date '+%F %T') ########"
+export PYTHONUNBUFFERED=1
+cd "$REPO" || exit 1
+source "$REPO/env_config.sh"
+
+# 统一前置(2026-08-12 补):本脚本此前完全没有 GPU 索引防护。PBS 批处理把
+# CUDA_VISIBLE_DEVICES 设成 GPU UUID,下面两个子壳里的 CUDA_VISIBLE_DEVICES=0/1
+# 只在 cgroup 已把可见设备重编号成 0..N-1 时才成立 —— pf_fix_gpus 正是断言这一点
+# 的地方(它还会在 cgroup 隔离失效、看得见邻居 GPU 时拒绝开跑)。详见
+# docs/infra/LANDMINES.md L1。
+# DUET_PREAMBLE_PORTS="":本作业是纯 forward 打分,不起环境栈也不占 36001/8081,
+# 不该因为邻居占着这两个端口而被拒绝启动。
+source "$REPO/scripts/duet_job_preamble.sh"
+DUET_PREAMBLE_PORTS=""
+duet_preamble_gpu 2 || { echo "ABORT: node preflight failed"; exit 1; }
+duet_preamble_wandb disabled   # 纯打分作业不写 W&B;顺带清掉明文凭证
+duet_preamble_tmp              # 节点本地 TRITON/VLLM cache
+
+PY=/projects_vol/gp_wangwy/qisheng/duet_h200/conda/envs/vllm2/bin/python
+export PYTHONPATH="$REPO:${PYTHONPATH:-}"
+
+# GPU0:alfworld a1 → a2(串行)
+(
+  for arm in a1 a2; do
+    CUDA_VISIBLE_DEVICES=0 $PY analysis/catalyst_purity_score.py \
+        --input "$PA/alfworld_${arm}.jsonl" \
+        --config "$CFG/alfworld_qwen35_4b_collect_h200.yaml" \
+        --device cuda:0 \
+        --output "$OUT/alfworld_${arm}_dehinted.jsonl" \
+        > "$SCRATCH/logs/catalyst_purity_af_${arm}.log" 2>&1
+    echo "alfworld_${arm} rc=$?"
+  done
+) &
+P1=$!
+# GPU1:webshop a1 → a2(串行)
+(
+  for arm in a1 a2; do
+    CUDA_VISIBLE_DEVICES=1 $PY analysis/catalyst_purity_score.py \
+        --input "$PA/webshop_${arm}.jsonl" \
+        --config "$CFG/webshop_qwen35_4b_collect_h200.yaml" \
+        --device cuda:0 \
+        --output "$OUT/webshop_${arm}_dehinted.jsonl" \
+        > "$SCRATCH/logs/catalyst_purity_ws_${arm}.log" 2>&1
+    echo "webshop_${arm} rc=$?"
+  done
+) &
+P2=$!
+wait $P1
+wait $P2
+ls -la "$OUT"/*_dehinted.jsonl.summary.json 2>/dev/null
+echo "######## CATALYST PURITY END $(date '+%F %T') ########"
