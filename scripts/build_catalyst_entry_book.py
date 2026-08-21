@@ -4,14 +4,17 @@
 输入:教师成功轨迹 jsonl(openrouter_teacher_trajectory_v2,如
     data/teacher_trajectories/iclr2027_flash/alfworld_dsv4flash_success_dedup.jsonl)
 输出:{"version","environment","tasks":{task_id:{"teacher_rollout_id",
-    "init_messages","steps":[{"action","observation"}...]}}} + manifest。
+    "init_messages","steps":[{"action","observation","think"}...]}}} + manifest。
 
 选材:每任务取**最短**成功轨迹(重放成本最低、k 梯子最密)。
 轨迹布局校验与试点 build_takeover_plan 逐字同构(init 前缀 + (assistant,user)
 交替、末条 assistant);任何 decision 无合法 <action> 块 → 该轨迹弃用
 (不是 fail-fast:换该任务的次短轨迹,全部不合格才丢任务并计数)。
 
-**教师 think 从不进册**:steps 只存提取后的 action 文本与 env 观测。
+教师 think 自 v6 入册(book/1.1.0):**只进事件日志的 seed 形态,永不进
+损失**(零模仿不变式不变);strip 渲染域下模板剥离、行为与旧册等价,
+近窗域(observation_tool_response + reasoning_recent_turns)下交接边界
+的教师思路原生保留。
 
 用法:
   python scripts/build_catalyst_entry_book.py \
@@ -24,6 +27,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -79,11 +83,21 @@ def try_build_entry(record: dict) -> dict:
                 f"alternation broken at post-init offset {offset}"
             )
     steps = []
-    # 只需前 n−1 步的 (action, observation):k ≤ n−1(最后一步永远留给学生)
+    # 只需前 n−1 步的 (action, observation, think):k ≤ n−1(最后一步永远
+    # 留给学生)。think 自 v6 入册(book/1.1.0):渲染域决定可见性——
+    # strip 域下与无 think 逐字节等价,近窗域下交接边界的教师思路原生保留。
     for index in range(n_decisions - 1):
-        action = extract_tagged_action(trace[index]["completion_content"])
+        completion = str(trace[index]["completion_content"])
+        action = extract_tagged_action(completion)
         observation = str(body[2 * index + 1].get("content", ""))
-        steps.append({"action": action, "observation": observation})
+        think_match = re.search(
+            r"<think>\s*(.*?)\s*</think>", completion, re.S
+        )
+        steps.append({
+            "action": action,
+            "observation": observation,
+            "think": think_match.group(1).strip() if think_match else "",
+        })
     return {
         "teacher_rollout_id": str(record.get("rollout_id", "")),
         "n_teacher_decisions": n_decisions,

@@ -1,0 +1,344 @@
+# ============================================================================
+# H200 CATALYST v4: 统一分配法则, 100 步.
+# GaaS cluster, 2026-08-17. 设计与回放验证: CATALYST_进展汇报_2026-08-17.md §六
+#   估计 V̂ 三层收缩 | 排产 m(1−m)·目标锚定 | 计账 LOO+先验统一优势(全臂)
+#   参数共 4: n0 / alpha / fbins / bare_floor。v1-v3 机制全部不启用(归档)。
+# Lineage: full copy of catalystv3 config with ONLY:
+#   * experiment_name / workspace_id -> p0_catalystv6_af_s3
+#   * entry.enable=false + v4 段启用(entry 素材册/状态池配置被 v4 复用)
+#   * governance/thermostat 等 legacy 键保留但在 v4 模式下零行为
+# ============================================================================
+hydra:
+  searchpath:
+    - file://external/config_fallback
+    - file://config
+
+defaults:
+  - ppo_trainer
+  - agentevolver
+  - _self_
+
+trainer:
+  experiment_name: p0_catalystv6_af_s3
+  project_name: agentevolver
+  n_gpus_per_node: 4
+  nnodes: 1
+  total_epochs: 2
+  total_training_steps: 100
+  # Persist every half of the run. This key is explicit so launcher.py
+  # resolves it into the workspace instead of a disposable Ray working_dir.
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  save_freq: 10
+  test_freq: 10
+  val_before_train: false
+  resume_mode: auto   # 2026-08-12: 原为 disable(继承自 smoke 血统),导致队列每次续跑都从 0 重来并覆盖 checkpoint/validation_log,100 步格子永远跑不完
+  # Preserve the exact pre-update state if a strict identity gate stops the run.
+  save_checkpoint_on_identity_failure: true
+  export_actor_weights_on_identity_failure: true
+  validation_data_dir: experiments/alfworld/${trainer.experiment_name}/validation_log
+  rollout_data_dir: experiments/alfworld/${trainer.experiment_name}/rollout_log
+  # Future launches are required to stream online while retaining local logs.
+  logger: [console, wandb]
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  grpo:
+    teacher_baseline_separation:
+      enable: false
+      teacher_baseline: all_mean
+      non_teacher_baseline: non_teacher_mean
+      std_source: non_teacher
+  dapo:
+    enable: false
+    dynamic_sampling:
+      enable: false
+      filter_mode: strict
+    overlong_reward_shaping:
+      enable: false
+      truncation_penalty: -0.5
+      soft_penalty_mode: additive
+
+actor_rollout_ref:
+  model:
+    path: /projects_vol/gp_wangwy/models/Qwen3.5-4B
+    # Qwen3.5 Gated DeltaNet cannot use verl's remove-padding/Ulysses patch.
+    use_remove_padding: false
+    enable_gradient_checkpointing: true
+  actor:
+    behavior_logprob_fp32_temperature: true
+    # A pure-GRPO all-equal group has no policy-gradient signal. Do not allow
+    # KL roundoff or AdamW decay to turn it into a weight-changing update.
+    skip_zero_advantage_grpo_update: true
+    optim:
+      lr: 1.0e-06
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_mini_batch_size: 8
+    ppo_max_token_len_per_gpu: 32768
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    off_cliprange_high: 0.6
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    use_dr3: false
+    use_chord: false
+    use_uniform_mix: false
+    teacher_use_log_prob: false
+    teacher_policy_shaping_enable: false
+    teacher_use_clip: false
+    use_dapo: false
+    # CATALYST v2: replay BC 永久关闭(失败归因 §3;必须与 exp_manager
+    # 侧 replay.enable 相等,trainer 有互斥断言)
+    catalyst:
+      replay_bc:
+        enable: false
+        beta: 0.1
+        w_cap: 1.0
+        phi_tau: 1.0
+        exclude_replay_from_entropy_kl: true
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    use_qwen3: true
+    thinking_mode: native_qwen35
+    enable_request_id: false
+    # One decision receives up to 10K sampled reasoning+action tokens; the
+    # managed prompt receives the remainder of the exact 32K model budget.
+    prompt_length: 22528
+    response_length: 10240
+    max_model_len: 32768
+    length_truncation_reward: 0.0
+    length_truncation_max_decision_fraction: 0.10
+    temperature: 0.9
+    log_prob_micro_batch_size_per_gpu: 1
+    tensor_model_parallel_size: 1
+    name: external_vllm
+    external_server_addresses:
+      - 127.0.0.1:8201
+      - 127.0.0.1:8202
+      - 127.0.0.1:8203
+      - 127.0.0.1:8204
+    external_request_timeout: 1200
+    external_sleep_between_steps: true
+    # Must match MAX_NUM_SEQS=1 in the external-server manifest.
+    max_num_seqs: 16
+    enforce_eager: false
+    # PPO's old-policy denominator is the logprob produced by the sampler.
+    use_rollout_log_probs_as_old: true
+    rollout_logprob_drift_mean_threshold: 0.025  # v3: 数值地板证据见复盘 §5
+    rollout_logprob_drift_p99_threshold: 0.25
+    rollout_importance_ratio_outside_clip_threshold: 0.01
+    # A lone raw maximum is diagnostic-only; aggregate and non-finite hard
+    # gates remain active. Negative disables this one gate in the trainer.
+    rollout_logprob_drift_max_threshold: -1
+    # One same-UID/same-rollout retry tolerates a transient env HTTP failure;
+    # the group-integrity gate still refuses any incomplete n=8 group.
+    max_trajectory_resubmits: 1
+    mode: async
+    gpu_memory_utilization: 0.35
+    n: 8
+    log_prob_max_token_len_per_gpu: 32768
+    val_kwargs:
+      n: 1
+      temperature: 0
+      top_p: 1.0
+      top_k: -1
+      do_sample: false
+      seed: 2025
+    # Preserve the original baseline's 32 outstanding environment workers;
+    # each TP1 server admits one sequence at a time via MAX_NUM_SEQS=1.
+    max_env_worker: 64
+    context_template: linear
+    context_template_train_sp_action: false
+    max_env_len: 4096
+    sparse: true
+    context_management:
+      enabled: true
+      max_prompt_tokens: 22528
+      recent_turns: 2
+      min_recent_turns: 1
+      # Remove repetitive stale AVAILABLE ACTIONS while protecting the goal,
+      # the two recent observations, and the current legal-action menu.
+      history_observation_max_tokens: 160
+      recent_observation_max_tokens: -1
+      allow_current_observation_truncation: false
+      # Historical hidden reasoning is not replayed by the native Qwen3.5
+      # template. Current-turn reasoning still has the full 10K response cap.
+      reasoning_history_tokens: 0
+      # v6 近窗域(设计定稿 2026-08-21):观察包 <tool_response> 启用模板
+      # 原生 interleaved 路径;最近 3 个 llm 轮保留 think(逐轮 512 帽)。
+      observation_tool_response: true
+      reasoning_recent_turns: 3
+      reasoning_max_tokens_per_turn: 512
+      snapshot_training: true
+      snapshot_selection: token_weighted
+      snapshot_selection_seed: 2025
+    multi_turn:
+      completion_callback: agentevolver.module.trainer.simple_completion_callback.SimpleCompletionCallback
+      enable: true
+      format: llama3_json
+      max_steps: 30
+      tool_config_path: ''
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    fsdp_config:
+      param_offload: true
+    log_prob_max_token_len_per_gpu: 32768
+
+critic:
+  ppo_max_token_len_per_gpu: 32768
+  forward_max_token_len_per_gpu: 32768
+
+data:
+  train_batch_size: 16
+  max_prompt_length: 22528
+  max_response_length: 10240
+  filter_overlong_prompts: true
+  truncation: error
+  return_raw_chat: true
+  train_files: null
+  val_files: null
+  val_batch_size: 16
+  # Smoke-sized validation slice of ALFWorld's fixed 200-task profile.
+  max_val_tasks: 128
+  validation_shuffle: false
+  dataloader_num_workers: 0
+  val_type: val
+  max_train_tasks: 800
+  shuffle: true
+  seed: 2025
+  task_seed: 2026
+
+env_service:
+  env_type: alfworld
+  env_url: http://127.0.0.1:8081
+  env_params:
+    action_format: react_tags
+
+task_manager:
+  n: 0
+  mixture:
+    use_original_tasks: true
+    synthetic_data_ratio: 0.0
+    shuffle: true
+  grader:
+    original_grader: env
+    synthetic_grader: llm-binary-gt-no_constraint
+  strategy: random
+  strategy_args:
+    max_explore_step: 30
+    max_llm_retries: 6
+    env_url: ${env_service.env_url}
+    exploration_llm_temperature: 1.0
+    exploration_llm_top_p: 1.0
+    exploration_llm_top_k: 100
+  llm_client: qwen-plus
+  bs: ${data.train_batch_size}
+  num_explore_threads: ${thread_pool.max_workers}
+  train_data_path: null
+  val_data_path: null
+  env_profile: cookbook/env_profiles/alfworld.json
+
+exp_manager:
+  train_rollout_mode: woexp
+  val_rollout_mode: woexp
+  rollout_ratio: 0
+  train_sample_mode: alldiscard
+  train_sample_keepratio: 0.0
+  experience_template: 'Some Related Experience: <EXP>{}</EXP>'
+  init_exp_before_training: false
+  init_exp_only: false
+  summary_batch_size: 8
+  reme:
+    base_url: http://127.0.0.1:8124
+    workspace_id: p0_catalystv6_af_s3
+    enable_summarizer: false
+    enable_context_generator: false
+    retrieve_top_k: 3
+    updated_freq: 0
+  experience_replay:
+    enable: false
+  teacher_experience:
+    enable: false
+  state_channel:
+    enable: false
+  # ========================= CATALYST M1 =========================
+  catalyst:
+    enable: true
+    hints:
+      file: /home/qisheng001/DUET_H200/EvolAnalsis/data/catalyst_hints/alfworld_dsv4flash.json
+      require_manifest: true
+    governance:
+      s_hi: 0.8
+      rho_max: 0.5
+      delta_u: 0.0
+      ema_alpha: 0.2
+      u_bootstrap_min_obs: 8
+      min_hint_rollouts: 2
+      max_hint_rollouts: 2   # v2: hint 税率 0.5 -> 0.25(中带专用,角点走 entry)
+      # v3.1:hint 臂 critic 基线 A = r − sr_hint_ema。SR_hint≈0.83 的 2 槽组
+      # ~72% 全同 → 分臂组基线优势恒 0,最强通道大部分时间发零梯度
+      # (v1/v2 同病,GRPO 覆盖 78% vs 我们 63% 的账本见 v2 复盘追录)
+      hint_critic_baseline: false  # v4 统一优势取代
+      retire_windows: 3
+      state_dir: null
+    arm_baseline:
+      enable: true
+      std_fallback_to_group: true
+    replay:
+      enable: false   # v2: 转写重放已裁定弃用(上下文级 off-policyness)
+      per_task: 1
+      pool_max_per_task: 4
+      ttl_steps: 20
+      audit_on_insert: true
+    # ------------------- v2 entry-k 状态课程(通路②主力化) -------------------
+    entry:
+      enable: false   # v4 模式下 legacy entry 关闭(素材配置仍被 v4 读取)
+      mode: interval          # v3 分布课程(v2 的 ladder 保留为归档对照)
+      book_file: /home/qisheng001/DUET_H200/EvolAnalsis/data/catalyst_entry/alfworld_dsv4flash_entry.json
+      require_manifest: true
+      stats_bootstrap_file: null  # v4 规范版:零自举;seed 2025 与 s0 配对,单独定价画像贡献
+      # 角点判定阈:裸 EMA < s_lo 且有观测才吃 entry 槽(零机会成本论证)
+      s_lo: 0.125
+      slots_per_task: 4
+      # 分布课程:frac ~ U[f_lo, f_hi] 逐槽独立采样(确定性 hash);
+      # 全败区间上移 / 全成下移 / 混合不动;端点触界见 graduate/retire
+      f_init: [0.5, 0.9]
+      f_delta: 0.05
+      f_min: 0.05
+      f_max: 0.95
+      graduate_f_hi: 0.15
+      retire_f_lo: 0.85
+      retire_windows: 3
+      # 课程 critic:A = r − V̂(task, frac 五段);逐任务观测 < 2 退化全局段
+      critic_alpha: 0.5
+      critic_min_task_obs: 2
+      adv_scale: 1.0
+      # 学生自产状态池(v3 通路③):非 entry 臂成功轨迹的 action/obs 入池
+      student_pool: true
+      pool_max_per_task: 4
+      pool_max_decisions: 30
+      # 角点混臂:2 hint(造学生成功轨迹喂池)+ 4 entry + 2 bare
+      corner_hint_slots: 2
+    # ===================== CATALYST v4(统一分配法则)=====================
+    v4:
+      enable: true
+      n0: 2.0          # 先验强度(留一基线里的先验样本数)
+      alpha: 0.5       # 两层 EMA 系数
+      fbins: 5         # entry 进度分段数
+      bare_floor: 2    # 每任务裸保底槽(目标分布锚定)
+    thermostat:
+      enable: false   # D5: first smoke measures catalyst/h_hat, then set h_ref
+      h_ref: 0.35
+      eta: 0.01
+      lambda_init: 0.0
+      lambda_max: 1.0
+
+attribution_driven_credit_assignment:
+  enable: false
+
+thread_pool:
+  max_workers: 8

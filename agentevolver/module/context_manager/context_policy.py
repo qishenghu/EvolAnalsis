@@ -115,6 +115,26 @@ class StructuredContextPolicy:
         self.reasoning_history_tokens = int(
             _cfg_get(cm, "reasoning_history_tokens", 0)
         )
+        # v6 近窗域(2026-08-21 定稿):
+        # - observation_tool_response:环境观察在渲染层包
+        #   <tool_response>…</tool_response>。Qwen3.5 模板以"最后一条非
+        #   tool_response 的 user 消息"为界,其后 assistant 轮的 think
+        #   原生保留;不包则每条观察都是"新的用户提问",历史 think 全剥
+        #   (即 strip 域,旧行为)。
+        # - reasoning_recent_turns:近窗 m——最近 m 个 llm 轮保留 think,
+        #   更老轮 action-only(模板渲染为空 think 块)。0 = 关闭(退回
+        #   reasoning_history_tokens 语义)。
+        # - reasoning_max_tokens_per_turn:窗内逐轮 think 硬帽(outlier
+        #   保险丝;教师 122B think 实测 p99=311,>512 仅 0.4%)。
+        self.reasoning_recent_turns = max(
+            0, int(_cfg_get(cm, "reasoning_recent_turns", 0))
+        )
+        self.reasoning_max_tokens_per_turn = int(
+            _cfg_get(cm, "reasoning_max_tokens_per_turn", 512)
+        )
+        self.observation_tool_response = bool(
+            _cfg_get(cm, "observation_tool_response", False)
+        )
         self.snapshot_training = bool(
             _cfg_get(cm, "snapshot_training", self.enabled)
         )
@@ -259,6 +279,13 @@ class StructuredContextPolicy:
         return prefix, turns
 
     def _reasoning_keep_indices(self, turns: List[List[Any]]) -> set[int]:
+        if self.reasoning_recent_turns > 0:
+            llm_indices = [
+                i
+                for i, turn in enumerate(turns)
+                if turn and getattr(turn[0], "author", None) == "llm"
+            ]
+            return set(llm_indices[-self.reasoning_recent_turns:])
         if self.reasoning_history_tokens < 0:
             return {
                 i
@@ -285,6 +312,22 @@ class StructuredContextPolicy:
             keep.add(i)
         return keep
 
+    def _clip_reasoning(self, content: str) -> str:
+        """窗内 llm 轮的逐轮 think 硬帽(只截 think 段,action 段不动)。"""
+        cap = self.reasoning_max_tokens_per_turn
+        if cap < 0 or "</think>" not in content:
+            return content
+        head, _, _ = content.partition("</think>")
+        think = head.split("<think>")[-1].strip("\n")
+        clipped, was_clipped = self._clip_text(think, cap)
+        if not was_clipped:
+            return content
+        post = self._post_think(content)
+        return f"<think>\n{clipped}\n</think>\n\n{post}"
+
+    def _wrap_tool_response(self, content: str) -> str:
+        return f"<tool_response>\n{content}\n</tool_response>"
+
     def _render_turn(
         self, turn: List[Any], *, old: bool, keep_reasoning: bool
     ) -> tuple[List[Dict[str, str]], int]:
@@ -294,7 +337,11 @@ class StructuredContextPolicy:
             author = getattr(msg, "author", None)
             raw = str(getattr(msg, "content", ""))
             if author == "llm":
-                content = raw if keep_reasoning else self._action_only(raw)
+                content = (
+                    self._clip_reasoning(raw)
+                    if keep_reasoning
+                    else self._action_only(raw)
+                )
             elif author == "env":
                 content = self._strip_action_hints(raw) if old else raw
                 limit = (
@@ -308,6 +355,10 @@ class StructuredContextPolicy:
                 )
                 content, clipped = self._clip_text(content, limit)
                 n_clipped += int(clipped)
+                # 包裹必须在裁剪之后:闭合标签被裁掉会使该观察被模板
+                # 误判为真实用户提问,think 保留窗口整体重置。
+                if self.observation_tool_response:
+                    content = self._wrap_tool_response(content)
             else:
                 content = raw
             rendered.append(self._as_message(msg, content))
@@ -409,13 +460,25 @@ class StructuredContextPolicy:
                 if user_index is None:
                     break
                 content = messages[user_index]["content"]
+                # tool_response 包裹的观察:先解包再裁,裁完重包——
+                # 裁掉闭合标签会重置模板的 think 保留窗口。
+                wrapped = (
+                    self.observation_tool_response
+                    and content.startswith("<tool_response>")
+                    and content.endswith("</tool_response>")
+                )
+                if wrapped:
+                    content = content[len("<tool_response>"): -len("</tool_response>")].strip("\n")
                 content_tokens = self._encode_text(content)
                 over = len(prompt_ids) - self.max_prompt_tokens
                 new_limit = max(32, len(content_tokens) - over - 32)
                 if new_limit >= len(content_tokens):
                     break
-                messages[user_index]["content"], _ = self._clip_text(
-                    content, new_limit
+                clipped_content, _ = self._clip_text(content, new_limit)
+                messages[user_index]["content"] = (
+                    self._wrap_tool_response(clipped_content)
+                    if wrapped
+                    else clipped_content
                 )
                 clipped_observations += 1
                 prompt_ids = self._prompt_ids(messages)

@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from loguru import logger
 
-ENTRY_BOOK_VERSION = "catalyst_entry_book/1.0.0"
+ENTRY_BOOK_VERSION = "catalyst_entry_book/1.1.0"  # 1.1.0: steps 携带教师 think(v6)
 ENTRY_SCHED_STATE_SCHEMA = "catalyst_entry_scheduler_state_v1"
 
 # 与试点 collect_student_takeover._extract_tagged_action 同习惯:
@@ -53,6 +53,20 @@ def canonical_action_message(action: str) -> str:
     return f"<action>\n{action}\n</action>"
 
 
+def canonical_seed_assistant(action: str, think: str = "") -> str:
+    """seed 进事件日志的 assistant 内容形(v6)。
+
+    think 非空时带 <think> 块——可见性由渲染域决定:strip 域(模板剥
+    历史 think)下与旧行为逐字节等价;近窗域(observation_tool_response
+    + reasoning_recent_turns)下最近 m 轮的教师 think 原生保留。
+    注意:发送给 env.step 推进环境的仍是 canonical_action_message
+    (action-only),本形态只进事件日志。"""
+    think = str(think or "").strip()
+    if think:
+        return f"<think>\n{think}\n</think>\n\n<action>\n{action}\n</action>"
+    return canonical_action_message(action)
+
+
 @dataclass(frozen=True)
 class EntryPlan:
     """单 rollout 接管计划;payload 形态跨线程传输(纯 str/int/float/list)。"""
@@ -66,12 +80,18 @@ class EntryPlan:
     init_messages: List[Dict[str, str]]
     replay_actions: List[str]
     expected_observations: List[str]
+    # v6:逐步教师/学生 think(与 replay_actions 等长;缺失处为 "")。
+    replay_thinks: List[str] = field(default_factory=list)
 
     def to_payload(self) -> Dict[str, Any]:
         return asdict(self)
 
     @staticmethod
     def from_payload(payload: Mapping[str, Any]) -> "EntryPlan":
+        actions = [str(a) for a in payload["replay_actions"]]
+        thinks = [str(t) for t in payload.get("replay_thinks", [])]
+        if len(thinks) < len(actions):  # 旧 payload 兼容:缺失补空
+            thinks = thinks + [""] * (len(actions) - len(thinks))
         return EntryPlan(
             task_id=str(payload["task_id"]),
             frac=float(payload["frac"]),
@@ -80,10 +100,11 @@ class EntryPlan:
             n_teacher_decisions=int(payload["n_teacher_decisions"]),
             teacher_rollout_id=str(payload["teacher_rollout_id"]),
             init_messages=[dict(m) for m in payload["init_messages"]],
-            replay_actions=[str(a) for a in payload["replay_actions"]],
+            replay_actions=actions,
             expected_observations=[
                 str(o) for o in payload["expected_observations"]
             ],
+            replay_thinks=thinks[: len(actions)],
         )
 
 
@@ -187,6 +208,7 @@ class CatalystEntryBook:
             expected_observations=[
                 str(s["observation"]) for s in steps[:k_steps]
             ],
+            replay_thinks=[str(s.get("think", "")) for s in steps[:k_steps]],
         )
 
 
@@ -258,8 +280,15 @@ def replay_teacher_prefix(
                 f"environment terminated during teacher replay at step "
                 f"{step_index + 1}/{plan.k_steps} (task {plan.task_id})"
             )
+        # v6:事件日志里的 seed 形态带 think(可见性由渲染域决定);
+        # env.step 发送的仍是上面的 action-only 规范形,环境契约不变。
+        think = (
+            plan.replay_thinks[step_index]
+            if step_index < len(plan.replay_thinks)
+            else ""
+        )
         seed_pairs.append(
-            (canonical_action_message(action), observed)
+            (canonical_seed_assistant(action, think), observed)
         )
     return seed_pairs, divergence
 
@@ -722,6 +751,7 @@ class CatalystStatePool:
             expected_observations=[
                 str(s["observation"]) for s in steps[:k_steps]
             ],
+            replay_thinks=[str(s.get("think", "")) for s in steps[:k_steps]],
         )
 
     def insert_from_cmt(self, cmt: Any, global_step: int) -> bool:
@@ -755,7 +785,14 @@ class CatalystStatePool:
                     self.rejected_total += 1
                     return False
                 action = extract_tagged_action(content_a)  # 无合法 action 抛
-                steps.append({"action": action, "observation": content_e})
+                think_m = re.search(
+                    r"<think>\s*(.*?)\s*</think>", content_a, re.S
+                )
+                steps.append({
+                    "action": action,
+                    "observation": content_e,
+                    "think": think_m.group(1).strip() if think_m else "",
+                })
             entry = {
                 "source": "student",
                 "rollout_id": str(getattr(cmt, "rollout_id", "")),
@@ -799,6 +836,7 @@ class CatalystStatePool:
             expected_observations=[
                 str(s["observation"]) for s in steps[:k_steps]
             ],
+            replay_thinks=[str(s.get("think", "")) for s in steps[:k_steps]],
         )
 
     def save_payload(self) -> Dict[str, Any]:

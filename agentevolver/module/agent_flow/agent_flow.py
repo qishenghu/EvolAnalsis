@@ -131,8 +131,9 @@ class AgentFlow(BaseAgentFlow):
         # ⭐ CATALYST v2 entry 臂(设计 §2,镜像试点 TakeoverAgentFlow 三步):
         # ① 逐步重放教师前 k 个 action 推进 env(失败抛
         #    CatalystEntryReplayError,worker 降级为裸臂重试);
-        # ② save_init_input 之后把 k 对 (action-only assistant, live env 观测)
-        #    seed 进 full_context——教师 think 从不出现,seed 消息不产生
+        # ② save_init_input 之后把 k 对 (assistant, live env 观测) seed 进
+        #    full_context——v6 起 assistant 侧带教师 think(可见性由渲染域
+        #    决定:strip 域模板剥离,近窗域最近 m 轮保留);seed 消息不产生
         #    decision snapshot,故拿不到 loss(零模仿不变式,结构保证);
         # ③ 学生步数预算收缩为 max_steps − k。
         catalyst_entry_seed_pairs = None
